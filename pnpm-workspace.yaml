@@ -1,0 +1,7 @@
+packages:
+  - server
+  - web
+onlyBuiltDependencies:
+  - esbuild
+  - '@tailwindcss/oxide-linux-x64-gnu'
+  - '@tailwindcss/oxide-linux-x64-musl'
