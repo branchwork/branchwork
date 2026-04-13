@@ -48,6 +48,8 @@ export const useWsStore = create<WsStore>((set, get) => ({
   },
 }));
 
+let planRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
 function handleWsMessage(msg: { type: string; data: unknown }) {
   const planStore = usePlanStore.getState();
   const agentStore = useAgentStore.getState();
@@ -58,7 +60,12 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
       if (d.plan) {
         planStore.updatePlan(d.plan as Parameters<typeof planStore.updatePlan>[0]);
       }
-      planStore.fetchPlans();
+      // Debounce plan list refresh to avoid flickering
+      if (planRefreshTimer) clearTimeout(planRefreshTimer);
+      planRefreshTimer = setTimeout(() => {
+        planStore.fetchPlans();
+        planRefreshTimer = null;
+      }, 2000);
       break;
     }
     case "agent_started": {

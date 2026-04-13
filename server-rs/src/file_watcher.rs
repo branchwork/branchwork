@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 use tokio::sync::broadcast;
@@ -21,8 +23,11 @@ pub fn start(
     let plans_dir_clone = plans_dir.clone();
     let start_time = std::time::Instant::now();
 
+    // Track file modification times to avoid duplicate events
+    let mtimes: Mutex<HashMap<PathBuf, std::time::SystemTime>> = Mutex::new(HashMap::new());
+
     let mut debouncer = new_debouncer(
-        std::time::Duration::from_millis(300),
+        std::time::Duration::from_millis(500),
         move |res: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             let events = match res {
                 Ok(events) => events,
@@ -32,8 +37,8 @@ pub fn start(
                 }
             };
 
-            // Ignore events during first 2 seconds (startup noise)
-            if start_time.elapsed().as_secs() < 2 {
+            // Ignore events during first 3 seconds (startup noise)
+            if start_time.elapsed().as_secs() < 3 {
                 return;
             }
 
@@ -41,11 +46,30 @@ pub fn start(
                 let path = &event.path;
 
                 // Only handle .md files in the plans directory
-                if path.extension().is_some_and(|e| e == "md")
-                    && path.parent() == Some(plans_dir_clone.as_path())
+                if !path.extension().is_some_and(|e| e == "md")
+                    || path.parent() != Some(plans_dir_clone.as_path())
                 {
-                    handle_event(&event.kind, path, &tx_clone);
+                    continue;
                 }
+
+                // Check if the file's mtime actually changed
+                let mut mtimes = mtimes.lock().unwrap();
+                if path.exists() {
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        if let Ok(mtime) = meta.modified() {
+                            let prev = mtimes.get(path);
+                            if prev == Some(&mtime) {
+                                continue; // mtime unchanged, skip
+                            }
+                            mtimes.insert(path.clone(), mtime);
+                        }
+                    }
+                } else {
+                    mtimes.remove(path);
+                }
+                drop(mtimes);
+
+                handle_event(&event.kind, path, &tx_clone);
             }
         },
     )?;
@@ -67,13 +91,11 @@ fn handle_event(
     match kind {
         DebouncedEventKind::Any => {
             if path.exists() {
-                // File added or changed
                 match plan_parser::parse_plan_file(path) {
                     Ok(plan) => {
-                        let action = "changed";
-                        println!("[watcher] Plan {action}: {}", path.display());
+                        println!("[watcher] Plan changed: {}", path.display());
                         broadcast_event(tx, "plan_updated", serde_json::json!({
-                            "action": action,
+                            "action": "changed",
                             "plan": plan,
                         }));
                     }
@@ -82,7 +104,6 @@ fn handle_event(
                     }
                 }
             } else {
-                // File removed
                 let name = path
                     .file_stem()
                     .and_then(|s| s.to_str())
