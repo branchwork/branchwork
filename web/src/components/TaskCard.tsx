@@ -47,7 +47,20 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const [agentId, setAgentId] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [merging, setMerging] = useState(false);
+  const agents = useAgentStore((s) => s.agents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+  const mergeAgentBranch = useAgentStore((s) => s.mergeAgentBranch);
+
+  // Find a completed agent with an unmerged branch for this task
+  const branchAgent = agents.find(
+    (a) =>
+      a.plan_name === planName &&
+      a.task_id === task.number &&
+      a.branch &&
+      a.status !== "running" &&
+      a.status !== "starting"
+  );
   const plan = usePlanStore((s) => s.selectedPlan);
   const selectPlan = usePlanStore((s) => s.selectPlan);
   const savePlan = usePlanStore((s) => s.savePlan);
@@ -263,8 +276,41 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
               View
             </button>
           )}
+
+          {/* Merge — when agent has an unmerged branch */}
+          {branchAgent && (
+            <button
+              onClick={async () => {
+                setMerging(true);
+                setError(null);
+                const result = await mergeAgentBranch(branchAgent.id);
+                if (result.ok) {
+                  await selectPlan(planName);
+                } else {
+                  setError(result.error ?? "Merge failed");
+                }
+                setMerging(false);
+              }}
+              disabled={merging}
+              className="px-2 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white rounded transition"
+              title={`Merge branch ${branchAgent.branch} into ${branchAgent.source_branch ?? "main"}`}
+            >
+              {merging ? "..." : "Merge"}
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Branch indicator */}
+      {branchAgent?.branch && (
+        <div className="mt-1.5 flex items-center gap-1.5 text-[10px]">
+          <span className="text-indigo-400">&#9739;</span>
+          <span className="font-mono text-indigo-400/70 truncate" title={branchAgent.branch}>
+            {branchAgent.branch}
+          </span>
+          <span className="text-gray-600">&#8594; {branchAgent.source_branch ?? "main"}</span>
+        </div>
+      )}
 
       {/* File paths */}
       {task.filePaths.length > 0 && (
