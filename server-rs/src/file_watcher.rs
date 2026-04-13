@@ -80,7 +80,7 @@ pub fn start(plans_dir: &Path, tx: broadcast::Sender<String>) -> notify::Result<
     Ok(debouncer)
 }
 
-fn handle_event(kind: &DebouncedEventKind, path: &PathBuf, tx: &broadcast::Sender<String>) {
+fn handle_event(kind: &DebouncedEventKind, path: &Path, tx: &broadcast::Sender<String>) {
     if kind == &DebouncedEventKind::Any {
         if path.exists() {
             match plan_parser::parse_plan_file(path) {

@@ -5,7 +5,7 @@ use std::thread;
 
 use rusqlite::params;
 
-use crate::agents::AgentRegistry;
+use crate::agents::{AgentRegistry, git_head_sha};
 use crate::config::Effort;
 use crate::ws::broadcast_event;
 
@@ -19,19 +19,21 @@ pub async fn start_check_agent(
 ) -> String {
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
+    let base_commit = git_head_sha(cwd);
 
     {
         let db = registry.db.lock().unwrap();
         db.execute(
-            "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt)
-             VALUES (?1, ?2, ?3, 'starting', 'stream-json', ?4, ?5, ?6)",
+            "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt, base_commit)
+             VALUES (?1, ?2, ?3, 'starting', 'stream-json', ?4, ?5, ?6, ?7)",
             params![
                 id,
                 session_id,
                 cwd.to_str().unwrap_or(""),
                 plan_name,
                 task_id,
-                prompt
+                prompt,
+                base_commit
             ],
         )
         .ok();
@@ -163,11 +165,27 @@ pub async fn start_check_agent(
             "failed"
         };
 
+        // Extract cost from the result event
+        let cost_usd: Option<f64> = {
+            let db_guard = db.lock().unwrap();
+            let mut stmt = db_guard
+                .prepare("SELECT content FROM agent_output WHERE agent_id = ? AND message_type = 'result' ORDER BY id DESC LIMIT 1")
+                .unwrap();
+            stmt.query_map(params![id_clone], |row| row.get::<_, String>(0))
+                .unwrap()
+                .flatten()
+                .find_map(|content| {
+                    serde_json::from_str::<serde_json::Value>(&content)
+                        .ok()
+                        .and_then(|v| v.get("total_cost_usd")?.as_f64())
+                })
+        };
+
         {
             let db = db.lock().unwrap();
             db.execute(
-                "UPDATE agents SET status = ?1, finished_at = datetime('now') WHERE id = ?2",
-                params![agent_status, id_clone],
+                "UPDATE agents SET status = ?1, finished_at = datetime('now'), cost_usd = ?3 WHERE id = ?2",
+                params![agent_status, id_clone, cost_usd],
             )
             .ok();
         }

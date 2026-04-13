@@ -6,9 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use regex::Regex;
 use rusqlite::params;
 
-use crate::agents::{AgentMode, AgentRegistry, ManagedAgent};
+use crate::agents::{
+    AgentRegistry, ManagedAgent, git_checkout_branch, git_current_branch, git_head_sha,
+};
 use crate::config::Effort;
 use crate::ws::broadcast_event;
 
@@ -16,31 +19,55 @@ fn tmux_session_name(agent_id: &str) -> String {
     format!("oai-{}", &agent_id[..8.min(agent_id.len())])
 }
 
-pub async fn start_pty_agent(
-    registry: &AgentRegistry,
-    prompt: String,
-    cwd: &Path,
-    plan_name: Option<&str>,
-    task_id: Option<&str>,
-    effort: Effort,
-) -> String {
+pub struct StartPtyOpts<'a> {
+    pub prompt: String,
+    pub cwd: &'a Path,
+    pub plan_name: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub effort: Effort,
+    pub branch: Option<&'a str>,
+    pub is_continue: bool,
+}
+
+pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -> String {
+    let StartPtyOpts {
+        prompt,
+        cwd,
+        plan_name,
+        task_id,
+        effort,
+        branch,
+        is_continue,
+    } = opts;
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
     let tmux_name = tmux_session_name(&id);
+
+    // Capture base commit and source branch BEFORE switching
+    let base_commit = git_head_sha(cwd);
+    let source_branch = git_current_branch(cwd);
+
+    // Checkout the task branch if specified
+    if let Some(branch_name) = branch {
+        git_checkout_branch(cwd, branch_name, is_continue);
+    }
 
     // Insert into DB
     {
         let db = registry.db.lock().unwrap();
         db.execute(
-            "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt)
-             VALUES (?1, ?2, ?3, 'starting', 'pty', ?4, ?5, ?6)",
+            "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt, base_commit, branch, source_branch)
+             VALUES (?1, ?2, ?3, 'starting', 'pty', ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 session_id,
                 cwd.to_str().unwrap_or(""),
                 plan_name,
                 task_id,
-                prompt
+                prompt,
+                base_commit,
+                branch,
+                source_branch,
             ],
         )
         .ok();
@@ -209,11 +236,6 @@ async fn attach_to_tmux(registry: &AgentRegistry, agent_id: &str, tmux_name: &st
 
     // Store in agent registry
     let agent = ManagedAgent {
-        id: agent_id.to_string(),
-        session_id: String::new(),
-        plan_name: None,
-        task_id: None,
-        mode: AgentMode::Pty,
         pty: Some(child),
         pty_writer: Some(pty_writer),
         pty_master: Some(master),
@@ -270,12 +292,15 @@ async fn attach_to_tmux(registry: &AgentRegistry, agent_id: &str, tmux_name: &st
             .is_ok_and(|s| s.success());
 
         if session_dead {
-            let db = db.lock().unwrap();
-            db.execute(
-                "UPDATE agents SET status = 'completed', finished_at = datetime('now') WHERE id = ? AND status = 'running'",
-                params![id],
+            // Parse cost from recent PTY output (Claude Code prints "Total cost: $X.XX")
+            let cost_usd = parse_cost_from_pty_output(&db, &id);
+
+            let db_guard = db.lock().unwrap();
+            db_guard.execute(
+                "UPDATE agents SET status = 'completed', finished_at = datetime('now'), cost_usd = ?2 WHERE id = ?1 AND status = 'running'",
+                params![id, cost_usd],
             ).ok();
-            drop(db);
+            drop(db_guard);
             agents.blocking_lock().remove(&id);
             broadcast_event(
                 &tx,
@@ -320,4 +345,32 @@ fn shell_escape(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Strip ANSI escape sequences from terminal output.
+fn strip_ansi(s: &str) -> String {
+    let re = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]").unwrap();
+    re.replace_all(s, "").to_string()
+}
+
+/// Parse cost from the last few PTY output lines.
+/// Claude Code prints lines like "Total cost:      $0.1234" at session end.
+fn parse_cost_from_pty_output(db: &crate::db::Db, agent_id: &str) -> Option<f64> {
+    let db = db.lock().unwrap();
+    let mut stmt = db
+        .prepare("SELECT content FROM agent_output WHERE agent_id = ? ORDER BY id DESC LIMIT 50")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map(params![agent_id], |row| row.get(0))
+        .unwrap()
+        .flatten()
+        .collect();
+
+    let combined = rows.into_iter().rev().collect::<String>();
+    let clean = strip_ansi(&combined);
+
+    // Match patterns like "Total cost:  $0.1234" or "total cost: $12.34"
+    let re = Regex::new(r"(?i)total\s+cost[:\s]*\$(\d+\.?\d*)").unwrap();
+    re.captures(&clean)
+        .and_then(|caps| caps.get(1)?.as_str().parse::<f64>().ok())
 }

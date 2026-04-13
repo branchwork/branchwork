@@ -648,20 +648,19 @@ pub async fn start_task(
         .unwrap_or(*state.effort.lock().unwrap());
 
     // Create a dedicated branch for this task
-    let branch_name = format!(
-        "orchestrai/{}/{}",
-        body.plan_name, body.task_number
-    );
+    let branch_name = format!("orchestrai/{}/{}", body.plan_name, body.task_number);
 
     let agent_id = pty_agent::start_pty_agent(
         &state.registry,
-        prompt,
-        &work_dir,
-        Some(&body.plan_name),
-        Some(&body.task_number),
-        effort,
-        Some(&branch_name),
-        is_continue,
+        pty_agent::StartPtyOpts {
+            prompt,
+            cwd: &work_dir,
+            plan_name: Some(&body.plan_name),
+            task_id: Some(&body.task_number),
+            effort,
+            branch: Some(&branch_name),
+            is_continue,
+        },
     )
     .await;
 
@@ -905,8 +904,19 @@ pub async fn create_plan(
     );
 
     let effort = *state.effort.lock().unwrap();
-    let agent_id =
-        pty_agent::start_pty_agent(&state.registry, prompt, &resolved, None, None, effort, None, false).await;
+    let agent_id = pty_agent::start_pty_agent(
+        &state.registry,
+        pty_agent::StartPtyOpts {
+            prompt,
+            cwd: &resolved,
+            plan_name: None,
+            task_id: None,
+            effort,
+            branch: None,
+            is_continue: false,
+        },
+    )
+    .await;
 
     let project_name = resolved
         .file_name()

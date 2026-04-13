@@ -97,6 +97,15 @@ async fn main() {
             "/api/agents/{id}/output",
             get(api::agents::get_agent_output),
         )
+        .route("/api/agents/{id}/diff", get(api::agents::get_agent_diff))
+        .route(
+            "/api/agents/{id}/merge",
+            post(api::agents::merge_agent_branch),
+        )
+        .route(
+            "/api/agents/{id}/discard",
+            post(api::agents::discard_agent_branch),
+        )
         .route("/api/agents/{id}", delete(api::agents::kill_agent))
         .route("/api/events", get(api::agents::get_events))
         // Plan routes

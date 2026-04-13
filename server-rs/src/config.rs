@@ -63,8 +63,6 @@ pub struct Config {
     pub effort: Effort,
     pub claude_dir: PathBuf,
     pub plans_dir: PathBuf,
-    pub tasks_dir: PathBuf,
-    pub sessions_dir: PathBuf,
     pub db_path: PathBuf,
 }
 
@@ -75,8 +73,6 @@ impl Config {
             port: cli.port,
             effort: cli.effort,
             plans_dir: claude_dir.join("plans"),
-            tasks_dir: claude_dir.join("tasks"),
-            sessions_dir: claude_dir.join("sessions"),
             db_path: claude_dir.join("orchestrai.db"),
             claude_dir,
         }

@@ -11,6 +11,98 @@ use crate::ws::broadcast_event;
 
 pub type AgentId = String;
 
+/// Get the current HEAD commit SHA in the given directory.
+/// Returns None if the directory is not a git repo or git is unavailable.
+pub fn git_head_sha(cwd: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Get the current branch name in the given directory.
+pub fn git_current_branch(cwd: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if name == "HEAD" {
+            // Detached HEAD — not on a branch
+            None
+        } else {
+            Some(name)
+        }
+    } else {
+        None
+    }
+}
+
+/// Create or checkout a git branch. Returns true if successful.
+/// For "start" mode: creates the branch (or checks it out if it already exists).
+/// For "continue" mode: checks out the existing branch.
+pub fn git_checkout_branch(cwd: &std::path::Path, branch: &str, is_continue: bool) -> bool {
+    if is_continue {
+        // Try to checkout the existing branch
+        let status = std::process::Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(cwd)
+            .output();
+        match status {
+            Ok(output) if output.status.success() => {
+                println!("[orchestrAI] Checked out existing branch: {branch}");
+                return true;
+            }
+            _ => {
+                // Branch doesn't exist yet — fall through to create it
+                println!("[orchestrAI] Branch {branch} not found for continue, creating it");
+            }
+        }
+    }
+
+    // Try to create the branch
+    let status = std::process::Command::new("git")
+        .args(["checkout", "-b", branch])
+        .current_dir(cwd)
+        .output();
+    match status {
+        Ok(output) if output.status.success() => {
+            println!("[orchestrAI] Created and checked out branch: {branch}");
+            true
+        }
+        _ => {
+            // Branch already exists — just check it out
+            let fallback = std::process::Command::new("git")
+                .args(["checkout", branch])
+                .current_dir(cwd)
+                .output();
+            match fallback {
+                Ok(output) if output.status.success() => {
+                    println!("[orchestrAI] Checked out existing branch: {branch}");
+                    true
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!("[orchestrAI] Failed to checkout branch {branch}: {stderr}");
+                    false
+                }
+                Err(e) => {
+                    eprintln!("[orchestrAI] Failed to run git checkout: {e}");
+                    false
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentRegistry {
     pub agents: Arc<Mutex<HashMap<AgentId, ManagedAgent>>>,
@@ -19,22 +111,13 @@ pub struct AgentRegistry {
 }
 
 pub struct ManagedAgent {
-    pub id: String,
-    pub session_id: String,
-    pub plan_name: Option<String>,
-    pub task_id: Option<String>,
-    pub mode: AgentMode,
+    /// Kept alive to prevent the child process from being dropped/killed.
+    #[allow(dead_code)]
     pub pty: Option<Box<dyn portable_pty::Child + Send>>,
     pub pty_writer: Option<Box<dyn std::io::Write + Send>>,
     pub pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pub tmux_session: Option<String>,
     pub terminals: Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum AgentMode {
-    Pty,
-    StreamJson,
 }
 
 impl AgentRegistry {
