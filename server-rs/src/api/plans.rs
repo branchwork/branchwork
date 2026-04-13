@@ -365,14 +365,16 @@ pub async fn auto_status(
 
     for phase in &plan.phases {
         for task in &phase.tasks {
-            if let Some(s) = manual.get(&task.number).filter(|s| s.as_str() != "pending") {
+            // If a status already exists in DB (manual or prior auto), keep it.
+            // Only auto-infer for tasks with no DB row at all.
+            if let Some(s) = manual.get(&task.number) {
                 let s = s.clone();
                 *summary.entry(s.clone()).or_insert(0) += 1;
                 results.push(serde_json::json!({
                     "taskNumber": task.number,
                     "title": task.title,
                     "status": s,
-                    "reason": "manual (kept)",
+                    "reason": "existing (kept)",
                 }));
                 continue;
             }
@@ -468,10 +470,9 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
 
         for phase in &plan.phases {
             for task in &phase.tasks {
-                let existing = manual.get(&task.number).cloned();
-                if existing.as_deref().is_some_and(|s| s != "pending") {
-                    let s = existing.unwrap();
-                    *totals.entry(s.as_str().to_string()).or_insert(0) += 1;
+                // Keep any existing DB status (manual or prior auto)
+                if let Some(s) = manual.get(&task.number) {
+                    *totals.entry(s.clone()).or_insert(0) += 1;
                     continue;
                 }
 
