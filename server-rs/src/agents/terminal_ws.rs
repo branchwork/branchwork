@@ -56,13 +56,34 @@ async fn handle_terminal(mut socket: WebSocket, agent_id: String, registry: Agen
     }
 
     if !attached {
-        // Agent not found / already exited — show replay and close
-        socket
-            .send(Message::Text(
-                "\r\n\x1b[90m--- session ended ---\x1b[0m\r\n".into(),
-            ))
-            .await
-            .ok();
+        // Check if agent is still running but detached (server restarted)
+        let is_running = {
+            let db = registry.db.lock().unwrap();
+            db.query_row(
+                "SELECT status FROM agents WHERE id = ?",
+                rusqlite::params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .is_some_and(|s| s == "running" || s == "starting")
+        };
+
+        if is_running {
+            socket
+                .send(Message::Text(
+                    "\r\n\x1b[33m--- terminal detached (server restarted while agent was running) ---\x1b[0m\r\n\
+                     \x1b[33m--- agent is still alive — use Kill to stop it, or wait for it to finish ---\x1b[0m\r\n".into(),
+                ))
+                .await
+                .ok();
+        } else {
+            socket
+                .send(Message::Text(
+                    "\r\n\x1b[90m--- session ended ---\x1b[0m\r\n".into(),
+                ))
+                .await
+                .ok();
+        }
         return;
     }
 

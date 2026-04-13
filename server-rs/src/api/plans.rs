@@ -403,13 +403,13 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
         ("in_progress".into(), 0),
         ("pending".into(), 0),
     ]);
-    let mut synced = 0;
 
-    for s in &summaries {
-        let project = match s.project.as_deref() {
-            Some(p) => p,
-            None => continue,
-        };
+    // Match TypeScript: synced = number of plans that have a project set
+    let plans_with_project: Vec<_> = summaries.iter().filter(|s| s.project.is_some()).collect();
+    let synced = plans_with_project.len();
+
+    for s in &plans_with_project {
+        let project = s.project.as_deref().unwrap();
         let project_dir = home.join(project);
         if !project_dir.is_dir() {
             continue;
@@ -465,7 +465,6 @@ pub async fn sync_all(State(state): State<AppState>) -> impl IntoResponse {
                 *totals.entry(status.to_string()).or_insert(0) += 1;
             }
         }
-        synced += 1;
     }
 
     Json(serde_json::json!({

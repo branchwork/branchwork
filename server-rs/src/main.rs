@@ -33,7 +33,40 @@ async fn main() {
     let registry = agents::AgentRegistry::new(db.clone(), broadcast_tx.clone());
     registry.cleanup_stale();
 
-    let state = AppState::new(&config, db, broadcast_tx.clone(), registry.clone());
+    let state = AppState::new(&config, db.clone(), broadcast_tx.clone(), registry.clone());
+
+    // Background: monitor detached agents (check PIDs every 30s)
+    let db_monitor = db;
+    let tx_monitor = broadcast_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            let db = db_monitor.lock().unwrap();
+            let mut stmt = db
+                .prepare("SELECT id, pid FROM agents WHERE status IN ('running', 'starting')")
+                .unwrap();
+            let agents: Vec<(String, i64)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            for (id, pid) in agents {
+                let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+                if !alive {
+                    db.execute(
+                        "UPDATE agents SET status = 'completed', finished_at = datetime('now') WHERE id = ?",
+                        rusqlite::params![id],
+                    ).ok();
+                    crate::ws::broadcast_event(
+                        &tx_monitor,
+                        "agent_stopped",
+                        serde_json::json!({"id": id, "status": "completed", "exit_code": 0}),
+                    );
+                    println!("[orchestrAI] Detached agent {} (pid {}) finished", &id[..8.min(id.len())], pid);
+                }
+            }
+        }
+    });
 
     // Start file watcher
     let _watcher = file_watcher::start(&config.plans_dir, broadcast_tx)

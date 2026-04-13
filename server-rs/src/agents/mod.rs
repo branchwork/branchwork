@@ -66,12 +66,16 @@ impl AgentRegistry {
                     rusqlite::params![id],
                 )
                 .ok();
-                println!("[orchestrAI] Cleaned stale agent {} (pid {})", &id[..8], pid);
+                println!("[orchestrAI] Cleaned stale agent {} (pid {}) — process dead", &id[..8], pid);
+            } else {
+                // Process is alive but we lost the PTY connection — keep running
+                println!("[orchestrAI] Agent {} (pid {}) still alive — detached (terminal lost, can still kill)", &id[..8], pid);
             }
         }
     }
 
     pub async fn kill_agent(&self, agent_id: &str) -> bool {
+        // Try in-memory registry first (live agents)
         let mut agents = self.agents.lock().await;
         if let Some(mut agent) = agents.remove(agent_id) {
             if let Some(ref mut child) = agent.pty {
@@ -90,6 +94,29 @@ impl AgentRegistry {
             );
             return true;
         }
+        drop(agents);
+
+        // Fallback: detached agent — kill by PID from DB
+        let db = self.db.lock().unwrap();
+        if let Ok(pid) = db.query_row(
+            "SELECT pid FROM agents WHERE id = ? AND status IN ('running', 'starting')",
+            rusqlite::params![agent_id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            db.execute(
+                "UPDATE agents SET status = 'killed', finished_at = datetime('now') WHERE id = ?",
+                rusqlite::params![agent_id],
+            )
+            .ok();
+            broadcast_event(
+                &self.broadcast_tx,
+                "agent_stopped",
+                serde_json::json!({"id": agent_id, "status": "killed"}),
+            );
+            return true;
+        }
+
         false
     }
 }
