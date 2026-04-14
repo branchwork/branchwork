@@ -279,6 +279,26 @@ pub async fn merge_agent_branch(
                 .output()
                 .ok();
 
+            // Clear branch in DB so the UI hides the Merge button
+            {
+                let db = state.db.lock().unwrap();
+                db.execute(
+                    "UPDATE agents SET branch = NULL WHERE id = ?",
+                    params![id],
+                ).ok();
+            }
+
+            // Broadcast so connected dashboards update immediately
+            crate::ws::broadcast_event(
+                &state.broadcast_tx,
+                "agent_branch_merged",
+                serde_json::json!({
+                    "id": id,
+                    "merged": task_branch,
+                    "into": target,
+                }),
+            );
+
             Json(serde_json::json!({
                 "ok": true,
                 "merged": task_branch,
@@ -376,12 +396,32 @@ pub async fn discard_agent_branch(
         .output();
 
     match delete {
-        Ok(output) if output.status.success() => Json(serde_json::json!({
-            "ok": true,
-            "deleted": task_branch,
-            "switched_to": target,
-        }))
-        .into_response(),
+        Ok(output) if output.status.success() => {
+            // Clear branch in DB
+            {
+                let db = state.db.lock().unwrap();
+                db.execute(
+                    "UPDATE agents SET branch = NULL WHERE id = ?",
+                    params![id],
+                ).ok();
+            }
+
+            crate::ws::broadcast_event(
+                &state.broadcast_tx,
+                "agent_branch_discarded",
+                serde_json::json!({
+                    "id": id,
+                    "deleted": task_branch,
+                }),
+            );
+
+            Json(serde_json::json!({
+                "ok": true,
+                "deleted": task_branch,
+                "switched_to": target,
+            }))
+            .into_response()
+        }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             (
