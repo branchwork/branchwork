@@ -5,6 +5,40 @@ import { useAgentStore } from "./agent-store.js";
 const MAX_RECONNECT_DELAY = 30_000;
 const INITIAL_RECONNECT_DELAY = 2_000;
 
+function notificationsSupported(): boolean {
+  return typeof window !== "undefined" && "Notification" in window;
+}
+
+function requestNotificationPermission() {
+  if (!notificationsSupported()) return;
+  if (Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {
+      // ignore — user may dismiss or browser may block
+    });
+  }
+}
+
+function notify(title: string, body: string, tag?: string) {
+  if (!notificationsSupported()) return;
+  if (Notification.permission !== "granted") return;
+  try {
+    new Notification(title, { body, tag, icon: "/favicon.ico" });
+  } catch {
+    // some browsers (mobile Safari, etc.) throw on direct construction
+  }
+}
+
+function lookupTaskTitle(planName: string | null, taskNumber: string | null): string {
+  if (!planName || !taskNumber) return taskNumber ?? "task";
+  const plan = usePlanStore.getState().selectedPlan;
+  if (plan?.name !== planName) return `Task ${taskNumber}`;
+  for (const phase of plan.phases) {
+    const t = phase.tasks.find((x) => x.number === taskNumber);
+    if (t) return `Task ${taskNumber}: ${t.title}`;
+  }
+  return `Task ${taskNumber}`;
+}
+
 interface WsStore {
   connected: boolean;
   socket: WebSocket | null;
@@ -21,6 +55,8 @@ export const useWsStore = create<WsStore>((set, get) => ({
   connect: () => {
     const { socket } = get();
     if (socket) return;
+
+    requestNotificationPermission();
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     let ws: WebSocket;
@@ -113,6 +149,11 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
     }
     case "agent_stopped": {
       const d = msg.data as { id: string; status: string };
+      const agent = agentStore.agents.find((a) => a.id === d.id);
+      const taskLabel = agent
+        ? lookupTaskTitle(agent.plan_name, agent.task_id)
+        : `Agent ${d.id.slice(0, 8)}`;
+      notify(`${taskLabel} — ${d.status}`, "Agent finished", `agent-${d.id}`);
       agentStore.updateAgentStatus(d.id, d.status);
       // Refetch to pick up fields that may have been updated after initial
       // insert (branch, cost, base_commit) — ensures the task card's Merge
@@ -133,11 +174,45 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
     }
     case "task_status_changed": {
       const d2 = msg.data as { plan_name: string; task_number: string; status: string };
+      if (d2.status === "completed" || d2.status === "failed") {
+        notify(
+          `${lookupTaskTitle(d2.plan_name, d2.task_number)} — ${d2.status}`,
+          d2.plan_name,
+          `task-${d2.plan_name}-${d2.task_number}`
+        );
+      }
       planStore.patchTaskStatus(d2.plan_name, d2.task_number, d2.status);
+      break;
+    }
+    case "ci_status_changed": {
+      const d = msg.data as {
+        plan_name: string;
+        task_number: string;
+        status: string;
+        conclusion?: string | null;
+        run_url?: string | null;
+        commit_sha?: string | null;
+      };
+      planStore.patchTaskCi(d.plan_name, d.task_number, {
+        status: d.status as
+          | "pending" | "running" | "success" | "failure" | "cancelled" | "unknown",
+        conclusion: d.conclusion ?? null,
+        runUrl: d.run_url ?? null,
+        commitSha: d.commit_sha ?? null,
+        updatedAt: new Date().toISOString(),
+      });
+      if (d.status === "success" || d.status === "failure") {
+        notify(
+          `CI ${d.status}: ${lookupTaskTitle(d.plan_name, d.task_number)}`,
+          d.run_url ?? d.plan_name,
+          `ci-${d.plan_name}-${d.task_number}`
+        );
+      }
       break;
     }
     case "plan_warning": {
       const d = msg.data as { name: string; file: string; error: string };
+      notify(`Plan error: ${d.name}`, d.error, `plan-warning-${d.name}`);
       planStore.addWarning({
         name: d.name,
         file: d.file,

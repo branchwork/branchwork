@@ -5,6 +5,7 @@ import { useWsStore } from "./stores/ws-store.js";
 import { useSettingsStore } from "./stores/settings-store.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { PlanBoard } from "./components/PlanBoard.js";
+import { ProjectDashboard } from "./components/ProjectDashboard.js";
 import { AgentTree } from "./components/AgentTree.js";
 import { AgentPanel } from "./components/AgentPanel.js";
 import { NewPlanForm } from "./components/NewPlanForm.js";
@@ -16,6 +17,7 @@ export function App() {
   const connected = useWsStore((s) => s.connected);
   const connect = useWsStore((s) => s.connect);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
+  const selectedPlan = usePlanStore((s) => s.selectedPlan);
   const fetchAgents = useAgentStore((s) => s.fetchAgents);
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
 
@@ -37,7 +39,7 @@ export function App() {
 
       <main className="flex-1 flex overflow-hidden">
         <div className="flex-1 overflow-auto">
-          {view === "plans" && <PlanBoard />}
+          {view === "plans" && (selectedPlan ? <PlanBoard /> : <ProjectDashboard />)}
           {view === "agents" && <AgentTree />}
           {view === "new-plan" && (
             <NewPlanForm onClose={() => setView("plans")} />

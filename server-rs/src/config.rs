@@ -49,6 +49,12 @@ pub struct Cli {
     /// Path to .claude directory
     #[arg(long, default_value_os_t = default_claude_dir())]
     pub claude_dir: PathBuf,
+
+    /// Webhook URL to notify on agent completion / phase advance.
+    /// Accepts Slack incoming webhooks (posts `{"text": "..."}`) or any
+    /// JSON-accepting endpoint. Falls back to `ORCHESTRAI_WEBHOOK_URL` env.
+    #[arg(long, env = "ORCHESTRAI_WEBHOOK_URL")]
+    pub webhook_url: Option<String>,
 }
 
 fn default_claude_dir() -> PathBuf {
@@ -64,6 +70,7 @@ pub struct Config {
     pub claude_dir: PathBuf,
     pub plans_dir: PathBuf,
     pub db_path: PathBuf,
+    pub webhook_url: Option<String>,
 }
 
 impl Config {
@@ -75,6 +82,7 @@ impl Config {
             plans_dir: claude_dir.join("plans"),
             db_path: claude_dir.join("orchestrai.db"),
             claude_dir,
+            webhook_url: cli.webhook_url.filter(|s| !s.trim().is_empty()),
         }
     }
 }

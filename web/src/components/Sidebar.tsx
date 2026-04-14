@@ -29,6 +29,7 @@ export function Sidebar({ view, onViewChange }: Props) {
   const plans = usePlanStore((s) => s.plans);
   const selectedPlan = usePlanStore((s) => s.selectedPlan);
   const selectPlan = usePlanStore((s) => s.selectPlan);
+  const clearSelectedPlan = usePlanStore((s) => s.clearSelectedPlan);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const warnings = usePlanStore((s) => s.warnings);
   const dismissWarning = usePlanStore((s) => s.dismissWarning);
@@ -143,13 +144,20 @@ export function Sidebar({ view, onViewChange }: Props) {
 
   return (
     <aside className="w-64 bg-gray-900 border-r border-gray-800 flex flex-col">
-      {/* Logo */}
-      <div className="p-4 border-b border-gray-800">
+      {/* Logo — click to return to project dashboard */}
+      <button
+        onClick={() => {
+          clearSelectedPlan();
+          onViewChange("plans");
+        }}
+        className="p-4 border-b border-gray-800 text-left hover:bg-gray-800/30 transition"
+        title="Back to project dashboard"
+      >
         <h1 className="text-lg font-bold tracking-tight">
           orchestr<span className="text-indigo-400">AI</span>
         </h1>
         <p className="text-xs text-gray-500 mt-0.5">Claude Code Dashboard</p>
-      </div>
+      </button>
 
       {/* Nav */}
       <nav className="p-2 flex gap-1">

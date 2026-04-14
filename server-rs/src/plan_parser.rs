@@ -23,6 +23,8 @@ pub struct PlanTask {
     pub status_updated_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci: Option<crate::ci::CiStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +298,7 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
                 status: None,
                 status_updated_at: None,
                 cost_usd: None,
+                ci: None,
             });
         }
 
@@ -321,6 +324,23 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
         total_cost_usd: None,
         max_budget_usd: None,
     }
+}
+
+fn extract_dependencies(text: &str) -> Vec<String> {
+    // Matches **Depends on:** 1.1, 1.2  /  **Dependencies:** 1.1, 1.2
+    // Capture stops at the next bullet / bold marker / heading / blank line.
+    let re = Regex::new(
+        r"(?is)\*\*(?:Depends on|Dependencies|Blocked by|Requires):?\*\*\s*(.+?)(?:\n\s*[-*]\s|\n\*\*|\n###|\n---|\n\n|\z|\n$)"
+    ).unwrap();
+    let Some(caps) = re.captures(text) else {
+        return Vec::new();
+    };
+    caps[1]
+        .split([',', ';'])
+        .map(|s| s.trim().trim_matches('`').trim_start_matches('#').trim())
+        .filter(|s| !s.is_empty() && s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
@@ -386,6 +406,7 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
             .unwrap_or_default();
 
         let file_paths = extract_file_paths(&task_body);
+        let dependencies = extract_dependencies(&task_body);
 
         tasks.push(PlanTask {
             number: task_number,
@@ -393,10 +414,11 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
             description: task_body,
             file_paths,
             acceptance,
-            dependencies: Vec::new(),
+            dependencies,
             status: None,
             status_updated_at: None,
             cost_usd: None,
+            ci: None,
         });
     }
     tasks
@@ -412,17 +434,20 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
             .get(2)
             .map(|m| m.as_str().trim().to_string())
             .unwrap_or_default();
-        let file_paths = extract_file_paths(caps.get(0).unwrap().as_str());
+        let full = caps.get(0).unwrap().as_str();
+        let file_paths = extract_file_paths(full);
+        let dependencies = extract_dependencies(full);
         tasks.push(PlanTask {
             number: format!("{phase_num}.{idx}"),
             title,
             description: desc,
             file_paths,
             acceptance: String::new(),
-            dependencies: Vec::new(),
+            dependencies,
             status: None,
             status_updated_at: None,
             cost_usd: None,
+            ci: None,
         });
         idx += 1;
     }
@@ -451,6 +476,7 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
                     status: None,
                     status_updated_at: None,
                     cost_usd: None,
+                    ci: None,
                 })
                 .collect();
 
@@ -799,6 +825,35 @@ Just patch the file at `src/lib.rs` and move on.
                 .file_paths
                 .contains(&"src/lib.rs".to_string())
         );
+    }
+
+    #[test]
+    fn markdown_extracts_dependencies() {
+        let md = "\
+# Plan
+
+## Phase 1: Work
+
+### 1.1 First
+
+- **What:** do the thing
+- **Acceptance:** it works
+
+### 1.2 Second
+
+- **What:** do another thing
+- **Depends on:** 1.1
+- **Acceptance:** it works
+
+### 1.3 Third
+
+- **What:** combine
+- **Depends on:** 1.1, 1.2
+";
+        let plan = parse_plan_markdown(md, "test", "/tmp/test.md");
+        assert!(plan.phases[0].tasks[0].dependencies.is_empty());
+        assert_eq!(plan.phases[0].tasks[1].dependencies, vec!["1.1"]);
+        assert_eq!(plan.phases[0].tasks[2].dependencies, vec!["1.1", "1.2"]);
     }
 
     #[test]

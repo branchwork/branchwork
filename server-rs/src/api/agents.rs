@@ -203,13 +203,28 @@ pub async fn merge_agent_branch(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Look up agent details
-    let (cwd, branch, source_branch): (String, Option<String>, Option<String>) = {
+    // Look up agent details (need plan/task for CI bookkeeping too)
+    #[allow(clippy::type_complexity)]
+    let (cwd, branch, source_branch, plan_name, task_id): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = {
         let db = state.db.lock().unwrap();
         match db.query_row(
-            "SELECT cwd, branch, source_branch FROM agents WHERE id = ?",
+            "SELECT cwd, branch, source_branch, plan_name, task_id FROM agents WHERE id = ?",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         ) {
             Ok(r) => r,
             Err(_) => {
@@ -279,6 +294,9 @@ pub async fn merge_agent_branch(
                 .output()
                 .ok();
 
+            // Capture merged SHA for CI tracking before we kick off side work
+            let merged_sha = crate::agents::git_head_sha(std::path::Path::new(&cwd));
+
             // Clear branch in DB so the UI hides the Merge button
             {
                 let db = state.db.lock().unwrap();
@@ -296,6 +314,24 @@ pub async fn merge_agent_branch(
                     "into": target,
                 }),
             );
+
+            // Kick off CI pipeline (push to origin, record pending run).
+            // Only possible when we know which task this agent was for.
+            if let (Some(plan), Some(task), Some(sha)) =
+                (plan_name.clone(), task_id.clone(), merged_sha)
+            {
+                tokio::spawn(crate::ci::trigger_after_merge(crate::ci::TriggerArgs {
+                    db: state.db.clone(),
+                    broadcast_tx: state.broadcast_tx.clone(),
+                    cwd: std::path::PathBuf::from(&cwd),
+                    plan_name: plan,
+                    task_number: task,
+                    agent_id: id.clone(),
+                    source_branch: target.clone(),
+                    task_branch: task_branch.clone(),
+                    merged_sha: sha,
+                }));
+            }
 
             Json(serde_json::json!({
                 "ok": true,

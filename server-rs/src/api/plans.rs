@@ -12,6 +12,7 @@ use crate::agents::{check_agent, pty_agent};
 use crate::auto_status;
 use crate::plan_parser;
 use crate::state::AppState;
+use crate::templates;
 
 // ── GET /api/plans ───────────────────────────────────────────────────────────
 
@@ -222,10 +223,16 @@ pub async fn get_plan(
         .unwrap_or(0.0);
 
     plan.total_cost_usd = Some(plan_total);
+
+    // Latest CI run per task for this plan.
+    let ci_map = crate::ci::latest_per_task(&db, &name);
     for phase in &mut plan.phases {
         for task in &mut phase.tasks {
             if let Some(c) = task_costs.get(&task.number) {
                 task.cost_usd = Some(*c);
+            }
+            if let Some(ci) = ci_map.get(&task.number) {
+                task.ci = Some(ci.clone());
             }
         }
     }
@@ -239,7 +246,21 @@ pub async fn get_plan(
         )
         .ok();
 
-    Json(serde_json::to_value(plan).unwrap()).into_response()
+    // Load auto-advance flag (opt-in, default off)
+    let auto_advance = db
+        .query_row(
+            "SELECT enabled FROM plan_auto_advance WHERE plan_name = ?",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false);
+
+    let mut value = serde_json::to_value(plan).unwrap();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("autoAdvance".to_string(), serde_json::json!(auto_advance));
+    }
+    Json(value).into_response()
 }
 
 // ── PUT /api/plans/:name/project ─────────────────────────────────────────────
@@ -323,6 +344,39 @@ pub async fn set_budget(
     )
 }
 
+// ── PUT /api/plans/:name/auto-advance ────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoAdvanceBody {
+    enabled: bool,
+}
+
+pub async fn set_auto_advance(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<AutoAdvanceBody>,
+) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+    db.execute(
+        "INSERT INTO plan_auto_advance (plan_name, enabled, updated_at)
+         VALUES (?1, ?2, datetime('now'))
+         ON CONFLICT(plan_name)
+         DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
+        params![name, body.enabled as i64],
+    )
+    .ok();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "planName": name,
+            "autoAdvance": body.enabled,
+        })),
+    )
+}
+
 // ── PUT /api/plans/:name/tasks/:num/status ───────────────────────────────────
 
 #[derive(Deserialize)]
@@ -374,6 +428,22 @@ pub async fn set_task_status(
         }),
     );
 
+    // Auto-advance: if this completed the last task in its phase, kick off the
+    // next phase's ready tasks (opt-in per plan). Spawn off so we don't block
+    // the HTTP response.
+    if body.status == "completed" || body.status == "skipped" {
+        let registry = state.registry.clone();
+        let plans_dir = state.plans_dir.clone();
+        let plan_name = name.clone();
+        let task = task_number.clone();
+        let effort = *state.effort.lock().unwrap();
+        let port = state.config_port();
+        tokio::spawn(async move {
+            crate::agents::try_auto_advance(registry, plans_dir, plan_name, task, effort, port)
+                .await;
+        });
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -414,6 +484,81 @@ pub async fn get_statuses(
         .unwrap()
         .flatten()
         .collect();
+
+    Json(rows)
+}
+
+// ── POST /api/plans/:name/tasks/:num/learnings ───────────────────────────────
+
+#[derive(Deserialize)]
+pub struct LearningBody {
+    learning: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LearningRow {
+    id: i64,
+    learning: String,
+    created_at: String,
+}
+
+pub async fn add_task_learning(
+    State(state): State<AppState>,
+    Path((plan_name, task_number)): Path<(String, String)>,
+    Json(body): Json<LearningBody>,
+) -> impl IntoResponse {
+    let learning = body.learning.trim();
+    if learning.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "learning is required"})),
+        )
+            .into_response();
+    }
+
+    let db = state.db.lock().unwrap();
+    db.execute(
+        "INSERT INTO task_learnings (plan_name, task_number, learning) VALUES (?1, ?2, ?3)",
+        params![plan_name, task_number, learning],
+    )
+    .unwrap();
+    let id = db.last_insert_rowid();
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "ok": true,
+            "id": id,
+            "planName": plan_name,
+            "taskNumber": task_number,
+            "learning": learning,
+        })),
+    )
+        .into_response()
+}
+
+pub async fn list_task_learnings(
+    State(state): State<AppState>,
+    Path((plan_name, task_number)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+    let rows: Vec<LearningRow> = db
+        .prepare(
+            "SELECT id, learning, created_at FROM task_learnings \
+             WHERE plan_name = ?1 AND task_number = ?2 ORDER BY id DESC",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![plan_name, task_number], |row| {
+                Ok(LearningRow {
+                    id: row.get(0)?,
+                    learning: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
 
     Json(rows)
 }
@@ -645,6 +790,37 @@ pub struct StartTaskBody {
     effort: Option<String>,
 }
 
+fn plan_remaining_budget(
+    db: &rusqlite::Connection,
+    plan_name: &str,
+) -> Result<Option<f64>, (f64, f64)> {
+    let budget: Option<f64> = db
+        .query_row(
+            "SELECT max_budget_usd FROM plan_budget WHERE plan_name = ?",
+            params![plan_name],
+            |row| row.get::<_, f64>(0),
+        )
+        .ok();
+    match budget {
+        Some(max) => {
+            let spent: f64 = db
+                .query_row(
+                    "SELECT COALESCE(SUM(cost_usd), 0) FROM agents \
+                     WHERE plan_name = ? AND cost_usd IS NOT NULL",
+                    params![plan_name],
+                    |row| row.get::<_, f64>(0),
+                )
+                .unwrap_or(0.0);
+            if spent >= max {
+                Err((spent, max))
+            } else {
+                Ok(Some((max - spent).max(0.0)))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
 pub async fn start_task(
     State(state): State<AppState>,
     Json(body): Json<StartTaskBody>,
@@ -692,43 +868,50 @@ pub async fn start_task(
         }
     };
 
+    // Dependency gate: refuse to start if any declared dep is not completed.
+    if !task.dependencies.is_empty() {
+        let done = {
+            let conn = state.db.lock().unwrap();
+            crate::db::completed_task_numbers(&conn, &body.plan_name)
+        };
+        let missing: Vec<String> = task
+            .dependencies
+            .iter()
+            .filter(|d| !done.contains(*d))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "dependencies_not_met",
+                    "message": format!("Blocked by task(s): {}", missing.join(", ")),
+                    "missing": missing,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Compute per-agent budget headroom. If plan has a max budget and it's
     // already exhausted, block the start. Otherwise pass the remaining budget
     // to the spawned agent so it self-terminates on overrun.
     let remaining_budget: Option<f64> = {
         let db = state.db.lock().unwrap();
-        let budget: Option<f64> = db
-            .query_row(
-                "SELECT max_budget_usd FROM plan_budget WHERE plan_name = ?",
-                params![body.plan_name],
-                |row| row.get::<_, f64>(0),
-            )
-            .ok();
-        match budget {
-            Some(max) => {
-                let spent: f64 = db
-                    .query_row(
-                        "SELECT COALESCE(SUM(cost_usd), 0) FROM agents \
-                         WHERE plan_name = ? AND cost_usd IS NOT NULL",
-                        params![body.plan_name],
-                        |row| row.get::<_, f64>(0),
-                    )
-                    .unwrap_or(0.0);
-                if spent >= max {
-                    return (
-                        StatusCode::PAYMENT_REQUIRED,
-                        Json(serde_json::json!({
-                            "error": "budget_exceeded",
-                            "message": format!("Plan budget of ${max:.2} exhausted (spent ${spent:.2})"),
-                            "spentUsd": spent,
-                            "maxBudgetUsd": max,
-                        })),
-                    )
-                        .into_response();
-                }
-                Some((max - spent).max(0.0))
+        match plan_remaining_budget(&db, &body.plan_name) {
+            Ok(b) => b,
+            Err((spent, max)) => {
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({
+                        "error": "budget_exceeded",
+                        "message": format!("Plan budget of ${max:.2} exhausted (spent ${spent:.2})"),
+                        "spentUsd": spent,
+                        "maxBudgetUsd": max,
+                    })),
+                )
+                    .into_response();
             }
-            None => None,
         }
     };
 
@@ -741,58 +924,15 @@ pub async fn start_task(
             .unwrap_or_else(|| std::env::current_dir().unwrap())
     });
 
-    let files_section = if !task.file_paths.is_empty() {
-        format!(
-            "\nFiles involved:\n{}",
-            task.file_paths
-                .iter()
-                .map(|f| format!("- {f}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    } else {
-        String::new()
-    };
-
-    let acceptance_section = if !task.acceptance.is_empty() {
-        format!("\nAcceptance criteria:\n{}", task.acceptance)
-    } else {
-        String::new()
-    };
-
-    let prompt = format!(
-        "{intro}\n\n\
-         Plan: {plan_title}\n\
-         Phase {phase_num}: {phase_title}\n\
-         Task {task_num}: {task_title}\n\n\
-         Description:\n{description}\n\
-         {files}{acceptance}\n\n\
-         {instruction}\n\n\
-         IMPORTANT: When you think you are done, do NOT stop. Instead:\n\
-         1. Summarize what you did\n\
-         2. Mark the task status by running: curl -s -X PUT http://localhost:{port}/api/plans/{plan_name}/tasks/{task_num}/status -H \"Content-Type: application/json\" -d '{{\"status\":\"completed\"}}'\n\
-         3. Ask the user if they need anything else\n\
-         4. Only stop when the user explicitly says they are done",
-        intro = if is_continue {
-            "You are continuing work on a partially implemented task. Some parts may already exist — check the current state of the code before making changes."
-        } else {
-            "You are working on the following task from a plan."
-        },
-        plan_title = plan.title,
-        phase_num = phase.number,
-        phase_title = phase.title,
-        task_num = task.number,
-        task_title = task.title,
-        description = task.description,
-        files = files_section,
-        acceptance = acceptance_section,
-        instruction = if is_continue {
-            "First, read the relevant files to understand what has already been done. Then complete the remaining work."
-        } else {
-            "Please implement this task. When done, summarize what you changed."
-        },
-        port = state.config_port(),
-        plan_name = body.plan_name,
+    let cross_ctx =
+        crate::agents::build_cross_plan_context(&state.db, &state.plans_dir, &plan, &task.number);
+    let prompt = crate::agents::build_task_prompt(
+        &plan,
+        phase,
+        task,
+        is_continue,
+        state.config_port(),
+        cross_ctx.as_deref(),
     );
 
     let effort = body
@@ -822,6 +962,211 @@ pub async fn start_task(
         "agentId": agent_id,
         "taskId": body.task_number,
         "branch": branch_name,
+    }))
+    .into_response()
+}
+
+// ── POST /api/plans/:name/phases/:num/start ─────────────────────────────────
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StartPhaseBody {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+pub async fn start_phase_tasks(
+    State(state): State<AppState>,
+    Path((plan_name, phase_number)): Path<(String, u32)>,
+    body: Option<Json<StartPhaseBody>>,
+) -> impl IntoResponse {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &plan_name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let phase = match plan.phases.iter().find(|p| p.number == phase_number) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Phase not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Merge in manual statuses from the DB and compute the set of tasks
+    // already completed (for dep gating).
+    let (status_map, mut done_set) = {
+        let db = state.db.lock().unwrap();
+        let mut statuses: HashMap<String, String> = HashMap::new();
+        if let Ok(mut stmt) =
+            db.prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?")
+            && let Ok(rows) = stmt.query_map(params![plan_name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+        {
+            for row in rows.flatten() {
+                statuses.insert(row.0, row.1);
+            }
+        }
+        let done = crate::db::completed_task_numbers(&db, &plan_name);
+        (statuses, done)
+    };
+
+    // Ready = status is pending/failed AND all dependencies satisfied.
+    // Skip anything already running, completed, or skipped.
+    let ready: Vec<&plan_parser::PlanTask> = phase
+        .tasks
+        .iter()
+        .filter(|t| {
+            let status = status_map
+                .get(&t.number)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+            if !(status == "pending" || status == "failed") {
+                return false;
+            }
+            t.dependencies.iter().all(|d| done_set.contains(d))
+        })
+        .collect();
+
+    if ready.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "started": [],
+                "skipped": [],
+                "reason": "no ready tasks in phase",
+            })),
+        )
+            .into_response();
+    }
+
+    // Budget check — if exhausted, refuse. Otherwise pass headroom to every
+    // spawned agent; they self-terminate once they've consumed it.
+    let remaining_budget: Option<f64> = {
+        let db = state.db.lock().unwrap();
+        match plan_remaining_budget(&db, &plan_name) {
+            Ok(b) => b,
+            Err((spent, max)) => {
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({
+                        "error": "budget_exceeded",
+                        "message": format!("Plan budget of ${max:.2} exhausted (spent ${spent:.2})"),
+                        "spentUsd": spent,
+                        "maxBudgetUsd": max,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let home = dirs::home_dir().unwrap();
+    let work_dir = body.cwd.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        plan.project
+            .as_ref()
+            .map(|p| home.join(p))
+            .unwrap_or_else(|| std::env::current_dir().unwrap())
+    });
+
+    let effort = body
+        .effort
+        .and_then(|e| e.parse().ok())
+        .unwrap_or(*state.effort.lock().unwrap());
+
+    let port = state.config_port();
+    let mut started = Vec::new();
+
+    for task in ready {
+        let cross_ctx = crate::agents::build_cross_plan_context(
+            &state.db,
+            &state.plans_dir,
+            &plan,
+            &task.number,
+        );
+        let prompt =
+            crate::agents::build_task_prompt(&plan, phase, task, false, port, cross_ctx.as_deref());
+        let branch_name = format!("orchestrai/{}/{}", plan_name, task.number);
+
+        let agent_id = pty_agent::start_pty_agent(
+            &state.registry,
+            pty_agent::StartPtyOpts {
+                prompt,
+                cwd: &work_dir,
+                plan_name: Some(&plan_name),
+                task_id: Some(&task.number),
+                effort,
+                branch: Some(&branch_name),
+                is_continue: false,
+                max_budget_usd: remaining_budget,
+            },
+        )
+        .await;
+
+        // Mark in_progress so subsequent clicks don't re-spawn.
+        {
+            let db = state.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO task_status (plan_name, task_number, status, updated_at)
+                 VALUES (?1, ?2, 'in_progress', datetime('now'))
+                 ON CONFLICT(plan_name, task_number)
+                 DO UPDATE SET status = 'in_progress', updated_at = datetime('now')",
+                params![plan_name, task.number],
+            )
+            .ok();
+        }
+        crate::ws::broadcast_event(
+            &state.broadcast_tx,
+            "task_status_changed",
+            serde_json::json!({
+                "plan_name": plan_name,
+                "task_number": task.number,
+                "status": "in_progress",
+            }),
+        );
+
+        // Track as "done" for this run so later tasks in the same click
+        // whose only unmet dep was this one aren't treated as ready mid-loop.
+        // (They won't be — we already filtered up front — but we keep the
+        // invariant just in case the filter is relaxed later.)
+        done_set.insert(task.number.clone());
+
+        started.push(serde_json::json!({
+            "taskId": task.number,
+            "title": task.title,
+            "agentId": agent_id,
+            "branch": branch_name,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "planName": plan_name,
+        "phaseNumber": phase_number,
+        "started": started,
     }))
     .into_response()
 }
@@ -967,6 +1312,7 @@ pub struct CreatePlanBody {
     description: String,
     folder: String,
     create_folder: Option<bool>,
+    template_id: Option<String>,
 }
 
 pub async fn create_plan(
@@ -1019,10 +1365,28 @@ pub async fn create_plan(
     }
 
     let plans_dir = state.plans_dir.display();
+
+    let template_section = body
+        .template_id
+        .as_deref()
+        .and_then(templates::find)
+        .map(|t| {
+            format!(
+                "Template: {name}\n\
+                 {skeleton}\n\n\
+                 Adapt the skeleton to the specifics in the request above — \
+                 rename phases, add or drop tasks, and change details to fit.\n\n",
+                name = t.name,
+                skeleton = t.skeleton,
+            )
+        })
+        .unwrap_or_default();
+
     let prompt = format!(
         "You are creating an implementation plan for a project.\n\n\
          Working directory: {folder}\n\n\
          Request:\n{description}\n\n\
+         {template_section}\
          Create a detailed implementation plan as a YAML file.\n\
          First explore the working directory to understand the existing codebase (if any).\n\
          Then write the plan to a file at {plans_dir}/<generated-name>.yaml using the Write tool.\n\
@@ -1167,6 +1531,7 @@ pub async fn update_plan(
                         status: None,
                         status_updated_at: None,
                         cost_usd: None,
+                        ci: None,
                     })
                     .collect(),
             })

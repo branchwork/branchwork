@@ -1,6 +1,22 @@
 import { create } from "zustand";
 import { fetchJson, putJson } from "../api.js";
 
+export type CiStatusValue =
+  | "pending"
+  | "running"
+  | "success"
+  | "failure"
+  | "cancelled"
+  | "unknown";
+
+export interface CiStatus {
+  status: CiStatusValue;
+  conclusion?: string | null;
+  runUrl?: string | null;
+  commitSha?: string | null;
+  updatedAt: string;
+}
+
 export interface PlanTask {
   number: string;
   title: string;
@@ -12,6 +28,7 @@ export interface PlanTask {
   statusUpdatedAt?: string;
   agentId?: string;
   costUsd?: number;
+  ci?: CiStatus | null;
 }
 
 export interface PlanPhase {
@@ -61,8 +78,10 @@ interface PlanStore {
   warnings: PlanWarning[];
   fetchPlans: () => Promise<void>;
   selectPlan: (name: string) => Promise<void>;
+  clearSelectedPlan: () => void;
   updatePlan: (plan: ParsedPlan) => void;
   patchTaskStatus: (planName: string, taskNumber: string, status: string) => void;
+  patchTaskCi: (planName: string, taskNumber: string, ci: CiStatus) => void;
   savePlan: (plan: ParsedPlan) => Promise<void>;
   addWarning: (w: PlanWarning) => void;
   dismissWarning: (name: string) => void;
@@ -95,11 +114,28 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     }
   },
 
+  clearSelectedPlan: () => set({ selectedPlan: null }),
+
   updatePlan: (plan: ParsedPlan) => {
     const { selectedPlan } = get();
     if (selectedPlan?.name === plan.name) {
       set({ selectedPlan: plan });
     }
+  },
+
+  patchTaskCi: (planName, taskNumber, ci) => {
+    const { selectedPlan } = get();
+    if (selectedPlan?.name !== planName) return;
+    const patched = {
+      ...selectedPlan,
+      phases: selectedPlan.phases.map((p) => ({
+        ...p,
+        tasks: p.tasks.map((t) =>
+          t.number === taskNumber ? { ...t, ci } : t
+        ),
+      })),
+    };
+    set({ selectedPlan: patched });
   },
 
   patchTaskStatus: (planName, taskNumber, status) => {

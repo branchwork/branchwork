@@ -258,6 +258,7 @@ async fn attach_to_tmux(registry: &AgentRegistry, agent_id: &str, tmux_name: &st
     let db = registry.db.clone();
     let agents = registry.agents.clone();
     let tx = registry.broadcast_tx.clone();
+    let webhook_url = registry.webhook_url.clone();
     let id = agent_id.to_string();
     let tmux = tmux_name.to_string();
 
@@ -301,6 +302,18 @@ async fn attach_to_tmux(registry: &AgentRegistry, agent_id: &str, tmux_name: &st
             // Parse cost from recent PTY output (Claude Code prints "Total cost: $X.XX")
             let cost_usd = parse_cost_from_pty_output(&db, &id);
 
+            // Grab plan/task/branch for the notification while we have the DB.
+            let meta: Option<(Option<String>, Option<String>, Option<String>)> = {
+                let db_guard = db.lock().unwrap();
+                db_guard
+                    .query_row(
+                        "SELECT plan_name, task_id, branch FROM agents WHERE id = ?1",
+                        params![id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .ok()
+            };
+
             let over_budget_plan: Option<String> = {
                 let db_guard = db.lock().unwrap();
                 db_guard.execute(
@@ -329,6 +342,19 @@ async fn attach_to_tmux(registry: &AgentRegistry, agent_id: &str, tmux_name: &st
                 "agent_stopped",
                 serde_json::json!({"id": id, "status": "completed", "exit_code": 0}),
             );
+
+            if webhook_url.is_some() {
+                let (plan, task, branch) = meta.unwrap_or((None, None, None));
+                let msg = crate::notifications::agent_completion_message(
+                    plan.as_deref(),
+                    task.as_deref(),
+                    &id,
+                    "completed",
+                    branch.as_deref(),
+                    cost_usd,
+                );
+                crate::notifications::notify(webhook_url.clone(), msg);
+            }
 
             if let Some(plan) = over_budget_plan {
                 kill_plan_agents(&db, &tx, &plan);

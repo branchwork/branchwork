@@ -14,6 +14,18 @@ interface Props {
 
 const STATUS_ORDER = ["pending", "in_progress", "completed", "skipped"] as const;
 
+const ciConfig: Record<
+  string,
+  { label: string; bg: string; dot: string; title: string }
+> = {
+  pending:   { label: "CI",     bg: "bg-amber-600/20 text-amber-400",   dot: "bg-amber-400",                title: "CI run queued" },
+  running:   { label: "CI",     bg: "bg-amber-600/20 text-amber-400",   dot: "bg-amber-400 animate-pulse",  title: "CI run in progress" },
+  success:   { label: "CI \u2713", bg: "bg-emerald-600/20 text-emerald-400", dot: "bg-emerald-400",          title: "CI passed" },
+  failure:   { label: "CI \u2717", bg: "bg-red-600/20 text-red-400",     dot: "bg-red-400",                  title: "CI failed" },
+  cancelled: { label: "CI \u2014", bg: "bg-gray-600/20 text-gray-400",   dot: "bg-gray-400",                 title: "CI cancelled or skipped" },
+  unknown:   { label: "CI ?",   bg: "bg-gray-600/20 text-gray-500",     dot: "bg-gray-500",                 title: "No CI run found for this commit" },
+};
+
 const statusConfig: Record<
   string,
   { label: string; bg: string; dot: string }
@@ -89,6 +101,16 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
 
   const status = task.status ?? "pending";
   const cfg = statusConfig[status] ?? statusConfig.pending;
+
+  // Dependency gate: any declared dep not completed/skipped blocks Start.
+  const completedSet = new Set<string>(
+    (plan?.phases ?? [])
+      .flatMap((p) => p.tasks)
+      .filter((t) => t.status === "completed" || t.status === "skipped")
+      .map((t) => t.number)
+  );
+  const unmetDeps = (task.dependencies ?? []).filter((d) => !completedSet.has(d));
+  const blocked = unmetDeps.length > 0;
 
   async function handleStart(mode: "start" | "continue" = "start") {
     setStarting(true);
@@ -221,6 +243,31 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 ${task.costUsd.toFixed(task.costUsd >= 1 ? 2 : 4)}
               </span>
             )}
+            {/* CI badge */}
+            {task.ci && (() => {
+              const c = ciConfig[task.ci.status] ?? ciConfig.unknown;
+              const className = `text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1 ${c.bg}`;
+              const inner = (
+                <>
+                  <span className={`w-1.5 h-1.5 rounded-full ${c.dot}`} />
+                  {c.label}
+                </>
+              );
+              return task.ci.runUrl ? (
+                <a
+                  href={task.ci.runUrl}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  className={`${className} hover:opacity-80`}
+                  title={`${c.title} — open run`}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {inner}
+                </a>
+              ) : (
+                <span className={className} title={c.title}>{inner}</span>
+              );
+            })()}
           </div>
           <h4 className="text-sm font-medium mt-0.5 leading-tight">
             <EditableText
@@ -248,8 +295,11 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
           {status === "pending" && !agentId && (
             <button
               onClick={() => handleStart("start")}
-              disabled={starting}
-              className="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded transition"
+              disabled={starting || blocked}
+              title={
+                blocked ? `Blocked by ${unmetDeps.join(", ")}` : undefined
+              }
+              className="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
             >
               {starting ? "..." : "Start"}
             </button>
@@ -288,6 +338,22 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
 
         </div>
       </div>
+
+      {/* Blocked banner — shown when unmet dependencies prevent starting */}
+      {blocked && status === "pending" && (
+        <div className="mt-2 flex items-center gap-2 bg-amber-950/40 border border-amber-800/40 rounded px-2 py-1">
+          <span className="text-amber-400 text-[10px]">&#9888;</span>
+          <span className="text-[10px] text-amber-300/90">
+            Blocked by{" "}
+            {unmetDeps.map((d, i) => (
+              <span key={d}>
+                <span className="font-mono bg-amber-900/40 px-1 rounded">{d}</span>
+                {i < unmetDeps.length - 1 ? ", " : ""}
+              </span>
+            ))}
+          </span>
+        </div>
+      )}
 
       {/* Branch banner — prominent when there's a pending branch to merge */}
       {branchAgent?.branch && (

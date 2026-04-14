@@ -30,19 +30,7 @@ export function PlanBoard() {
     );
   }
 
-  if (!plan) {
-    return (
-      <div className="flex items-center justify-center h-full">
-        <div className="text-center">
-          <div className="text-4xl mb-3 text-gray-700">&#9776;</div>
-          <p className="text-gray-500">Select a plan from the sidebar</p>
-          <p className="text-xs text-gray-600 mt-1">
-            Plans are loaded from ~/.claude/plans/
-          </p>
-        </div>
-      </div>
-    );
-  }
+  if (!plan) return null;
 
   // Aggregate stats
   const allTasks = plan.phases.flatMap((p) => p.tasks);

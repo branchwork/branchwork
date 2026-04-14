@@ -1,10 +1,41 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 /// Thread-safe handle to the SQLite database.
 pub type Db = Arc<Mutex<Connection>>;
+
+/// Return the set of task numbers whose `task_status` is `completed` or
+/// `skipped` for the given plan. Used to evaluate task dependency gates.
+pub fn completed_task_numbers(conn: &Connection, plan_name: &str) -> HashSet<String> {
+    conn.prepare(
+        "SELECT task_number FROM task_status \
+         WHERE plan_name = ?1 AND status IN ('completed', 'skipped')",
+    )
+    .and_then(|mut stmt| {
+        stmt.query_map(params![plan_name], |row| row.get::<_, String>(0))?
+            .collect::<Result<HashSet<_>, _>>()
+    })
+    .unwrap_or_default()
+}
+
+/// Load the recorded learnings for a single task. Most-recent first.
+pub fn task_learnings(conn: &Connection, plan_name: &str, task_number: &str) -> Vec<String> {
+    conn.prepare(
+        "SELECT learning FROM task_learnings \
+         WHERE plan_name = ?1 AND task_number = ?2 \
+         ORDER BY id DESC",
+    )
+    .and_then(|mut stmt| {
+        stmt.query_map(params![plan_name, task_number], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()
+    })
+    .unwrap_or_default()
+}
 
 /// Open (or create) the database at `db_path` and run migrations.
 pub fn init(db_path: &Path) -> Db {
@@ -90,6 +121,39 @@ fn migrate(conn: &Connection) {
             max_budget_usd REAL NOT NULL,
             updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS plan_auto_advance (
+            plan_name  TEXT PRIMARY KEY,
+            enabled    INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS task_learnings (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_name    TEXT    NOT NULL,
+            task_number  TEXT    NOT NULL,
+            learning     TEXT    NOT NULL,
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_learnings_plan_task ON task_learnings(plan_name, task_number);
+
+        CREATE TABLE IF NOT EXISTS ci_runs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_name    TEXT    NOT NULL,
+            task_number  TEXT    NOT NULL,
+            agent_id     TEXT,
+            provider     TEXT    NOT NULL DEFAULT 'github',
+            commit_sha   TEXT,
+            branch       TEXT,
+            run_id       TEXT,
+            run_url      TEXT,
+            status       TEXT    NOT NULL DEFAULT 'pending',
+            conclusion   TEXT,
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+            updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_ci_runs_plan_task ON ci_runs(plan_name, task_number);
+        CREATE INDEX IF NOT EXISTS idx_ci_runs_status ON ci_runs(status);
         ",
     )
     .expect("failed to run schema migration");
@@ -108,7 +172,6 @@ fn migrate(conn: &Connection) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::params;
     use tempfile::TempDir;
 
     fn test_db() -> (Db, TempDir) {
@@ -136,6 +199,39 @@ mod tests {
         assert!(tables.contains(&"agent_output".to_string()));
         assert!(tables.contains(&"plan_project".to_string()));
         assert!(tables.contains(&"task_status".to_string()));
+        assert!(tables.contains(&"task_learnings".to_string()));
+    }
+
+    #[test]
+    fn task_learnings_round_trip() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        conn.execute(
+            "INSERT INTO task_learnings (plan_name, task_number, learning) VALUES (?1, ?2, ?3)",
+            params!["plan-a", "1.1", "first learning"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_learnings (plan_name, task_number, learning) VALUES (?1, ?2, ?3)",
+            params!["plan-a", "1.1", "second learning"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_learnings (plan_name, task_number, learning) VALUES (?1, ?2, ?3)",
+            params!["plan-a", "1.2", "other task learning"],
+        )
+        .unwrap();
+
+        let ls = task_learnings(&conn, "plan-a", "1.1");
+        // Most-recent first.
+        assert_eq!(ls, vec!["second learning", "first learning"]);
+
+        assert_eq!(
+            task_learnings(&conn, "plan-a", "1.2"),
+            vec!["other task learning"]
+        );
+        assert!(task_learnings(&conn, "plan-a", "9.9").is_empty());
     }
 
     #[test]
@@ -162,6 +258,32 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM hook_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn completed_task_numbers_gate() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO task_status (plan_name, task_number, status) VALUES
+               ('p1', '1.1', 'completed'),
+               ('p1', '1.2', 'skipped'),
+               ('p1', '1.3', 'in_progress'),
+               ('p1', '1.4', 'pending'),
+               ('p2', '1.1', 'completed');",
+        )
+        .unwrap();
+
+        let done = completed_task_numbers(&conn, "p1");
+        assert!(done.contains("1.1"));
+        assert!(done.contains("1.2"));
+        assert!(!done.contains("1.3"));
+        assert!(!done.contains("1.4"));
+        assert_eq!(done.len(), 2);
+
+        let empty = completed_task_numbers(&conn, "nonexistent");
+        assert!(empty.is_empty());
     }
 
     #[test]
