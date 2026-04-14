@@ -8,7 +8,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::agents::{check_agent, pty_agent};
+use crate::agents::{check_agent, ensure_git_initialized, pty_agent};
 use crate::auto_status;
 use crate::plan_parser;
 use crate::state::AppState;
@@ -940,6 +940,9 @@ pub async fn start_task(
         .and_then(|e| e.parse().ok())
         .unwrap_or(*state.effort.lock().unwrap());
 
+    // Ensure git is initialized — required for branch isolation and diffs
+    ensure_git_initialized(&work_dir);
+
     // Create a dedicated branch for this task
     let branch_name = format!("orchestrai/{}/{}", body.plan_name, body.task_number);
 
@@ -1097,6 +1100,9 @@ pub async fn start_phase_tasks(
         .effort
         .and_then(|e| e.parse().ok())
         .unwrap_or(*state.effort.lock().unwrap());
+
+    // Ensure git is initialized — required for branch isolation and diffs
+    ensure_git_initialized(&work_dir);
 
     let port = state.config_port();
     let mut started = Vec::new();
@@ -1363,6 +1369,9 @@ pub async fn create_plan(
         )
             .into_response();
     }
+
+    // Ensure git is initialized — branch isolation + diff features need it
+    ensure_git_initialized(&resolved);
 
     let plans_dir = state.plans_dir.display();
 

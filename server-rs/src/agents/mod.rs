@@ -1,6 +1,7 @@
 pub mod check_agent;
 pub mod pty_agent;
 pub mod session_protocol;
+pub mod supervisor;
 pub mod terminal_ws;
 
 use std::collections::HashMap;
@@ -17,6 +18,69 @@ pub type AgentId = String;
 
 /// Get the current HEAD commit SHA in the given directory.
 /// Returns None if the directory is not a git repo or git is unavailable.
+/// Ensure the given directory is a git repository. If it isn't, run
+/// `git init`, stage everything, and create an initial commit so that
+/// branch isolation and diffs work for this project.
+///
+/// Returns true if the directory was already a repo or was successfully
+/// initialized. Safe to call repeatedly.
+pub fn ensure_git_initialized(cwd: &std::path::Path) -> bool {
+    // Already a repo?
+    let in_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output();
+    if matches!(&in_repo, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+    {
+        return true;
+    }
+
+    // git init
+    let init = std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(cwd)
+        .output();
+    if !matches!(&init, Ok(o) if o.status.success()) {
+        eprintln!("[orchestrAI] git init failed in {}", cwd.display());
+        return false;
+    }
+
+    // Set a minimal identity if none exists globally — git commit will refuse otherwise
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "orchestrai@localhost"])
+        .current_dir(cwd)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "orchestrAI"])
+        .current_dir(cwd)
+        .output();
+
+    // Stage and make an empty initial commit — gives us a HEAD so branches can be created
+    let _ = std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(cwd)
+        .output();
+    let commit = std::process::Command::new("git")
+        .args([
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Initial commit (orchestrAI)",
+        ])
+        .current_dir(cwd)
+        .output();
+    match commit {
+        Ok(o) if o.status.success() => {
+            println!("[orchestrAI] Initialized git repo in {}", cwd.display());
+            true
+        }
+        _ => {
+            eprintln!("[orchestrAI] initial commit failed in {}", cwd.display());
+            false
+        }
+    }
+}
+
 pub fn git_head_sha(cwd: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])

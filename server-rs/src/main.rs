@@ -19,7 +19,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use clap::Parser;
-use config::{Cli, Config};
+use config::{Cli, Command, Config};
 use state::AppState;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -30,9 +30,29 @@ async fn health() -> impl IntoResponse {
     }))
 }
 
-#[tokio::main]
-async fn main() {
-    let config = Config::from_cli(Cli::parse());
+fn main() {
+    let mut cli = Cli::parse();
+
+    if let Some(Command::Session(args)) = cli.command.take() {
+        // Must dispatch before any tokio runtime starts — fork() with an
+        // active multi-threaded runtime would leave the child in an
+        // unusable state.
+        if let Err(e) = agents::supervisor::run_session(args) {
+            eprintln!("session daemon error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    rt.block_on(run_server(cli));
+}
+
+async fn run_server(cli: Cli) {
+    let config = Config::from_cli(cli);
     let db = db::init(&config.db_path);
     let (broadcast_tx, _rx) = ws::create_broadcast();
 

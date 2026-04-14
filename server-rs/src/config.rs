@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
+
+use crate::agents::supervisor::SessionArgs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -38,6 +40,9 @@ impl std::fmt::Display for Effort {
 #[derive(Parser, Debug)]
 #[command(name = "orchestrai", about = "orchestrAI dashboard server")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Port to listen on
     #[arg(long, default_value_t = 3100)]
     pub port: u16,
@@ -55,6 +60,16 @@ pub struct Cli {
     /// JSON-accepting endpoint. Falls back to `ORCHESTRAI_WEBHOOK_URL` env.
     #[arg(long, env = "ORCHESTRAI_WEBHOOK_URL")]
     pub webhook_url: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Run as a detached session daemon supervising one PTY.
+    ///
+    /// Internal helper normally spawned by the server itself; not something
+    /// end users invoke directly. Forks + setsid on Unix so the daemon
+    /// survives the parent's death.
+    Session(SessionArgs),
 }
 
 fn default_claude_dir() -> PathBuf {
