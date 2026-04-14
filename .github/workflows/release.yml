@@ -49,13 +49,12 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Build web frontend
         run: |
-          cd web
           pnpm install --frozen-lockfile
-          pnpm build
+          pnpm --filter @orchestrai/web build
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
