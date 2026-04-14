@@ -1706,3 +1706,206 @@ pub async fn convert_all(State(state): State<AppState>) -> impl IntoResponse {
     }))
     .into_response()
 }
+
+// ── POST /api/plans/:name/reset-status — reset all task statuses to pending ─
+
+pub async fn reset_plan_status(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+    let changes = db
+        .execute("DELETE FROM task_status WHERE plan_name = ?", params![name])
+        .unwrap_or(0);
+    drop(db);
+
+    // Broadcast so the UI refreshes in place
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "plan_reset",
+        serde_json::json!({ "plan_name": name, "cleared": changes }),
+    );
+
+    Json(serde_json::json!({
+        "ok": true,
+        "plan_name": name,
+        "cleared": changes,
+    }))
+}
+
+// ── POST /api/plans/:name/check-all — spawn a check agent for every non-completed task ─
+
+#[derive(Deserialize, Default)]
+pub struct CheckAllBody {
+    #[serde(default)]
+    pub phase: Option<u32>,
+    #[serde(default)]
+    pub include_completed: bool,
+}
+
+pub async fn check_all(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<CheckAllBody>,
+) -> impl IntoResponse {
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Failed to parse plan: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let project = match plan.project.as_deref() {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Plan has no associated project"})),
+            )
+                .into_response();
+        }
+    };
+
+    let home = dirs::home_dir().unwrap();
+    let project_dir = home.join(project);
+
+    // Load existing statuses so we skip "completed" tasks unless user opts in
+    let existing: HashMap<String, String> = {
+        let db = state.db.lock().unwrap();
+        let mut stmt = db
+            .prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?")
+            .unwrap();
+        stmt.query_map(params![name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .flatten()
+        .collect()
+    };
+
+    let effort = *state.effort.lock().unwrap();
+    let mut spawned: Vec<String> = Vec::new();
+
+    for phase in &plan.phases {
+        if let Some(p) = body.phase
+            && phase.number != p
+        {
+            continue;
+        }
+        for task in &phase.tasks {
+            let current = existing
+                .get(&task.number)
+                .map(|s| s.as_str())
+                .unwrap_or("pending");
+            if !body.include_completed && matches!(current, "completed" | "skipped" | "checking") {
+                continue;
+            }
+
+            let prompt = build_check_prompt(&plan, phase, task, &project_dir);
+
+            // Set to checking
+            {
+                let db = state.db.lock().unwrap();
+                db.execute(
+                    "INSERT INTO task_status (plan_name, task_number, status, updated_at)
+                     VALUES (?1, ?2, 'checking', datetime('now'))
+                     ON CONFLICT(plan_name, task_number)
+                     DO UPDATE SET status = 'checking', updated_at = datetime('now')",
+                    params![name, task.number],
+                )
+                .ok();
+            }
+            crate::ws::broadcast_event(
+                &state.broadcast_tx,
+                "task_status_changed",
+                serde_json::json!({
+                    "plan_name": name,
+                    "task_number": task.number,
+                    "status": "checking",
+                }),
+            );
+
+            let agent_id = crate::agents::check_agent::start_check_agent(
+                &state.registry,
+                prompt,
+                &project_dir,
+                Some(&name),
+                Some(&task.number),
+                effort,
+            )
+            .await;
+            spawned.push(agent_id);
+        }
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "plan_name": name,
+        "spawned": spawned.len(),
+        "agent_ids": spawned,
+    }))
+    .into_response()
+}
+
+fn build_check_prompt(
+    plan: &plan_parser::ParsedPlan,
+    phase: &plan_parser::PlanPhase,
+    task: &plan_parser::PlanTask,
+    project_dir: &std::path::Path,
+) -> String {
+    let files_section = if task.file_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nFiles mentioned:\n{}",
+            task.file_paths
+                .iter()
+                .map(|f| format!("- {f}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let acceptance_section = if task.acceptance.is_empty() {
+        String::new()
+    } else {
+        format!("\nAcceptance criteria:\n{}", task.acceptance)
+    };
+    format!(
+        "You are verifying whether a task from a plan has been implemented.\n\
+         Answer with ONLY a JSON object, no other text: {{\"status\": \"completed\"|\"in_progress\"|\"pending\", \"reason\": \"brief explanation\"}}\n\n\
+         Project directory: {project_dir}\n\
+         Plan: {plan_title}\n\
+         Phase {phase_num}: {phase_title}\n\
+         Task {task_num}: {task_title}\n\n\
+         Task description:\n{description}\n\
+         {files}{acceptance}\n\n\
+         Check the project at {project_dir}. Read the relevant files. Determine if this task is:\n\
+         - \"completed\": all described changes exist in the code\n\
+         - \"in_progress\": some changes exist but the task is not fully done\n\
+         - \"pending\": no evidence of this task being started\n\n\
+         Respond with ONLY the JSON object.",
+        project_dir = project_dir.display(),
+        plan_title = plan.title,
+        phase_num = phase.number,
+        phase_title = phase.title,
+        task_num = task.number,
+        task_title = task.title,
+        description = task.description,
+        files = files_section,
+        acceptance = acceptance_section,
+    )
+}

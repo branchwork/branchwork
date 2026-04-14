@@ -15,6 +15,8 @@ export function PlanBoard() {
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [converting, setConverting] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [checkingAll, setCheckingAll] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
@@ -59,6 +61,39 @@ export function PlanBoard() {
       console.error("Sync failed:", e);
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function handleReset() {
+    if (!plan) return;
+    if (!confirm(`Reset all task statuses to pending for "${plan.title}"?`)) return;
+    setResetting(true);
+    setError(null);
+    try {
+      await postJson(`/api/plans/${plan.name}/reset-status`, {});
+      await selectPlan(plan.name);
+    } catch (e) {
+      setError(`Reset failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setResetting(false);
+    }
+  }
+
+  async function handleCheckAll() {
+    if (!plan) return;
+    const pendingCount = plan.phases
+      .flatMap((p) => p.tasks)
+      .filter((t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending"))
+      .length;
+    if (!confirm(`Spawn ${pendingCount} check agents for this plan? This will use API credits.`)) return;
+    setCheckingAll(true);
+    setError(null);
+    try {
+      await postJson(`/api/plans/${plan.name}/check-all`, {});
+    } catch (e) {
+      setError(`Check all failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setCheckingAll(false);
     }
   }
 
@@ -165,6 +200,22 @@ export function PlanBoard() {
             title={plan.project ? "Scan project files and git history to detect task statuses" : "Set a project first to enable auto-detection"}
           >
             {syncing ? "Scanning..." : "Sync Status"}
+          </button>
+          <button
+            onClick={handleCheckAll}
+            disabled={checkingAll || !plan.project}
+            className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-emerald-600 hover:text-emerald-400 disabled:opacity-50 disabled:hover:border-gray-700 disabled:hover:text-gray-400 text-gray-300 rounded transition"
+            title="Spawn a check agent for every unfinished task in this plan"
+          >
+            {checkingAll ? "Spawning..." : "Check All"}
+          </button>
+          <button
+            onClick={handleReset}
+            disabled={resetting}
+            className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-red-600 hover:text-red-400 disabled:opacity-50 text-gray-300 rounded transition"
+            title="Reset all task statuses to pending"
+          >
+            {resetting ? "Resetting..." : "Reset"}
           </button>
         </div>
         {/* Error toast */}

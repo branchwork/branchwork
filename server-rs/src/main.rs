@@ -155,6 +155,11 @@ async fn main() {
             post(api::plans::auto_status),
         )
         .route(
+            "/api/plans/{name}/reset-status",
+            post(api::plans::reset_plan_status),
+        )
+        .route("/api/plans/{name}/check-all", post(api::plans::check_all))
+        .route(
             "/api/plans/{name}/tasks/{task_number}/check",
             post(api::plans::check_task),
         )

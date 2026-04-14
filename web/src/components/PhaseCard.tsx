@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { PlanPhase } from "../stores/plan-store.js";
+import { postJson } from "../api.js";
 import { TaskCard } from "./TaskCard.js";
 
 interface Props {
@@ -22,10 +23,29 @@ export function PhaseCard({ phase, planName, statusFilter }: Props) {
 
   // Done phases start collapsed, active phases start expanded
   const [expanded, setExpanded] = useState(!allDone);
+  const [checking, setChecking] = useState(false);
 
   const filteredTasks = statusFilter
     ? phase.tasks.filter((t) => (t.status ?? "pending") === statusFilter)
     : phase.tasks;
+
+  async function handleCheckPhase(e: React.MouseEvent) {
+    e.stopPropagation();
+    const eligible = phase.tasks.filter(
+      (t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending")
+    ).length;
+    if (eligible === 0) return;
+    if (!confirm(`Spawn ${eligible} check agents for Phase ${phase.number}? This will use API credits.`))
+      return;
+    setChecking(true);
+    try {
+      await postJson(`/api/plans/${planName}/check-all`, { phase: phase.number });
+    } catch (e) {
+      console.error("Check phase failed:", e);
+    } finally {
+      setChecking(false);
+    }
+  }
 
   return (
     <div
@@ -89,6 +109,18 @@ export function PhaseCard({ phase, planName, statusFilter }: Props) {
                   style={{ width: `${pct}%` }}
                 />
               </div>
+            )}
+
+            {/* Check phase button (only when there's something to check) */}
+            {!allDone && (
+              <button
+                onClick={handleCheckPhase}
+                disabled={checking}
+                className="flex-shrink-0 px-2 py-0.5 text-[10px] bg-gray-800 border border-gray-700 hover:border-emerald-600 hover:text-emerald-400 disabled:opacity-50 text-gray-400 rounded transition"
+                title="Spawn a check agent for every unfinished task in this phase"
+              >
+                {checking ? "..." : "Check"}
+              </button>
             )}
 
             {/* Percentage */}

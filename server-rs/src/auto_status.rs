@@ -45,6 +45,7 @@ pub fn find_file_in_project(project_dir: &Path, file_path: &str) -> bool {
 }
 
 /// Check git log for commits matching keywords.
+#[allow(dead_code)] // Retained for future use — keyword grep disabled due to false positives
 pub fn check_git_for_task(project_dir: &Path, keywords: &[&str]) -> usize {
     let git_dir = project_dir.join(".git");
     if !git_dir.exists() {
@@ -77,31 +78,36 @@ pub fn check_git_for_task(project_dir: &Path, keywords: &[&str]) -> usize {
     hits
 }
 
-/// Determine task status based on file existence and git history.
+/// Determine task status based on file existence.
+///
+/// Git history matching by task title is unreliable (common keywords like
+/// "server", "driver", "agent" match too many existing commits and produce
+/// false positives). We use it only as a weak tie-breaker: a single-word grep
+/// is never enough to mark anything as done.
+///
+/// Policy:
+/// - No file paths listed for the task → status is "pending". We can't infer
+///   progress from keywords alone.
+/// - All referenced files missing → "pending" regardless of git hits.
+/// - ≥80% of files exist → "completed".
+/// - Some files exist → "in_progress".
+/// - No files exist → "pending".
 pub fn infer_status(
     project_dir: &Path,
     file_paths: &[String],
-    title_words: &[&str],
+    _title_words: &[&str],
 ) -> (&'static str, String) {
     let total_checked = file_paths.len();
+
+    if total_checked == 0 {
+        // No anchor to verify against — don't guess.
+        return ("pending", "no file paths to check".into());
+    }
+
     let found_count = file_paths
         .iter()
         .filter(|fp| find_file_in_project(project_dir, fp))
         .count();
-
-    let git_hits = check_git_for_task(project_dir, title_words);
-
-    if total_checked == 0 {
-        if git_hits >= 2 {
-            return (
-                "completed",
-                format!("{git_hits} git commits match keywords"),
-            );
-        } else if git_hits == 1 {
-            return ("in_progress", "1 git commit matches".into());
-        }
-        return ("pending", "no files or git references found".into());
-    }
 
     let ratio = found_count as f64 / total_checked as f64;
     if ratio >= 0.8 {
@@ -109,22 +115,12 @@ pub fn infer_status(
             "completed",
             format!("{found_count}/{total_checked} files exist"),
         )
-    } else if ratio >= 0.3 || git_hits > 0 {
+    } else if found_count > 0 {
         (
             "in_progress",
-            format!(
-                "{found_count}/{total_checked} files exist{}",
-                if git_hits > 0 {
-                    format!(", {git_hits} git hits")
-                } else {
-                    String::new()
-                }
-            ),
-        )
-    } else {
-        (
-            "pending",
             format!("{found_count}/{total_checked} files exist"),
         )
+    } else {
+        ("pending", format!("0/{total_checked} files exist"))
     }
 }
