@@ -114,6 +114,16 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
     case "agent_stopped": {
       const d = msg.data as { id: string; status: string };
       agentStore.updateAgentStatus(d.id, d.status);
+      // Refetch to pick up fields that may have been updated after initial
+      // insert (branch, cost, base_commit) — ensures the task card's Merge
+      // button shows up immediately when the agent finishes
+      agentStore.fetchAgents();
+      break;
+    }
+    case "agent_branch_merged":
+    case "agent_branch_discarded": {
+      // Branch was merged/discarded — refetch so the Merge button disappears
+      agentStore.fetchAgents();
       break;
     }
     case "task_checked": {
