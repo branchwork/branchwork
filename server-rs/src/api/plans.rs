@@ -1939,15 +1939,25 @@ fn build_check_prompt(
         format!("\nAcceptance criteria:\n{}", task.acceptance)
     };
     let task_branch = format!("orchestrai/{plan_name}/{task_num}", task_num = task.number);
+    let quoted_files: Vec<String> = task
+        .file_paths
+        .iter()
+        .map(|f| format!("'{}'", f.replace('\'', "'\\''")))
+        .collect();
     let git_log_cmd = if task.file_paths.is_empty() {
         format!("git log {task_branch}")
     } else {
-        let quoted: Vec<String> = task
-            .file_paths
-            .iter()
-            .map(|f| format!("'{}'", f.replace('\'', "'\\''")))
-            .collect();
-        format!("git log {task_branch} -- {}", quoted.join(" "))
+        format!("git log {task_branch} -- {}", quoted_files.join(" "))
+    };
+    // Exclude commits reachable from master/main so pre-existing history on the
+    // base branch doesn't masquerade as the agent's committed work.
+    let git_log_unique_cmd = if task.file_paths.is_empty() {
+        format!("git log {task_branch} --not master main 2>/dev/null || git log {task_branch} --not master 2>/dev/null || git log {task_branch} --not main")
+    } else {
+        let files = quoted_files.join(" ");
+        format!(
+            "git log {task_branch} --not master main -- {files} 2>/dev/null || git log {task_branch} --not master -- {files} 2>/dev/null || git log {task_branch} --not main -- {files}"
+        )
     };
     format!(
         "You are verifying whether a task from a plan has been implemented.\n\
@@ -1960,12 +1970,13 @@ fn build_check_prompt(
          {files}{acceptance}\n\n\
          Check the project at {project_dir}. Read the relevant files to see what's in the working tree.\n\n\
          CRITICAL — verify the work is committed on the task branch:\n\
-         Run `{git_log_cmd}` (cd into {project_dir} first). This lists commits on the task branch `{task_branch}` that touch the files mentioned above.\n\
-         - If the branch does not exist (git errors), treat the work as not committed on a task branch.\n\
-         - If the working tree shows the changes BUT `git log {task_branch} -- <files>` returns no commits touching them, the agent edited files without committing. Respond with status \"in_progress\" and reason starting \"incomplete — agent did not commit its work\" (briefly note which files are uncommitted).\n\
-         - Only return \"completed\" when the acceptance-criteria changes both exist in the code AND appear in the task-branch git log.\n\n\
+         Run `{git_log_cmd}` (cd into {project_dir} first). This lists commits on the task branch `{task_branch}` that touch the acceptance files.\n\
+         Then run `{git_log_unique_cmd}` to list commits UNIQUE to the task branch (excluding base-branch history). This is the authoritative signal — pre-existing commits on master/main don't count as the agent's work.\n\
+         - If the branch does not exist (both git commands error), treat the work as not committed on a task branch.\n\
+         - If the working tree shows the changes BUT the unique-commits command returns no output touching the acceptance files, the agent edited files without committing. Respond with status \"in_progress\" and reason starting \"incomplete — agent did not commit its work\" (briefly note which files are uncommitted).\n\
+         - Only return \"completed\" when the acceptance-criteria changes both exist in the code AND appear in the unique-to-task-branch git log.\n\n\
          Status values:\n\
-         - \"completed\": all described changes exist in the code AND are committed on the task branch\n\
+         - \"completed\": all described changes exist in the code AND are committed on the task branch (unique to it, not inherited from master/main)\n\
          - \"in_progress\": some changes exist but the task is not fully done, OR changes exist but are uncommitted on the task branch\n\
          - \"pending\": no evidence of this task being started\n\n\
          Respond with ONLY the JSON object.",
@@ -2051,6 +2062,14 @@ mod check_prompt_tests {
         assert!(
             prompt.contains("incomplete — agent did not commit its work"),
             "prompt must instruct the uncommitted verdict phrasing"
+        );
+        assert!(
+            prompt.contains("--not master main"),
+            "prompt must ask for commits unique to the task branch"
+        );
+        assert!(
+            prompt.contains("UNIQUE to the task branch"),
+            "prompt must explain why unique-commits matters"
         );
     }
 
