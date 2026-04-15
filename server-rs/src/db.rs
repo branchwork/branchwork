@@ -208,6 +208,12 @@ fn migrate(conn: &Connection) {
     // tight when we pass it to a fix-CI agent.
     conn.execute_batch("ALTER TABLE ci_runs ADD COLUMN failure_log TEXT;")
         .ok();
+    // Soft-delete marker for CI runs the user dismissed from the dashboard.
+    // `latest_per_task` filters rows with non-NULL `dismissed_at` so a stuck
+    // red badge can be cleared without affecting the underlying GitHub
+    // pipeline or future runs for the same commit.
+    conn.execute_batch("ALTER TABLE ci_runs ADD COLUMN dismissed_at TEXT;")
+        .ok();
 }
 
 #[cfg(test)]

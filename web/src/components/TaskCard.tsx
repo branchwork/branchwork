@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { PlanTask } from "../stores/plan-store.js";
-import { postJson, putJson } from "../api.js";
+import { postJson, putJson, deleteJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import {
@@ -283,7 +283,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
 
               {/* Status dropdown menu */}
               {showMenu && (
-                <div className="absolute top-6 left-0 z-10 bg-gray-800 border border-gray-700 rounded-md shadow-lg py-1 min-w-[120px]">
+                <div className="absolute top-6 left-0 z-10 bg-gray-800 border border-gray-700 rounded-md shadow-lg py-1 min-w-[140px]">
                   {Object.entries(statusConfig)
                     .filter(([k]) => k !== "checking")
                     .map(([key, val]) => (
@@ -298,6 +298,30 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                       {val.label}
                     </button>
                   ))}
+                  {/* Reset — clears the task_status row entirely. Useful when
+                      a task has ended up stuck in `checking` or similar from
+                      a dead agent. Backend refuses if an agent is still live. */}
+                  <div className="border-t border-gray-700 my-1" />
+                  <button
+                    onClick={async () => {
+                      setShowMenu(false);
+                      try {
+                        await postJson(
+                          `/api/plans/${planName}/tasks/${task.number}/reset-status`,
+                          {},
+                        );
+                        await selectPlan(planName);
+                      } catch (e) {
+                        const msg = e instanceof Error ? e.message : String(e);
+                        setError(`Reset failed: ${msg}`);
+                      }
+                    }}
+                    className="w-full text-left px-3 py-1 text-xs hover:bg-red-950/40 text-red-400/80 hover:text-red-300 flex items-center gap-2"
+                    title="Clear status row — useful to unwedge a stuck 'checking' task"
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-red-400/80" />
+                    Reset
+                  </button>
                 </div>
               )}
             </div>
@@ -316,7 +340,8 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 ${task.costUsd.toFixed(task.costUsd >= 1 ? 2 : 4)}
               </span>
             )}
-            {/* CI badge */}
+            {/* CI badge + dismiss button (only shown for failed/unknown
+                runs — passing or running CI shouldn't be dismissable). */}
             {task.ci && (() => {
               const c = ciConfig[task.ci.status] ?? ciConfig.unknown;
               const className = `text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1 ${c.bg}`;
@@ -326,7 +351,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                   {c.label}
                 </>
               );
-              return task.ci.runUrl ? (
+              const badge = task.ci.runUrl ? (
                 <a
                   href={task.ci.runUrl}
                   target="_blank"
@@ -339,6 +364,35 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 </a>
               ) : (
                 <span className={className} title={c.title}>{inner}</span>
+              );
+              const dismissable =
+                task.ci.status === "failure" ||
+                task.ci.status === "cancelled" ||
+                task.ci.status === "unknown";
+              const ciRunId = task.ci.id;
+              return (
+                <span className="inline-flex items-center">
+                  {badge}
+                  {dismissable && ciRunId != null && (
+                    <button
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        try {
+                          await deleteJson(`/api/ci/${ciRunId}`);
+                          await selectPlan(planName);
+                        } catch (err) {
+                          const msg =
+                            err instanceof Error ? err.message : String(err);
+                          setError(`Dismiss CI failed: ${msg}`);
+                        }
+                      }}
+                      className="ml-0.5 text-[10px] text-gray-500 hover:text-gray-300 hover:bg-gray-800/60 px-1 rounded transition"
+                      title="Dismiss this CI result — won't affect future runs"
+                    >
+                      &#x2715;
+                    </button>
+                  )}
+                </span>
               );
             })()}
           </div>

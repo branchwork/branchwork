@@ -9,6 +9,35 @@ use serde::Deserialize;
 
 use crate::state::AppState;
 
+/// Resolve the merge target for an agent. Prefer the agent's recorded
+/// `source_branch`, but fall back to master/main if it doesn't resolve —
+/// e.g. the branch was deleted out-of-band, or a prior bug stored a bad
+/// value. Without this fallback `git checkout <target>` 500s before the
+/// merge guard even runs.
+fn resolve_merge_target(source_branch: Option<&str>, cwd: &std::path::Path) -> String {
+    let resolves = |name: &str| -> bool {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", name])
+            .current_dir(cwd)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if let Some(c) = source_branch
+        && resolves(c)
+    {
+        return c.to_string();
+    }
+    if resolves("master") {
+        return "master".to_string();
+    }
+    if resolves("main") {
+        return "main".to_string();
+    }
+    // Hopeless — let `git checkout` produce its own error downstream.
+    source_branch.unwrap_or("main").to_string()
+}
+
 pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
     let mut stmt = db
@@ -268,7 +297,7 @@ pub async fn merge_agent_branch(
         }
     };
 
-    let target = source_branch.unwrap_or_else(|| "main".to_string());
+    let target = resolve_merge_target(source_branch.as_deref(), std::path::Path::new(&cwd));
 
     // Guard: refuse to merge a branch with no commits ahead of its source.
     // Agents that exit before committing leave a branch that points at the
@@ -479,7 +508,7 @@ pub async fn discard_agent_branch(
         }
     };
 
-    let target = source_branch.unwrap_or_else(|| "main".to_string());
+    let target = resolve_merge_target(source_branch.as_deref(), std::path::Path::new(&cwd));
 
     // Checkout the target branch first
     let checkout = std::process::Command::new("git")

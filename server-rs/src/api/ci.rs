@@ -9,10 +9,60 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use rusqlite::params;
 use serde::Deserialize;
 
 use crate::agents::pty_agent;
 use crate::state::AppState;
+
+/// DELETE /api/ci/{run_id}
+///
+/// Soft-dismisses a CI run — sets `ci_runs.dismissed_at` so `latest_per_task`
+/// skips it and the badge goes away. Future runs for the same commit are
+/// unaffected. Idempotent; dismissing twice is a no-op.
+pub async fn dismiss_run(
+    State(state): State<AppState>,
+    Path(ci_run_id): Path<i64>,
+) -> impl IntoResponse {
+    // Look up plan/task first so we can broadcast a targeted clear event.
+    let target: Option<(String, String)> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT plan_name, task_number FROM ci_runs WHERE id = ?1",
+            params![ci_run_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()
+    };
+
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE ci_runs SET dismissed_at = datetime('now') WHERE id = ?1",
+            params![ci_run_id],
+        )
+        .ok();
+    }
+
+    if let Some((plan_name, task_number)) = &target {
+        crate::ws::broadcast_event(
+            &state.broadcast_tx,
+            "ci_run_dismissed",
+            serde_json::json!({
+                "id": ci_run_id,
+                "plan_name": plan_name,
+                "task_number": task_number,
+            }),
+        );
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "id": ci_run_id,
+        "plan_name": target.as_ref().map(|t| &t.0),
+        "task_number": target.as_ref().map(|t| &t.1),
+    }))
+}
 
 /// GET /api/ci/{run_id}/failure-log
 ///

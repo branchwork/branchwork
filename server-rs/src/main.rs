@@ -265,6 +265,18 @@ async fn run_server(cli: Cli) {
             "/api/plans/{name}/reset-status",
             post(api::plans::reset_plan_status),
         )
+        .route(
+            "/api/plans/{name}/tasks/{task_number}/reset-status",
+            post(api::plans::reset_task_status),
+        )
+        .route(
+            "/api/plans/{name}/branches/stale",
+            get(api::plans::list_stale_branches),
+        )
+        .route(
+            "/api/plans/{name}/branches/stale/purge",
+            post(api::plans::purge_stale_branches),
+        )
         .route("/api/plans/{name}/check-all", post(api::plans::check_all))
         .route(
             "/api/plans/{name}/tasks/{task_number}/check",
@@ -272,6 +284,10 @@ async fn run_server(cli: Cli) {
         )
         .route("/api/actions/start-task", post(api::plans::start_task))
         .route("/api/actions/fix-ci", post(api::ci::fix_ci))
+        .route(
+            "/api/ci/{ci_run_id}",
+            axum::routing::delete(api::ci::dismiss_run),
+        )
         .route("/api/ci/{ci_run_id}/failure-log", get(api::ci::failure_log))
         .route(
             "/api/plans/{name}/phases/{phase_number}/start",

@@ -1787,6 +1787,338 @@ pub async fn reset_plan_status(
     }))
 }
 
+// ── POST /api/plans/:name/tasks/:task/reset-status — unwedge a single task ──
+
+/// Clear the task's `task_status` row so it reverts to "derived / unknown"
+/// and the user can pick up from a clean slate. Idempotent: safe to re-run.
+///
+/// Refuses if there's a running/starting agent for the task — resetting
+/// status from under a live agent would orphan the agent's writes and
+/// confuse the dashboard. Kill the agent first, then reset.
+pub async fn reset_task_status(
+    State(state): State<AppState>,
+    Path((name, task_number)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // Live-agent check. We scope the lock tightly so the subsequent DELETE
+    // doesn't contend for the same guard.
+    let live_agent: Option<String> = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT id FROM agents \
+             WHERE plan_name = ?1 AND task_id = ?2 \
+                   AND status IN ('running', 'starting') \
+             LIMIT 1",
+            params![name, task_number],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    };
+    if let Some(id) = live_agent {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "agent_running",
+                "message": format!(
+                    "Agent {} is still running for this task. Kill or finish it before resetting.",
+                    &id[..8.min(id.len())]
+                ),
+                "agent_id": id,
+            })),
+        )
+            .into_response();
+    }
+
+    let cleared = {
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "DELETE FROM task_status WHERE plan_name = ?1 AND task_number = ?2",
+            params![name, task_number],
+        )
+        .unwrap_or(0)
+    };
+
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "task_status_changed",
+        serde_json::json!({
+            "plan_name": name,
+            "task_number": task_number,
+            // Null status = reverted to derived; clients treat as pending unless
+            // something else (e.g. CI) contradicts.
+            "status": serde_json::Value::Null,
+        }),
+    );
+
+    Json(serde_json::json!({
+        "ok": true,
+        "plan_name": name,
+        "task_number": task_number,
+        "cleared": cleared,
+    }))
+    .into_response()
+}
+
+// ── Branch cleanup helpers ──────────────────────────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleBranch {
+    pub name: String,
+    pub sha: Option<String>,
+    pub commits_ahead_of_trunk: Option<u64>,
+    pub last_commit_age_secs: Option<i64>,
+    pub agent_id: Option<String>,
+    /// When false, the branch has no unique commits and is safe to delete
+    /// without the `force` flag.
+    pub has_unique_commits: bool,
+}
+
+/// GET /api/plans/:name/branches/stale
+///
+/// Enumerate all `orchestrai/<plan>/*` refs in the plan's project dir and
+/// report their state so the user can decide which to delete. Read-only.
+pub async fn list_stale_branches(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(cwd) = crate::ci::project_dir_for(&state.plans_dir, &state.db, &name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plan has no resolvable project directory"})),
+        )
+            .into_response();
+    };
+
+    // List local branches matching this plan's prefix.
+    let prefix = format!("orchestrai/{name}/");
+    let prefix_fix = format!("orchestrai/fix/{name}/");
+    let branches: Vec<(String, String, Option<i64>)> = {
+        let out = std::process::Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname:short)|%(objectname)|%(committerdate:unix)",
+                "refs/heads/",
+            ])
+            .current_dir(&cwd)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let parts: Vec<&str> = l.splitn(3, '|').collect();
+                    if parts.len() < 3 {
+                        return None;
+                    }
+                    let n = parts[0].to_string();
+                    if !(n.starts_with(&prefix) || n.starts_with(&prefix_fix)) {
+                        return None;
+                    }
+                    Some((n, parts[1].to_string(), parts[2].parse::<i64>().ok()))
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+
+    // Which agent rows still reference each branch — one query.
+    let agent_by_branch: std::collections::HashMap<String, String> = {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT branch, id FROM agents WHERE branch IS NOT NULL")
+        {
+            Ok(s) => s,
+            Err(_) => return Json(serde_json::json!({"branches": []})).into_response(),
+        };
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default()
+    };
+
+    // Determine trunk — try master, then main.
+    let trunk = ["master", "main"]
+        .iter()
+        .find(|t| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--verify", t])
+                .current_dir(&cwd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .copied();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let stale: Vec<StaleBranch> = branches
+        .into_iter()
+        .map(|(branch, sha, ts)| {
+            let commits_ahead = trunk.and_then(|t| {
+                std::process::Command::new("git")
+                    .args(["rev-list", "--count", &format!("{t}..{branch}")])
+                    .current_dir(&cwd)
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .trim()
+                            .parse::<u64>()
+                            .ok()
+                    })
+            });
+            StaleBranch {
+                name: branch.clone(),
+                sha: Some(sha),
+                last_commit_age_secs: ts.map(|t| now - t),
+                commits_ahead_of_trunk: commits_ahead,
+                agent_id: agent_by_branch.get(&branch).cloned(),
+                // Unknown commits_ahead = assume risky (has_unique_commits=true)
+                // so the user has to actively opt in via force=true.
+                has_unique_commits: commits_ahead.map(|c| c > 0).unwrap_or(true),
+            }
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "plan_name": name,
+        "trunk": trunk,
+        "branches": stale,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeBranchesBody {
+    pub branches: Vec<String>,
+    /// Required to delete a branch with unique commits not on trunk.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// POST /api/plans/:name/branches/stale/purge
+///
+/// Delete the specified branches and null out matching `agents.branch`
+/// columns. Safety guard: refuses branches with unique commits unless
+/// `force=true`. Returns a per-branch outcome so partial failures are
+/// legible in the UI.
+pub async fn purge_stale_branches(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<PurgeBranchesBody>,
+) -> impl IntoResponse {
+    let Some(cwd) = crate::ci::project_dir_for(&state.plans_dir, &state.db, &name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plan has no resolvable project directory"})),
+        )
+            .into_response();
+    };
+
+    // Determine trunk for safety check.
+    let trunk = ["master", "main"]
+        .iter()
+        .find(|t| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--verify", t])
+                .current_dir(&cwd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .copied()
+        .unwrap_or("master");
+
+    let prefix = format!("orchestrai/{name}/");
+    let prefix_fix = format!("orchestrai/fix/{name}/");
+
+    let mut results = Vec::new();
+    for branch in &body.branches {
+        // Scope-check: only allow deletion within this plan's prefix so a
+        // malicious / mistaken caller can't purge unrelated refs.
+        if !(branch.starts_with(&prefix) || branch.starts_with(&prefix_fix)) {
+            results.push(serde_json::json!({
+                "branch": branch,
+                "ok": false,
+                "error": "out_of_scope",
+            }));
+            continue;
+        }
+
+        // Commit-ahead check: unique commits need force=true.
+        if !body.force {
+            let ahead = std::process::Command::new("git")
+                .args(["rev-list", "--count", &format!("{trunk}..{branch}")])
+                .current_dir(&cwd)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                });
+            if ahead.map(|c| c > 0).unwrap_or(true) {
+                results.push(serde_json::json!({
+                    "branch": branch,
+                    "ok": false,
+                    "error": "has_unique_commits",
+                    "ahead_of_trunk": ahead,
+                }));
+                continue;
+            }
+        }
+
+        // Delete. -D is force-delete (handles branches not merged into trunk
+        // when the caller set force=true); for the default safe path the
+        // above check already guaranteed zero commits ahead so -d would also
+        // work. Use -D uniformly to avoid a second error mode.
+        let out = std::process::Command::new("git")
+            .args(["branch", "-D", branch])
+            .current_dir(&cwd)
+            .output();
+        let ok = matches!(out.as_ref(), Ok(o) if o.status.success());
+        if ok {
+            // Clear any agent row still pointing at it.
+            let db = state.db.lock().unwrap();
+            db.execute(
+                "UPDATE agents SET branch = NULL WHERE branch = ?1",
+                params![branch],
+            )
+            .ok();
+            drop(db);
+            crate::ws::broadcast_event(
+                &state.broadcast_tx,
+                "agent_branch_cleared",
+                serde_json::json!({"branch": branch}),
+            );
+            results.push(serde_json::json!({
+                "branch": branch,
+                "ok": true,
+            }));
+        } else {
+            let stderr = out
+                .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                .unwrap_or_else(|e| e.to_string());
+            results.push(serde_json::json!({
+                "branch": branch,
+                "ok": false,
+                "error": "git_failed",
+                "stderr": stderr.trim(),
+            }));
+        }
+    }
+
+    Json(serde_json::json!({
+        "plan_name": name,
+        "results": results,
+    }))
+    .into_response()
+}
+
 // ── POST /api/plans/:name/check-all — spawn a check agent for every non-completed task ─
 
 #[derive(Deserialize, Default)]
@@ -1953,7 +2285,9 @@ fn build_check_prompt(
     // Exclude commits reachable from master/main so pre-existing history on the
     // base branch doesn't masquerade as the agent's committed work.
     let git_log_unique_cmd = if task.file_paths.is_empty() {
-        format!("git log {task_branch} --not master main 2>/dev/null || git log {task_branch} --not master 2>/dev/null || git log {task_branch} --not main")
+        format!(
+            "git log {task_branch} --not master main 2>/dev/null || git log {task_branch} --not master 2>/dev/null || git log {task_branch} --not main"
+        )
     } else {
         let files = quoted_files.join(" ");
         format!(

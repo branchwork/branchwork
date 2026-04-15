@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { usePlanStore, type ParsedPlan } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
-import { postJson, putJson } from "../api.js";
+import { fetchJson, postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
 
@@ -185,6 +185,7 @@ export function PlanBoard() {
           >
             {resetting ? "Resetting..." : "Reset"}
           </button>
+          <StaleBranchesButton planName={plan.name} onError={setError} onDone={() => selectPlan(plan.name)} />
         </div>
         {/* Error toast */}
         {error && (
@@ -353,4 +354,194 @@ function BudgetBadge({ plan }: { plan: ParsedPlan }) {
         : `Budget: $${spent.toFixed(2)} / $${max.toFixed(2)}`}
     </button>
   );
+}
+
+interface StaleBranch {
+  name: string;
+  sha: string | null;
+  commitsAheadOfTrunk: number | null;
+  lastCommitAgeSecs: number | null;
+  agentId: string | null;
+  hasUniqueCommits: boolean;
+}
+
+interface StaleBranchesButtonProps {
+  planName: string;
+  onError: (msg: string | null) => void;
+  onDone: () => void;
+}
+
+/// Two-stage button: click it to load the list of `orchestrai/<plan>/*`
+/// branches, then pick which to purge. Defaults to selecting only the
+/// branches with no unique commits (the "agent exited without committing"
+/// leftovers). Dangerous branches require a force opt-in.
+function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonProps) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [branches, setBranches] = useState<StaleBranch[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [force, setForce] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  async function openAndLoad() {
+    setOpen(true);
+    setLoading(true);
+    onError(null);
+    try {
+      const data = await fetchJson<{ branches: StaleBranch[] }>(
+        `/api/plans/${planName}/branches/stale`,
+      );
+      setBranches(data.branches);
+      // Default selection: safe-only (no unique commits).
+      setSelected(
+        new Set(data.branches.filter((b) => !b.hasUniqueCommits).map((b) => b.name)),
+      );
+    } catch (e) {
+      onError(`Load branches failed: ${e instanceof Error ? e.message : String(e)}`);
+      setOpen(false);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function purge() {
+    setBusy(true);
+    onError(null);
+    try {
+      const toPurge = [...selected];
+      const { results } = await postJson<{
+        results: Array<{ branch: string; ok: boolean; error?: string }>;
+      }>(`/api/plans/${planName}/branches/stale/purge`, { branches: toPurge, force });
+      const failed = results.filter((r) => !r.ok);
+      if (failed.length > 0) {
+        onError(
+          `${failed.length} failed: ` +
+            failed.map((f) => `${f.branch} (${f.error})`).join(", "),
+        );
+      }
+      setOpen(false);
+      setSelected(new Set());
+      setForce(false);
+      onDone();
+    } catch (e) {
+      onError(`Purge failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <button
+        onClick={openAndLoad}
+        className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-red-600 hover:text-red-400 disabled:opacity-50 text-gray-300 rounded transition"
+        title="List and delete stale orchestrai/* branches"
+      >
+        Clean Branches
+      </button>
+      {open && (
+        <div
+          className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center"
+          onClick={() => !busy && setOpen(false)}
+        >
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-md shadow-xl p-4 max-w-2xl w-full max-h-[70vh] overflow-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-sm font-semibold mb-3">
+              Stale branches for <span className="font-mono">{planName}</span>
+            </h3>
+            {loading ? (
+              <div className="text-gray-500 text-xs">Loading...</div>
+            ) : branches.length === 0 ? (
+              <div className="text-gray-500 text-xs">No orchestrai/* branches found.</div>
+            ) : (
+              <>
+                <table className="w-full text-xs">
+                  <thead className="text-gray-500">
+                    <tr className="text-left border-b border-gray-800">
+                      <th className="py-1 pr-2">Pick</th>
+                      <th className="py-1 pr-2">Branch</th>
+                      <th className="py-1 pr-2">Commits ahead</th>
+                      <th className="py-1 pr-2">Age</th>
+                      <th className="py-1 pr-2">Agent</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {branches.map((b) => {
+                      const risky = b.hasUniqueCommits;
+                      return (
+                        <tr key={b.name} className="border-b border-gray-800/50">
+                          <td className="py-1 pr-2">
+                            <input
+                              type="checkbox"
+                              checked={selected.has(b.name)}
+                              disabled={risky && !force}
+                              onChange={(e) => {
+                                const next = new Set(selected);
+                                if (e.target.checked) next.add(b.name);
+                                else next.delete(b.name);
+                                setSelected(next);
+                              }}
+                            />
+                          </td>
+                          <td className="py-1 pr-2 font-mono text-gray-300">{b.name}</td>
+                          <td
+                            className={`py-1 pr-2 ${
+                              risky ? "text-amber-400" : "text-gray-500"
+                            }`}
+                          >
+                            {b.commitsAheadOfTrunk ?? "?"}
+                          </td>
+                          <td className="py-1 pr-2 text-gray-500">
+                            {b.lastCommitAgeSecs != null
+                              ? formatAge(b.lastCommitAgeSecs)
+                              : "?"}
+                          </td>
+                          <td className="py-1 pr-2 font-mono text-gray-600">
+                            {b.agentId ? b.agentId.slice(0, 8) : "-"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <label className="flex items-center gap-2 mt-3 text-xs text-amber-400">
+                  <input
+                    type="checkbox"
+                    checked={force}
+                    onChange={(e) => setForce(e.target.checked)}
+                  />
+                  Allow branches with unique commits (force)
+                </label>
+              </>
+            )}
+            <div className="flex justify-end gap-2 mt-4">
+              <button
+                onClick={() => setOpen(false)}
+                disabled={busy}
+                className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={purge}
+                disabled={busy || selected.size === 0}
+                className="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-600 disabled:opacity-50 text-white rounded transition"
+              >
+                {busy ? "Purging..." : `Delete ${selected.size}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function formatAge(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+  return `${Math.floor(secs / 86400)}d`;
 }

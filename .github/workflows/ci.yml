@@ -60,7 +60,12 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --release --all-targets -- -D warnings
 
-      - name: cargo test
+      # Runs unit tests AND integration tests under `tests/` — notably the
+      # e2e suite (`tests/recovery.rs`, `tests/merge_guard.rs`) which spawns
+      # the real `orchestrai-server` binary against a scratch git repo and
+      # drives it over HTTP. These would have caught every shipped bug in
+      # the dashboard-polish cycle.
+      - name: cargo test (unit + e2e)
         run: cargo test --release
 
       - name: Install cargo-audit

@@ -348,6 +348,146 @@ impl AgentRegistry {
                 self.mark_detached(&id, "reconnect failed");
             }
         }
+
+        // Second pass: normalize task_status rows. A task stuck in `checking`
+        // whose check-agent is no longer running is the most common wedged
+        // state — the server died mid-check, the status row is orphaned, the
+        // task card is effectively frozen. Revert to whatever the previous
+        // status was (fall back to deleting the row if we can't infer).
+        self.reconcile_task_statuses().await;
+
+        // Third pass: clear `agents.branch` rows whose branch no longer
+        // exists in the project's git. Out-of-band `git branch -D` leaves
+        // the row pointing at a ghost; the merge banner keeps offering an
+        // action that can't succeed.
+        self.reconcile_orphaned_branches().await;
+    }
+
+    /// Revert `task_status` rows stuck in `checking` when their check-agent
+    /// is no longer alive. Called by [`cleanup_and_reattach`] on boot.
+    async fn reconcile_task_statuses(&self) {
+        let stuck: Vec<(String, String)> = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = match db
+                .prepare("SELECT plan_name, task_number FROM task_status WHERE status = 'checking'")
+            {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map(|it| it.flatten().collect())
+                .unwrap_or_default()
+        };
+
+        for (plan_name, task_number) in stuck {
+            // Is there any still-running check agent for this task?
+            let live: Option<String> = {
+                let db = self.db.lock().unwrap();
+                db.query_row(
+                    "SELECT id FROM agents \
+                     WHERE plan_name = ?1 AND task_id = ?2 \
+                           AND status IN ('running', 'starting') \
+                     LIMIT 1",
+                    rusqlite::params![plan_name, task_number],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+            };
+            if live.is_some() {
+                continue; // agent still alive — leave the status alone
+            }
+
+            // Nothing alive. Drop the checking row so the task reverts to
+            // whatever its task_status update history implied (or pending
+            // when there's no prior row). Simpler and more honest than
+            // guessing a fallback status.
+            {
+                let db = self.db.lock().unwrap();
+                db.execute(
+                    "DELETE FROM task_status \
+                     WHERE plan_name = ?1 AND task_number = ?2 AND status = 'checking'",
+                    rusqlite::params![plan_name, task_number],
+                )
+                .ok();
+            }
+            broadcast_event(
+                &self.broadcast_tx,
+                "task_status_changed",
+                serde_json::json!({
+                    "plan_name": plan_name,
+                    "task_number": task_number,
+                    "status": serde_json::Value::Null,
+                    "reason": "boot_sweep: checking status reverted, check-agent not alive",
+                }),
+            );
+            println!(
+                "[orchestrAI] Reverted stuck 'checking' on {plan_name}/{task_number} — \
+                 no live check-agent"
+            );
+        }
+    }
+
+    /// Clear `agents.branch` for rows whose branch no longer resolves in
+    /// the project's git. Fast-path: if nothing has a branch, skip entirely.
+    async fn reconcile_orphaned_branches(&self) {
+        let rows: Vec<(String, String, String)> = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = match db.prepare(
+                "SELECT id, branch, cwd FROM agents \
+                 WHERE branch IS NOT NULL AND cwd IS NOT NULL AND cwd != ''",
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default()
+        };
+
+        for (agent_id, branch, cwd) in rows {
+            let exists = std::process::Command::new("git")
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .current_dir(&cwd)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if exists {
+                continue;
+            }
+            {
+                let db = self.db.lock().unwrap();
+                db.execute(
+                    "UPDATE agents SET branch = NULL WHERE id = ?1",
+                    rusqlite::params![agent_id],
+                )
+                .ok();
+            }
+            broadcast_event(
+                &self.broadcast_tx,
+                "agent_branch_cleared",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "branch": branch,
+                    "reason": "boot_sweep: branch not present in project git",
+                }),
+            );
+            println!(
+                "[orchestrAI] Cleared orphaned branch {branch} on agent {} — \
+                 not in project git",
+                &agent_id[..8.min(agent_id.len())]
+            );
+        }
     }
 
     /// Mark an agent `failed` + stop_reason='supervisor_unreachable' when the

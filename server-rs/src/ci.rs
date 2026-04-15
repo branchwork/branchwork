@@ -517,14 +517,17 @@ pub fn latest_per_task(
     conn: &rusqlite::Connection,
     plan_name: &str,
 ) -> std::collections::HashMap<String, CiStatus> {
-    // Pick row with max(id) per (plan_name, task_number).
+    // Pick row with max(id) per (plan_name, task_number), ignoring rows
+    // the user dismissed via the UI (see `api::ci::dismiss_run`). A task
+    // with only dismissed runs shows no badge rather than a stale red one.
     let mut stmt = match conn.prepare(
         "SELECT c.task_number, c.id, c.status, c.conclusion, c.run_url, c.commit_sha, c.updated_at \
          FROM ci_runs c \
          INNER JOIN (SELECT task_number, MAX(id) AS max_id FROM ci_runs \
-                     WHERE plan_name = ?1 GROUP BY task_number) m \
+                     WHERE plan_name = ?1 AND dismissed_at IS NULL \
+                     GROUP BY task_number) m \
            ON c.id = m.max_id \
-         WHERE c.plan_name = ?1",
+         WHERE c.plan_name = ?1 AND c.dismissed_at IS NULL",
     ) {
         Ok(s) => s,
         Err(_) => return Default::default(),
@@ -588,7 +591,8 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE ci_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, \
               plan_name TEXT, task_number TEXT, status TEXT, conclusion TEXT, \
-              run_url TEXT, commit_sha TEXT, updated_at TEXT DEFAULT (datetime('now')));",
+              run_url TEXT, commit_sha TEXT, updated_at TEXT DEFAULT (datetime('now')), \
+              dismissed_at TEXT);",
         )
         .unwrap();
         conn.execute(
