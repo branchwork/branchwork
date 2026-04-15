@@ -409,16 +409,22 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         {/* Actions */}
         <div className="flex-shrink-0 flex gap-1 items-center">
           {/* Driver selector — only show when a start action is possible, and
-              only when the server advertises more than one driver. */}
+              only when the server advertises more than one driver. Disabled
+              (not hidden) while taskLocked so users can see which driver is
+              in flight and why they can't change it. */}
           {drivers.length > 1 &&
             !agentId &&
-            !taskLocked &&
             (status === "pending" || status === "in_progress" || status === "failed") && (
               <select
                 value={driver}
                 onChange={(e) => setDriver(e.target.value)}
-                className="text-[10px] bg-gray-800 border border-gray-700 text-gray-300 rounded px-1 py-0.5 focus:outline-none focus:border-gray-500"
-                title="Agent driver to use when starting this task"
+                disabled={taskLocked}
+                className="text-[10px] bg-gray-800 border border-gray-700 text-gray-300 rounded px-1 py-0.5 focus:outline-none focus:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                title={
+                  taskLocked
+                    ? "Agent running — wait for it to finish"
+                    : "Agent driver to use when starting this task"
+                }
               >
                 {drivers.map((d) => (
                   <option key={d.name} value={d.name}>
