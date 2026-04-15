@@ -10,6 +10,9 @@ export type CiStatusValue =
   | "unknown";
 
 export interface CiStatus {
+  /// Row id in the server's `ci_runs` table — passed to the fix-CI endpoint
+  /// so the server knows which specific run to recover from.
+  id: number;
   status: CiStatusValue;
   conclusion?: string | null;
   runUrl?: string | null;

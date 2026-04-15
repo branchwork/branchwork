@@ -271,6 +271,8 @@ async fn run_server(cli: Cli) {
             post(api::plans::check_task),
         )
         .route("/api/actions/start-task", post(api::plans::start_task))
+        .route("/api/actions/fix-ci", post(api::ci::fix_ci))
+        .route("/api/ci/{ci_run_id}/failure-log", get(api::ci::failure_log))
         .route(
             "/api/plans/{name}/phases/{phase_number}/start",
             post(api::plans::start_phase_tasks),

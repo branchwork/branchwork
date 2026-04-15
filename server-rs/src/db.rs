@@ -197,6 +197,17 @@ fn migrate(conn: &Connection) {
     // NULL as the default driver.
     conn.execute_batch("ALTER TABLE agents ADD COLUMN driver TEXT DEFAULT 'claude';")
         .ok();
+    // Free-form tag explaining why an agent stopped: 'completed', 'killed',
+    // 'orphaned' (reconciled on startup, daemon dead), 'supervisor_unreachable'
+    // (heartbeat timeout). NULL while the agent is still live. Used for
+    // debugging and rendered as a hover-label on the task card.
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN stop_reason TEXT;")
+        .ok();
+    // Cached `gh run view --log-failed` output for a failed CI run. Populated
+    // lazily by the failure-log endpoint; bounded at ~8 KB to keep prompts
+    // tight when we pass it to a fix-CI agent.
+    conn.execute_batch("ALTER TABLE ci_runs ADD COLUMN failure_log TEXT;")
+        .ok();
 }
 
 #[cfg(test)]

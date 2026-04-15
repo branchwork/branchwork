@@ -74,6 +74,7 @@ function timeAgo(iso?: string): string {
 export function TaskCard({ task, planName, phaseNumber }: Props) {
   const [starting, setStarting] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [fixingCi, setFixingCi] = useState(false);
   const [agentId, setAgentId] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -91,6 +92,18 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       a.status !== "running" &&
       a.status !== "starting"
   );
+  // Task is locked while any agent for it is running/starting (possibly
+  // spawned from another browser/session — we can't rely on the local
+  // `agentId` state alone). Locked tasks hide the driver selector and
+  // disable Check/Start/Continue/Retry so the user can't trigger duplicate
+  // work or swap drivers mid-run. Kill/Finish stay available.
+  const runningAgent = agents.find(
+    (a) =>
+      a.plan_name === planName &&
+      a.task_id === task.number &&
+      (a.status === "running" || a.status === "starting")
+  );
+  const taskLocked = !!runningAgent;
   const plan = usePlanStore((s) => s.selectedPlan);
   const selectPlan = usePlanStore((s) => s.selectPlan);
   const savePlan = usePlanStore((s) => s.savePlan);
@@ -187,6 +200,31 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       console.error("Failed to check task:", e);
     } finally {
       setChecking(false);
+    }
+  }
+
+  async function handleFixCi() {
+    if (!task.ci || task.ci.status !== "failure") return;
+    setFixingCi(true);
+    setError(null);
+    try {
+      const res = await postJson<{ agentId: string; branch: string }>(
+        "/api/actions/fix-ci",
+        {
+          planName,
+          taskNumber: task.number,
+          ciRunId: task.ci.id,
+          driver,
+        }
+      );
+      setAgentId(res.agentId);
+      selectAgent(res.agentId);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Fix CI failed: ${msg}`);
+      console.error("Failed to start Fix CI agent:", e);
+    } finally {
+      setFixingCi(false);
     }
   }
 
@@ -317,6 +355,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
               only when the server advertises more than one driver. */}
           {drivers.length > 1 &&
             !agentId &&
+            !taskLocked &&
             (status === "pending" || status === "in_progress" || status === "failed") && (
               <select
                 value={driver}
@@ -331,12 +370,37 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 ))}
               </select>
             )}
-          {/* Check button — always available */}
+          {/* Fix CI — visible when the latest CI run for this task failed.
+              Spawns an agent on a recovery branch off the failing commit with
+              the failure log baked into the prompt. */}
+          {task.ci?.status === "failure" && !agentId && (
+            <button
+              onClick={handleFixCi}
+              disabled={fixingCi || taskLocked || !authReady}
+              title={
+                taskLocked
+                  ? "Agent running — wait for it to finish"
+                  : !authReady
+                    ? `${driver} not ready: ${authStatusLabel(auth)}`
+                    : `Spawn an agent to fix the failing CI on ${
+                        task.ci.commitSha?.slice(0, 7) ?? "the merged commit"
+                      }`
+              }
+              className="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
+            >
+              {fixingCi ? "..." : "Fix CI"}
+            </button>
+          )}
+          {/* Check button — always available except while an agent is running */}
           <button
             onClick={handleCheck}
-            disabled={checking || status === "checking"}
+            disabled={checking || status === "checking" || taskLocked}
             className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-300 rounded transition"
-            title="Spawn an agent to verify this task against the codebase"
+            title={
+              taskLocked
+                ? "Agent running — wait for it to finish"
+                : "Spawn an agent to verify this task against the codebase"
+            }
           >
             {checking || status === "checking" ? "..." : "Check"}
           </button>
@@ -345,13 +409,15 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
           {status === "pending" && !agentId && (
             <button
               onClick={() => handleStart("start")}
-              disabled={starting || blocked || !authReady}
+              disabled={starting || blocked || !authReady || taskLocked}
               title={
-                !authReady
-                  ? `${driver} not ready: ${authStatusLabel(auth)}`
-                  : blocked
-                    ? `Blocked by ${unmetDeps.join(", ")}`
-                    : undefined
+                taskLocked
+                  ? "Agent running — wait for it to finish"
+                  : !authReady
+                    ? `${driver} not ready: ${authStatusLabel(auth)}`
+                    : blocked
+                      ? `Blocked by ${unmetDeps.join(", ")}`
+                      : undefined
               }
               className="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
             >
@@ -363,8 +429,14 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
           {status === "in_progress" && !agentId && (
             <button
               onClick={() => handleStart("continue")}
-              disabled={starting || !authReady}
-              title={!authReady ? `${driver} not ready: ${authStatusLabel(auth)}` : undefined}
+              disabled={starting || !authReady || taskLocked}
+              title={
+                taskLocked
+                  ? "Agent running — wait for it to finish"
+                  : !authReady
+                    ? `${driver} not ready: ${authStatusLabel(auth)}`
+                    : undefined
+              }
               className="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
             >
               {starting ? "..." : "Continue"}
@@ -375,8 +447,14 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
           {status === "failed" && !agentId && (
             <button
               onClick={() => handleStart("continue")}
-              disabled={starting || !authReady}
-              title={!authReady ? `${driver} not ready: ${authStatusLabel(auth)}` : undefined}
+              disabled={starting || !authReady || taskLocked}
+              title={
+                taskLocked
+                  ? "Agent running — wait for it to finish"
+                  : !authReady
+                    ? `${driver} not ready: ${authStatusLabel(auth)}`
+                    : undefined
+              }
               className="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
             >
               {starting ? "..." : "Retry"}

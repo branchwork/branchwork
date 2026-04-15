@@ -139,6 +139,7 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
         &broadcast_tx,
         "ci_status_changed",
         serde_json::json!({
+            "id": run_id,
             "plan_name": plan_name,
             "task_number": task_number,
             "status": "pending",
@@ -343,6 +344,7 @@ fn update_row(
         broadcast_tx,
         "ci_status_changed",
         serde_json::json!({
+            "id": id,
             "plan_name": plan_name,
             "task_number": task_number,
             "status": status,
@@ -373,6 +375,98 @@ pub fn spawn_poller(db: Db, broadcast_tx: broadcast::Sender<String>, plans_dir: 
             poll_once(&db, &broadcast_tx, &project_dirs).await;
         }
     });
+}
+
+/// Resolve the on-disk directory for a single plan. Mirrors the per-plan
+/// lookup inside [`resolve_project_dirs`] but cheaper when the caller only
+/// needs one plan — used by the failure-log endpoint.
+pub fn project_dir_for(plans_dir: &Path, db: &Db, plan_name: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let override_project: Option<String> = {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT project FROM plan_project WHERE plan_name = ?1",
+            rusqlite::params![plan_name],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    };
+    if let Some(p) = override_project {
+        return Some(home.join(p));
+    }
+    let summaries = crate::plan_parser::list_plans(plans_dir);
+    summaries
+        .into_iter()
+        .find(|s| s.name == plan_name)
+        .and_then(|s| s.project.map(|p| home.join(p)))
+}
+
+/// Fetch the failure log for a CI run via `gh run view --log-failed`.
+/// Capped at ~8 KB (last slice — failures usually accumulate at the tail),
+/// cached back into `ci_runs.failure_log` so repeat fetches don't re-hit
+/// GitHub. Returns `None` when the run is still pending, the project has
+/// no remote, or `gh` isn't installed.
+pub async fn fetch_failure_log(db: &Db, plans_dir: PathBuf, ci_run_id: i64) -> Option<String> {
+    const CAP_BYTES: usize = 8 * 1024;
+
+    // Cache hit?
+    let cached: Option<String> = {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT failure_log FROM ci_runs WHERE id = ?1",
+            rusqlite::params![ci_run_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+    if cached.is_some() {
+        return cached;
+    }
+
+    // Lookup provider run_id + plan so we can shell out in the right cwd.
+    let (provider_run_id, plan_name): (Option<String>, String) = {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT run_id, plan_name FROM ci_runs WHERE id = ?1",
+            rusqlite::params![ci_run_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()?
+    };
+    let run_id = provider_run_id?;
+    let cwd = project_dir_for(&plans_dir, db, &plan_name)?;
+
+    let log = tokio::task::spawn_blocking(move || {
+        let out = Command::new("gh")
+            .args(["run", "view", &run_id, "--log-failed"])
+            .current_dir(&cwd)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // `--log-failed` can be hundreds of KB; keep the tail (failures
+        // accumulate there) and decode lossily so stray non-UTF8 doesn't
+        // drop the whole buffer.
+        let raw = out.stdout;
+        let start = raw.len().saturating_sub(CAP_BYTES);
+        Some(String::from_utf8_lossy(&raw[start..]).into_owned())
+    })
+    .await
+    .ok()
+    .flatten()?;
+
+    // Write-through cache so the next call is free.
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE ci_runs SET failure_log = ?1 WHERE id = ?2",
+            rusqlite::params![log, ci_run_id],
+        )
+        .ok();
+    }
+    Some(log)
 }
 
 fn resolve_project_dirs(plans_dir: &Path, db: &Db) -> std::collections::HashMap<String, PathBuf> {
@@ -407,6 +501,10 @@ fn resolve_project_dirs(plans_dir: &Path, db: &Db) -> std::collections::HashMap<
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CiStatus {
+    /// `ci_runs.id` — the dashboard's internal row id, needed by the
+    /// failure-log / fix-CI endpoints so the frontend can refer back to
+    /// this specific run without guessing.
+    pub id: i64,
     pub status: String,
     pub conclusion: Option<String>,
     pub run_url: Option<String>,
@@ -421,7 +519,7 @@ pub fn latest_per_task(
 ) -> std::collections::HashMap<String, CiStatus> {
     // Pick row with max(id) per (plan_name, task_number).
     let mut stmt = match conn.prepare(
-        "SELECT c.task_number, c.status, c.conclusion, c.run_url, c.commit_sha, c.updated_at \
+        "SELECT c.task_number, c.id, c.status, c.conclusion, c.run_url, c.commit_sha, c.updated_at \
          FROM ci_runs c \
          INNER JOIN (SELECT task_number, MAX(id) AS max_id FROM ci_runs \
                      WHERE plan_name = ?1 GROUP BY task_number) m \
@@ -436,11 +534,12 @@ pub fn latest_per_task(
             Ok((
                 r.get::<_, String>(0)?,
                 CiStatus {
-                    status: r.get(1)?,
-                    conclusion: r.get(2)?,
-                    run_url: r.get(3)?,
-                    commit_sha: r.get(4)?,
-                    updated_at: r.get(5)?,
+                    id: r.get(1)?,
+                    status: r.get(2)?,
+                    conclusion: r.get(3)?,
+                    run_url: r.get(4)?,
+                    commit_sha: r.get(5)?,
+                    updated_at: r.get(6)?,
                 },
             ))
         })

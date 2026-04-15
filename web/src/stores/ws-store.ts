@@ -186,6 +186,7 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
     }
     case "ci_status_changed": {
       const d = msg.data as {
+        id: number;
         plan_name: string;
         task_number: string;
         status: string;
@@ -194,6 +195,7 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
         commit_sha?: string | null;
       };
       planStore.patchTaskCi(d.plan_name, d.task_number, {
+        id: d.id,
         status: d.status as
           | "pending" | "running" | "success" | "failure" | "cancelled" | "unknown",
         conclusion: d.conclusion ?? null,

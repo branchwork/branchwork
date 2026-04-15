@@ -318,12 +318,7 @@ impl AgentRegistry {
             if mode != "pty" {
                 let alive = pid.map(process_alive).unwrap_or(false);
                 if !alive {
-                    let db = self.db.lock().unwrap();
-                    db.execute(
-                        "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
-                        rusqlite::params![id],
-                    )
-                    .ok();
+                    self.mark_orphaned(&id, "stream-json child PID dead on boot");
                 }
                 continue;
             }
@@ -339,17 +334,7 @@ impl AgentRegistry {
 
             let alive = pid.map(process_alive).unwrap_or(false);
             if !alive {
-                let db = self.db.lock().unwrap();
-                db.execute(
-                    "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
-                    rusqlite::params![id],
-                )
-                .ok();
-                println!(
-                    "[orchestrAI] Cleaned stale agent {} (pid {:?}) — daemon dead",
-                    &id[..8.min(id.len())],
-                    pid
-                );
+                self.mark_orphaned(&id, &format!("supervisor PID {pid:?} not alive on boot"));
                 continue;
             }
 
@@ -363,6 +348,76 @@ impl AgentRegistry {
                 self.mark_detached(&id, "reconnect failed");
             }
         }
+    }
+
+    /// Mark an agent `failed` + stop_reason='supervisor_unreachable' when the
+    /// heartbeat loop in [`pty_agent::spawn_heartbeat_task`] sees three
+    /// consecutive Pings go unanswered. Evicts the live registry entry so
+    /// the UI can't pretend the agent is still there, updates the DB, and
+    /// broadcasts a stop event so task cards unlock in real-time.
+    pub async fn mark_supervisor_unreachable(&self, agent_id: &str) {
+        // Drop the live session. Any still-open reader/writer on the same
+        // ManagedAgent will wind down on their own once they hit the closed
+        // channel or connection.
+        self.agents.lock().await.remove(agent_id);
+        {
+            let db = self.db.lock().unwrap();
+            db.execute(
+                "UPDATE agents SET status = 'failed', \
+                     stop_reason = 'supervisor_unreachable', \
+                     finished_at = datetime('now') \
+                 WHERE id = ? AND status IN ('running', 'starting')",
+                rusqlite::params![agent_id],
+            )
+            .ok();
+        }
+        broadcast_event(
+            &self.broadcast_tx,
+            "agent_stopped",
+            serde_json::json!({
+                "id": agent_id,
+                "status": "failed",
+                "stop_reason": "supervisor_unreachable",
+                "reason": "supervisor did not respond to 3 consecutive pings (~45s)",
+            }),
+        );
+        println!(
+            "[orchestrAI] Agent {} marked unreachable — heartbeat timeout",
+            &agent_id[..8.min(agent_id.len())]
+        );
+    }
+
+    /// Mark an agent `failed` + stop_reason='orphaned' and broadcast the
+    /// change so any connected browser unlocks the task card without
+    /// waiting for a manual refresh. Used by cleanup_and_reattach when the
+    /// daemon/child PID is not alive — the row was from a previous server
+    /// run whose supervisor did not survive.
+    fn mark_orphaned(&self, agent_id: &str, detail: &str) {
+        {
+            let db = self.db.lock().unwrap();
+            db.execute(
+                "UPDATE agents SET status = 'failed', \
+                     stop_reason = 'orphaned', \
+                     finished_at = datetime('now') \
+                 WHERE id = ? AND status IN ('running', 'starting')",
+                rusqlite::params![agent_id],
+            )
+            .ok();
+        }
+        broadcast_event(
+            &self.broadcast_tx,
+            "agent_stopped",
+            serde_json::json!({
+                "id": agent_id,
+                "status": "failed",
+                "stop_reason": "orphaned",
+                "reason": detail,
+            }),
+        );
+        println!(
+            "[orchestrAI] Agent {} marked orphaned — {detail}",
+            &agent_id[..8.min(agent_id.len())]
+        );
     }
 
     /// Flip an agent to the `detached` status so the UI can offer a kill/

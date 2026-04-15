@@ -10,10 +10,13 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use interprocess::local_socket::ConnectOptions;
 use interprocess::local_socket::tokio::prelude::*;
 use rusqlite::params;
+use tokio::sync::Notify;
 
 use crate::agents::driver::{AgentDriver, SpawnOpts};
 use crate::agents::session_protocol::{self, Message as SessionMessage};
@@ -255,12 +258,28 @@ async fn connect_and_wire(
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel::<SessionMessage>();
     let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1024);
 
+    // Shared heartbeat state: reader resets the miss counter on any inbound
+    // frame; heartbeat task increments before each Ping and gives up after
+    // three consecutive misses (~45s) without a response. `cancel` is fired
+    // when the reader exits so the heartbeat doesn't outlive the session.
+    let unanswered = Arc::new(AtomicU32::new(0));
+    let cancel = Arc::new(Notify::new());
+
     spawn_writer_task(write_half, command_rx);
     spawn_reader_task(
         registry.clone(),
         agent_id.to_string(),
         read_half,
         output_tx.clone(),
+        unanswered.clone(),
+        cancel.clone(),
+    );
+    spawn_heartbeat_task(
+        registry.clone(),
+        agent_id.to_string(),
+        command_tx.clone(),
+        unanswered,
+        cancel,
     );
 
     let agent = ManagedAgent {
@@ -304,12 +323,16 @@ fn spawn_reader_task(
     agent_id: String,
     read_half: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     output_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
+    unanswered: Arc<AtomicU32>,
+    cancel: Arc<Notify>,
 ) {
     tokio::spawn(async move {
         let mut read_half = read_half;
         loop {
             match session_protocol::read_frame(&mut read_half).await {
                 Ok(SessionMessage::Output(bytes)) => {
+                    // Any inbound frame means the supervisor is alive.
+                    unanswered.store(0, Ordering::SeqCst);
                     // Persist; use lossy so bad utf-8 doesn't drop the chunk.
                     let text = String::from_utf8_lossy(&bytes).to_string();
                     {
@@ -324,13 +347,53 @@ fn spawn_reader_task(
                     // when there are zero subscribers; that's fine.
                     let _ = output_tx.send(bytes);
                 }
-                Ok(_) => { /* Pong / non-Output messages: ignore */ }
+                Ok(_) => {
+                    // Pong / non-Output messages: count as liveness signal
+                    // but don't persist or forward.
+                    unanswered.store(0, Ordering::SeqCst);
+                }
                 Err(_) => break,
             }
         }
 
+        // Release the heartbeat task before invoking exit; on_agent_exit
+        // may touch registry state the heartbeat also reads.
+        cancel.notify_waiters();
         // Supervisor closed the connection: treat as agent completion.
         on_agent_exit(&registry, &agent_id).await;
+    });
+}
+
+/// Send a `Ping` every 15 s and count unanswered ones. Three consecutive
+/// misses (~45 s of silence) means the supervisor is unreachable — likely
+/// crashed or wedged — so mark the agent stopped and broadcast. Exits
+/// cleanly when `cancel` is notified by the reader on EOF.
+fn spawn_heartbeat_task(
+    registry: AgentRegistry,
+    agent_id: String,
+    command_tx: tokio::sync::mpsc::UnboundedSender<SessionMessage>,
+    unanswered: Arc<AtomicU32>,
+    cancel: Arc<Notify>,
+) {
+    const INTERVAL: Duration = Duration::from_secs(15);
+    const MAX_MISSES: u32 = 3;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.notified() => break,
+                _ = tokio::time::sleep(INTERVAL) => {}
+            }
+            if unanswered.load(Ordering::SeqCst) >= MAX_MISSES {
+                registry.mark_supervisor_unreachable(&agent_id).await;
+                break;
+            }
+            unanswered.fetch_add(1, Ordering::SeqCst);
+            // If the writer's receiver has dropped (agent killed / evicted
+            // from the registry) the send fails and we're done.
+            if command_tx.send(SessionMessage::Ping).is_err() {
+                break;
+            }
+        }
     });
 }
 
