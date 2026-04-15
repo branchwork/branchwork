@@ -374,8 +374,14 @@ fn spawn_reader_task(
 
 /// Send a `Ping` every 15 s and count unanswered ones. Three consecutive
 /// misses (~45 s of silence) means the supervisor is unreachable — likely
-/// crashed or wedged — so mark the agent stopped and broadcast. Exits
-/// cleanly when `cancel` is notified by the reader on EOF.
+/// wedged without closing the socket — so mark the agent stopped and
+/// broadcast. Exits cleanly when `cancel` is notified by the reader on EOF.
+///
+/// Order matters: we send first, then sleep, then check. With a 15 s
+/// interval and 3-miss threshold this yields detection at ~45 s after the
+/// supervisor goes silent (ping at t=0 lost, ping at t=15 lost, ping at
+/// t=30 lost, check at t=45 trips the threshold). Sleeping first would
+/// push the first ping to t=15 and detection to t=60.
 fn spawn_heartbeat_task(
     registry: AgentRegistry,
     agent_id: String,
@@ -387,10 +393,6 @@ fn spawn_heartbeat_task(
     const MAX_MISSES: u32 = 3;
     tokio::spawn(async move {
         loop {
-            tokio::select! {
-                _ = cancel.notified() => break,
-                _ = tokio::time::sleep(INTERVAL) => {}
-            }
             if unanswered.load(Ordering::SeqCst) >= MAX_MISSES {
                 registry.mark_supervisor_unreachable(&agent_id).await;
                 break;
@@ -400,6 +402,10 @@ fn spawn_heartbeat_task(
             // from the registry) the send fails and we're done.
             if command_tx.send(SessionMessage::Ping).is_err() {
                 break;
+            }
+            tokio::select! {
+                _ = cancel.notified() => break,
+                _ = tokio::time::sleep(INTERVAL) => {}
             }
         }
     });
@@ -437,11 +443,25 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
         .ok()
     };
 
-    // Only flip `running → completed`. If the row is already `killed` (from
+    // Distinguish clean supervisor exit from a crash. The daemon removes
+    // its pidfile as the final step of orderly shutdown (PTY child exited,
+    // or we sent it a `Kill`); a SIGKILL skips that cleanup and leaves the
+    // pidfile on disk. Reading its presence right before we unlink it below
+    // gives us a reliable crash signal — much faster than waiting for the
+    // heartbeat to trip (~45 s), which the acceptance test does not.
+    let socket_path = registry.socket_for(agent_id);
+    let supervisor_crashed = supervisor::pidfile_path(&socket_path).exists();
+
+    // Only flip `running → <terminal>`. If the row is already `killed` (from
     // kill_agent) or `failed` we leave the terminal status alone — but we
     // still stamp cost_usd so the UI reports spend accurately regardless of
     // how the agent ended.
-    let marked_completed = {
+    let (new_status, stop_reason) = if supervisor_crashed {
+        ("failed", Some("supervisor_unreachable"))
+    } else {
+        ("completed", None)
+    };
+    let marked = {
         let db = registry.db.lock().unwrap();
         db.execute(
             "UPDATE agents SET cost_usd = ?2 WHERE id = ?1 AND cost_usd IS NULL",
@@ -450,8 +470,9 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
         .ok();
         let n = db
             .execute(
-                "UPDATE agents SET status = 'completed', finished_at = datetime('now') WHERE id = ?1 AND status = 'running'",
-                params![agent_id],
+                "UPDATE agents SET status = ?1, stop_reason = ?2, finished_at = datetime('now') \
+                 WHERE id = ?3 AND status = 'running'",
+                params![new_status, stop_reason, agent_id],
             )
             .unwrap_or(0);
         n > 0
@@ -475,25 +496,29 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
 
     // Clean up the per-agent socket / pidfile siblings. Log stays so the
     // full transcript is still recoverable post-mortem.
-    let socket_path = registry.socket_for(agent_id);
     #[cfg(unix)]
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(supervisor::pidfile_path(&socket_path));
 
-    // Only broadcast completion when we actually flipped the row. Otherwise
-    // kill_agent already emitted an `agent_stopped:killed` event and a
-    // duplicate here would confuse the dashboard.
-    if marked_completed {
-        broadcast_event(
-            &registry.broadcast_tx,
-            "agent_stopped",
-            serde_json::json!({"id": agent_id, "status": "completed", "exit_code": 0}),
-        );
+    // Only broadcast when we actually flipped the row. Otherwise kill_agent
+    // already emitted an `agent_stopped:killed` event and a duplicate here
+    // would confuse the dashboard.
+    if marked {
+        let mut payload = serde_json::json!({"id": agent_id, "status": new_status});
+        if let Some(reason) = stop_reason {
+            payload["stop_reason"] = serde_json::Value::String(reason.to_string());
+            payload["reason"] =
+                serde_json::Value::String("supervisor exited without clean shutdown".to_string());
+        } else {
+            payload["exit_code"] = serde_json::Value::from(0);
+        }
+        broadcast_event(&registry.broadcast_tx, "agent_stopped", payload);
     }
 
-    // Webhook only when we actually completed; kill_agent owns user-visible
-    // messaging for the kill path.
-    if marked_completed && registry.webhook_url.is_some() {
+    // Webhook only when we cleanly completed; kill_agent owns user-visible
+    // messaging for the kill path, and supervisor crashes are already
+    // surfaced via the WS event.
+    if marked && !supervisor_crashed && registry.webhook_url.is_some() {
         let (plan, task, branch) = meta.unwrap_or((None, None, None));
         let msg = crate::notifications::agent_completion_message(
             plan.as_deref(),
@@ -645,4 +670,173 @@ fn parse_cost_from_pty_output(
 
     let combined = rows.into_iter().rev().collect::<String>();
     driver.parse_cost(&combined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::AgentRegistry;
+    use crate::db::Db;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn fresh_db() -> (Db, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        (crate::db::init(&path), dir)
+    }
+
+    fn test_registry(
+        db: Db,
+        sockets_dir: PathBuf,
+    ) -> (AgentRegistry, tokio::sync::broadcast::Receiver<String>) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(32);
+        let registry = AgentRegistry::new(
+            db,
+            tx,
+            None,
+            sockets_dir,
+            PathBuf::from("/nonexistent/orchestrai-server"),
+            3100,
+        );
+        (registry, rx)
+    }
+
+    fn insert_running_agent(db: &Db, id: &str, socket: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, mode, pid, supervisor_socket) \
+             VALUES (?1, '/tmp', 'running', 'pty', 1, ?2)",
+            params![id, socket],
+        )
+        .unwrap();
+    }
+
+    fn status_and_reason(db: &Db, id: &str) -> (String, Option<String>) {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT status, stop_reason FROM agents WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn drain(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    /// Clean-exit path: the supervisor's orderly shutdown removes its
+    /// pidfile before exiting. on_agent_exit must see "pidfile missing" and
+    /// mark the agent as `completed`, not `supervisor_unreachable`.
+    #[tokio::test]
+    async fn on_agent_exit_marks_completed_when_pidfile_missing() {
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone(), sockets_dir.clone());
+
+        let agent_id = "clean-exit";
+        let socket = sockets_dir.join(format!("{agent_id}.sock"));
+        insert_running_agent(&db, agent_id, &socket.to_string_lossy());
+        // No pidfile on disk: simulates the supervisor running its normal
+        // cleanup (remove pidfile → remove socket → exit).
+
+        on_agent_exit(&registry, agent_id).await;
+
+        let (status, reason) = status_and_reason(&db, agent_id);
+        assert_eq!(status, "completed", "pidfile absent => clean exit");
+        assert_eq!(reason, None);
+
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("agent_stopped")
+                && e.contains(agent_id)
+                && e.contains("completed")),
+            "expected completed broadcast: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.contains("supervisor_unreachable")),
+            "should not mention supervisor_unreachable: {events:?}"
+        );
+    }
+
+    /// Crash path: the supervisor was SIGKILL'd mid-flight and left its
+    /// pidfile sibling on disk. on_agent_exit must read that as "supervisor
+    /// died without cleaning up" and mark the agent `failed` /
+    /// `supervisor_unreachable` — which is what unlocks the task card.
+    #[tokio::test]
+    async fn on_agent_exit_marks_supervisor_unreachable_when_pidfile_present() {
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone(), sockets_dir.clone());
+
+        let agent_id = "crashed";
+        let socket = sockets_dir.join(format!("{agent_id}.sock"));
+        insert_running_agent(&db, agent_id, &socket.to_string_lossy());
+        // Supervisor didn't run cleanup, so the pidfile is still on disk.
+        std::fs::write(supervisor::pidfile_path(&socket), "99999").unwrap();
+
+        on_agent_exit(&registry, agent_id).await;
+
+        let (status, reason) = status_and_reason(&db, agent_id);
+        assert_eq!(status, "failed");
+        assert_eq!(reason.as_deref(), Some("supervisor_unreachable"));
+
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("agent_stopped")
+                && e.contains(agent_id)
+                && e.contains("supervisor_unreachable")),
+            "expected supervisor_unreachable broadcast: {events:?}"
+        );
+
+        // Side-effect: the on_agent_exit cleanup also removes the pidfile
+        // so a future reboot doesn't mistake it for a live daemon.
+        assert!(
+            !supervisor::pidfile_path(&socket).exists(),
+            "on_agent_exit should remove the stale pidfile"
+        );
+    }
+
+    /// Double-exit safety: if the row is already `killed` (kill_agent ran
+    /// first), on_agent_exit must not rewrite the status or re-broadcast.
+    #[tokio::test]
+    async fn on_agent_exit_leaves_killed_row_alone() {
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone(), sockets_dir.clone());
+
+        let agent_id = "user-killed";
+        let socket = sockets_dir.join(format!("{agent_id}.sock"));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, cwd, status, mode, pid, supervisor_socket) \
+                 VALUES (?1, '/tmp', 'killed', 'pty', 1, ?2)",
+                params![agent_id, socket.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        }
+
+        on_agent_exit(&registry, agent_id).await;
+
+        let (status, reason) = status_and_reason(&db, agent_id);
+        assert_eq!(status, "killed", "terminal row must not be rewritten");
+        assert_eq!(reason, None);
+
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.contains("agent_stopped") && e.contains(agent_id)),
+            "must not broadcast a duplicate stop: {events:?}"
+        );
+    }
 }

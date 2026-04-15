@@ -1647,16 +1647,24 @@ mod tests {
         for id in ["check-alive", "check-dead"] {
             let (status, reason) = agent_status(&db, id);
             assert_eq!(status, "failed", "{id}: expected failed");
-            assert_eq!(reason.as_deref(), Some("orphaned"), "{id}: expected orphaned");
+            assert_eq!(
+                reason.as_deref(),
+                Some("orphaned"),
+                "{id}: expected orphaned"
+            );
         }
 
         let events = drain_events(&mut rx);
         assert!(
-            events.iter().any(|e| e.contains("check-alive") && e.contains("orphaned")),
+            events
+                .iter()
+                .any(|e| e.contains("check-alive") && e.contains("orphaned")),
             "missing orphan broadcast for check-alive: {events:?}"
         );
         assert!(
-            events.iter().any(|e| e.contains("check-dead") && e.contains("orphaned")),
+            events
+                .iter()
+                .any(|e| e.contains("check-dead") && e.contains("orphaned")),
             "missing orphan broadcast for check-dead: {events:?}"
         );
     }
@@ -1685,9 +1693,58 @@ mod tests {
 
         let events = drain_events(&mut rx);
         assert!(
-            events.iter().any(|e| e.contains("pty-dead") && e.contains("orphaned")),
+            events
+                .iter()
+                .any(|e| e.contains("pty-dead") && e.contains("orphaned")),
             "missing orphan broadcast: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn mark_supervisor_unreachable_flips_running_row_and_broadcasts() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        insert_agent(
+            &db,
+            "wedged",
+            "pty",
+            "running",
+            Some(1),
+            Some("/tmp/w.sock"),
+        );
+        registry.mark_supervisor_unreachable("wedged").await;
+
+        let (status, reason) = agent_status(&db, "wedged");
+        assert_eq!(status, "failed");
+        assert_eq!(reason.as_deref(), Some("supervisor_unreachable"));
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("agent_stopped")
+                && e.contains("wedged")
+                && e.contains("supervisor_unreachable")),
+            "expected agent_stopped/supervisor_unreachable broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_supervisor_unreachable_leaves_terminal_rows_alone() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // Already-killed agent: the heartbeat shouldn't overwrite the row.
+        insert_agent(&db, "already-killed", "pty", "killed", Some(1), None);
+        registry.mark_supervisor_unreachable("already-killed").await;
+
+        let (status, reason) = agent_status(&db, "already-killed");
+        assert_eq!(status, "killed", "terminal status must not be overwritten");
+        assert_eq!(reason.as_deref(), None);
+
+        // The broadcast still fires (the method doesn't read back the DB to
+        // decide), but what matters is that the row survives. Drain to keep
+        // the channel tidy.
+        let _ = drain_events(&mut rx);
     }
 
     #[tokio::test]
@@ -1707,7 +1764,8 @@ mod tests {
         // that neither completed nor killed got touched.
         let events = drain_events(&mut rx);
         assert!(
-            !events.iter().any(|e| (e.contains("\"id\":\"done\"") || e.contains("\"id\":\"killed\""))
+            !events.iter().any(|e| (e.contains("\"id\":\"done\"")
+                || e.contains("\"id\":\"killed\""))
                 && e.contains("agent_stopped")),
             "terminal rows re-broadcast: {events:?}"
         );
