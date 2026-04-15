@@ -224,6 +224,10 @@ pub struct AgentRegistry {
     /// Absolute path to the running server binary. Used to respawn the
     /// `session` subcommand as a detached daemon.
     pub server_exe: PathBuf,
+    /// TCP port the dashboard's HTTP listener (and MCP endpoint) is bound
+    /// to. Used by drivers that auto-register the orchestrAI MCP server
+    /// with the spawned CLI.
+    pub port: u16,
     /// Available agent drivers, keyed by name. Built once at startup with
     /// [`DriverRegistry::with_defaults`]; clones share the underlying Arc.
     pub drivers: DriverRegistry,
@@ -253,6 +257,7 @@ impl AgentRegistry {
         webhook_url: Option<String>,
         sockets_dir: PathBuf,
         server_exe: PathBuf,
+        port: u16,
     ) -> Self {
         Self {
             agents: Arc::new(Mutex::new(HashMap::new())),
@@ -261,6 +266,7 @@ impl AgentRegistry {
             webhook_url,
             sockets_dir,
             server_exe,
+            port,
             drivers: DriverRegistry::with_defaults(),
         }
     }
@@ -268,6 +274,14 @@ impl AgentRegistry {
     /// Resolve the per-agent socket path `<sockets_dir>/<id>.sock`.
     pub fn socket_for(&self, agent_id: &str) -> PathBuf {
         self.sockets_dir.join(format!("{agent_id}.sock"))
+    }
+
+    /// Resolve the per-agent MCP config path
+    /// `<sockets_dir>/<id>.mcp.json`. The file is written by
+    /// [`pty_agent::start_pty_agent`] when the driver declares an MCP
+    /// config via [`AgentDriver::mcp_config_json`].
+    pub fn mcp_config_for(&self, agent_id: &str) -> PathBuf {
+        self.sockets_dir.join(format!("{agent_id}.mcp.json"))
     }
 
     /// Clean up dead agents and reattach alive ones (from previous server runs).
@@ -636,6 +650,7 @@ pub fn build_task_prompt(
     is_continue: bool,
     port: u16,
     cross_plan_context: Option<&str>,
+    mcp_available: bool,
 ) -> String {
     let files_section = if !task.file_paths.is_empty() {
         format!(
@@ -660,6 +675,28 @@ pub fn build_task_prompt(
         .map(|c| format!("\n{c}\n"))
         .unwrap_or_default();
 
+    // Drivers that auto-register the orchestrAI MCP server (currently just
+    // Claude) get a terser "call the MCP tool" instruction; others fall back
+    // to a curl against the HTTP API, which is always live as a backstop.
+    let status_step = if mcp_available {
+        format!(
+            "3. Mark the task status by calling the `update_task_status` MCP tool \
+             (from the `orchestrai` server) with {{\"plan\": \"{plan_name}\", \
+             \"task\": \"{task_num}\", \"status\": \"completed\"}}",
+            plan_name = plan.name,
+            task_num = task.number,
+        )
+    } else {
+        format!(
+            "3. Mark the task status by running: curl -s -X PUT \
+             http://localhost:{port}/api/plans/{plan_name}/tasks/{task_num}/status \
+             -H \"Content-Type: application/json\" -d '{{\"status\":\"completed\"}}'",
+            port = port,
+            plan_name = plan.name,
+            task_num = task.number,
+        )
+    };
+
     format!(
         "{intro}\n\n\
          Plan: {plan_title}\n\
@@ -672,7 +709,7 @@ pub fn build_task_prompt(
          IMPORTANT: When you think you are done, do NOT stop. Instead:\n\
          1. Summarize what you did\n\
          2. Record one short learning other tasks in this project should know (file paths established, key decisions, gotchas) by running: curl -s -X POST http://localhost:{port}/api/plans/{plan_name}/tasks/{task_num}/learnings -H \"Content-Type: application/json\" -d '{{\"learning\":\"...\"}}'\n\
-         3. Mark the task status by running: curl -s -X PUT http://localhost:{port}/api/plans/{plan_name}/tasks/{task_num}/status -H \"Content-Type: application/json\" -d '{{\"status\":\"completed\"}}'\n\
+         {status_step}\n\
          4. Ask the user if they need anything else\n\
          5. Only stop when the user explicitly says they are done",
         intro = if is_continue {
@@ -900,7 +937,18 @@ pub async fn try_auto_advance(
         );
 
         let cross_ctx = build_cross_plan_context(&registry.db, &plans_dir, &plan, &task.number);
-        let prompt = build_task_prompt(&plan, next_phase, task, false, port, cross_ctx.as_deref());
+        // Auto-advance spawns use the default driver; check whether it
+        // auto-registers MCP so the prompt picks MCP tool vs curl.
+        let mcp_available = registry.drivers.injects_mcp(None, port);
+        let prompt = build_task_prompt(
+            &plan,
+            next_phase,
+            task,
+            false,
+            port,
+            cross_ctx.as_deref(),
+            mcp_available,
+        );
         let branch_name = format!("orchestrai/{}/{}", plan_name, task.number);
 
         pty_agent::start_pty_agent(
@@ -1179,5 +1227,74 @@ mod tests {
         }
         // Completed tasks are never re-spawned.
         assert!(!claim_task(&db, "p1", "1.1"));
+    }
+
+    fn sample_plan_for_prompt() -> (ParsedPlan, PlanPhase, PlanTask) {
+        let task = PlanTask {
+            number: "2.6".to_string(),
+            title: "Update agent prompts".to_string(),
+            description: "Replace curl with MCP tools.".to_string(),
+            file_paths: vec![],
+            acceptance: String::new(),
+            dependencies: vec![],
+            status: None,
+            status_updated_at: None,
+            cost_usd: None,
+            ci: None,
+        };
+        let phase = PlanPhase {
+            number: 2,
+            title: "MCP Server".to_string(),
+            description: String::new(),
+            tasks: vec![task.clone()],
+        };
+        let plan = ParsedPlan {
+            name: "portable-agents".to_string(),
+            file_path: String::new(),
+            title: "Portable agents".to_string(),
+            context: String::new(),
+            project: None,
+            created_at: String::new(),
+            modified_at: String::new(),
+            phases: vec![phase.clone()],
+            total_cost_usd: None,
+            max_budget_usd: None,
+        };
+        (plan, phase, task)
+    }
+
+    #[test]
+    fn build_task_prompt_uses_mcp_tool_when_available() {
+        let (plan, phase, task) = sample_plan_for_prompt();
+        let prompt = build_task_prompt(&plan, &phase, &task, false, 3100, None, true);
+        // MCP branch: tool name appears, curl PUT does not.
+        assert!(
+            prompt.contains("update_task_status"),
+            "expected MCP tool mention, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("curl -s -X PUT"),
+            "curl PUT should be omitted when MCP is available: {prompt}"
+        );
+        // Learnings curl (step 2) is still there regardless of MCP.
+        assert!(
+            prompt.contains("curl -s -X POST"),
+            "learnings curl should remain: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_task_prompt_falls_back_to_curl_when_mcp_unavailable() {
+        let (plan, phase, task) = sample_plan_for_prompt();
+        let prompt = build_task_prompt(&plan, &phase, &task, false, 3100, None, false);
+        // Curl branch: PUT appears, MCP tool does not.
+        assert!(
+            prompt.contains("curl -s -X PUT"),
+            "expected curl PUT fallback, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("update_task_status"),
+            "MCP tool should not be mentioned when unavailable: {prompt}"
+        );
     }
 }

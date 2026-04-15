@@ -928,13 +928,19 @@ pub async fn start_task(
 
     let cross_ctx =
         crate::agents::build_cross_plan_context(&state.db, &state.plans_dir, &plan, &task.number);
+    let port = state.config_port();
+    let mcp_available = state
+        .registry
+        .drivers
+        .injects_mcp(body.driver.as_deref(), port);
     let prompt = crate::agents::build_task_prompt(
         &plan,
         phase,
         task,
         is_continue,
-        state.config_port(),
+        port,
         cross_ctx.as_deref(),
+        mcp_available,
     );
 
     let effort = body
@@ -1111,6 +1117,10 @@ pub async fn start_phase_tasks(
     ensure_git_initialized(&work_dir);
 
     let port = state.config_port();
+    let mcp_available = state
+        .registry
+        .drivers
+        .injects_mcp(body.driver.as_deref(), port);
     let mut started = Vec::new();
 
     for task in ready {
@@ -1120,8 +1130,15 @@ pub async fn start_phase_tasks(
             &plan,
             &task.number,
         );
-        let prompt =
-            crate::agents::build_task_prompt(&plan, phase, task, false, port, cross_ctx.as_deref());
+        let prompt = crate::agents::build_task_prompt(
+            &plan,
+            phase,
+            task,
+            false,
+            port,
+            cross_ctx.as_deref(),
+            mcp_available,
+        );
         let branch_name = format!("orchestrai/{}/{}", plan_name, task.number);
 
         let agent_id = pty_agent::start_pty_agent(

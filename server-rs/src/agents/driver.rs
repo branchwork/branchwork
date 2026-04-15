@@ -31,6 +31,11 @@ pub struct SpawnOpts<'a> {
     /// hard ceiling pass it to the CLI; others ignore it and rely on the
     /// server-side budget enforcement in `pty_agent`.
     pub max_budget_usd: Option<f64>,
+    /// Path to a JSON file that registers the orchestrAI MCP server. When
+    /// set, drivers that [declare MCP injection][AgentDriver::mcp_config_json]
+    /// add the appropriate flag (e.g. `--mcp-config <path>`) to their argv.
+    /// The caller is responsible for having written the file before spawn.
+    pub mcp_config_path: Option<&'a Path>,
 }
 
 /// Verdict produced by a check-agent run. Mirrors the
@@ -158,6 +163,20 @@ pub trait AgentDriver: Send + Sync {
         DriverCapabilities::default()
     }
 
+    /// Content of an `.mcp.json` file that registers the orchestrAI MCP
+    /// server with the CLI. `Some` means the driver supports config
+    /// injection — the caller writes this string to a file and passes the
+    /// path via [`SpawnOpts::mcp_config_path`]. `None` (the default) means
+    /// the driver has no portable MCP integration and the file is skipped.
+    ///
+    /// `port` is the TCP port the dashboard's HTTP MCP endpoint is bound
+    /// to. Drivers that prefer stdio (e.g. to avoid requiring the server
+    /// to be reachable over HTTP) can ignore it and emit a stdio entry
+    /// instead.
+    fn mcp_config_json(&self, _port: u16) -> Option<String> {
+        None
+    }
+
     /// Check whether the CLI is installed and authenticated. Default
     /// implementation just confirms the binary is on PATH and reports
     /// [`AuthStatus::Unknown`] otherwise — drivers that know how to read
@@ -238,6 +257,10 @@ impl AgentDriver for ClaudeDriver {
             cmd.push("--max-budget-usd".to_string());
             cmd.push(v.to_string());
         }
+        if let Some(path) = opts.mcp_config_path {
+            cmd.push("--mcp-config".to_string());
+            cmd.push(path.to_string_lossy().to_string());
+        }
         cmd
     }
 
@@ -245,6 +268,23 @@ impl AgentDriver for ClaudeDriver {
         output
             .windows(CLAUDE_PROMPT_GLYPH.len())
             .any(|w| w == CLAUDE_PROMPT_GLYPH)
+    }
+
+    fn mcp_config_json(&self, port: u16) -> Option<String> {
+        // Claude Code's `.mcp.json` schema: top-level `mcpServers` map,
+        // one entry per server. We emit a streamable-HTTP entry pointing
+        // at the dashboard's `/mcp` endpoint (same transport the server
+        // already exposes at that path). Server name "orchestrai" maps to
+        // tool names like `mcp__orchestrai__list_plans` on the Claude side.
+        let cfg = serde_json::json!({
+            "mcpServers": {
+                "orchestrai": {
+                    "type": "http",
+                    "url": format!("http://127.0.0.1:{port}/mcp"),
+                }
+            }
+        });
+        Some(cfg.to_string())
     }
 
     fn parse_cost(&self, output: &str) -> Option<f64> {
@@ -644,6 +684,15 @@ impl DriverRegistry {
         out.sort();
         out
     }
+
+    /// Whether the driver resolved from `name` (falling back to the default)
+    /// auto-registers the orchestrAI MCP server with its CLI. Callers use
+    /// this to decide whether a spawned agent can reach MCP tools like
+    /// `update_task_status`, or whether the prompt needs to fall back to
+    /// curl against the HTTP API.
+    pub fn injects_mcp(&self, name: Option<&str>, port: u16) -> bool {
+        self.get_or_default(name).1.mcp_config_json(port).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -667,6 +716,7 @@ mod tests {
             cwd: &cwd,
             effort: Effort::High,
             max_budget_usd: None,
+            mcp_config_path: None,
         });
         assert_eq!(args.first().map(String::as_str), Some("claude"));
         assert!(args.iter().any(|a| a == "--session-id"));
@@ -676,6 +726,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "--effort"));
         assert!(args.iter().any(|a| a == "high"));
         assert!(!args.iter().any(|a| a == "--max-budget-usd"));
+        assert!(!args.iter().any(|a| a == "--mcp-config"));
     }
 
     #[test]
@@ -687,9 +738,36 @@ mod tests {
             cwd: &cwd,
             effort: Effort::Low,
             max_budget_usd: Some(2.50),
+            mcp_config_path: None,
         });
         let i = args.iter().position(|a| a == "--max-budget-usd").unwrap();
         assert_eq!(args[i + 1], "2.5");
+    }
+
+    #[test]
+    fn claude_spawn_args_appends_mcp_config_when_set() {
+        let driver = ClaudeDriver::new();
+        let cwd = PathBuf::from("/tmp/project");
+        let mcp_path = PathBuf::from("/tmp/agent-abc.mcp.json");
+        let args = driver.spawn_args(&SpawnOpts {
+            session_id: "s",
+            cwd: &cwd,
+            effort: Effort::Low,
+            max_budget_usd: None,
+            mcp_config_path: Some(&mcp_path),
+        });
+        let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!(args[i + 1], "/tmp/agent-abc.mcp.json");
+    }
+
+    #[test]
+    fn claude_mcp_config_json_has_expected_shape() {
+        let driver = ClaudeDriver::new();
+        let raw = driver.mcp_config_json(3100).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let entry = &parsed["mcpServers"]["orchestrai"];
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://127.0.0.1:3100/mcp");
     }
 
     #[test]
@@ -786,6 +864,7 @@ mod tests {
             cwd: &cwd,
             effort: Effort::High,
             max_budget_usd: Some(5.0),
+            mcp_config_path: None,
         });
         assert_eq!(args, vec!["aider".to_string(), "--yes-always".to_string()]);
     }
@@ -835,9 +914,19 @@ Tokens: 200 sent, 75 received. Cost: $0.0150 message, $0.0250 session.
             cwd: &cwd,
             effort: Effort::High,
             max_budget_usd: Some(1.0),
+            mcp_config_path: None,
         };
         assert_eq!(CodexDriver::new().spawn_args(&opts), vec!["codex"]);
         assert_eq!(GeminiDriver::new().spawn_args(&opts), vec!["gemini"]);
+    }
+
+    #[test]
+    fn non_claude_drivers_have_no_mcp_config() {
+        // Default trait impl returns None for drivers that haven't opted
+        // in to MCP injection. Only Claude ships a config today.
+        assert!(AiderDriver::new().mcp_config_json(3100).is_none());
+        assert!(CodexDriver::new().mcp_config_json(3100).is_none());
+        assert!(GeminiDriver::new().mcp_config_json(3100).is_none());
     }
 
     #[test]

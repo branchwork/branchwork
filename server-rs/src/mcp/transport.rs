@@ -1,6 +1,9 @@
 //! Transport glue: wraps [`OrchestrAiMcp`] in either a streamable-HTTP
 //! service (mounted on the axum router) or a stdio session (read
 //! line-delimited JSON-RPC from stdin, write to stdout).
+//!
+//! Both transports take the same [`McpContext`] so tool behaviour is
+//! identical whichever wire is used.
 
 use std::sync::Arc;
 
@@ -14,13 +17,13 @@ use rmcp::{
     },
 };
 
-use super::OrchestrAiMcp;
+use super::{McpContext, OrchestrAiMcp};
 
 pub type McpService = StreamableHttpService<OrchestrAiMcp, LocalSessionManager>;
 
-pub fn build_http_service() -> McpService {
+pub fn build_http_service(ctx: McpContext) -> McpService {
     StreamableHttpService::new(
-        || Ok(OrchestrAiMcp::new()),
+        move || Ok(OrchestrAiMcp::new(ctx.clone())),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     )
@@ -31,8 +34,8 @@ pub fn build_http_service() -> McpService {
 /// In stdio mode only protocol bytes may appear on stdout; logs must go
 /// to stderr. Callers are responsible for not writing to stdout
 /// themselves while this future is running.
-pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
-    let service = OrchestrAiMcp::new().serve(stdio()).await?;
+pub async fn run_stdio(ctx: McpContext) -> Result<(), Box<dyn std::error::Error>> {
+    let service = OrchestrAiMcp::new(ctx).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

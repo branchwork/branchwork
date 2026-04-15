@@ -3,12 +3,14 @@ import { usePlanStore } from "./stores/plan-store.js";
 import { useAgentStore } from "./stores/agent-store.js";
 import { useWsStore } from "./stores/ws-store.js";
 import { useSettingsStore } from "./stores/settings-store.js";
+import { useAuthStore } from "./stores/auth-store.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { PlanBoard } from "./components/PlanBoard.js";
 import { ProjectDashboard } from "./components/ProjectDashboard.js";
 import { AgentTree } from "./components/AgentTree.js";
 import { AgentPanel } from "./components/AgentPanel.js";
 import { NewPlanForm } from "./components/NewPlanForm.js";
+import { LoginPage } from "./components/LoginPage.js";
 
 type View = "plans" | "agents" | "new-plan";
 
@@ -24,13 +26,37 @@ export function App() {
   const fetchSettings = useSettingsStore((s) => s.fetchSettings);
   const fetchDrivers = useSettingsStore((s) => s.fetchDrivers);
 
+  const user = useAuthStore((s) => s.user);
+  const authLoading = useAuthStore((s) => s.loading);
+  const fetchMe = useAuthStore((s) => s.fetchMe);
+  const logout = useAuthStore((s) => s.logout);
+
+  // Resolve auth first. Other stores/WS are gated below so unauthenticated
+  // requests don't spam 401s into the dashboard.
   useEffect(() => {
+    fetchMe();
+  }, [fetchMe]);
+
+  useEffect(() => {
+    if (!user) return;
     connect();
     fetchPlans().catch(() => {});
     fetchAgents().catch(() => {});
     fetchSettings().catch(() => {});
     fetchDrivers().catch(() => {});
-  }, []);
+  }, [user]);
+
+  if (authLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-950 text-gray-500 text-sm">
+        …
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <LoginPage />;
+  }
 
   return (
     <div className="flex h-screen bg-gray-950 text-gray-100">
@@ -55,14 +81,24 @@ export function App() {
         )}
       </main>
 
-      {/* Connection indicator */}
-      <div className="fixed bottom-3 right-3 flex items-center gap-2 text-xs text-gray-500">
-        <span
-          className={`inline-block w-2 h-2 rounded-full ${
-            connected ? "bg-emerald-500" : "bg-red-500"
-          }`}
-        />
-        {connected ? "Connected" : "Disconnected"}
+      {/* Connection indicator + logout */}
+      <div className="fixed bottom-3 right-3 flex items-center gap-3 text-xs text-gray-500">
+        <span className="flex items-center gap-2">
+          <span
+            className={`inline-block w-2 h-2 rounded-full ${
+              connected ? "bg-emerald-500" : "bg-red-500"
+            }`}
+          />
+          {connected ? "Connected" : "Disconnected"}
+        </span>
+        <span className="text-gray-600">·</span>
+        <span className="text-gray-500">{user.email}</span>
+        <button
+          onClick={() => logout()}
+          className="text-gray-600 hover:text-gray-300 transition"
+        >
+          Sign out
+        </button>
       </div>
     </div>
   );

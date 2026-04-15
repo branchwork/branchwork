@@ -1,5 +1,6 @@
 mod agents;
 mod api;
+mod auth;
 mod auto_status;
 mod ci;
 mod config;
@@ -56,7 +57,44 @@ fn main() {
 
     match cli.command.take() {
         Some(Command::Mcp) => {
-            if let Err(e) = rt.block_on(mcp::transport::run_stdio()) {
+            // Reuse the same config/DB init as the server so stdio tools see
+            // the same plans and state.
+            let config = Config::from_cli(cli);
+            let db = db::init(&config.db_path);
+            let (broadcast_tx, _rx) = ws::create_broadcast();
+
+            // Stdio mode still needs a registry for auto-advance triggered
+            // by update_task_status. The spawned agents will outlive this
+            // stdio process (they run under their own session daemons), so
+            // auto-advance is still meaningful here.
+            let sockets_dir = config.claude_dir.join("sessions");
+            std::fs::create_dir_all(&sockets_dir).expect("failed to create sessions directory");
+            let server_exe = std::env::current_exe().unwrap_or_else(|e| {
+                eprintln!("[orchestrAI] current_exe() failed: {e} — falling back to argv[0]");
+                std::path::PathBuf::from(
+                    std::env::args()
+                        .next()
+                        .unwrap_or_else(|| "orchestrai-server".into()),
+                )
+            });
+            let registry = agents::AgentRegistry::new(
+                db.clone(),
+                broadcast_tx.clone(),
+                config.webhook_url.clone(),
+                sockets_dir,
+                server_exe,
+                config.port,
+            );
+
+            let ctx = mcp::McpContext {
+                plans_dir: config.plans_dir,
+                db,
+                broadcast_tx,
+                registry,
+                effort: std::sync::Arc::new(std::sync::Mutex::new(config.effort)),
+                port: config.port,
+            };
+            if let Err(e) = rt.block_on(mcp::transport::run_stdio(ctx)) {
                 eprintln!("mcp stdio error: {e}");
                 std::process::exit(1);
             }
@@ -95,6 +133,7 @@ async fn run_server(cli: Cli) {
         config.webhook_url.clone(),
         sockets_dir,
         server_exe,
+        config.port,
     );
     registry.cleanup_and_reattach().await;
 
@@ -152,6 +191,15 @@ async fn run_server(cli: Cli) {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
+
+    let mcp_ctx = mcp::McpContext {
+        plans_dir: state.plans_dir.clone(),
+        db: state.db.clone(),
+        broadcast_tx: state.broadcast_tx.clone(),
+        registry: state.registry.clone(),
+        effort: state.effort.clone(),
+        port: state.port,
+    };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -234,12 +282,24 @@ async fn run_server(cli: Cli) {
         )
         .route("/api/folders", get(api::settings::list_folders))
         .route("/api/templates", get(templates::list_templates))
+        // Auth
+        .route("/api/auth/signup", post(auth::signup))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/me", get(auth::me))
+        // Populate AuthUser on every request. Protected handlers opt in by
+        // taking `AuthUser` as an extractor; public routes (health, login,
+        // signup, static) are unaffected.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::populate_auth_user,
+        ))
         // Static frontend (fallback)
         .fallback(get(static_files::serve_frontend))
         .with_state(state)
         // MCP server (streamable HTTP transport). Mounted via nest_service so
         // it runs alongside the dashboard API without sharing its AppState.
-        .nest_service("/mcp", mcp::transport::build_http_service())
+        .nest_service("/mcp", mcp::transport::build_http_service(mcp_ctx))
         .layer(cors);
 
     let addr = format!("0.0.0.0:{}", config.port);

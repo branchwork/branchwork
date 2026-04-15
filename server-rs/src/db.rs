@@ -139,6 +139,24 @@ fn migrate(conn: &Connection) {
         );
         CREATE INDEX IF NOT EXISTS idx_learnings_plan_task ON task_learnings(plan_name, task_number);
 
+        CREATE TABLE IF NOT EXISTS users (
+            id             TEXT PRIMARY KEY,
+            email          TEXT NOT NULL UNIQUE,
+            password_hash  TEXT NOT NULL,
+            created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            token       TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at  TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
         CREATE TABLE IF NOT EXISTS ci_runs (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             plan_name    TEXT    NOT NULL,
@@ -212,6 +230,8 @@ mod tests {
         assert!(tables.contains(&"plan_project".to_string()));
         assert!(tables.contains(&"task_status".to_string()));
         assert!(tables.contains(&"task_learnings".to_string()));
+        assert!(tables.contains(&"users".to_string()));
+        assert!(tables.contains(&"sessions".to_string()));
     }
 
     #[test]

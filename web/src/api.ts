@@ -1,11 +1,26 @@
 const BASE = "";
 
+export class HttpError extends Error {
+  constructor(public status: number, public statusText: string, public body?: unknown) {
+    super(`${status} ${statusText}`);
+  }
+}
+
 export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      // body was not JSON — fine, leave undefined
+    }
+    throw new HttpError(res.status, res.statusText, body);
+  }
   return res.json() as Promise<T>;
 }
 

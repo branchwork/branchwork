@@ -91,6 +91,25 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         .ok();
     }
 
+    // If the driver supports MCP config injection, materialise the config
+    // file alongside the agent's socket so `--mcp-config` can point at it.
+    // Failure to write is non-fatal: the agent still runs, just without
+    // orchestrAI tool access. Log and continue.
+    let mcp_config_path = driver.mcp_config_json(registry.port).and_then(|json| {
+        let path = registry.mcp_config_for(&id);
+        match std::fs::write(&path, &json) {
+            Ok(()) => Some(path),
+            Err(e) => {
+                eprintln!(
+                    "[agent {}] Failed to write MCP config at {}: {e} — continuing without MCP injection",
+                    &id[..8.min(id.len())],
+                    path.display()
+                );
+                None
+            }
+        }
+    });
+
     // Build the CLI argv via the driver. No shell involved — `portable-pty`
     // spawns it directly in the daemon, so we don't need to escape spaces.
     let cli_cmd = driver.spawn_args(&SpawnOpts {
@@ -98,6 +117,7 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         cwd,
         effort,
         max_budget_usd,
+        mcp_config_path: mcp_config_path.as_deref(),
     });
     let formatted_prompt = driver.format_prompt(&prompt);
 
