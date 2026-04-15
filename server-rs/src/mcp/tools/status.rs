@@ -120,6 +120,29 @@ impl OrchestrAiMcp {
             ));
         }
 
+        // Reject `completed` on a dirty working tree — the most common way
+        // tasks get silently dropped is an agent that edits files, calls
+        // this tool, and exits without `git commit`. See
+        // `agents::check_tree_clean_for_completion` for the full story.
+        if req.status == "completed"
+            && let crate::agents::TreeState::Dirty { files } =
+                crate::agents::check_tree_clean_for_completion(
+                    &self.ctx.db,
+                    &self.ctx.plans_dir,
+                    &req.plan,
+                )
+        {
+            let preview = files.join(", ");
+            return Err(McpError::invalid_params(
+                format!(
+                    "Cannot mark task completed — working tree has uncommitted changes: {preview}. \
+                     Run `git add -A && git commit -m '<msg>'` in the project, then call \
+                     update_task_status(completed) again."
+                ),
+                None,
+            ));
+        }
+
         {
             let db = self.ctx.db.lock().unwrap();
             db.execute(

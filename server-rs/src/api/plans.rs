@@ -406,6 +406,25 @@ pub async fn set_task_status(
         );
     }
 
+    // Reject `completed` on a dirty working tree — agents can't finish a task
+    // with uncommitted changes in the project. See
+    // `agents::check_tree_clean_for_completion` for the full reasoning.
+    if body.status == "completed"
+        && let crate::agents::TreeState::Dirty { files } =
+            crate::agents::check_tree_clean_for_completion(&state.db, &state.plans_dir, &name)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "working_tree_dirty",
+                "message": "Cannot mark task completed — the project's working tree has \
+                            uncommitted changes. Commit them before calling \
+                            update_task_status(completed).",
+                "files": files,
+            })),
+        );
+    }
+
     let db = state.db.lock().unwrap();
     db.execute(
         "INSERT INTO task_status (plan_name, task_number, status, updated_at)

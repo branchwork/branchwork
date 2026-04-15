@@ -582,6 +582,60 @@ fn plan_project(db: &Db, plan_name: &str, parsed_project: Option<&str>) -> Optio
     .or_else(|| parsed_project.map(|s| s.to_string()))
 }
 
+/// Outcome of [`check_tree_clean_for_completion`]: the working tree is
+/// either clean (good — we can mark `completed`), or dirty (reject the
+/// status change with a helpful error), or we couldn't tell (missing
+/// project dir, no git, git errored — treat as clean; the merge-time
+/// empty-branch guard is the backstop).
+pub enum TreeState {
+    Clean,
+    Dirty { files: Vec<String> },
+    Unknown,
+}
+
+/// Refuse to mark a task `completed` if the project's working tree has
+/// uncommitted changes. Closes the hole where an agent modifies files,
+/// calls `update_task_status(completed)`, and exits — leaving the changes
+/// to be silently stepped on by the next agent.
+///
+/// Returns `Dirty` with the first few changed paths for a useful error
+/// message, `Clean` when it's safe to proceed, and `Unknown` when we
+/// can't introspect (no project dir, not a git repo, etc) — the caller
+/// should treat that as permissive because the merge-time empty-branch
+/// guard still catches the case where nothing was ever committed.
+pub fn check_tree_clean_for_completion(
+    db: &Db,
+    plans_dir: &std::path::Path,
+    plan_name: &str,
+) -> TreeState {
+    let Some(cwd) = crate::ci::project_dir_for(plans_dir, db, plan_name) else {
+        return TreeState::Unknown;
+    };
+    // `git status --porcelain` is the canonical "is this tree clean?"
+    // probe: empty stdout == clean tree. `-z` so filenames with spaces
+    // don't split weirdly; we only use it for the display list anyway.
+    let out = match std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&cwd)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return TreeState::Unknown,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return TreeState::Clean;
+    }
+    // Porcelain lines are "XY path" with a 3-char prefix; slice past it.
+    let files: Vec<String> = lines
+        .iter()
+        .take(10)
+        .map(|l| l.get(3..).unwrap_or(l).to_string())
+        .collect();
+    TreeState::Dirty { files }
+}
+
 /// Build a prompt fragment listing completed tasks from sibling plans (and the
 /// current plan's earlier tasks) in the same project, so an agent picking up a
 /// task inherits what its predecessors established.
