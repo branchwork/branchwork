@@ -250,3 +250,156 @@ fn failure_log_serves_cached_text_and_404s_when_missing() {
         "{body:?}"
     );
 }
+
+/// End-to-end for POST /api/actions/fix-ci. Verifies the validation branches
+/// (bad run id, non-failure run, missing SHA) and — for a valid failing run
+/// with a cached failure log and a real commit SHA in the scratch repo —
+/// that the endpoint creates the `orchestrai/fix/<plan>/<task>/<run_id>`
+/// branch at the failing commit and records an agents row pointing at it.
+///
+/// Side-steps needing `claude` on PATH: the endpoint spawns a session daemon
+/// that tries to exec `claude` and dies, but `start_pty_agent` still returns
+/// the agent id either way (the row is inserted before the PTY spawn and
+/// stays even if the daemon fails). We assert on the branch + DB row, not
+/// on the live agent process.
+#[test]
+fn fix_ci_validates_run_state_and_creates_recovery_branch() {
+    let d = TestDashboard::new();
+    let plan = d.create_plan("plan-fix", &minimal_plan("plan-fix", &d.project));
+
+    // Resolve the scratch repo's HEAD SHA so the `git checkout -b <fix> <sha>`
+    // inside the endpoint has something real to branch off. Using a bogus
+    // SHA would 500 on checkout and muddy the test.
+    let head_sha = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&d.project)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let db_path = d.dir.path().join(".claude/orchestrai.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    // Row 1: real failure with SHA + cached log — the happy path.
+    conn.execute(
+        "INSERT INTO ci_runs (plan_name, task_number, status, commit_sha, failure_log) \
+         VALUES (?1, '1.1', 'failure', ?2, 'cargo test: mod::x FAILED')",
+        rusqlite::params![plan, head_sha],
+    )
+    .unwrap();
+    let good_id = conn.last_insert_rowid();
+    // Row 2: still running — should 400.
+    conn.execute(
+        "INSERT INTO ci_runs (plan_name, task_number, status, commit_sha) \
+         VALUES (?1, '1.2', 'pending', ?2)",
+        rusqlite::params![plan, head_sha],
+    )
+    .unwrap();
+    let pending_id = conn.last_insert_rowid();
+    // Row 3: failure but no commit_sha — can't branch, should 400.
+    conn.execute(
+        "INSERT INTO ci_runs (plan_name, task_number, status) \
+         VALUES (?1, '1.1', 'failure')",
+        rusqlite::params![plan],
+    )
+    .unwrap();
+    let shaless_id = conn.last_insert_rowid();
+    drop(conn);
+
+    // Unknown run id → 404.
+    let (s, body) = d.post(
+        "/api/actions/fix-ci",
+        json!({"planName": plan, "taskNumber": "1.1", "ciRunId": 999_999}),
+    );
+    assert_eq!(s, 404, "{body:?}");
+
+    // Non-failure run → 400 with a clear message.
+    let (s, body) = d.post(
+        "/api/actions/fix-ci",
+        json!({"planName": plan, "taskNumber": "1.2", "ciRunId": pending_id}),
+    );
+    assert_eq!(s, 400, "{body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("nothing to fix"),
+        "{body:?}"
+    );
+
+    // Failure run with no SHA → 400.
+    let (s, body) = d.post(
+        "/api/actions/fix-ci",
+        json!({"planName": plan, "taskNumber": "1.1", "ciRunId": shaless_id}),
+    );
+    assert_eq!(s, 400, "{body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no commit SHA"),
+        "{body:?}"
+    );
+
+    // Happy path. Response carries agentId + branch + ciRunId.
+    let (s, body) = d.post(
+        "/api/actions/fix-ci",
+        json!({"planName": plan, "taskNumber": "1.1", "ciRunId": good_id}),
+    );
+    assert_eq!(s, 200, "{body:?}");
+    let expected_branch = format!("orchestrai/fix/{plan}/1.1/{good_id}");
+    assert_eq!(body["branch"], expected_branch);
+    assert_eq!(body["ciRunId"], good_id);
+    let agent_id = body["agentId"].as_str().expect("agentId in response");
+    assert!(!agent_id.is_empty());
+
+    // Recovery branch exists in the scratch repo and points at the failing SHA.
+    assert!(
+        d.local_branches().contains(&expected_branch),
+        "branch {expected_branch} missing from {:?}",
+        d.local_branches()
+    );
+    let branch_sha = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", &expected_branch])
+            .current_dir(&d.project)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        branch_sha, head_sha,
+        "fix branch didn't start at failing SHA"
+    );
+
+    // Agents row was inserted with that branch + the task bookkeeping the
+    // merge flow needs. Prompt must carry the failure-log excerpt and the
+    // pre-commit checks the task description mandates.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (db_branch, db_plan, db_task, db_prompt): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT branch, plan_name, task_id, prompt FROM agents WHERE id = ?1",
+            rusqlite::params![agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("agents row for fix-ci agent");
+    assert_eq!(db_branch.as_deref(), Some(expected_branch.as_str()));
+    assert_eq!(db_plan.as_deref(), Some(plan.as_str()));
+    assert_eq!(db_task.as_deref(), Some("1.1"));
+    let prompt = db_prompt.unwrap_or_default();
+    assert!(prompt.contains("CI IS FAILING"), "prompt missing banner");
+    assert!(
+        prompt.contains("cargo test: mod::x FAILED"),
+        "prompt missing failure log excerpt"
+    );
+    assert!(
+        prompt.contains("cargo fmt") && prompt.contains("clippy"),
+        "prompt missing pre-commit requirement"
+    );
+}
