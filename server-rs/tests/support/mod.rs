@@ -64,8 +64,11 @@ impl TestDashboard {
             ])
             // HOME=tmpdir so `project_dir_for` (home.join(plan.project))
             // resolves to the scratch project when the YAML's `project:`
-            // field is a bare directory name.
+            // field is a bare directory name. On Windows `dirs::home_dir`
+            // reads USERPROFILE instead, so set that too; also set
+            // HOMEDRIVE/HOMEPATH for the older fallback path.
             .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
             // Silence server stdout/stderr during tests unless the user
             // asked for it. Route to piped so we can drain on drop.
             .stdout(if std::env::var("TEST_SERVER_LOG").is_ok() {
