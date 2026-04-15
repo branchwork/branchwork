@@ -132,3 +132,42 @@ doc (server `doneCount = 10/11`, frontend `doneCount = 12/11`).
 
 **Acceptance**: `patchTaskStatus` applies an unsigned `+1` delta, never
 decrements, and `task_status_changed` has no refetch safety net.
+
+## Task 1.3 — backend ruled out
+
+`list_plans` in `server-rs/src/api/plans.rs:76-127` recomputes
+`done_count` from authoritative state on every `GET /api/plans`:
+
+```rust
+parsed.phases.iter().flat_map(|p| &p.tasks)
+    .filter(|t| {
+        let status = status_map.get(&t.number)
+            .map(|s| s.as_str()).unwrap_or("pending");
+        status == "completed" || status == "skipped"
+    })
+    .count()
+```
+
+`status_map` is loaded fresh from `task_status` (line 84-93); tasks
+without a row default to `pending`. The filter only counts `completed`
+and `skipped`, matching the same semantics used by `set_task_status`
+when persisting transitions. A hard refresh therefore always converges
+to truth.
+
+Grep across `server-rs/src` for `done_count|doneCount` returns only:
+
+- `api/plans.rs:27` — `PlanListEntry.done_count` field on the
+  `GET /api/plans` response.
+- `api/plans.rs:80,120` — the recomputation above.
+- `mcp/tools/plans.rs:45,136,156` — the parallel MCP tool path
+  (`list_plans` over MCP) which mirrors the same DB-derived
+  recomputation.
+
+No WebSocket event ships a precomputed `doneCount` (no matches in
+`ws.rs`, `hooks.rs`, or anywhere else); WS only emits granular events
+like `task_status_changed`, `plan_updated`, etc. The server never
+hands the client a stale or precomputed `doneCount` that could be
+trusted blindly.
+
+**Acceptance**: server code verified correct; the fix must be
+frontend-only.
