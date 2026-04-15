@@ -370,9 +370,35 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 task.ci.status === "cancelled" ||
                 task.ci.status === "unknown";
               const ciRunId = task.ci.id;
+              const isFailed = task.ci.status === "failure";
               return (
                 <span className="inline-flex items-center">
                   {badge}
+                  {/* Fix CI — inline with the badge so the failure state and
+                      its recovery action read as one unit. Spawns an agent on
+                      a recovery branch off the failing commit with the failure
+                      log baked into the prompt. */}
+                  {isFailed && !agentId && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleFixCi();
+                      }}
+                      disabled={fixingCi || taskLocked || !authReady}
+                      title={
+                        taskLocked
+                          ? "Agent running — wait for it to finish"
+                          : !authReady
+                            ? `${driver} not ready: ${authStatusLabel(auth)}`
+                            : `Spawn an agent to fix the failing CI on ${
+                                task.ci.commitSha?.slice(0, 7) ?? "the merged commit"
+                              }`
+                      }
+                      className="ml-1 text-[10px] px-1.5 py-0.5 rounded font-medium bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white transition"
+                    >
+                      {fixingCi ? "..." : "Fix CI"}
+                    </button>
+                  )}
                   {dismissable && ciRunId != null && (
                     <button
                       onClick={async (e) => {
@@ -433,27 +459,6 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 ))}
               </select>
             )}
-          {/* Fix CI — visible when the latest CI run for this task failed.
-              Spawns an agent on a recovery branch off the failing commit with
-              the failure log baked into the prompt. */}
-          {task.ci?.status === "failure" && !agentId && (
-            <button
-              onClick={handleFixCi}
-              disabled={fixingCi || taskLocked || !authReady}
-              title={
-                taskLocked
-                  ? "Agent running — wait for it to finish"
-                  : !authReady
-                    ? `${driver} not ready: ${authStatusLabel(auth)}`
-                    : `Spawn an agent to fix the failing CI on ${
-                        task.ci.commitSha?.slice(0, 7) ?? "the merged commit"
-                      }`
-              }
-              className="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
-            >
-              {fixingCi ? "..." : "Fix CI"}
-            </button>
-          )}
           {/* Check button — always available except while an agent is running */}
           <button
             onClick={handleCheck}
