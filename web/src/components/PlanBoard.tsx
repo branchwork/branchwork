@@ -1,6 +1,11 @@
 import { useState } from "react";
-import { usePlanStore, type ParsedPlan } from "../stores/plan-store.js";
+import {
+  usePlanStore,
+  type ParsedPlan,
+  type PlanVerdict,
+} from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
+import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { fetchJson, postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
@@ -12,11 +17,14 @@ export function PlanBoard() {
   const [converting, setConverting] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [checkingAll, setCheckingAll] = useState(false);
+  const [checkingPlan, setCheckingPlan] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const savePlan = usePlanStore((s) => s.savePlan);
   const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
+  const agents = useAgentStore((s) => s.agents);
+  const selectAgent = useAgentStore((s) => s.selectAgent);
 
   const isMd = plan?.filePath?.endsWith(".md") ?? false;
 
@@ -69,6 +77,23 @@ export function PlanBoard() {
       setError(`Check all failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setCheckingAll(false);
+    }
+  }
+
+  async function handleCheckPlan() {
+    if (!plan) return;
+    setCheckingPlan(true);
+    setError(null);
+    try {
+      const res = await postJson<{ agentId: string }>(
+        `/api/plans/${plan.name}/check`,
+        {},
+      );
+      selectAgent(res.agentId);
+    } catch (e) {
+      setError(`Check Plan failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setCheckingPlan(false);
     }
   }
 
@@ -169,6 +194,13 @@ export function PlanBoard() {
               {converting ? "Converting..." : "Convert to YAML"}
             </button>
           )}
+          <CheckPlanButton
+            plan={plan}
+            agents={agents}
+            checkingPlan={checkingPlan}
+            onCheck={handleCheckPlan}
+            onViewAgent={selectAgent}
+          />
           <button
             onClick={handleCheckAll}
             disabled={checkingAll || !plan.project}
@@ -240,6 +272,126 @@ export function PlanBoard() {
 
       <VerificationSection verification={plan.verification ?? null} />
     </div>
+  );
+}
+
+interface CheckPlanButtonProps {
+  plan: ParsedPlan;
+  agents: Agent[];
+  checkingPlan: boolean;
+  onCheck: () => void;
+  onViewAgent: (agentId: string) => void;
+}
+
+/// "Check Plan" button with verdict badge. Lives next to the plan header,
+/// not per-task. Disabled when the plan has no `verification` block or no
+/// associated project — tooltip explains which. While a plan-level check
+/// agent is running it shows a spinner and the View affordance re-opens the
+/// terminal. Verdict badge is persisted server-side and survives reloads.
+function CheckPlanButton({
+  plan,
+  agents,
+  checkingPlan,
+  onCheck,
+  onViewAgent,
+}: CheckPlanButtonProps) {
+  const hasVerification = !!(plan.verification && plan.verification.trim());
+  const hasProject = !!plan.project;
+
+  // A plan-level check agent is one whose plan_name matches but task_id is
+  // null. There can only be one outstanding (the backend doesn't enforce it,
+  // but in practice only one Check Plan button click is live at a time).
+  const runningAgent = agents.find(
+    (a) =>
+      a.plan_name === plan.name &&
+      !a.task_id &&
+      (a.status === "running" || a.status === "starting"),
+  );
+  const running = !!runningAgent || checkingPlan;
+
+  const verdict = plan.verdict ?? null;
+  const badge = verdictBadge(verdict);
+  const hasView = !!runningAgent || !!verdict?.agentId;
+
+  const disabled = running || !hasVerification || !hasProject;
+  const disabledReason = !hasVerification
+    ? "Plan has no verification block — add one in the YAML"
+    : !hasProject
+      ? "Plan has no associated project"
+      : null;
+  const title = disabledReason
+    ? disabledReason
+    : running
+      ? "Check Plan agent is running — click View to open terminal"
+      : verdict
+        ? `Last check: ${verdict.verdict}${verdict.reason ? ` — ${verdict.reason}` : ""} (${new Date(verdict.checkedAt).toLocaleString()})`
+        : "Spawn a Check Plan agent to verify this plan against its verification block";
+
+  return (
+    <span className="flex-shrink-0 inline-flex items-center">
+      <button
+        onClick={onCheck}
+        disabled={disabled}
+        className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-emerald-600 hover:text-emerald-400 disabled:opacity-50 disabled:hover:border-gray-700 disabled:hover:text-gray-400 text-gray-300 transition ${hasView ? "rounded-l" : "rounded"}`}
+        title={title}
+      >
+        {running ? (
+          <span
+            className="w-3 h-3 rounded-full border-2 border-gray-500 border-t-emerald-400 animate-spin"
+            aria-label="Checking"
+          />
+        ) : null}
+        {running ? "Checking..." : "Check Plan"}
+        {badge}
+      </button>
+      {runningAgent && (
+        <button
+          onClick={() => onViewAgent(runningAgent.id)}
+          className="px-2 py-1.5 text-xs bg-gray-800 border border-l-0 border-gray-700 hover:border-indigo-600 hover:text-indigo-400 text-gray-300 rounded-r transition"
+          title="Open the Check Plan agent's terminal"
+        >
+          View
+        </button>
+      )}
+      {!runningAgent && verdict?.agentId && (
+        <button
+          onClick={() => onViewAgent(verdict.agentId!)}
+          className="px-2 py-1.5 text-xs bg-gray-800 border border-l-0 border-gray-700 hover:border-indigo-600 hover:text-indigo-400 text-gray-300 rounded-r transition"
+          title="Open the last Check Plan agent's terminal"
+        >
+          View
+        </button>
+      )}
+    </span>
+  );
+}
+
+/// Verdict badge renderer. Maps the three plan_verdicts statuses to a
+/// coloured pill rendered inside the Check Plan button. Returns null when
+/// no verdict has ever been recorded.
+function verdictBadge(verdict: PlanVerdict | null) {
+  if (!verdict) return null;
+  const map: Record<string, { label: string; cls: string }> = {
+    completed: {
+      label: "\u2713",
+      cls: "bg-emerald-600/30 text-emerald-300 border-emerald-500/40",
+    },
+    in_progress: {
+      label: "\u25D0",
+      cls: "bg-amber-600/30 text-amber-300 border-amber-500/40",
+    },
+    pending: {
+      label: "\u2717",
+      cls: "bg-red-600/30 text-red-300 border-red-500/40",
+    },
+  };
+  const cfg = map[verdict.verdict] ?? map.pending;
+  return (
+    <span
+      className={`inline-flex items-center justify-center text-[10px] font-semibold w-4 h-4 rounded-full border ${cfg.cls}`}
+    >
+      {cfg.label}
+    </span>
   );
 }
 

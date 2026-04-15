@@ -173,14 +173,25 @@ fn free_port() -> u16 {
 }
 
 fn wait_healthy(base_url: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s. Linux boots the server in <1s, but Windows CI under four parallel
+    // spawns + Defender AV scan on the fresh .exe routinely takes 6–10s and
+    // has flaked at exactly the 10s mark. Generous headroom, still fails
+    // fast enough if the server genuinely crashed.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_status: u16 = 0;
+    let mut last_body = serde_json::Value::Null;
     while Instant::now() < deadline {
-        if let (200, _) = http("GET", &format!("{base_url}/api/health"), None) {
+        let (s, body) = http("GET", &format!("{base_url}/api/health"), None);
+        if s == 200 {
             return;
         }
+        last_status = s;
+        last_body = body;
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("server at {base_url} never became healthy");
+    panic!(
+        "server at {base_url} never became healthy (last status={last_status}, body={last_body})"
+    );
 }
 
 fn run(cmd: &str, args: &[&str], cwd: &Path) {

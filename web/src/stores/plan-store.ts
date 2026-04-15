@@ -41,6 +41,14 @@ export interface PlanPhase {
   tasks: PlanTask[];
 }
 
+export interface PlanVerdict {
+  /// Status from the Check Plan agent: completed | in_progress | pending.
+  verdict: string;
+  reason?: string | null;
+  agentId?: string | null;
+  checkedAt: string;
+}
+
 export interface ParsedPlan {
   name: string;
   filePath: string;
@@ -51,6 +59,7 @@ export interface ParsedPlan {
   modifiedAt: string;
   phases: PlanPhase[];
   verification?: string | null;
+  verdict?: PlanVerdict | null;
   totalCostUsd?: number;
   maxBudgetUsd?: number | null;
 }
@@ -86,6 +95,7 @@ interface PlanStore {
   updatePlan: (plan: ParsedPlan) => void;
   patchTaskStatus: (planName: string, taskNumber: string, status: string) => void;
   patchTaskCi: (planName: string, taskNumber: string, ci: CiStatus) => void;
+  patchPlanVerdict: (planName: string, verdict: PlanVerdict) => void;
   savePlan: (plan: ParsedPlan) => Promise<void>;
   addWarning: (w: PlanWarning) => void;
   dismissWarning: (name: string) => void;
@@ -140,6 +150,12 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       })),
     };
     set({ selectedPlan: patched });
+  },
+
+  patchPlanVerdict: (planName, verdict) => {
+    const { selectedPlan } = get();
+    if (selectedPlan?.name !== planName) return;
+    set({ selectedPlan: { ...selectedPlan, verdict } });
   },
 
   patchTaskStatus: (planName, taskNumber, status) => {

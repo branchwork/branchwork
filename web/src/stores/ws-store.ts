@@ -172,6 +172,26 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
       planStore.patchTaskStatus(d2.plan_name, d2.task_number, d2.status);
       break;
     }
+    case "plan_checked": {
+      const d = msg.data as {
+        plan_name: string;
+        verdict: string;
+        reason?: string;
+        agent_id?: string;
+      };
+      planStore.patchPlanVerdict(d.plan_name, {
+        verdict: d.verdict,
+        reason: d.reason ?? null,
+        agentId: d.agent_id ?? null,
+        checkedAt: new Date().toISOString(),
+      });
+      notify(
+        `Plan check: ${d.verdict}`,
+        d.reason ? `${d.plan_name} — ${d.reason}` : d.plan_name,
+        `plan-checked-${d.plan_name}`,
+      );
+      break;
+    }
     case "task_status_changed": {
       const d2 = msg.data as { plan_name: string; task_number: string; status: string };
       if (d2.status === "completed" || d2.status === "failed") {

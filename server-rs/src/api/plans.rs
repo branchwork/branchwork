@@ -256,9 +256,28 @@ pub async fn get_plan(
         .map(|v| v != 0)
         .unwrap_or(false);
 
+    // Latest plan-level verdict (None when no Check Plan has ever run).
+    let verdict = db
+        .query_row(
+            "SELECT verdict, reason, agent_id, checked_at FROM plan_verdicts WHERE plan_name = ?",
+            params![name],
+            |row| {
+                Ok(serde_json::json!({
+                    "verdict": row.get::<_, String>(0)?,
+                    "reason": row.get::<_, Option<String>>(1)?,
+                    "agentId": row.get::<_, Option<String>>(2)?,
+                    "checkedAt": row.get::<_, String>(3)?,
+                }))
+            },
+        )
+        .ok();
+
     let mut value = serde_json::to_value(plan).unwrap();
     if let Some(obj) = value.as_object_mut() {
         obj.insert("autoAdvance".to_string(), serde_json::json!(auto_advance));
+        if let Some(v) = verdict {
+            obj.insert("verdict".to_string(), v);
+        }
     }
     Json(value).into_response()
 }
