@@ -612,10 +612,13 @@ pub fn check_tree_clean_for_completion(
         return TreeState::Unknown;
     };
     // `git status --porcelain` is the canonical "is this tree clean?"
-    // probe: empty stdout == clean tree. `-z` so filenames with spaces
-    // don't split weirdly; we only use it for the display list anyway.
+    // probe. `--untracked-files=no` is the key bit: the failure mode we're
+    // catching is "agent modified tracked files but didn't commit", not
+    // "editor left a swap file lying around". Untracked files are noise
+    // agents can't reason about — gitignore or stash is the user's call,
+    // not something to block task completion on.
     let out = match std::process::Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(&cwd)
         .output()
     {

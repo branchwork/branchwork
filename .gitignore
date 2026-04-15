@@ -5,3 +5,7 @@ target/
 .env
 package-lock.json
 screenshots/take-screenshots.mjs
+# Claude Code's local state (scheduled-task locks, user settings)
+.claude/
+# Drafts + ephemera we don't track
+devto-article.md
