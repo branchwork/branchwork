@@ -205,3 +205,48 @@ fn dismiss_ci_run_hides_it_from_latest() {
         "expected ci cleared after dismiss, got {t11:?}"
     );
 }
+
+#[test]
+fn failure_log_serves_cached_text_and_404s_when_missing() {
+    // Pre-seed a ci_runs row with a cached `failure_log` so the endpoint
+    // serves from cache without ever shelling out to `gh` (which the test
+    // env may not have, and which has no remote to query anyway). A second
+    // row with no cache + no provider run_id covers the 404 path.
+    let d = TestDashboard::new();
+    let plan = d.create_plan("plan-f", &minimal_plan("plan-f", &d.project));
+
+    let db_path = d.dir.path().join(".claude/orchestrai.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO ci_runs (plan_name, task_number, status, commit_sha, run_id, failure_log) \
+         VALUES (?1, '1.1', 'failure', 'deadbeef', '999', 'boom: it broke')",
+        rusqlite::params![plan],
+    )
+    .unwrap();
+    let cached_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO ci_runs (plan_name, task_number, status, commit_sha) \
+         VALUES (?1, '1.2', 'pending', 'cafef00d')",
+        rusqlite::params![plan],
+    )
+    .unwrap();
+    let pending_id = conn.last_insert_rowid();
+    drop(conn);
+
+    // Cache hit: 200 with the literal log body, content-type text/plain.
+    // The harness parses non-JSON bodies as `Value::String`, so we read it
+    // back as a string.
+    let (s, body) = d.get(&format!("/api/ci/{cached_id}/failure-log"));
+    assert_eq!(s, 200, "{body:?}");
+    assert_eq!(body.as_str(), Some("boom: it broke"), "{body:?}");
+
+    // Pending run with no provider run_id: 404, plain-text reason.
+    let (s, body) = d.get(&format!("/api/ci/{pending_id}/failure-log"));
+    assert_eq!(s, 404, "{body:?}");
+    assert!(
+        body.as_str()
+            .unwrap_or("")
+            .contains("failure log unavailable"),
+        "{body:?}"
+    );
+}

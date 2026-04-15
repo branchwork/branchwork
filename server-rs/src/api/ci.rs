@@ -6,7 +6,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::IntoResponse,
 };
 use rusqlite::params;
@@ -66,26 +66,28 @@ pub async fn dismiss_run(
 
 /// GET /api/ci/{run_id}/failure-log
 ///
-/// Returns the cached-or-freshly-fetched failure log for a CI run. The
-/// first call shells out to `gh run view --log-failed` in the project's
-/// directory, stores the tail in `ci_runs.failure_log`, and returns it.
-/// Subsequent calls serve from the cache.
+/// Returns the cached-or-freshly-fetched failure log for a CI run as
+/// `text/plain`. The first call shells out to `gh run view --log-failed`
+/// in the project's directory, stores the tail (~8 KB) in
+/// `ci_runs.failure_log`, and returns it. Subsequent calls serve from the
+/// cache. 404 when the run passed, is still pending, has no provider run
+/// id yet, or `gh` is unavailable.
 pub async fn failure_log(
     State(state): State<AppState>,
     Path(ci_run_id): Path<i64>,
 ) -> impl IntoResponse {
     match crate::ci::fetch_failure_log(&state.db, state.plans_dir.clone(), ci_run_id).await {
-        Some(log) => Json(serde_json::json!({
-            "ciRunId": ci_run_id,
-            "log": log,
-        }))
-        .into_response(),
+        Some(log) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            log,
+        )
+            .into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "failure log unavailable — run may still be pending, \
-                          have no remote, or `gh` is not installed"
-            })),
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "failure log unavailable — run may still be pending, have no \
+             remote, or `gh` is not installed",
         )
             .into_response(),
     }
