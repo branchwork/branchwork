@@ -275,6 +275,11 @@ pub async fn merge_agent_branch(
     // same SHA as the source — merging it is a silent no-op that hides the
     // real problem (the agent did no work). Return 409 so the UI can tell
     // the user to retry or commit manually.
+    //
+    // If git can't resolve the range (stale branch reference, missing
+    // trunk, detached HEAD, etc) we fall through permissively — the
+    // actual `git merge` below will fail with its own clear error and
+    // that's better than blocking the user on an inscrutable guard.
     let revlist = std::process::Command::new("git")
         .args(["rev-list", "--count", &format!("{target}..{task_branch}")])
         .current_dir(&cwd)
@@ -299,14 +304,13 @@ pub async fn merge_agent_branch(
             }
         }
         Ok(output) => {
+            // `rev-list` failed — most likely one of the refs doesn't resolve
+            // (deleted branch, typo, detached HEAD). Log and proceed; `git
+            // merge` below will return the same or better error.
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Failed to inspect branch commits: {stderr}")
-                })),
-            )
-                .into_response();
+            eprintln!(
+                "[merge] rev-list {target}..{task_branch} failed, skipping empty-branch guard: {stderr}"
+            );
         }
         Err(e) => {
             return (

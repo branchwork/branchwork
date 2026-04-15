@@ -61,9 +61,17 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    // Capture base commit and source branch BEFORE switching
+    // Capture base commit and source branch BEFORE switching. If the tree
+    // is already on the target task branch (e.g. a previous agent left it
+    // there, or the caller pre-checked-out a recovery branch), recording
+    // that as `source_branch` would later make the merge guard compare
+    // `<task>..<task>` = 0 commits and 409 every legitimate merge. Treat
+    // that case as unknown — the merge path falls back to main/master.
     let base_commit = git_head_sha(cwd);
-    let source_branch = git_current_branch(cwd);
+    let source_branch = git_current_branch(cwd).filter(|cur| match branch {
+        Some(target) => cur != target,
+        None => true,
+    });
 
     // Checkout the task branch if specified
     if let Some(branch_name) = branch {
