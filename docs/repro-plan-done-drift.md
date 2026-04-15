@@ -171,3 +171,60 @@ trusted blindly.
 
 **Acceptance**: server code verified correct; the fix must be
 frontend-only.
+
+## Task 3.3 — manual re-run of the Phase 0 repro
+
+Re-verified after Task 2.1 (signed delta) + Task 2.2 (debounced
+authoritative refetch on `task_status_changed`) + Task 3.2 (vitest
+regression test) landed.
+
+At the moment Task 3.3 was executed, the plan was already sitting in
+the exact end-state of the T0.2 sequence: 10 of 11 tasks
+`completed`/`skipped`, with the last task (3.3 itself) `in_progress`.
+`GET /api/plans` returned:
+
+```json
+{ "name": "fix-plan-done-in-progress", "taskCount": 11, "doneCount": 10 }
+```
+
+That is the scenario that previously flipped the plan into the Done
+section in the sidebar and Project Dashboard.
+
+Under the fix, both copies of the gate evaluate to `false`:
+
+```ts
+isPlanDone({ taskCount: 11, doneCount: 10 })
+  === (11 > 0 && 10 >= 11) === false
+```
+
+so the plan stays in the Active section in both
+`web/src/components/Sidebar.tsx:19-21` and
+`web/src/components/ProjectDashboard.tsx:17-19`.
+
+Convergence of the frontend `doneCount` to the server's `10/11` is
+guaranteed by two independent mechanisms:
+
+1. **Signed delta** (`web/src/stores/plan-store.ts:197-207`) — the
+   `completed → in_progress` step of the repro now subtracts `1` via
+   `(isDone ? 1 : 0) - (wasDone ? 1 : 0)`, so the cached `doneCount`
+   cannot drift upward on the selected plan.
+2. **Debounced refetch** (`web/src/stores/ws-store.ts:195-214`) — every
+   `task_status_changed` event now shares the `planRefreshTimer` with
+   `plan_updated`, so any residual drift (non-selected plan, MCP /
+   agent-driven transition, re-entrant events) is reconciled against
+   `GET /api/plans` within 2 s.
+
+Automated coverage: `web/src/stores/plan-store.test.ts` drives the exact
+T0.2 three-step transition in a `node`-environment vitest and asserts
+`doneCount === 3` and `isPlanDone(plan) === false` after the sequence.
+`pnpm --filter @orchestrai/web test` → 1 passed (confirmed during this
+task).
+
+**Sandbox caveat**: this task was executed from a headless environment,
+so a real-browser click-through of the Active / Done sidebar sections
+was not performed. The end-to-end state that a browser would render is
+fully determined by `PlanSummary.doneCount` + `PlanSummary.taskCount`
+(per Task 1.1), both of which are verified above.
+
+**Acceptance**: manual repro no longer shows the plan as completed
+while a task is `in_progress`.
