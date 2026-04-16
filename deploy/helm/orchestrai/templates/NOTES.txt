@@ -1,0 +1,23 @@
+orchestrAI has been deployed!
+
+{{- if .Values.ingress.enabled }}
+Access the dashboard at:
+{{- range .Values.ingress.hosts }}
+  https://{{ .host }}
+{{- end }}
+{{- else if eq .Values.service.type "LoadBalancer" }}
+Get the external IP:
+  kubectl get svc {{ include "orchestrai.fullname" . }} -n {{ .Release.Namespace }}
+{{- else }}
+Port-forward to access the dashboard:
+  kubectl port-forward svc/{{ include "orchestrai.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+  open http://localhost:{{ .Values.service.port }}
+{{- end }}
+
+Database mode: {{ .Values.database.mode }}
+{{- if eq .Values.database.mode "sqlite" }}
+Data is persisted to a PVC at /data.
+Note: SQLite mode supports only 1 replica (Recreate strategy).
+{{- else }}
+Postgres mode: scale replicas as needed.
+{{- end }}

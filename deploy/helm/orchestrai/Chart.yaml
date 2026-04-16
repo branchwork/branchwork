@@ -1,0 +1,16 @@
+apiVersion: v2
+name: orchestrai
+description: Real-time dashboard for visualizing and orchestrating AI coding agents
+type: application
+version: 0.1.0
+appVersion: "0.3.0"
+keywords:
+  - ai
+  - agents
+  - orchestration
+  - claude
+  - dashboard
+home: https://github.com/cyrilpoder/orchestrAI
+maintainers:
+  - name: Cyril Poder
+    email: cyril.poder@gmail.com

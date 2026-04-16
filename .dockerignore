@@ -1,0 +1,10 @@
+server-rs/target
+web/node_modules
+web/dist
+node_modules
+.git
+*.md
+docs/
+.github/
+deploy/terraform
+deploy/helm

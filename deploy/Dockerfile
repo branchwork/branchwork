@@ -1,0 +1,59 @@
+# ── Stage 1: Build frontend ──────────────────────────────────────────
+FROM node:20-alpine AS web
+WORKDIR /src
+RUN corepack enable && corepack prepare pnpm@9 --activate
+
+# Install deps first (cache-friendly)
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json ./
+COPY web/package.json web/
+RUN pnpm install --frozen-lockfile
+
+# Build
+COPY web/ web/
+COPY tsconfig.base.json ./
+RUN pnpm --filter @orchestrai/web build
+
+# ── Stage 2: Build Rust server ───────────────────────────────────────
+FROM rust:1.86-alpine AS server
+RUN apk add --no-cache musl-dev build-base perl
+
+WORKDIR /src/server-rs
+
+# Cache deps: copy manifests, create dummy src, build deps only
+COPY server-rs/Cargo.toml server-rs/Cargo.lock ./
+
+# Create minimal stubs so cargo can resolve the dependency graph
+RUN mkdir -p src/bin src/agents src/api src/auth src/mcp src/saas && \
+    echo 'fn main() {}' > src/main.rs && \
+    echo 'fn main() {}' > src/bin/orchestrai_runner.rs && \
+    echo 'fn main() {}' > src/bin/session_daemon.rs
+
+# Pre-build deps (this layer is cached until Cargo.toml/lock change)
+RUN cargo build --release 2>/dev/null || true
+
+# Copy real source + frontend dist
+COPY server-rs/ ./
+COPY --from=web /src/web/dist /src/web/dist
+
+# Touch main.rs to force rebuild of our crate (not deps)
+RUN touch src/main.rs && cargo build --release --bin orchestrai-server
+
+# ── Stage 3: Minimal runtime image ──────────────────────────────────
+FROM alpine:3.21 AS runtime
+RUN apk add --no-cache git ca-certificates tini && \
+    addgroup -g 1000 orchestrai && \
+    adduser -u 1000 -G orchestrai -D orchestrai
+
+COPY --from=server /src/server-rs/target/release/orchestrai-server /usr/local/bin/
+
+# Data directory: plans, DB, sockets
+RUN mkdir -p /data && chown orchestrai:orchestrai /data
+VOLUME ["/data"]
+
+USER orchestrai
+EXPOSE 3100
+
+ENV ORCHESTRAI_DATA_DIR=/data
+
+ENTRYPOINT ["tini", "--"]
+CMD ["orchestrai-server", "--port", "3100", "--claude-dir", "/data"]

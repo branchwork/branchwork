@@ -1,0 +1,108 @@
+# -- Number of replicas. Keep at 1 for SQLite; scale with Postgres.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/cyrilpoder/orchestrai
+  tag: ""  # defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# -- orchestrAI server configuration
+config:
+  # -- HTTP port inside the container
+  port: 3100
+  # -- Agent effort level: low | medium | high | max
+  effort: high
+  # -- Slack / generic webhook URL for agent completion events
+  webhookUrl: ""
+
+# -- Database mode: "sqlite" (self-hosted, single replica) or "postgres" (SaaS, scalable)
+database:
+  mode: sqlite
+  # -- Postgres connection string (only when mode=postgres)
+  # Format: postgres://user:pass@host:5432/orchestrai
+  postgresUrl: ""
+  # -- Use an existing Secret for the Postgres URL (key: DATABASE_URL)
+  existingSecret: ""
+
+# -- Persistent volume for SQLite data + plans (ignored when database.mode=postgres)
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 5Gi
+  existingClaim: ""
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: orchestrai.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: orchestrai-tls
+  #    hosts:
+  #      - orchestrai.local
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Extra environment variables (list of {name, value} or {name, valueFrom})
+extraEnv: []
+
+# -- Pod-level annotations
+podAnnotations: {}
+
+# -- Pod security context
+podSecurityContext:
+  fsGroup: 1000
+
+# -- Container security context
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+
+# -- SMTP config for budget alerts (optional)
+smtp:
+  host: ""
+  port: 587
+  from: ""
+  username: ""
+  password: ""
+  # -- Use existing Secret (keys: SMTP_USERNAME, SMTP_PASSWORD)
+  existingSecret: ""
