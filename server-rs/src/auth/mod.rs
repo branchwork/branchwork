@@ -166,6 +166,20 @@ pub async fn signup(State(state): State<AppState>, Json(creds): Json<Credentials
         .ok();
     }
 
+    {
+        let conn = state.db.lock().unwrap();
+        crate::audit::log(
+            &conn,
+            &personal_org_id,
+            Some(&id),
+            Some(&email),
+            crate::audit::actions::AUTH_SIGNUP,
+            crate::audit::resources::USER,
+            Some(&id),
+            None,
+        );
+    }
+
     let token = sessions::create(&state.db, &id);
     let headers = set_cookie(sessions::set_cookie_value(&token));
     (
@@ -212,7 +226,18 @@ pub async fn login(State(state): State<AppState>, Json(creds): Json<Credentials>
     let first_org = {
         let conn = state.db.lock().unwrap();
         let memberships = orgs::user_memberships(&conn, &id);
-        memberships.first().map(|m| m.org_id.clone())
+        let first = memberships.first().map(|m| m.org_id.clone());
+        crate::audit::log(
+            &conn,
+            first.as_deref().unwrap_or(orgs::DEFAULT_ORG_ID),
+            Some(&id),
+            Some(&email),
+            crate::audit::actions::AUTH_LOGIN,
+            crate::audit::resources::USER,
+            Some(&id),
+            None,
+        );
+        first
     };
 
     let token = sessions::create(&state.db, &id);

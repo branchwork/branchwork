@@ -128,9 +128,21 @@ pub async fn get_agent_output(
 
 pub async fn kill_agent(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if state.registry.kill_agent(&id).await {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::AGENT_KILL,
+            crate::audit::resources::AGENT,
+            Some(&id),
+            None,
+        );
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
         (
@@ -145,9 +157,21 @@ pub async fn kill_agent(
 /// Kill this preserves any in-flight commit/cleanup the agent wants to do.
 pub async fn finish_agent(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if state.registry.graceful_exit(&id).await {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::AGENT_FINISH,
+            crate::audit::resources::AGENT,
+            Some(&id),
+            None,
+        );
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
         (
@@ -262,6 +286,7 @@ pub async fn get_agent_diff(
 
 pub async fn merge_agent_branch(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Look up agent details (need plan/task for CI bookkeeping too)
@@ -420,6 +445,24 @@ pub async fn merge_agent_branch(
                     params![task_branch],
                 )
                 .ok();
+                crate::audit::log(
+                    &db,
+                    auth.org_id(),
+                    auth.0.as_ref().map(|u| u.id.as_str()),
+                    auth.0.as_ref().map(|u| u.email.as_str()),
+                    crate::audit::actions::BRANCH_MERGE,
+                    crate::audit::resources::AGENT,
+                    Some(&id),
+                    Some(
+                        &serde_json::json!({
+                            "branch": task_branch,
+                            "into": target,
+                            "plan": plan_name,
+                            "task": task_id,
+                        })
+                        .to_string(),
+                    ),
+                );
             }
 
             // Broadcast so connected dashboards update immediately
@@ -488,6 +531,7 @@ pub async fn merge_agent_branch(
 
 pub async fn discard_agent_branch(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Look up agent details
@@ -557,6 +601,16 @@ pub async fn discard_agent_branch(
                     params![task_branch],
                 )
                 .ok();
+                crate::audit::log(
+                    &db,
+                    auth.org_id(),
+                    auth.0.as_ref().map(|u| u.id.as_str()),
+                    auth.0.as_ref().map(|u| u.email.as_str()),
+                    crate::audit::actions::BRANCH_DISCARD,
+                    crate::audit::resources::AGENT,
+                    Some(&id),
+                    Some(&serde_json::json!({"branch": task_branch}).to_string()),
+                );
             }
 
             crate::ws::broadcast_event(

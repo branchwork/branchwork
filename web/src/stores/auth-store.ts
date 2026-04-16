@@ -4,6 +4,7 @@ import { HttpError, fetchJson, postJson } from "../api.js";
 export interface AuthUser {
   id: string;
   email: string;
+  orgId?: string;
 }
 
 interface AuthStore {

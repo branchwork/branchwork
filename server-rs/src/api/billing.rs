@@ -130,6 +130,16 @@ pub async fn set_budget(
         Some(max) if max > 0.0 => billing::set_org_budget(&conn, &org_id, max),
         _ => billing::delete_org_budget(&conn, &org_id),
     }
+    crate::audit::log(
+        &conn,
+        &org_id,
+        Some(&user.id),
+        Some(&user.email),
+        crate::audit::actions::CONFIG_BUDGET_CHANGE,
+        crate::audit::resources::ORG,
+        Some(&slug),
+        Some(&serde_json::json!({"maxBudgetUsd": body.max_budget_usd}).to_string()),
+    );
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
@@ -156,6 +166,22 @@ pub async fn toggle_kill_switch(
     }
     let conn = state.db.lock().unwrap();
     billing::set_kill_switch(&conn, &org_id, body.active, body.reason.as_deref());
+    crate::audit::log(
+        &conn,
+        &org_id,
+        Some(&user.id),
+        Some(&user.email),
+        crate::audit::actions::CONFIG_KILL_SWITCH,
+        crate::audit::resources::ORG,
+        Some(&slug),
+        Some(
+            &serde_json::json!({
+                "active": body.active,
+                "reason": body.reason,
+            })
+            .to_string(),
+        ),
+    );
     Json(serde_json::json!({"ok": true, "active": body.active})).into_response()
 }
 

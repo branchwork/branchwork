@@ -272,6 +272,22 @@ fn migrate(conn: &Connection) {
             toggled_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
         );
+
+        -- ── Audit log ────────────────────────────────────────────────────────
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id        TEXT NOT NULL DEFAULT 'default-org',
+            user_id       TEXT,
+            user_email    TEXT,
+            action        TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id   TEXT,
+            diff          TEXT,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_org_created ON audit_logs(org_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
+        CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_logs(resource_type, resource_id);
         ",
     )
     .expect("failed to run schema migration");
@@ -388,6 +404,7 @@ mod tests {
         assert!(tables.contains(&"organizations".to_string()));
         assert!(tables.contains(&"org_members".to_string()));
         assert!(tables.contains(&"plan_org".to_string()));
+        assert!(tables.contains(&"audit_logs".to_string()));
     }
 
     #[test]

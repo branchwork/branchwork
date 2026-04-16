@@ -324,6 +324,7 @@ pub struct ProjectBody {
 
 pub async fn set_project(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path(name): Path<String>,
     Json(body): Json<ProjectBody>,
 ) -> impl IntoResponse {
@@ -343,6 +344,17 @@ pub async fn set_project(
         params![name, body.project],
     )
     .unwrap();
+
+    crate::audit::log(
+        &db,
+        auth.org_id(),
+        auth.0.as_ref().map(|u| u.id.as_str()),
+        auth.0.as_ref().map(|u| u.email.as_str()),
+        crate::audit::actions::CONFIG_PROJECT_CHANGE,
+        crate::audit::resources::PLAN,
+        Some(&name),
+        Some(&serde_json::json!({"project": body.project}).to_string()),
+    );
 
     (
         StatusCode::OK,
@@ -365,6 +377,7 @@ pub struct BudgetBody {
 
 pub async fn set_budget(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path(name): Path<String>,
     Json(body): Json<BudgetBody>,
 ) -> impl IntoResponse {
@@ -386,6 +399,17 @@ pub async fn set_budget(
         }
     }
 
+    crate::audit::log(
+        &db,
+        auth.org_id(),
+        auth.0.as_ref().map(|u| u.id.as_str()),
+        auth.0.as_ref().map(|u| u.email.as_str()),
+        crate::audit::actions::CONFIG_BUDGET_CHANGE,
+        crate::audit::resources::PLAN,
+        Some(&name),
+        Some(&serde_json::json!({"maxBudgetUsd": body.max_budget_usd}).to_string()),
+    );
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -406,6 +430,7 @@ pub struct AutoAdvanceBody {
 
 pub async fn set_auto_advance(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path(name): Path<String>,
     Json(body): Json<AutoAdvanceBody>,
 ) -> impl IntoResponse {
@@ -418,6 +443,17 @@ pub async fn set_auto_advance(
         params![name, body.enabled as i64],
     )
     .ok();
+
+    crate::audit::log(
+        &db,
+        auth.org_id(),
+        auth.0.as_ref().map(|u| u.id.as_str()),
+        auth.0.as_ref().map(|u| u.email.as_str()),
+        crate::audit::actions::CONFIG_AUTO_ADVANCE,
+        crate::audit::resources::PLAN,
+        Some(&name),
+        Some(&serde_json::json!({"enabled": body.enabled}).to_string()),
+    );
 
     (
         StatusCode::OK,
@@ -438,6 +474,7 @@ pub struct StatusBody {
 
 pub async fn set_task_status(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path((name, task_number)): Path<(String, String)>,
     Json(body): Json<StatusBody>,
 ) -> impl IntoResponse {
@@ -478,6 +515,16 @@ pub async fn set_task_status(
     }
 
     let db = state.db.lock().unwrap();
+
+    // Capture previous status for audit diff
+    let prev_status: Option<String> = db
+        .query_row(
+            "SELECT status FROM task_status WHERE plan_name = ?1 AND task_number = ?2",
+            params![name, task_number],
+            |row| row.get(0),
+        )
+        .ok();
+
     db.execute(
         "INSERT INTO task_status (plan_name, task_number, status, updated_at)
          VALUES (?1, ?2, ?3, datetime('now'))
@@ -486,6 +533,23 @@ pub async fn set_task_status(
         params![name, task_number, body.status],
     )
     .unwrap();
+
+    crate::audit::log(
+        &db,
+        auth.org_id(),
+        auth.0.as_ref().map(|u| u.id.as_str()),
+        auth.0.as_ref().map(|u| u.email.as_str()),
+        crate::audit::actions::TASK_STATUS_CHANGE,
+        crate::audit::resources::TASK,
+        Some(&format!("{name}/{task_number}")),
+        Some(
+            &serde_json::json!({
+                "from": prev_status.as_deref().unwrap_or("pending"),
+                "to": body.status,
+            })
+            .to_string(),
+        ),
+    );
     drop(db);
 
     // Broadcast so the dashboard updates in real-time
@@ -1081,6 +1145,28 @@ pub async fn start_task(
     )
     .await;
 
+    {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            &org_id_str,
+            user_id_str.as_deref(),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::AGENT_START,
+            crate::audit::resources::AGENT,
+            Some(&agent_id),
+            Some(
+                &serde_json::json!({
+                    "plan": body.plan_name,
+                    "task": body.task_number,
+                    "driver": body.driver.as_deref().unwrap_or("claude"),
+                    "mode": body.mode.as_deref().unwrap_or("start"),
+                })
+                .to_string(),
+            ),
+        );
+    }
+
     Json(serde_json::json!({
         "agentId": agent_id,
         "taskId": body.task_number,
@@ -1630,6 +1716,7 @@ pub struct CreatePlanBody {
 
 pub async fn create_plan(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Json(body): Json<CreatePlanBody>,
 ) -> impl IntoResponse {
     if body.description.trim().is_empty() {
@@ -1761,6 +1848,26 @@ pub async fn create_plan(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
+    {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::PLAN_CREATE,
+            crate::audit::resources::PLAN,
+            None,
+            Some(
+                &serde_json::json!({
+                    "folder": resolved.to_str(),
+                    "template": body.template_id,
+                })
+                .to_string(),
+            ),
+        );
+    }
+
     Json(serde_json::json!({
         "agentId": agent_id,
         "folder": resolved.to_str(),
@@ -1807,6 +1914,7 @@ pub struct UpdateTaskBody {
 
 pub async fn update_plan(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path(name): Path<String>,
     Json(body): Json<UpdatePlanBody>,
 ) -> impl IntoResponse {
@@ -1886,6 +1994,20 @@ pub async fn update_plan(
     // Remove old .md if we just migrated
     if plan_path.extension().is_some_and(|e| e == "md") {
         std::fs::remove_file(&plan_path).ok();
+    }
+
+    {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::PLAN_UPDATE,
+            crate::audit::resources::PLAN,
+            Some(&name),
+            None,
+        );
     }
 
     Json(serde_json::json!({"ok": true, "name": name})).into_response()

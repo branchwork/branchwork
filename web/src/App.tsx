@@ -10,9 +10,10 @@ import { ProjectDashboard } from "./components/ProjectDashboard.js";
 import { AgentTree } from "./components/AgentTree.js";
 import { AgentPanel } from "./components/AgentPanel.js";
 import { NewPlanForm } from "./components/NewPlanForm.js";
+import { AuditLog } from "./components/AuditLog.js";
 import { LoginPage } from "./components/LoginPage.js";
 
-type View = "plans" | "agents" | "new-plan";
+type View = "plans" | "agents" | "new-plan" | "audit";
 
 export function App() {
   const [view, setView] = useState<View>("plans");
@@ -83,6 +84,7 @@ export function App() {
         <div className="flex-1 overflow-auto">
           {view === "plans" && (selectedPlan ? <PlanBoard /> : <ProjectDashboard />)}
           {view === "agents" && <AgentTree />}
+          {view === "audit" && <AuditLog />}
           {view === "new-plan" && (
             <NewPlanForm onClose={() => setView("plans")} />
           )}

@@ -1,5 +1,6 @@
 mod agents;
 mod api;
+mod audit;
 mod auth;
 mod auto_status;
 mod ci;
@@ -339,6 +340,12 @@ async fn run_server(cli: Cli) {
         .route(
             "/api/orgs/{slug}/user-quotas/{user_id}",
             axum::routing::put(api::billing::set_user_quota),
+        )
+        // Audit log
+        .route("/api/orgs/{slug}/audit-log", get(audit::list_audit_log))
+        .route(
+            "/api/orgs/{slug}/audit-log/export",
+            get(audit::export_audit_log),
         )
         // Remote runners (SaaS)
         .route("/ws/runner", get(saas::runner_ws::runner_ws_handler))

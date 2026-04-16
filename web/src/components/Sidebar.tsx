@@ -21,8 +21,8 @@ function isPlanDone(p: PlanSummary): boolean {
 }
 
 interface Props {
-  view: "plans" | "agents" | "new-plan";
-  onViewChange: (v: "plans" | "agents" | "new-plan") => void;
+  view: "plans" | "agents" | "new-plan" | "audit";
+  onViewChange: (v: "plans" | "agents" | "new-plan" | "audit") => void;
 }
 
 export function Sidebar({ view, onViewChange }: Props) {
@@ -168,6 +168,16 @@ export function Sidebar({ view, onViewChange }: Props) {
               {activeCount}
             </span>
           )}
+        </button>
+        <button
+          onClick={() => onViewChange("audit")}
+          className={`flex-1 px-3 py-1.5 rounded text-sm font-medium transition ${
+            view === "audit"
+              ? "bg-indigo-600 text-white"
+              : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+          }`}
+        >
+          Activity
         </button>
       </nav>
 

@@ -419,6 +419,24 @@ pub async fn add_member(
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error");
     }
 
+    crate::audit::log(
+        &conn,
+        &org_id,
+        Some(&user.id),
+        Some(&user.email),
+        crate::audit::actions::ORG_MEMBER_ADD,
+        crate::audit::resources::ORG,
+        Some(&slug),
+        Some(
+            &serde_json::json!({
+                "targetUser": target_id,
+                "email": body.email.trim().to_lowercase(),
+                "role": role,
+            })
+            .to_string(),
+        ),
+    );
+
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
@@ -466,6 +484,17 @@ pub async fn remove_member(
         params![org_id, target_user_id],
     )
     .ok();
+
+    crate::audit::log(
+        &conn,
+        &org_id,
+        Some(&user.id),
+        Some(&user.email),
+        crate::audit::actions::ORG_MEMBER_REMOVE,
+        crate::audit::resources::ORG,
+        Some(&slug),
+        Some(&serde_json::json!({"targetUser": target_user_id}).to_string()),
+    );
 
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
@@ -516,6 +545,23 @@ pub async fn update_member_role(
         params![body.role, org_id, target_user_id],
     )
     .ok();
+
+    crate::audit::log(
+        &conn,
+        &org_id,
+        Some(&user.id),
+        Some(&user.email),
+        crate::audit::actions::ORG_MEMBER_ROLE_CHANGE,
+        crate::audit::resources::ORG,
+        Some(&slug),
+        Some(
+            &serde_json::json!({
+                "targetUser": target_user_id,
+                "newRole": body.role,
+            })
+            .to_string(),
+        ),
+    );
 
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
