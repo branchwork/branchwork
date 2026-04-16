@@ -19,10 +19,10 @@
 
 // Pull in self-contained modules via #[path] so this binary compiles
 // independently of the main orchestrai-server crate.
-#[path = "../saas/runner_protocol.rs"]
-mod runner_protocol;
 #[path = "../saas/outbox.rs"]
 mod outbox;
+#[path = "../saas/runner_protocol.rs"]
+mod runner_protocol;
 #[path = "../agents/session_protocol.rs"]
 mod session_protocol;
 
@@ -35,9 +35,7 @@ use clap::Parser;
 use rusqlite::Connection;
 use tokio::sync::{Mutex, mpsc};
 
-use runner_protocol::{
-    DriverAuthInfo, DriverAuthStatus, Envelope, WireMessage,
-};
+use runner_protocol::{DriverAuthInfo, DriverAuthStatus, Envelope, WireMessage};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -136,11 +134,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     outbox::init_seq_tracker(&conn);
 
     // Load or generate runner_id.
-    let runner_id = cli.runner_id.unwrap_or_else(|| {
-        load_or_generate_runner_id(&conn)
-    });
+    let runner_id = cli
+        .runner_id
+        .unwrap_or_else(|| load_or_generate_runner_id(&conn));
 
-    println!("[runner] id={runner_id} cwd={} db={}", cwd.display(), db_path.display());
+    println!(
+        "[runner] id={runner_id} cwd={} db={}",
+        cwd.display(),
+        db_path.display()
+    );
 
     let db = Arc::new(Mutex::new(conn));
 
@@ -309,10 +311,7 @@ async fn ws_reader(
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Ping(_) => {
-                let pong = Envelope::best_effort(
-                    state.runner_id.clone(),
-                    WireMessage::Pong {},
-                );
+                let pong = Envelope::best_effort(state.runner_id.clone(), WireMessage::Pong {});
                 let _ = state
                     .ws_tx
                     .send(serde_json::to_string(&pong).unwrap_or_default());
@@ -323,7 +322,10 @@ async fn ws_reader(
         };
 
         let Ok(envelope) = serde_json::from_str::<Envelope>(&text) else {
-            eprintln!("[runner] failed to parse envelope: {}", &text[..80.min(text.len())]);
+            eprintln!(
+                "[runner] failed to parse envelope: {}",
+                &text[..80.min(text.len())]
+            );
             continue;
         };
 
@@ -335,11 +337,11 @@ async fn ws_reader(
             };
 
             // Always ACK (so server prunes its outbox).
-            let ack = Envelope::best_effort(
-                state.runner_id.clone(),
-                WireMessage::Ack { ack_seq: seq },
-            );
-            let _ = state.ws_tx.send(serde_json::to_string(&ack).unwrap_or_default());
+            let ack =
+                Envelope::best_effort(state.runner_id.clone(), WireMessage::Ack { ack_seq: seq });
+            let _ = state
+                .ws_tx
+                .send(serde_json::to_string(&ack).unwrap_or_default());
 
             if !is_new {
                 continue; // Duplicate — skip.
@@ -471,7 +473,9 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
             for (seq, _event_type, payload) in events {
                 if let Ok(msg) = serde_json::from_str::<WireMessage>(&payload) {
                     let env = Envelope::reliable(state.runner_id.clone(), seq, msg);
-                    let _ = state.ws_tx.send(serde_json::to_string(&env).unwrap_or_default());
+                    let _ = state
+                        .ws_tx
+                        .send(serde_json::to_string(&env).unwrap_or_default());
                 }
             }
         }
@@ -559,7 +563,10 @@ async fn spawn_agent(
     let child = cmd.spawn()?;
     let pid = child.id();
 
-    println!("[runner] spawned session daemon pid={pid} socket={}", socket_path.display());
+    println!(
+        "[runner] spawned session daemon pid={pid} socket={}",
+        socket_path.display()
+    );
 
     // Wait for the socket to appear.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -676,7 +683,9 @@ async fn send_reliable(state: &RunnerState, message: WireMessage) {
         outbox::enqueue_runner_event(&conn, message.event_type(), &payload)
     };
     let env = Envelope::reliable(state.runner_id.clone(), seq, message);
-    let _ = state.ws_tx.send(serde_json::to_string(&env).unwrap_or_default());
+    let _ = state
+        .ws_tx
+        .send(serde_json::to_string(&env).unwrap_or_default());
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -760,7 +769,11 @@ fn collect_driver_auth() -> Vec<DriverAuthInfo> {
 
     for (name, binary, env_vars) in [
         ("claude", "claude", vec!["ANTHROPIC_API_KEY"]),
-        ("aider", "aider", vec!["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]),
+        (
+            "aider",
+            "aider",
+            vec!["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
+        ),
         ("codex", "codex", vec!["OPENAI_API_KEY"]),
         ("gemini", "gemini", vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
     ] {
@@ -853,10 +866,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
 
 async fn connect_to_socket(
     socket_path: &Path,
-) -> Result<
-    interprocess::local_socket::tokio::Stream,
-    Box<dyn std::error::Error>,
-> {
+) -> Result<interprocess::local_socket::tokio::Stream, Box<dyn std::error::Error>> {
     use interprocess::local_socket::ConnectOptions;
     use interprocess::local_socket::GenericFilePath;
     use interprocess::local_socket::tokio::prelude::*;
@@ -865,10 +875,7 @@ async fn connect_to_socket(
         .to_path_buf()
         .to_fs_name::<GenericFilePath>()?
         .into_owned();
-    let stream = ConnectOptions::new()
-        .name(name)
-        .connect_tokio()
-        .await?;
+    let stream = ConnectOptions::new().name(name).connect_tokio().await?;
     Ok(stream)
 }
 

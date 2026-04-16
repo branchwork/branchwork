@@ -1194,6 +1194,8 @@ pub async fn try_auto_advance(
                 is_continue: false,
                 max_budget_usd,
                 driver: None,
+                user_id: None,
+                org_id: None,
             },
         )
         .await;

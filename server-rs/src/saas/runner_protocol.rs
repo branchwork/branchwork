@@ -36,7 +36,6 @@ pub struct Envelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WireMessage {
     // ── Runner -> SaaS ──────────────────────────────────────────────────
-
     /// First message after connect. Carries runner metadata and driver
     /// capabilities so the dashboard can render the Drivers panel.
     RunnerHello {
@@ -82,12 +81,9 @@ pub enum WireMessage {
     },
 
     /// Driver authentication status snapshot. Sent at startup and on change.
-    DriverAuthReport {
-        drivers: Vec<DriverAuthInfo>,
-    },
+    DriverAuthReport { drivers: Vec<DriverAuthInfo> },
 
     // ── SaaS -> Runner ──────────────────────────────────────────────────
-
     /// Dashboard user clicked "Start" — spawn an agent.
     StartAgent {
         agent_id: String,
@@ -114,19 +110,12 @@ pub enum WireMessage {
 
     /// Forward keyboard input to the agent's PTY.
     /// Best-effort — no ACK. `data` is base64-encoded.
-    AgentInput {
-        agent_id: String,
-        data: String,
-    },
+    AgentInput { agent_id: String, data: String },
 
     /// Request terminal replay from a byte offset (reconnecting browser).
-    TerminalReplay {
-        agent_id: String,
-        from_offset: u64,
-    },
+    TerminalReplay { agent_id: String, from_offset: u64 },
 
     // ── Bidirectional ───────────────────────────────────────────────────
-
     /// Acknowledge receipt of a sequenced message. The receiver sends this
     /// after persisting the event so the sender can prune its outbox.
     Ack {
@@ -274,11 +263,7 @@ mod tests {
 
     #[test]
     fn ack_round_trip() {
-        let env = Envelope::reliable(
-            "r1".into(),
-            1,
-            WireMessage::Ack { ack_seq: 42 },
-        );
+        let env = Envelope::reliable("r1".into(), 1, WireMessage::Ack { ack_seq: 42 });
         let json = serde_json::to_string(&env).unwrap();
         let back: Envelope = serde_json::from_str(&json).unwrap();
         assert!(matches!(back.message, WireMessage::Ack { ack_seq: 42 }));
@@ -286,19 +271,23 @@ mod tests {
 
     #[test]
     fn is_best_effort_classification() {
-        assert!(WireMessage::AgentOutput {
-            agent_id: "a".into(),
-            data: "x".into()
-        }
-        .is_best_effort());
+        assert!(
+            WireMessage::AgentOutput {
+                agent_id: "a".into(),
+                data: "x".into()
+            }
+            .is_best_effort()
+        );
         assert!(WireMessage::Ping {}.is_best_effort());
-        assert!(!WireMessage::AgentStarted {
-            agent_id: "a".into(),
-            plan_name: "p".into(),
-            task_id: "t".into(),
-            driver: "d".into(),
-            cwd: "/".into(),
-        }
-        .is_best_effort());
+        assert!(
+            !WireMessage::AgentStarted {
+                agent_id: "a".into(),
+                plan_name: "p".into(),
+                task_id: "t".into(),
+                driver: "d".into(),
+                cwd: "/".into(),
+            }
+            .is_best_effort()
+        );
     }
 }

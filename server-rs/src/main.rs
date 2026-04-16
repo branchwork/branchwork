@@ -322,6 +322,24 @@ async fn run_server(cli: Cli) {
             "/api/orgs/{slug}/members/{user_id}/role",
             axum::routing::put(auth::orgs::update_member_role),
         )
+        // Org billing / budgets
+        .route("/api/orgs/{slug}/usage", get(api::billing::get_usage))
+        .route(
+            "/api/orgs/{slug}/budget",
+            get(api::billing::get_budget).put(api::billing::set_budget),
+        )
+        .route(
+            "/api/orgs/{slug}/kill-switch",
+            axum::routing::put(api::billing::toggle_kill_switch),
+        )
+        .route(
+            "/api/orgs/{slug}/user-quotas",
+            get(api::billing::list_user_quotas),
+        )
+        .route(
+            "/api/orgs/{slug}/user-quotas/{user_id}",
+            axum::routing::put(api::billing::set_user_quota),
+        )
         // Remote runners (SaaS)
         .route("/ws/runner", get(saas::runner_ws::runner_ws_handler))
         .route(

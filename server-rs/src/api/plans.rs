@@ -896,8 +896,46 @@ fn plan_remaining_budget(
 
 pub async fn start_task(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Json(body): Json<StartTaskBody>,
 ) -> impl IntoResponse {
+    // ── Org budget / kill switch gate ───────────────────────────────────
+    let org_id_str = auth.org_id().to_string();
+    let user_id_str = auth.0.as_ref().map(|u| u.id.clone());
+    {
+        let db = state.db.lock().unwrap();
+        let status = crate::saas::billing::check_org_budget(&db, &org_id_str);
+        if matches!(
+            status,
+            crate::saas::billing::BudgetStatus::Exceeded
+                | crate::saas::billing::BudgetStatus::Killed
+        ) {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({
+                    "error": "org_budget_exceeded",
+                    "message": "Organization budget exceeded. New agents are blocked.",
+                })),
+            )
+                .into_response();
+        }
+        // Per-user quota check.
+        if let Some(uid) = &user_id_str
+            && let Err((spent, max)) = crate::saas::billing::check_user_quota(&db, &org_id_str, uid)
+        {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({
+                    "error": "user_quota_exceeded",
+                    "message": format!("Your quota of ${max:.2} exceeded (spent ${spent:.2})"),
+                    "spentUsd": spent,
+                    "maxQuotaUsd": max,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &body.plan_name) {
         Some(p) => p,
         None => {
@@ -1037,6 +1075,8 @@ pub async fn start_task(
             is_continue,
             max_budget_usd: remaining_budget,
             driver: body.driver.as_deref(),
+            user_id: user_id_str.as_deref(),
+            org_id: Some(&org_id_str),
         },
     )
     .await;
@@ -1065,10 +1105,13 @@ pub struct StartPhaseBody {
 
 pub async fn start_phase_tasks(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path((plan_name, phase_number)): Path<(String, u32)>,
     body: Option<Json<StartPhaseBody>>,
 ) -> impl IntoResponse {
     let body = body.map(|Json(b)| b).unwrap_or_default();
+    let org_id_str = auth.org_id().to_string();
+    let user_id_str = auth.0.as_ref().map(|u| u.id.clone());
 
     let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &plan_name) {
         Some(p) => p,
@@ -1150,6 +1193,26 @@ pub async fn start_phase_tasks(
             .into_response();
     }
 
+    // Org budget / kill switch gate.
+    {
+        let db = state.db.lock().unwrap();
+        let status = crate::saas::billing::check_org_budget(&db, &org_id_str);
+        if matches!(
+            status,
+            crate::saas::billing::BudgetStatus::Exceeded
+                | crate::saas::billing::BudgetStatus::Killed
+        ) {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({
+                    "error": "org_budget_exceeded",
+                    "message": "Organization budget exceeded. New agents are blocked.",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Budget check — if exhausted, refuse. Otherwise pass headroom to every
     // spawned agent; they self-terminate once they've consumed it.
     let remaining_budget: Option<f64> = {
@@ -1224,6 +1287,8 @@ pub async fn start_phase_tasks(
                 is_continue: false,
                 max_budget_usd: remaining_budget,
                 driver: body.driver.as_deref(),
+                user_id: user_id_str.as_deref(),
+                org_id: Some(&org_id_str),
             },
         )
         .await;
@@ -1685,6 +1750,8 @@ pub async fn create_plan(
             is_continue: false,
             max_budget_usd: None,
             driver: None,
+            user_id: None,
+            org_id: None,
         },
     )
     .await;

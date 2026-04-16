@@ -84,9 +84,7 @@ pub async fn runner_ws_handler(
         return (axum::http::StatusCode::UNAUTHORIZED, "invalid_token").into_response();
     };
 
-    ws.on_upgrade(move |socket| {
-        handle_runner_ws(socket, state, runner_name, org_id)
-    })
+    ws.on_upgrade(move |socket| handle_runner_ws(socket, state, runner_name, org_id))
 }
 
 /// Per-runner WebSocket event loop.
@@ -116,11 +114,7 @@ async fn handle_runner_ws(
     let write_handle = tokio::spawn(async move {
         use futures_util::SinkExt;
         while let Some(msg) = cmd_rx.recv().await {
-            if ws_sink
-                .send(Message::Text(msg.into()))
-                .await
-                .is_err()
-            {
+            if ws_sink.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
         }
@@ -218,22 +212,14 @@ async fn handle_runner_ws(
                         // Re-wrap in an envelope with the seq.
                         if let Ok(msg) = serde_json::from_str::<WireMessage>(&payload) {
                             let env = Envelope::reliable("server".into(), seq, msg);
-                            let _ = cmd_tx
-                                .send(serde_json::to_string(&env).unwrap_or_default());
+                            let _ = cmd_tx.send(serde_json::to_string(&env).unwrap_or_default());
                         }
                     }
                 }
             }
 
             // Handle the message.
-            handle_runner_message(
-                &state,
-                &rid,
-                &org_id,
-                &envelope,
-                &cmd_tx,
-            )
-            .await;
+            handle_runner_message(&state, &rid, &org_id, &envelope, &cmd_tx).await;
         }
     }
 
@@ -285,17 +271,11 @@ async fn handle_runner_message(
 
         if is_new {
             // Send ACK back to runner.
-            let ack = Envelope::best_effort(
-                "server".into(),
-                WireMessage::Ack { ack_seq: seq },
-            );
+            let ack = Envelope::best_effort("server".into(), WireMessage::Ack { ack_seq: seq });
             let _ = cmd_tx.send(serde_json::to_string(&ack).unwrap_or_default());
         } else {
             // Duplicate — already processed. Still ACK so the runner prunes.
-            let ack = Envelope::best_effort(
-                "server".into(),
-                WireMessage::Ack { ack_seq: seq },
-            );
+            let ack = Envelope::best_effort("server".into(), WireMessage::Ack { ack_seq: seq });
             let _ = cmd_tx.send(serde_json::to_string(&ack).unwrap_or_default());
             return; // Don't re-process.
         }
@@ -397,6 +377,20 @@ async fn handle_runner_message(
                     params![status, cost_usd, stop_reason, agent_id],
                 )
                 .ok();
+
+                // Org budget enforcement after cost update.
+                if cost_usd.is_some() {
+                    let org_id: Option<String> = conn
+                        .query_row(
+                            "SELECT org_id FROM agents WHERE id = ?1",
+                            params![agent_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok();
+                    if let Some(org_id) = org_id {
+                        super::billing::enforce_org_budget(&conn, &org_id, None);
+                    }
+                }
             }
             broadcast_event(
                 &state.broadcast_tx,
@@ -529,10 +523,7 @@ pub async fn create_runner_token(
 }
 
 /// GET /api/runners — list registered runners.
-pub async fn list_runners(
-    State(state): State<AppState>,
-    user: crate::auth::AuthUser,
-) -> Response {
+pub async fn list_runners(State(state): State<AppState>, user: crate::auth::AuthUser) -> Response {
     let runners: Vec<serde_json::Value> = {
         let conn = state.db.lock().unwrap();
         let mut stmt = conn

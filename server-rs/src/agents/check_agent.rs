@@ -128,6 +128,7 @@ pub async fn start_check_agent(
     let id_clone = id.clone();
     let plan_name_owned = plan_name.map(|s| s.to_string());
     let task_id_owned = task_id.map(|s| s.to_string());
+    let webhook = registry.webhook_url.clone();
 
     thread::spawn(move || {
         let reader = std::io::BufReader::new(stdout);
@@ -188,6 +189,20 @@ pub async fn start_check_agent(
                 params![agent_status, id_clone, cost_usd],
             )
             .ok();
+
+            // Org budget enforcement after cost update.
+            if cost_usd.is_some() {
+                let org_id: Option<String> = db
+                    .query_row(
+                        "SELECT org_id FROM agents WHERE id = ?1",
+                        params![id_clone],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok();
+                if let Some(org_id) = org_id {
+                    crate::saas::billing::enforce_org_budget(&db, &org_id, webhook.as_deref());
+                }
+            }
         }
 
         // Parse verdict. Per-task checks have Some(task_id); plan-level checks

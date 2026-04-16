@@ -11,6 +11,7 @@
 //! - [`outbox`] — SQLite-backed outbox for at-least-once delivery
 //! - [`runner_ws`] — server-side WebSocket handler + token management API
 
+pub mod billing;
 pub mod outbox;
 pub mod runner_protocol;
 pub mod runner_ws;

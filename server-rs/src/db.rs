@@ -235,6 +235,43 @@ fn migrate(conn: &Connection) {
             FOREIGN KEY (created_by) REFERENCES users(id)
         );
         CREATE INDEX IF NOT EXISTS idx_runner_tokens_org ON runner_tokens(org_id);
+
+        -- ── Per-org usage tracking and budgets ────────────────────────────
+        CREATE TABLE IF NOT EXISTS org_budgets (
+            org_id         TEXT PRIMARY KEY,
+            max_budget_usd REAL NOT NULL,
+            billing_period TEXT NOT NULL DEFAULT 'monthly',
+            period_start   TEXT,
+            updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS user_quotas (
+            org_id         TEXT NOT NULL,
+            user_id        TEXT NOT NULL,
+            max_budget_usd REAL NOT NULL,
+            updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (org_id, user_id),
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id)         ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS budget_alerts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id     TEXT NOT NULL,
+            threshold  INTEGER NOT NULL,
+            period_key TEXT NOT NULL,
+            alerted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(org_id, threshold, period_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS org_kill_switch (
+            org_id     TEXT PRIMARY KEY,
+            active     INTEGER NOT NULL DEFAULT 0,
+            reason     TEXT,
+            toggled_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
         ",
     )
     .expect("failed to run schema migration");
@@ -303,6 +340,11 @@ fn migrate(conn: &Connection) {
     )
     .ok();
     conn.execute_batch("ALTER TABLE ci_runs ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+
+    // ── Per-org usage tracking ────────────────────────────────────────────
+    // Track which user spawned each agent for per-user cost allocation.
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN user_id TEXT;")
         .ok();
 
     // Seed the default org and migrate orphaned users/plans into it.

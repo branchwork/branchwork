@@ -43,6 +43,10 @@ pub struct StartPtyOpts<'a> {
     /// Requested driver name (e.g. `"claude"`). Unknown / `None` values
     /// fall back to [`crate::agents::driver::DEFAULT_DRIVER`].
     pub driver: Option<&'a str>,
+    /// User who spawned this agent (for per-user cost allocation).
+    pub user_id: Option<&'a str>,
+    /// Org this agent belongs to (for org-level budget tracking).
+    pub org_id: Option<&'a str>,
 }
 
 pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -> String {
@@ -56,6 +60,8 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         is_continue,
         max_budget_usd,
         driver: driver_name,
+        user_id,
+        org_id,
     } = opts;
     let (driver_name, driver) = registry.drivers.get_or_default(driver_name);
     let id = uuid::Uuid::new_v4().to_string();
@@ -83,8 +89,8 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     {
         let db = registry.db.lock().unwrap();
         db.execute(
-            "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt, base_commit, branch, source_branch, supervisor_socket, driver)
-             VALUES (?1, ?2, ?3, 'starting', 'pty', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt, base_commit, branch, source_branch, supervisor_socket, driver, user_id, org_id)
+             VALUES (?1, ?2, ?3, 'starting', 'pty', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 id,
                 session_id,
@@ -97,6 +103,8 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
                 source_branch,
                 socket_path.to_string_lossy().to_string(),
                 driver_name,
+                user_id,
+                org_id.unwrap_or("default-org"),
             ],
         )
         .ok();
@@ -533,6 +541,22 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
 
     if let Some(plan) = over_budget_plan {
         kill_plan_agents(registry, &plan).await;
+    }
+
+    // ── Org-level budget enforcement ───────────────────────────────────
+    // Check thresholds and fire alerts when an agent finishes with a cost.
+    if cost_usd.is_some() {
+        let db = registry.db.lock().unwrap();
+        let org_id: Option<String> = db
+            .query_row(
+                "SELECT org_id FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        if let Some(org_id) = org_id {
+            crate::saas::billing::enforce_org_budget(&db, &org_id, registry.webhook_url.as_deref());
+        }
     }
 }
 

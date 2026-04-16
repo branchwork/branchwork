@@ -322,6 +322,8 @@ pub async fn fix_ci(
             is_continue: true,
             max_budget_usd: None,
             driver: body.driver.as_deref(),
+            user_id: None,
+            org_id: None,
         },
     )
     .await;
