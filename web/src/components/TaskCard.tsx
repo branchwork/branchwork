@@ -557,7 +557,9 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         </div>
       )}
 
-      {/* Branch banner — prominent when there's a pending branch to merge */}
+      {/* Branch banner — prominent when there's a pending branch to merge.
+         For non-commit tasks (producesCommit === false) the Merge button is
+         hidden but Discard is kept so the empty branch can be cleaned up. */}
       {branchAgent?.branch && (
         <div className="mt-2 flex items-center gap-2 bg-indigo-950/40 border border-indigo-800/40 rounded px-2 py-1.5">
           <span className="text-indigo-400 text-[10px]">&#9739;</span>
@@ -609,24 +611,26 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 >
                   Discard
                 </button>
-                <button
-                  onClick={async () => {
-                    setMerging(true);
-                    setError(null);
-                    const result = await mergeAgentBranch(branchAgent.id);
-                    if (result.ok) {
-                      await selectPlan(planName);
-                    } else {
-                      setError(result.error ?? "Merge failed");
-                    }
-                    setMerging(false);
-                  }}
-                  disabled={merging}
-                  className="px-2 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white rounded transition"
-                  title={`Merge branch ${branchAgent.branch} into ${branchAgent.source_branch ?? "main"}`}
-                >
-                  {merging ? "..." : "Merge"}
-                </button>
+                {task.producesCommit !== false && (
+                  <button
+                    onClick={async () => {
+                      setMerging(true);
+                      setError(null);
+                      const result = await mergeAgentBranch(branchAgent.id);
+                      if (result.ok) {
+                        await selectPlan(planName);
+                      } else {
+                        setError(result.error ?? "Merge failed");
+                      }
+                      setMerging(false);
+                    }}
+                    disabled={merging}
+                    className="px-2 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white rounded transition"
+                    title={`Merge branch ${branchAgent.branch} into ${branchAgent.source_branch ?? "main"}`}
+                  >
+                    {merging ? "..." : "Merge"}
+                  </button>
+                )}
               </>
             )}
           </div>

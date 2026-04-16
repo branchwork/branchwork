@@ -27,6 +27,7 @@ export interface PlanTask {
   filePaths: string[];
   acceptance: string;
   dependencies?: string[];
+  producesCommit?: boolean;
   status?: string;
   statusUpdatedAt?: string;
   agentId?: string;
@@ -232,6 +233,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
           filePaths: t.filePaths,
           acceptance: t.acceptance,
           dependencies: t.dependencies ?? [],
+          ...(t.producesCommit === false && { producesCommit: false }),
         })),
       })),
     });
