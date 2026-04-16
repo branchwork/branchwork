@@ -306,6 +306,24 @@ async fn run_server(cli: Cli) {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
+        // Organizations
+        .route(
+            "/api/orgs",
+            get(auth::orgs::list_orgs).post(auth::orgs::create_org),
+        )
+        .route("/api/orgs/{slug}", get(auth::orgs::get_org))
+        .route(
+            "/api/orgs/{slug}/members",
+            post(auth::orgs::add_member),
+        )
+        .route(
+            "/api/orgs/{slug}/members/{user_id}",
+            delete(auth::orgs::remove_member),
+        )
+        .route(
+            "/api/orgs/{slug}/members/{user_id}/role",
+            axum::routing::put(auth::orgs::update_member_role),
+        )
         // Populate AuthUser on every request. Protected handlers opt in by
         // taking `AuthUser` as an extractor; public routes (health, login,
         // signup, static) are unaffected.

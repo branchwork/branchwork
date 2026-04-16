@@ -7,6 +7,7 @@ use axum::{
 use rusqlite::params;
 use serde::Deserialize;
 
+use crate::auth::OptionalAuthUser;
 use crate::state::AppState;
 
 /// Resolve the merge target for an agent. Prefer the agent's recorded
@@ -38,14 +39,25 @@ fn resolve_merge_target(source_branch: Option<&str>, cwd: &std::path::Path) -> S
     source_branch.unwrap_or("main").to_string()
 }
 
-pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn list_agents(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+) -> impl IntoResponse {
+    let org_id = auth.org_id().to_string();
     let db = state.db.lock().unwrap();
     let mut stmt = db
-        .prepare("SELECT id, session_id, pid, parent_agent_id, plan_name, task_id, cwd, status, mode, prompt, started_at, finished_at, last_tool, last_activity_at, base_commit, branch, source_branch, cost_usd, driver FROM agents ORDER BY started_at DESC LIMIT 50")
+        .prepare(
+            "SELECT id, session_id, pid, parent_agent_id, plan_name, task_id, \
+                    cwd, status, mode, prompt, started_at, finished_at, \
+                    last_tool, last_activity_at, base_commit, branch, \
+                    source_branch, cost_usd, driver \
+             FROM agents WHERE org_id = ?1 \
+             ORDER BY started_at DESC LIMIT 50",
+        )
         .unwrap();
 
     let rows: Vec<serde_json::Value> = stmt
-        .query_map([], |row| {
+        .query_map(params![org_id], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
                 "session_id": row.get::<_, String>(1)?,

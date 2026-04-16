@@ -182,6 +182,36 @@ fn migrate(conn: &Connection) {
         );
         CREATE INDEX IF NOT EXISTS idx_ci_runs_plan_task ON ci_runs(plan_name, task_number);
         CREATE INDEX IF NOT EXISTS idx_ci_runs_status ON ci_runs(status);
+
+        -- Multi-tenancy: organizations and membership
+        CREATE TABLE IF NOT EXISTS organizations (
+            id         TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            slug       TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_orgs_slug ON organizations(slug);
+
+        CREATE TABLE IF NOT EXISTS org_members (
+            org_id    TEXT NOT NULL,
+            user_id   TEXT NOT NULL,
+            role      TEXT NOT NULL DEFAULT 'member',
+            joined_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (org_id, user_id),
+            FOREIGN KEY (org_id)  REFERENCES organizations(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id)         ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_org_members_user ON org_members(user_id);
+
+        -- Authoritative plan-to-org ownership mapping. Plans discovered
+        -- on the filesystem that have no row here are treated as belonging
+        -- to the default org (backward-compat).
+        CREATE TABLE IF NOT EXISTS plan_org (
+            plan_name TEXT PRIMARY KEY,
+            org_id    TEXT NOT NULL DEFAULT 'default-org',
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_plan_org_org ON plan_org(org_id);
         ",
     )
     .expect("failed to run schema migration");
@@ -222,6 +252,32 @@ fn migrate(conn: &Connection) {
     // pipeline or future runs for the same commit.
     conn.execute_batch("ALTER TABLE ci_runs ADD COLUMN dismissed_at TEXT;")
         .ok();
+
+    // ── Multi-tenancy: org_id on every data table ───────────────────────────
+    // DEFAULT 'default-org' means pre-existing rows automatically belong to
+    // the default org. New rows inserted by org-aware code pass the real
+    // org_id explicitly.
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+    conn.execute_batch("ALTER TABLE hook_events ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+    conn.execute_batch("ALTER TABLE plan_project ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+    conn.execute_batch("ALTER TABLE task_status ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+    conn.execute_batch("ALTER TABLE task_learnings ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+    conn.execute_batch("ALTER TABLE plan_verdicts ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+    conn.execute_batch("ALTER TABLE plan_budget ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+    conn.execute_batch("ALTER TABLE plan_auto_advance ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+    conn.execute_batch("ALTER TABLE ci_runs ADD COLUMN org_id TEXT DEFAULT 'default-org';")
+        .ok();
+
+    // Seed the default org and migrate orphaned users/plans into it.
+    crate::auth::orgs::ensure_default_org(conn);
 }
 
 #[cfg(test)]
@@ -258,6 +314,9 @@ mod tests {
         assert!(tables.contains(&"users".to_string()));
         assert!(tables.contains(&"sessions".to_string()));
         assert!(tables.contains(&"plan_verdicts".to_string()));
+        assert!(tables.contains(&"organizations".to_string()));
+        assert!(tables.contains(&"org_members".to_string()));
+        assert!(tables.contains(&"plan_org".to_string()));
     }
 
     #[test]

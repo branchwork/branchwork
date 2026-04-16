@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::agents::{check_agent, ensure_git_initialized, pty_agent};
+use crate::auth::OptionalAuthUser;
+use crate::auth::orgs;
 use crate::auto_status;
 use crate::plan_parser;
 use crate::state::AppState;
@@ -31,20 +33,38 @@ struct PlanListEntry {
     max_budget_usd: Option<f64>,
 }
 
-pub async fn list_plans(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn list_plans(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+) -> impl IntoResponse {
     let summaries = plan_parser::list_plans(&state.plans_dir);
+    let org_id = auth.org_id().to_string();
 
     let db = state.db.lock().unwrap();
 
-    // Load all project overrides
+    // Load all project overrides scoped to the active org
     let mut overrides: HashMap<String, String> = HashMap::new();
-    if let Ok(mut stmt) = db.prepare("SELECT plan_name, project FROM plan_project")
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT plan_name, project FROM plan_project WHERE org_id = ?1",
+    ) && let Ok(rows) = stmt.query_map(params![org_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
     {
         for row in rows.flatten() {
             overrides.insert(row.0, row.1);
+        }
+    }
+    // Also load overrides without org_id filter for backward-compat: rows
+    // that belong to the default org but were inserted before multi-tenancy.
+    if org_id == orgs::DEFAULT_ORG_ID {
+        if let Ok(mut stmt) = db.prepare("SELECT plan_name, project FROM plan_project")
+            && let Ok(rows) = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+        {
+            for row in rows.flatten() {
+                overrides.entry(row.0).or_insert(row.1);
+            }
         }
     }
 
@@ -75,6 +95,7 @@ pub async fn list_plans(State(state): State<AppState>) -> impl IntoResponse {
 
     let entries: Vec<PlanListEntry> = summaries
         .into_iter()
+        .filter(|s| orgs::plan_belongs_to_org(&db, &s.name, &org_id))
         .map(|s| {
             // Parse the full plan to merge statuses and get accurate done count
             let done_count = plan_parser::find_plan_file(&state.plans_dir, &s.name)
@@ -133,8 +154,21 @@ pub async fn list_plans(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn get_plan(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    // Org gate: verify the plan belongs to the caller's org.
+    {
+        let conn = state.db.lock().unwrap();
+        if !orgs::plan_belongs_to_org(&conn, &name, auth.org_id()) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    }
+
     let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
         Some(p) => p,
         None => {
