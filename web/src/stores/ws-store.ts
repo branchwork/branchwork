@@ -69,7 +69,13 @@ export const useWsStore = create<WsStore>((set, get) => ({
     }
 
     ws.onopen = () => {
+      const wasReconnect = get().reconnectAttempt > 0;
       set({ connected: true, reconnectAttempt: 0 });
+      if (wasReconnect) {
+        // Refetch all data — events during the disconnect were lost
+        usePlanStore.getState().fetchPlans();
+        useAgentStore.getState().fetchAgents();
+      }
     };
 
     ws.onerror = (ev) => {

@@ -46,6 +46,20 @@ export function App() {
     fetchDrivers().catch(() => {});
   }, [user]);
 
+  // Refetch when the tab becomes visible again — covers events missed
+  // while the browser throttled or suspended the WebSocket.
+  useEffect(() => {
+    if (!user) return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        fetchPlans().catch(() => {});
+        fetchAgents().catch(() => {});
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [user, fetchPlans, fetchAgents]);
+
   if (authLoading) {
     return (
       <div className="flex h-screen items-center justify-center bg-gray-950 text-gray-500 text-sm">

@@ -271,8 +271,10 @@ fn migrate(conn: &Connection) {
         .ok();
     conn.execute_batch("ALTER TABLE plan_budget ADD COLUMN org_id TEXT DEFAULT 'default-org';")
         .ok();
-    conn.execute_batch("ALTER TABLE plan_auto_advance ADD COLUMN org_id TEXT DEFAULT 'default-org';")
-        .ok();
+    conn.execute_batch(
+        "ALTER TABLE plan_auto_advance ADD COLUMN org_id TEXT DEFAULT 'default-org';",
+    )
+    .ok();
     conn.execute_batch("ALTER TABLE ci_runs ADD COLUMN org_id TEXT DEFAULT 'default-org';")
         .ok();
 

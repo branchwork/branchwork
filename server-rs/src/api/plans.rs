@@ -44,11 +44,11 @@ pub async fn list_plans(
 
     // Load all project overrides scoped to the active org
     let mut overrides: HashMap<String, String> = HashMap::new();
-    if let Ok(mut stmt) = db.prepare(
-        "SELECT plan_name, project FROM plan_project WHERE org_id = ?1",
-    ) && let Ok(rows) = stmt.query_map(params![org_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })
+    if let Ok(mut stmt) =
+        db.prepare("SELECT plan_name, project FROM plan_project WHERE org_id = ?1")
+        && let Ok(rows) = stmt.query_map(params![org_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
     {
         for row in rows.flatten() {
             overrides.insert(row.0, row.1);
@@ -56,15 +56,14 @@ pub async fn list_plans(
     }
     // Also load overrides without org_id filter for backward-compat: rows
     // that belong to the default org but were inserted before multi-tenancy.
-    if org_id == orgs::DEFAULT_ORG_ID {
-        if let Ok(mut stmt) = db.prepare("SELECT plan_name, project FROM plan_project")
-            && let Ok(rows) = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-        {
-            for row in rows.flatten() {
-                overrides.entry(row.0).or_insert(row.1);
-            }
+    if org_id == orgs::DEFAULT_ORG_ID
+        && let Ok(mut stmt) = db.prepare("SELECT plan_name, project FROM plan_project")
+        && let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+    {
+        for row in rows.flatten() {
+            overrides.entry(row.0).or_insert(row.1);
         }
     }
 

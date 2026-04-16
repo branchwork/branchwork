@@ -312,10 +312,7 @@ async fn run_server(cli: Cli) {
             get(auth::orgs::list_orgs).post(auth::orgs::create_org),
         )
         .route("/api/orgs/{slug}", get(auth::orgs::get_org))
-        .route(
-            "/api/orgs/{slug}/members",
-            post(auth::orgs::add_member),
-        )
+        .route("/api/orgs/{slug}/members", post(auth::orgs::add_member))
         .route(
             "/api/orgs/{slug}/members/{user_id}",
             delete(auth::orgs::remove_member),
