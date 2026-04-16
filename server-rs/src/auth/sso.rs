@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::AuthUser;
 use super::orgs;
 use super::sessions;
-use super::AuthUser;
 use crate::state::AppState;
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -530,10 +530,7 @@ fn validate_id_token(
 }
 
 /// Extract group names from the ID token's extra claims.
-fn extract_groups_from_claims(
-    claims: &IdTokenClaims,
-    groups_claim: &str,
-) -> Vec<String> {
+fn extract_groups_from_claims(claims: &IdTokenClaims, groups_claim: &str) -> Vec<String> {
     claims
         .extra
         .get(groups_claim)
@@ -577,15 +574,8 @@ fn encode_saml_redirect(authn_request: &str, idp_sso_url: &str) -> String {
     let compressed = encoder.finish().unwrap();
     let encoded = general_purpose::STANDARD.encode(&compressed);
 
-    let sep = if idp_sso_url.contains('?') {
-        "&"
-    } else {
-        "?"
-    };
-    format!(
-        "{idp_sso_url}{sep}SAMLRequest={}",
-        percent_encode(&encoded)
-    )
+    let sep = if idp_sso_url.contains('?') { "&" } else { "?" };
+    format!("{idp_sso_url}{sep}SAMLRequest={}", percent_encode(&encoded))
 }
 
 /// Generate SAML 2.0 SP metadata XML for IdP configuration.
@@ -610,8 +600,8 @@ fn build_sp_metadata(sp_entity_id: &str, acs_url: &str) -> String {
 
 /// Parse a base64-decoded SAML 2.0 Response XML and extract the user identity.
 fn parse_saml_response_xml(xml: &str) -> Result<SamlResponseData, String> {
-    use quick_xml::events::Event;
     use quick_xml::Reader;
+    use quick_xml::events::Event;
 
     let mut reader = Reader::from_str(xml);
     let mut buf = Vec::new();
@@ -671,14 +661,9 @@ fn parse_saml_response_xml(xml: &str) -> Result<SamlResponseData, String> {
                             data.issuer = Some(text);
                         } else if in_name_id {
                             data.name_id = Some(text);
-                        } else if in_attribute_value
-                        && let Some(ref name) = current_attr_name
-                    {
-                        data.attributes
-                            .entry(name.clone())
-                            .or_default()
-                            .push(text);
-                    }
+                        } else if in_attribute_value && let Some(ref name) = current_attr_name {
+                            data.attributes.entry(name.clone()).or_default().push(text);
+                        }
                     }
                 }
             }
@@ -736,7 +721,13 @@ fn find_or_provision_sso_user(
             params![email, groups_json, provider.id, external_id],
         )
         .ok();
-        apply_group_mapping(conn, &provider.org_id, &user_id, &provider.group_role_mapping, groups);
+        apply_group_mapping(
+            conn,
+            &provider.org_id,
+            &user_id,
+            &provider.group_role_mapping,
+            groups,
+        );
         return Ok((user_id, false));
     }
 
@@ -809,7 +800,13 @@ fn find_or_provision_sso_user(
     .map_err(|e| format!("SSO account link failed: {e}"))?;
 
     // 5. Apply group-to-role mapping.
-    apply_group_mapping(conn, &provider.org_id, &user_id, &provider.group_role_mapping, groups);
+    apply_group_mapping(
+        conn,
+        &provider.org_id,
+        &user_id,
+        &provider.group_role_mapping,
+        groups,
+    );
 
     Ok((user_id, is_new))
 }
@@ -877,8 +874,7 @@ fn complete_sso_login(
 ) -> Response {
     let result = {
         let conn = state.db.lock().unwrap();
-        let result =
-            find_or_provision_sso_user(&conn, provider, email, external_id, groups);
+        let result = find_or_provision_sso_user(&conn, provider, email, external_id, groups);
 
         if let Ok((ref user_id, is_new)) = result {
             crate::audit::log(
@@ -920,10 +916,7 @@ fn complete_sso_login(
     let cookie = sessions::set_cookie_value(&token);
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&cookie).unwrap(),
-    );
+    headers.insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     headers.insert(header::LOCATION, HeaderValue::from_static("/"));
     (StatusCode::FOUND, headers).into_response()
 }
@@ -940,11 +933,7 @@ fn redirect_with_error(code: &str) -> Response {
 // ── Admin permission helper ─────────────────────────────────────────────────
 
 #[allow(clippy::result_large_err)]
-fn require_org_admin(
-    conn: &Connection,
-    user: &AuthUser,
-    slug: &str,
-) -> Result<String, Response> {
+fn require_org_admin(conn: &Connection, user: &AuthUser, slug: &str) -> Result<String, Response> {
     let org_id: Option<String> = conn
         .query_row(
             "SELECT id FROM organizations WHERE slug = ?1",
@@ -1070,9 +1059,7 @@ pub async fn create_provider(
         crate::audit::actions::SSO_PROVIDER_CREATE,
         crate::audit::resources::SSO_PROVIDER,
         Some(&id),
-        Some(
-            &serde_json::json!({"name": body.name.trim(), "protocol": body.protocol}).to_string(),
-        ),
+        Some(&serde_json::json!({"name": body.name.trim(), "protocol": body.protocol}).to_string()),
     );
 
     match load_provider(&conn, &id) {
@@ -1275,11 +1262,7 @@ pub async fn sso_login(
     }
 }
 
-async fn oidc_login_redirect(
-    state: &AppState,
-    provider: &SsoProvider,
-    base_url: &str,
-) -> Response {
+async fn oidc_login_redirect(state: &AppState, provider: &SsoProvider, base_url: &str) -> Response {
     let issuer_url = match provider.issuer_url.as_deref() {
         Some(url) if !url.is_empty() => url,
         _ => return err(StatusCode::INTERNAL_SERVER_ERROR, "missing_issuer_url"),
@@ -1477,8 +1460,10 @@ pub async fn oidc_callback(
         Some(e) if !e.is_empty() => e.to_lowercase(),
         _ => return redirect_with_error("missing_email"),
     };
-    let groups =
-        extract_groups_from_claims(&claims, provider.groups_claim.as_deref().unwrap_or("groups"));
+    let groups = extract_groups_from_claims(
+        &claims,
+        provider.groups_claim.as_deref().unwrap_or("groups"),
+    );
 
     complete_sso_login(&state, &provider, &email, &claims.sub, &groups)
 }
@@ -1763,22 +1748,20 @@ mod tests {
         .unwrap();
 
         let provider = load_provider(&conn, "prov-1").unwrap();
-        let (user_id, is_new) = find_or_provision_sso_user(
-            &conn,
-            &provider,
-            "existing@corp.com",
-            "okta-sub-456",
-            &[],
-        )
-        .unwrap();
+        let (user_id, is_new) =
+            find_or_provision_sso_user(&conn, &provider, "existing@corp.com", "okta-sub-456", &[])
+                .unwrap();
         assert!(!is_new);
         assert_eq!(user_id, "u1");
     }
 
     #[test]
     fn saml_authn_request_is_valid_xml() {
-        let xml =
-            build_saml_authn_request("https://sp.example.com", "https://sp.example.com/acs", "https://idp.example.com/sso");
+        let xml = build_saml_authn_request(
+            "https://sp.example.com",
+            "https://sp.example.com/acs",
+            "https://idp.example.com/sso",
+        );
         assert!(xml.contains("AuthnRequest"));
         assert!(xml.contains("https://sp.example.com"));
         assert!(xml.contains("https://idp.example.com/sso"));

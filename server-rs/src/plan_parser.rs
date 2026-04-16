@@ -172,7 +172,7 @@ pub fn infer_project(raw: &str) -> Option<String> {
     }
     if !abs_counts.is_empty() {
         let mut sorted: Vec<_> = abs_counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         let candidate = &sorted[0].0;
         if home.join(candidate).exists() {
             return Some(candidate.clone());
@@ -210,7 +210,7 @@ pub fn infer_project(raw: &str) -> Option<String> {
     //    Sort by name length descending so "reglyze" beats "rust" (substring of "trust").
     let header: String = raw.chars().take(500).collect::<String>().to_lowercase();
     let mut sorted_dirs: Vec<_> = project_dirs.iter().collect();
-    sorted_dirs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    sorted_dirs.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
     for (proj_name, _) in sorted_dirs {
         if proj_name.len() >= 4 && header.contains(&proj_name.to_lowercase()) {
             return Some(proj_name.clone());
@@ -453,8 +453,7 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
 fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
     let bullet_re = Regex::new(r"(?m)^[-*]\s+\*\*(.+?)\*\*\s*[—:\-]?\s*(.*)").unwrap();
     let mut tasks = Vec::new();
-    let mut idx = 1u32;
-    for caps in bullet_re.captures_iter(body) {
+    for (idx, caps) in (1u32..).zip(bullet_re.captures_iter(body)) {
         let title = caps[1].trim().to_string();
         let desc = caps
             .get(2)
@@ -476,7 +475,6 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
             cost_usd: None,
             ci: None,
         });
-        idx += 1;
     }
     tasks
 }

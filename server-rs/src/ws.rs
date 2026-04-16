@@ -64,11 +64,10 @@ async fn handle_dashboard_ws(mut socket: axum::extract::ws::WebSocket, state: Ap
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(Message::Ping(data))) => {
-                        if socket.send(Message::Pong(data)).await.is_err() {
+                    Some(Ok(Message::Ping(data)))
+                        if socket.send(Message::Pong(data.clone())).await.is_err() => {
                             break;
                         }
-                    }
                     _ => {} // ignore other messages
                 }
             }

@@ -330,8 +330,7 @@ async fn run_server(cli: Cli) {
         )
         .route(
             "/api/orgs/{slug}/sso/{provider_id}",
-            axum::routing::put(auth::sso::update_provider)
-                .delete(auth::sso::delete_provider),
+            axum::routing::put(auth::sso::update_provider).delete(auth::sso::delete_provider),
         )
         // SSO public (login flow)
         .route(
