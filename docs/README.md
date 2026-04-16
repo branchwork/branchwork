@@ -21,8 +21,8 @@ Pages marked _(stub)_ do not exist yet — they are tracked by the
 
 The three-binary split, wire protocols, and storage model.
 
-- [architecture/overview.md](architecture/overview.md) _(stub)_ —
-  three-binary diagram, data flow, self-hosted vs. SaaS deployment shapes.
+- [architecture/overview.md](architecture/overview.md) — three-binary
+  diagram, data flow, self-hosted vs. SaaS deployment shapes.
 - [architecture/server.md](architecture/server.md) _(stub)_ — dashboard
   server: HTTP API, WebSocket fan-out, file watcher, auto-status, hooks.
 - [architecture/session-daemon.md](architecture/session-daemon.md) _(stub)_
