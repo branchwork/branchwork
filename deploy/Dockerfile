@@ -14,7 +14,7 @@ COPY tsconfig.base.json ./
 RUN pnpm --filter @orchestrai/web build
 
 # ── Stage 2: Build Rust server ───────────────────────────────────────
-FROM rust:1.86-alpine AS server
+FROM rust:1.88-alpine AS server
 RUN apk add --no-cache musl-dev build-base perl
 
 WORKDIR /src/server-rs
