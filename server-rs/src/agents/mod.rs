@@ -1468,6 +1468,7 @@ mod tests {
             file_paths: vec![],
             acceptance: String::new(),
             dependencies: vec![],
+            produces_commit: true,
             status: None,
             status_updated_at: None,
             cost_usd: None,

@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanTask {
@@ -17,6 +25,8 @@ pub struct PlanTask {
     pub acceptance: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub produces_commit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,6 +91,8 @@ struct YamlPlanTask {
     acceptance: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     dependencies: Vec<String>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    produces_commit: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -306,6 +318,7 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
                 file_paths: extract_file_paths(&body),
                 acceptance: String::new(),
                 dependencies: Vec::new(),
+                produces_commit: true,
                 status: None,
                 status_updated_at: None,
                 cost_usd: None,
@@ -427,6 +440,7 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
             file_paths,
             acceptance,
             dependencies,
+            produces_commit: true,
             status: None,
             status_updated_at: None,
             cost_usd: None,
@@ -456,6 +470,7 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
             file_paths,
             acceptance: String::new(),
             dependencies,
+            produces_commit: true,
             status: None,
             status_updated_at: None,
             cost_usd: None,
@@ -486,6 +501,7 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
                     file_paths: t.file_paths,
                     acceptance: t.acceptance,
                     dependencies: t.dependencies,
+                    produces_commit: t.produces_commit,
                     status: None,
                     status_updated_at: None,
                     cost_usd: None,
@@ -545,6 +561,7 @@ pub fn serialize_plan_yaml(plan: &ParsedPlan) -> Result<String, String> {
                         file_paths: t.file_paths.clone(),
                         acceptance: t.acceptance.clone(),
                         dependencies: t.dependencies.clone(),
+                        produces_commit: t.produces_commit,
                     })
                     .collect(),
             })
