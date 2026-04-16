@@ -95,6 +95,8 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       a.status !== "running" &&
       a.status !== "starting"
   );
+  // undefined/true → show Merge; false → hide Merge (task not expected to produce a commit)
+  const canMerge = task.producesCommit !== false;
   // Task is locked while any agent for it is running/starting (possibly
   // spawned from another browser/session — we can't rely on the local
   // `agentId` state alone). Locked tasks hide the driver selector and
@@ -561,9 +563,14 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
          For non-commit tasks (producesCommit === false) the Merge button is
          hidden but Discard is kept so the empty branch can be cleaned up. */}
       {branchAgent?.branch && (
-        <div className="mt-2 flex items-center gap-2 bg-indigo-950/40 border border-indigo-800/40 rounded px-2 py-1.5">
-          <span className="text-indigo-400 text-[10px]">&#9739;</span>
+        <div className={`mt-2 flex items-center gap-2 ${canMerge ? "bg-indigo-950/40 border-indigo-800/40" : "bg-gray-900/40 border-gray-700/40"} border rounded px-2 py-1.5`}>
+          <span className={`${canMerge ? "text-indigo-400" : "text-gray-500"} text-[10px]`}>&#9739;</span>
           <div className="flex-1 min-w-0">
+            {!canMerge && (
+              <div className="text-[10px] text-gray-400 mb-0.5">
+                Agent finished — no commit expected. Discard the scratch branch when you're done reviewing.
+              </div>
+            )}
             <div className="text-[10px] font-mono text-indigo-300/90 truncate" title={branchAgent.branch}>
               {branchAgent.branch}
             </div>
@@ -611,7 +618,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 >
                   Discard
                 </button>
-                {task.producesCommit !== false && (
+                {canMerge && (
                   <button
                     onClick={async () => {
                       setMerging(true);
