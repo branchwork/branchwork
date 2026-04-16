@@ -1430,6 +1430,122 @@ Do stuff.
         assert_eq!(plan.verification, None);
     }
 
+    // ── produces_commit tests ─────────────────────────────────────────────
+
+    #[test]
+    fn yaml_produces_commit_defaults_to_true() {
+        let yaml = "\
+title: Plan
+phases:
+  - number: 0
+    title: Setup
+    tasks:
+      - number: \"0.1\"
+        title: Do stuff
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        assert!(
+            plan.phases[0].tasks[0].produces_commit,
+            "produces_commit should default to true when the key is absent"
+        );
+    }
+
+    #[test]
+    fn yaml_produces_commit_false_override() {
+        let yaml = "\
+title: Plan
+phases:
+  - number: 0
+    title: Setup
+    tasks:
+      - number: \"0.1\"
+        title: Investigate bug
+        produces_commit: false
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        assert!(
+            !plan.phases[0].tasks[0].produces_commit,
+            "produces_commit should be false when explicitly set"
+        );
+    }
+
+    #[test]
+    fn produces_commit_round_trip_serialization() {
+        // Build a plan with one task produces_commit=false, another =true
+        let plan = ParsedPlan {
+            name: "rt".to_string(),
+            file_path: "/tmp/rt.yaml".to_string(),
+            title: "Round-trip".to_string(),
+            context: String::new(),
+            project: None,
+            created_at: String::new(),
+            modified_at: String::new(),
+            phases: vec![PlanPhase {
+                number: 0,
+                title: "P0".to_string(),
+                description: String::new(),
+                tasks: vec![
+                    PlanTask {
+                        number: "0.1".to_string(),
+                        title: "No commit".to_string(),
+                        description: String::new(),
+                        file_paths: Vec::new(),
+                        acceptance: String::new(),
+                        dependencies: Vec::new(),
+                        produces_commit: false,
+                        status: None,
+                        status_updated_at: None,
+                        cost_usd: None,
+                        ci: None,
+                    },
+                    PlanTask {
+                        number: "0.2".to_string(),
+                        title: "Has commit".to_string(),
+                        description: String::new(),
+                        file_paths: Vec::new(),
+                        acceptance: String::new(),
+                        dependencies: Vec::new(),
+                        produces_commit: true,
+                        status: None,
+                        status_updated_at: None,
+                        cost_usd: None,
+                        ci: None,
+                    },
+                ],
+            }],
+            verification: None,
+            total_cost_usd: None,
+            max_budget_usd: None,
+        };
+
+        let yaml_str = serialize_plan_yaml(&plan).unwrap();
+
+        // produces_commit: false must appear for task 0.1
+        assert!(
+            yaml_str.contains("produces_commit: false"),
+            "serialized YAML should contain 'produces_commit: false': {yaml_str}"
+        );
+
+        // The key should NOT appear for the true task (skip_serializing_if = "is_true")
+        // Count occurrences — should be exactly 1 (only the false one)
+        let count = yaml_str.matches("produces_commit").count();
+        assert_eq!(
+            count, 1,
+            "produces_commit should appear exactly once (for the false task), found {count} in: {yaml_str}"
+        );
+
+        // Re-parse and verify values survive the round-trip
+        let reparsed = parse_plan_yaml(&yaml_str, "rt", "/tmp/rt.yaml").unwrap();
+        assert!(
+            !reparsed.phases[0].tasks[0].produces_commit,
+            "round-tripped task 0.1 should have produces_commit=false"
+        );
+        assert!(
+            reparsed.phases[0].tasks[1].produces_commit,
+            "round-tripped task 0.2 should have produces_commit=true (default)"
+        );
+    }
+
     #[test]
     fn project_inference_all_plans() {
         let Some(plans_dir) = dirs::home_dir().map(|h| h.join(".claude/plans")) else {
