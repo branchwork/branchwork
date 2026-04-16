@@ -438,11 +438,11 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
             // Forward to the local session daemon.
             if let Ok(bytes) = base64_decode(data) {
                 let agents = state.agents.lock().await;
-                if let Some(handle) = agents.get(agent_id.as_str()) {
-                    if let Ok(mut stream) = connect_to_socket(&handle.socket_path).await {
-                        let msg = session_protocol::Message::Input(bytes);
-                        let _ = session_protocol::write_frame(&mut stream, &msg).await;
-                    }
+                if let Some(handle) = agents.get(agent_id.as_str())
+                    && let Ok(mut stream) = connect_to_socket(&handle.socket_path).await
+                {
+                    let msg = session_protocol::Message::Input(bytes);
+                    let _ = session_protocol::write_frame(&mut stream, &msg).await;
                 }
             }
         }
@@ -453,14 +453,14 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
             rows,
         } => {
             let agents = state.agents.lock().await;
-            if let Some(handle) = agents.get(agent_id.as_str()) {
-                if let Ok(mut stream) = connect_to_socket(&handle.socket_path).await {
-                    let msg = session_protocol::Message::Resize {
-                        cols: *cols,
-                        rows: *rows,
-                    };
-                    let _ = session_protocol::write_frame(&mut stream, &msg).await;
-                }
+            if let Some(handle) = agents.get(agent_id.as_str())
+                && let Ok(mut stream) = connect_to_socket(&handle.socket_path).await
+            {
+                let msg = session_protocol::Message::Resize {
+                    cols: *cols,
+                    rows: *rows,
+                };
+                let _ = session_protocol::write_frame(&mut stream, &msg).await;
             }
         }
 
@@ -532,11 +532,11 @@ async fn spawn_agent(
     ];
 
     // Add effort for Claude.
-    if binary == "claude" {
-        if let Some(eff) = effort {
-            args.push("--effort".to_string());
-            args.push(eff.to_string());
-        }
+    if binary == "claude"
+        && let Some(eff) = effort
+    {
+        args.push("--effort".to_string());
+        args.push(eff.to_string());
     }
 
     // Spawn the session daemon.
@@ -808,7 +808,7 @@ fn is_ready(buf: &[u8]) -> bool {
 fn base64_encode(data: &[u8]) -> String {
     // Simple base64 without pulling in a crate.
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
