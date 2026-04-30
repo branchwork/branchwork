@@ -107,7 +107,7 @@ pub struct FixCiBody {
 ///
 /// Spawn an agent on a recovery branch off the failing commit, with the
 /// CI failure log baked into the prompt and a hard pre-commit requirement.
-/// The agent commits its fix on `orchestrai/fix/<plan>/<task>/<run_id>`;
+/// The agent commits its fix on `branchwork/fix/<plan>/<task>/<run_id>`;
 /// the user merges it through the existing banner UX, which creates a
 /// fresh `ci_runs` row that eventually supersedes the red badge.
 pub async fn fix_ci(
@@ -214,7 +214,7 @@ pub async fn fix_ci(
     //    start_pty_agent's record once the row exists.
     //
     //    Best-effort: if a previous Fix CI attempt left the working tree
-    //    on a stale `orchestrai/fix/...` branch, try to land on the repo's
+    //    on a stale `branchwork/fix/...` branch, try to land on the repo's
     //    default trunk first so the captured value is a real merge target.
     //    Ignored on failure (dirty tree, etc) — we fall back to whatever
     //    git_current_branch reports.
@@ -235,7 +235,7 @@ pub async fn fix_ci(
     // spawn path's `git_checkout_branch(..., is_continue=true)` will
     // then just check it out.
     let fix_branch = format!(
-        "orchestrai/fix/{plan}/{task}/{run}",
+        "branchwork/fix/{plan}/{task}/{run}",
         plan = body.plan_name,
         task = body.task_number,
         run = body.ci_run_id,

@@ -4,17 +4,17 @@
 # Dashboard at http://localhost:3100
 
 services:
-  orchestrai:
-    image: ghcr.io/cyrilpoder/orchestrai:${ORCHESTRAI_VERSION:-0.3.0}
+  branchwork:
+    image: ghcr.io/branchwork/branchwork:${BRANCHWORK_VERSION:-0.3.0}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     ports:
-      - "${ORCHESTRAI_PORT:-3100}:3100"
+      - "${BRANCHWORK_PORT:-3100}:3100"
     volumes:
-      - orchestrai-data:/data
+      - branchwork-data:/data
     environment:
-      - ORCHESTRAI_WEBHOOK_URL=${ORCHESTRAI_WEBHOOK_URL:-}
+      - BRANCHWORK_WEBHOOK_URL=${BRANCHWORK_WEBHOOK_URL:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3100/health"]
@@ -24,4 +24,4 @@ services:
       start_period: 5s
 
 volumes:
-  orchestrai-data:
+  branchwork-data:

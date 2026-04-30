@@ -1,9 +1,9 @@
 #!/bin/sh
 set -eu
 
-REPO="cpoder/orchestrAI"
-INSTALL_DIR="${ORCHESTRAI_INSTALL_DIR:-/usr/local/bin}"
-BINARY_NAME="orchestrai-server"
+REPO="branchwork/branchwork"
+INSTALL_DIR="${BRANCHWORK_INSTALL_DIR:-/usr/local/bin}"
+BINARY_NAME="branchwork-server"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -35,8 +35,8 @@ detect_platform() {
 # ── Resolve version ─────────────────────────────────────────────────────────
 
 resolve_version() {
-    if [ -n "${ORCHESTRAI_VERSION:-}" ]; then
-        VERSION="$ORCHESTRAI_VERSION"
+    if [ -n "${BRANCHWORK_VERSION:-}" ]; then
+        VERSION="$BRANCHWORK_VERSION"
         return
     fi
 
@@ -45,7 +45,7 @@ resolve_version() {
         curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
         | grep '"tag_name"' \
         | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
-    )" || die "Could not determine latest release. Set ORCHESTRAI_VERSION to install a specific version."
+    )" || die "Could not determine latest release. Set BRANCHWORK_VERSION to install a specific version."
 
     [ -n "$VERSION" ] || die "Could not parse latest release tag."
 }
@@ -93,7 +93,7 @@ verify() {
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
-    printf "orchestrAI installer\n\n"
+    printf "Branchwork installer\n\n"
 
     detect_platform
     info "Platform: ${OS_TAG}-${ARCH_TAG}"

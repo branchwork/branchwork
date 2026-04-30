@@ -6,7 +6,7 @@
 //! and the sender replays everything after that from the outbox.
 //!
 //! This module is **self-contained** — no `crate::` dependencies — so it
-//! can be `#[path]`-included by the standalone `orchestrai_runner` binary.
+//! can be `#[path]`-included by the standalone `branchwork_runner` binary.
 
 #![allow(dead_code)] // Both binaries include this module but each uses a different subset.
 

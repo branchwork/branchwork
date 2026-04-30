@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# E2E test runner for orchestrAI.
+# E2E test runner for Branchwork.
 # Builds the Docker image, starts the container, runs tests, tears down.
 #
 # Usage:

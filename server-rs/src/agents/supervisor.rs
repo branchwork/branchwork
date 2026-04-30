@@ -2,7 +2,7 @@
 //! agent, replacing tmux as the agent persistence layer.
 //!
 //! Invoked two ways, both of which land in [`run_session`]:
-//! - `orchestrai-server session --socket <s> --cwd <d> -- <cmd> <args...>`
+//! - `branchwork-server session --socket <s> --cwd <d> -- <cmd> <args...>`
 //!   (the subcommand dispatched from `main.rs`).
 //! - The standalone `session_daemon` binary in `src/bin/session_daemon.rs`.
 //!
@@ -152,7 +152,7 @@ pub fn socket_name(socket: &Path) -> io::Result<Name<'static>> {
 /// PID should prefer [`spawn_session_daemon`], which waits for the
 /// pidfile.
 // Dead in the standalone `session_daemon` binary (which `#[path]`-includes
-// this file), used from the main `orchestrai-server` binary. Silence the
+// this file), used from the main `branchwork-server` binary. Silence the
 // dual-binary dead-code warning.
 #[allow(dead_code)]
 pub fn spawn_detached(exe: &Path, args: &[&str]) -> io::Result<u32> {
@@ -180,7 +180,7 @@ pub fn log_path(socket: &Path) -> PathBuf {
     socket.with_extension("log")
 }
 
-/// Spawn `orchestrai-server session …` detached, then block (async) until the
+/// Spawn `branchwork-server session …` detached, then block (async) until the
 /// daemon has written its pidfile and the listener is accepting connections.
 /// Returns the durable daemon PID.
 ///

@@ -5,34 +5,34 @@ your browser. Self-hosted, single machine, no account.
 
 ## 1. Install
 
-Pick one. All three land the same `orchestrai-server` binary on your
+Pick one. All three land the same `branchwork-server` binary on your
 `PATH`.
 
 **Shell installer (Linux / macOS).** Downloads the latest release
 binary for your platform into `/usr/local/bin`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/cpoder/orchestrAI/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/branchwork/branchwork/master/install.sh | sh
 ```
 
 **Direct binary.** Grab the archive that matches your platform from
-[github.com/cpoder/orchestrAI/releases](https://github.com/cpoder/orchestrAI/releases/latest)
-(`orchestrai-server-{linux,macos}-{x64,arm64}.tar.gz`), extract it, and
-move `orchestrai-server` somewhere on your `PATH`.
+[github.com/branchwork/branchwork/releases](https://github.com/branchwork/branchwork/releases/latest)
+(`branchwork-server-{linux,macos}-{x64,arm64}.tar.gz`), extract it, and
+move `branchwork-server` somewhere on your `PATH`.
 
 **Build from source.** Requires Rust 1.88+, Node.js 20+, pnpm:
 
 ```sh
-pnpm --filter @orchestrai/web build && \
+pnpm --filter @branchwork/web build && \
   cd server-rs && cargo build --release
 ```
 
-Binary lands at `server-rs/target/release/orchestrai-server`
+Binary lands at `server-rs/target/release/branchwork-server`
 (~15 MB, no runtime dependencies).
 
 ## 2. Check prerequisites
 
-orchestrAI drives an external AI CLI and works out of a git worktree.
+Branchwork drives an external AI CLI and works out of a git worktree.
 Confirm both are reachable:
 
 ```sh
@@ -43,21 +43,21 @@ git --version
 If `claude` isn't installed, follow the
 [Claude Code install guide](https://docs.claude.com/en/docs/claude-code/setup)
 and run `claude` once to complete OAuth login (or export
-`ANTHROPIC_API_KEY`). Any driver orchestrAI supports is fine — Claude
+`ANTHROPIC_API_KEY`). Any driver Branchwork supports is fine — Claude
 Code is the default because its MCP integration gives agents the
 richest feedback loop.
 
-You do not need to pre-create a git repo for your project: orchestrAI
+You do not need to pre-create a git repo for your project: Branchwork
 auto-inits one the first time it needs a task branch.
 
 ## 3. Run the server
 
 ```sh
-orchestrai-server
+branchwork-server
 ```
 
 No flags needed. The server binds `http://localhost:3100`, creates
-`~/.claude/plans/` and `~/.claude/orchestrai.db` if they don't exist,
+`~/.claude/plans/` and `~/.claude/branchwork.db` if they don't exist,
 and embeds the dashboard SPA into the same binary.
 
 Open <http://localhost:3100> in any browser. You should see an empty
@@ -69,12 +69,12 @@ plan board.
 2. Describe what you want to build in one or two sentences
    (e.g. "Add a `/health` endpoint that returns `{status: \"ok\"}`").
 3. Pick a folder. Any directory on the host machine works — if it
-   isn't a git repo yet, orchestrAI will init one.
+   isn't a git repo yet, Branchwork will init one.
 4. Click **Create Plan**. A design agent spins up and writes
    `~/.claude/plans/<slug>.yaml` with phases and tasks. The plan
    appears in the sidebar as soon as the file is written.
 5. On any task card, click **Start**. An agent spawns on the branch
-   `orchestrai/<plan>/<task>` and a live xterm.js terminal opens in
+   `branchwork/<plan>/<task>` and a live xterm.js terminal opens in
    the panel on the right.
 
 The agent is now working. You can type at it like any other terminal.
@@ -82,15 +82,15 @@ The agent is now working. You can type at it like any other terminal.
 ## 5. Prove session persistence
 
 The terminal you're watching lives inside a detached supervisor
-daemon, not inside `orchestrai-server` itself. Kill the server to
+daemon, not inside `branchwork-server` itself. Kill the server to
 prove it:
 
-1. In the terminal where `orchestrai-server` is running, press
+1. In the terminal where `branchwork-server` is running, press
    `Ctrl-C`. The browser tab disconnects.
 2. Start it again:
 
    ```sh
-   orchestrai-server
+   branchwork-server
    ```
 
 3. Reload the browser. Click back into the running agent. The same
@@ -107,8 +107,8 @@ daemons, git branches per task, review and merge in the browser.
   authoring, check agents, diffs, merge/discard, cost tracking, CI
   integration, drivers.
 - [architecture/overview.md](architecture/overview.md) — the three
-  binaries (`orchestrai-server`, `session_daemon`,
-  `orchestrai-runner`), the protocols between them, and where session
+  binaries (`branchwork-server`, `session_daemon`,
+  `branchwork-runner`), the protocols between them, and where session
   state lives.
 - [troubleshooting.md](troubleshooting.md) — common failures (empty
   merge branch, stuck status, driver auth).

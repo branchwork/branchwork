@@ -1,5 +1,5 @@
 //! Standalone `session_daemon` binary. Equivalent to
-//! `orchestrai-server session ...` — both dispatch into
+//! `branchwork-server session ...` — both dispatch into
 //! [`supervisor::run_session`]. Exists so that tests and alternate callers
 //! can invoke the daemon without knowing the main binary's subcommand layout.
 //!
@@ -18,7 +18,7 @@ use clap::Parser;
 use supervisor::SessionArgs;
 
 #[derive(Parser, Debug)]
-#[command(name = "session_daemon", about = "orchestrAI mini-supervisor daemon")]
+#[command(name = "session_daemon", about = "Branchwork mini-supervisor daemon")]
 struct Cli {
     #[command(flatten)]
     args: SessionArgs,

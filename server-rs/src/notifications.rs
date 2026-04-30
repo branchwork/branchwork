@@ -118,7 +118,7 @@ mod tests {
             Some("1.2"),
             "abcdef1234",
             "completed",
-            Some("orchestrai/my-plan/1.2"),
+            Some("branchwork/my-plan/1.2"),
             Some(0.1234),
         );
         assert!(m.contains("abcdef12"));

@@ -19,19 +19,19 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: false
-            artifact: orchestrai-server-linux-x64
+            artifact: branchwork-server-linux-x64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             use_cross: false
-            artifact: orchestrai-server-linux-arm64
+            artifact: branchwork-server-linux-arm64
           - target: x86_64-apple-darwin
             os: macos-14
             use_cross: false
-            artifact: orchestrai-server-macos-x64
+            artifact: branchwork-server-macos-x64
           - target: aarch64-apple-darwin
             os: macos-14
             use_cross: false
-            artifact: orchestrai-server-macos-arm64
+            artifact: branchwork-server-macos-arm64
 
     runs-on: ${{ matrix.os }}
     name: Build ${{ matrix.artifact }}
@@ -54,7 +54,7 @@ jobs:
       - name: Build web frontend
         run: |
           pnpm install --frozen-lockfile
-          pnpm --filter @orchestrai/web build
+          pnpm --filter @branchwork/web build
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -88,7 +88,7 @@ jobs:
       - name: Package binary
         run: |
           mkdir -p dist
-          cp server-rs/target/${{ matrix.target }}/release/orchestrai-server dist/${{ matrix.artifact }}
+          cp server-rs/target/${{ matrix.target }}/release/branchwork-server dist/${{ matrix.artifact }}
           chmod +x dist/${{ matrix.artifact }}
           tar -czf ${{ matrix.artifact }}.tar.gz -C dist ${{ matrix.artifact }}
 

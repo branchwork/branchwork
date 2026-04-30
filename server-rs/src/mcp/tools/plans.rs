@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agents::build_cross_plan_context;
 use crate::db as dbmod;
-use crate::mcp::OrchestrAiMcp;
+use crate::mcp::BranchworkMcp;
 use crate::plan_parser;
 
 // ── Request schemas ──────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ pub struct TaskContext {
 // ── Tools ────────────────────────────────────────────────────────────────────
 
 #[tool_router(router = plans_router, vis = "pub")]
-impl OrchestrAiMcp {
+impl BranchworkMcp {
     #[tool(
         description = "List all plans with name, title, project, and task counts \
                        (including how many tasks are already completed or skipped)."
@@ -277,7 +277,7 @@ impl OrchestrAiMcp {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn load_plan(mcp: &OrchestrAiMcp, name: &str) -> Result<plan_parser::ParsedPlan, McpError> {
+fn load_plan(mcp: &BranchworkMcp, name: &str) -> Result<plan_parser::ParsedPlan, McpError> {
     let path = plan_parser::find_plan_file(&mcp.ctx.plans_dir, name)
         .ok_or_else(|| McpError::invalid_params(format!("plan not found: {name}"), None))?;
     plan_parser::parse_plan_file(&path)

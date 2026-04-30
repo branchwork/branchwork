@@ -1,13 +1,13 @@
 variable "name" {
   description = "Resource name prefix"
   type        = string
-  default     = "orchestrai"
+  default     = "branchwork"
 }
 
 variable "image" {
-  description = "Container image (e.g. ghcr.io/cyrilpoder/orchestrai:0.3.0)"
+  description = "Container image (e.g. ghcr.io/branchwork/branchwork:0.3.0)"
   type        = string
-  default     = "ghcr.io/cyrilpoder/orchestrai:0.3.0"
+  default     = "ghcr.io/branchwork/branchwork:0.3.0"
 }
 
 variable "port" {

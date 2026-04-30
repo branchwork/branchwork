@@ -7,22 +7,22 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     environment:
-      POSTGRES_DB: orchestrai
-      POSTGRES_USER: orchestrai
+      POSTGRES_DB: branchwork
+      POSTGRES_USER: branchwork
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U orchestrai"]
+      test: ["CMD-SHELL", "pg_isready -U branchwork"]
       interval: 5s
       timeout: 3s
       retries: 5
     restart: unless-stopped
 
-  orchestrai:
+  branchwork:
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgres://orchestrai:${POSTGRES_PASSWORD:-changeme}@postgres:5432/orchestrai
+      - DATABASE_URL=postgres://branchwork:${POSTGRES_PASSWORD:-changeme}@postgres:5432/branchwork
       - SMTP_HOST=${SMTP_HOST:-}
       - SMTP_PORT=${SMTP_PORT:-587}
       - SMTP_FROM=${SMTP_FROM:-}

@@ -20,7 +20,7 @@ fn seed_agent(
     branch: Option<&str>,
     source_branch: Option<&str>,
 ) {
-    let conn = rusqlite::Connection::open(d.dir.path().join(".claude/orchestrai.db")).unwrap();
+    let conn = rusqlite::Connection::open(d.dir.path().join(".claude/branchwork.db")).unwrap();
     conn.execute(
         "INSERT INTO agents \
             (id, session_id, cwd, status, mode, plan_name, task_id, \
@@ -57,7 +57,7 @@ fn empty_branch_merge_returns_409_not_500() {
     // A branch with no commits ahead of master — the classic "agent
     // exited without committing" failure mode. Before the guard this
     // silently no-opped. Now it should 409.
-    let empty = "orchestrai/mp-a/1.1";
+    let empty = "branchwork/mp-a/1.1";
     d.create_task_branch(empty, /* with_commit */ false);
     seed_agent(
         &d,
@@ -84,7 +84,7 @@ fn merge_with_real_commits_succeeds() {
     let d = TestDashboard::new();
     d.create_plan("mp-b", &minimal_plan("mp-b", &d.project));
 
-    let br = "orchestrai/mp-b/1.1";
+    let br = "branchwork/mp-b/1.1";
     d.create_task_branch(br, /* with_commit */ true);
     seed_agent(&d, "agent-real", "mp-b", "1.1", Some(br), Some("master"));
 
@@ -107,7 +107,7 @@ fn self_referencing_source_branch_does_not_cause_500() {
     let d = TestDashboard::new();
     d.create_plan("mp-c", &minimal_plan("mp-c", &d.project));
 
-    let br = "orchestrai/mp-c/1.1";
+    let br = "branchwork/mp-c/1.1";
     d.create_task_branch(br, /* with_commit */ true);
     // Store source_branch as the same thing as branch — the bug shape.
     seed_agent(&d, "agent-self", "mp-c", "1.1", Some(br), Some(br));
@@ -134,7 +134,7 @@ fn merge_with_nonexistent_source_branch_does_not_500() {
     let d = TestDashboard::new();
     d.create_plan("mp-d", &minimal_plan("mp-d", &d.project));
 
-    let br = "orchestrai/mp-d/1.1";
+    let br = "branchwork/mp-d/1.1";
     d.create_task_branch(br, /* with_commit */ true);
     seed_agent(
         &d,

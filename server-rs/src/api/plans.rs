@@ -1125,7 +1125,7 @@ pub async fn start_task(
     ensure_git_initialized(&work_dir);
 
     // Create a dedicated branch for this task
-    let branch_name = format!("orchestrai/{}/{}", body.plan_name, body.task_number);
+    let branch_name = format!("branchwork/{}/{}", body.plan_name, body.task_number);
 
     let agent_id = pty_agent::start_pty_agent(
         &state.registry,
@@ -1359,7 +1359,7 @@ pub async fn start_phase_tasks(
             cross_ctx.as_deref(),
             mcp_available,
         );
-        let branch_name = format!("orchestrai/{}/{}", plan_name, task.number);
+        let branch_name = format!("branchwork/{}/{}", plan_name, task.number);
 
         let agent_id = pty_agent::start_pty_agent(
             &state.registry,
@@ -2264,7 +2264,7 @@ pub struct StaleBranch {
 
 /// GET /api/plans/:name/branches/stale
 ///
-/// Enumerate all `orchestrai/<plan>/*` refs in the plan's project dir and
+/// Enumerate all `branchwork/<plan>/*` refs in the plan's project dir and
 /// report their state so the user can decide which to delete. Read-only.
 pub async fn list_stale_branches(
     State(state): State<AppState>,
@@ -2279,8 +2279,8 @@ pub async fn list_stale_branches(
     };
 
     // List local branches matching this plan's prefix.
-    let prefix = format!("orchestrai/{name}/");
-    let prefix_fix = format!("orchestrai/fix/{name}/");
+    let prefix = format!("branchwork/{name}/");
+    let prefix_fix = format!("branchwork/fix/{name}/");
     let branches: Vec<(String, String, Option<i64>)> = {
         let out = std::process::Command::new("git")
             .args([
@@ -2420,8 +2420,8 @@ pub async fn purge_stale_branches(
         .copied()
         .unwrap_or("master");
 
-    let prefix = format!("orchestrai/{name}/");
-    let prefix_fix = format!("orchestrai/fix/{name}/");
+    let prefix = format!("branchwork/{name}/");
+    let prefix_fix = format!("branchwork/fix/{name}/");
 
     let mut results = Vec::new();
     for branch in &body.branches {
@@ -2660,7 +2660,7 @@ fn build_check_prompt(
     } else {
         format!("\nAcceptance criteria:\n{}", task.acceptance)
     };
-    let task_branch = format!("orchestrai/{plan_name}/{task_num}", task_num = task.number);
+    let task_branch = format!("branchwork/{plan_name}/{task_num}", task_num = task.number);
     let quoted_files: Vec<String> = task
         .file_paths
         .iter()
@@ -2778,7 +2778,7 @@ mod check_prompt_tests {
             std::path::Path::new("/tmp/proj"),
         );
         assert!(
-            prompt.contains("git log orchestrai/dashboard-polish/1.3"),
+            prompt.contains("git log branchwork/dashboard-polish/1.3"),
             "prompt must reference task branch git log"
         );
         assert!(
@@ -2816,7 +2816,7 @@ mod check_prompt_tests {
             &task,
             std::path::Path::new("/tmp/proj"),
         );
-        assert!(prompt.contains("Run `git log orchestrai/myplan/2.1`"));
+        assert!(prompt.contains("Run `git log branchwork/myplan/2.1`"));
     }
 
     #[test]

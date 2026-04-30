@@ -229,7 +229,7 @@ resource "aws_efs_access_point" "this" {
   }
 
   root_directory {
-    path = "/orchestrai"
+    path = "/branchwork"
     creation_info {
       owner_uid   = 1000
       owner_gid   = 1000
@@ -272,14 +272,14 @@ resource "aws_ecs_task_definition" "this" {
     }]
 
     command = [
-      "orchestrai-server",
+      "branchwork-server",
       "--port", tostring(var.port),
       "--effort", var.effort,
       "--claude-dir", "/data"
     ]
 
     environment = concat(
-      var.webhook_url != "" ? [{ name = "ORCHESTRAI_WEBHOOK_URL", value = var.webhook_url }] : [],
+      var.webhook_url != "" ? [{ name = "BRANCHWORK_WEBHOOK_URL", value = var.webhook_url }] : [],
       []
     )
 

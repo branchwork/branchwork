@@ -38,7 +38,7 @@ impl std::fmt::Display for Effort {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "orchestrai", about = "orchestrAI dashboard server")]
+#[command(name = "branchwork", about = "Branchwork dashboard server")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -57,8 +57,8 @@ pub struct Cli {
 
     /// Webhook URL to notify on agent completion / phase advance.
     /// Accepts Slack incoming webhooks (posts `{"text": "..."}`) or any
-    /// JSON-accepting endpoint. Falls back to `ORCHESTRAI_WEBHOOK_URL` env.
-    #[arg(long, env = "ORCHESTRAI_WEBHOOK_URL")]
+    /// JSON-accepting endpoint. Falls back to `BRANCHWORK_WEBHOOK_URL` env.
+    #[arg(long, env = "BRANCHWORK_WEBHOOK_URL")]
     pub webhook_url: Option<String>,
 }
 
@@ -71,7 +71,7 @@ pub enum Command {
     /// survives the parent's death.
     Session(SessionArgs),
 
-    /// Serve the orchestrAI MCP server over stdio.
+    /// Serve the Branchwork MCP server over stdio.
     ///
     /// For MCP clients (e.g. Claude Code) that spawn the server as a child
     /// process and speak JSON-RPC on stdin/stdout. The same MCP handler is
@@ -102,7 +102,7 @@ impl Config {
             port: cli.port,
             effort: cli.effort,
             plans_dir: claude_dir.join("plans"),
-            db_path: claude_dir.join("orchestrai.db"),
+            db_path: claude_dir.join("branchwork.db"),
             claude_dir,
             webhook_url: cli.webhook_url.filter(|s| !s.trim().is_empty()),
         }

@@ -1,14 +1,14 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "orchestrai.name" -}}
+{{- define "branchwork.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Create a default fully qualified app name.
 */}}
-{{- define "orchestrai.fullname" -}}
+{{- define "branchwork.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -24,16 +24,16 @@ Create a default fully qualified app name.
 {{/*
 Create chart name and version as used by the chart label.
 */}}
-{{- define "orchestrai.chart" -}}
+{{- define "branchwork.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Common labels
 */}}
-{{- define "orchestrai.labels" -}}
-helm.sh/chart: {{ include "orchestrai.chart" . }}
-{{ include "orchestrai.selectorLabels" . }}
+{{- define "branchwork.labels" -}}
+helm.sh/chart: {{ include "branchwork.chart" . }}
+{{ include "branchwork.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -43,17 +43,17 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/*
 Selector labels
 */}}
-{{- define "orchestrai.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "orchestrai.name" . }}
+{{- define "branchwork.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "branchwork.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
 Service account name
 */}}
-{{- define "orchestrai.serviceAccountName" -}}
+{{- define "branchwork.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
-{{- default (include "orchestrai.fullname" .) .Values.serviceAccount.name }}
+{{- default (include "branchwork.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
@@ -62,6 +62,6 @@ Service account name
 {{/*
 Image tag — defaults to appVersion
 */}}
-{{- define "orchestrai.imageTag" -}}
+{{- define "branchwork.imageTag" -}}
 {{- default .Chart.AppVersion .Values.image.tag }}
 {{- end }}

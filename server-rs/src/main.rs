@@ -72,11 +72,11 @@ fn main() {
             let sockets_dir = config.claude_dir.join("sessions");
             std::fs::create_dir_all(&sockets_dir).expect("failed to create sessions directory");
             let server_exe = std::env::current_exe().unwrap_or_else(|e| {
-                eprintln!("[orchestrAI] current_exe() failed: {e} — falling back to argv[0]");
+                eprintln!("[Branchwork] current_exe() failed: {e} — falling back to argv[0]");
                 std::path::PathBuf::from(
                     std::env::args()
                         .next()
-                        .unwrap_or_else(|| "orchestrai-server".into()),
+                        .unwrap_or_else(|| "branchwork-server".into()),
                 )
             });
             let registry = agents::AgentRegistry::new(
@@ -120,11 +120,11 @@ async fn run_server(cli: Cli) {
     // `session` subcommand. Falls back to the clap-provided arg0 if
     // `current_exe()` isn't available for some reason.
     let server_exe = std::env::current_exe().unwrap_or_else(|e| {
-        eprintln!("[orchestrAI] current_exe() failed: {e} — falling back to argv[0]");
+        eprintln!("[Branchwork] current_exe() failed: {e} — falling back to argv[0]");
         std::path::PathBuf::from(
             std::env::args()
                 .next()
-                .unwrap_or_else(|| "orchestrai-server".into()),
+                .unwrap_or_else(|| "branchwork-server".into()),
         )
     });
 
@@ -169,7 +169,7 @@ async fn run_server(cli: Cli) {
                         serde_json::json!({"id": id, "status": "completed", "exit_code": 0}),
                     );
                     println!(
-                        "[orchestrAI] Detached agent {} (pid {}) finished",
+                        "[Branchwork] Detached agent {} (pid {}) finished",
                         &id[..8.min(id.len())],
                         pid
                     );
@@ -406,7 +406,7 @@ async fn run_server(cli: Cli) {
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     println!(
-        "orchestrAI server listening on http://localhost:{} (effort: {}, claude-dir: {})",
+        "Branchwork server listening on http://localhost:{} (effort: {}, claude-dir: {})",
         config.port,
         config.effort,
         config.claude_dir.display()

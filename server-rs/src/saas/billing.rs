@@ -381,7 +381,7 @@ impl SmtpConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(587),
-            from: std::env::var("SMTP_FROM").unwrap_or_else(|_| "orchestrai@localhost".to_string()),
+            from: std::env::var("SMTP_FROM").unwrap_or_else(|_| "branchwork@localhost".to_string()),
             username: std::env::var("SMTP_USERNAME").ok(),
             password: std::env::var("SMTP_PASSWORD").ok(),
         })
@@ -403,9 +403,9 @@ pub fn send_budget_alert_email(
 
     for email in to_emails {
         let subject = if threshold >= 100 {
-            format!("[orchestrAI] Budget exceeded for {org_name}")
+            format!("[Branchwork] Budget exceeded for {org_name}")
         } else {
-            format!("[orchestrAI] {threshold}% budget warning for {org_name}")
+            format!("[Branchwork] {threshold}% budget warning for {org_name}")
         };
         let body = if threshold >= 100 {
             format!(
@@ -414,7 +414,7 @@ pub fn send_budget_alert_email(
                  Budget: ${max_budget:.2}\n\n\
                  New agent spawns are blocked until the budget is increased or \
                  the next billing period begins.\n\n\
-                 — orchestrAI"
+                 — Branchwork"
             )
         } else {
             format!(
@@ -422,7 +422,7 @@ pub fn send_budget_alert_email(
                  Spent: ${spent:.2}\n\
                  Budget: ${max_budget:.2}\n\n\
                  Consider increasing the budget or reviewing agent usage.\n\n\
-                 — orchestrAI"
+                 — Branchwork"
             )
         };
 
@@ -430,7 +430,7 @@ pub fn send_budget_alert_email(
             .from(
                 smtp.from
                     .parse()
-                    .unwrap_or_else(|_| "orchestrai@localhost".parse().unwrap()),
+                    .unwrap_or_else(|_| "branchwork@localhost".parse().unwrap()),
             )
             .to(match email.parse() {
                 Ok(addr) => addr,

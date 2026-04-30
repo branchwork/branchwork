@@ -11,7 +11,7 @@ RUN pnpm install --frozen-lockfile
 # Build
 COPY web/ web/
 COPY tsconfig.base.json ./
-RUN pnpm --filter @orchestrai/web build
+RUN pnpm --filter @branchwork/web build
 
 # ── Stage 2: Build Rust server ───────────────────────────────────────
 FROM rust:1.88-alpine AS server
@@ -25,7 +25,7 @@ COPY server-rs/Cargo.toml server-rs/Cargo.lock ./
 # Create minimal stubs so cargo can resolve the dependency graph
 RUN mkdir -p src/bin src/agents src/api src/auth src/mcp src/saas && \
     echo 'fn main() {}' > src/main.rs && \
-    echo 'fn main() {}' > src/bin/orchestrai_runner.rs && \
+    echo 'fn main() {}' > src/bin/branchwork_runner.rs && \
     echo 'fn main() {}' > src/bin/session_daemon.rs
 
 # Pre-build deps (this layer is cached until Cargo.toml/lock change)
@@ -36,24 +36,24 @@ COPY server-rs/ ./
 COPY --from=web /src/web/dist /src/web/dist
 
 # Touch main.rs to force rebuild of our crate (not deps)
-RUN touch src/main.rs && cargo build --release --bin orchestrai-server
+RUN touch src/main.rs && cargo build --release --bin branchwork-server
 
 # ── Stage 3: Minimal runtime image ──────────────────────────────────
 FROM alpine:3.21 AS runtime
 RUN apk add --no-cache git ca-certificates tini && \
-    addgroup -g 1000 orchestrai && \
-    adduser -u 1000 -G orchestrai -D orchestrai
+    addgroup -g 1000 branchwork && \
+    adduser -u 1000 -G branchwork -D branchwork
 
-COPY --from=server /src/server-rs/target/release/orchestrai-server /usr/local/bin/
+COPY --from=server /src/server-rs/target/release/branchwork-server /usr/local/bin/
 
 # Data directory: plans, DB, sockets
-RUN mkdir -p /data && chown orchestrai:orchestrai /data
+RUN mkdir -p /data && chown branchwork:branchwork /data
 VOLUME ["/data"]
 
-USER orchestrai
+USER branchwork
 EXPOSE 3100
 
-ENV ORCHESTRAI_DATA_DIR=/data
+ENV BRANCHWORK_DATA_DIR=/data
 
 ENTRYPOINT ["tini", "--"]
-CMD ["orchestrai-server", "--port", "3100", "--claude-dir", "/data"]
+CMD ["branchwork-server", "--port", "3100", "--claude-dir", "/data"]

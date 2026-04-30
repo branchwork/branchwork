@@ -31,7 +31,7 @@ pub struct SpawnOpts<'a> {
     /// hard ceiling pass it to the CLI; others ignore it and rely on the
     /// server-side budget enforcement in `pty_agent`.
     pub max_budget_usd: Option<f64>,
-    /// Path to a JSON file that registers the orchestrAI MCP server. When
+    /// Path to a JSON file that registers the Branchwork MCP server. When
     /// set, drivers that [declare MCP injection][AgentDriver::mcp_config_json]
     /// add the appropriate flag (e.g. `--mcp-config <path>`) to their argv.
     /// The caller is responsible for having written the file before spawn.
@@ -163,7 +163,7 @@ pub trait AgentDriver: Send + Sync {
         DriverCapabilities::default()
     }
 
-    /// Content of an `.mcp.json` file that registers the orchestrAI MCP
+    /// Content of an `.mcp.json` file that registers the Branchwork MCP
     /// server with the CLI. `Some` means the driver supports config
     /// injection — the caller writes this string to a file and passes the
     /// path via [`SpawnOpts::mcp_config_path`]. `None` (the default) means
@@ -274,11 +274,11 @@ impl AgentDriver for ClaudeDriver {
         // Claude Code's `.mcp.json` schema: top-level `mcpServers` map,
         // one entry per server. We emit a streamable-HTTP entry pointing
         // at the dashboard's `/mcp` endpoint (same transport the server
-        // already exposes at that path). Server name "orchestrai" maps to
-        // tool names like `mcp__orchestrai__list_plans` on the Claude side.
+        // already exposes at that path). Server name "branchwork" maps to
+        // tool names like `mcp__branchwork__list_plans` on the Claude side.
         let cfg = serde_json::json!({
             "mcpServers": {
-                "orchestrai": {
+                "branchwork": {
                     "type": "http",
                     "url": format!("http://127.0.0.1:{port}/mcp"),
                 }
@@ -346,7 +346,7 @@ impl AgentDriver for ClaudeDriver {
 
         AuthStatus::Unauthenticated {
             help: "Run `claude` in a terminal to complete OAuth sign-in, or set \
-                   `ANTHROPIC_API_KEY` and restart orchestrAI."
+                   `ANTHROPIC_API_KEY` and restart Branchwork."
                 .into(),
         }
     }
@@ -469,7 +469,7 @@ impl AgentDriver for AiderDriver {
         }
         AuthStatus::Unauthenticated {
             help: "Set an API key for your preferred model (`OPENAI_API_KEY`, \
-                   `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, etc.) and restart orchestrAI."
+                   `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, etc.) and restart Branchwork."
                 .into(),
         }
     }
@@ -543,7 +543,7 @@ impl AgentDriver for CodexDriver {
             return AuthStatus::ApiKey;
         }
         AuthStatus::Unauthenticated {
-            help: "Set `OPENAI_API_KEY` and restart orchestrAI, or sign in by \
+            help: "Set `OPENAI_API_KEY` and restart Branchwork, or sign in by \
                    running `codex` once in a terminal."
                 .into(),
         }
@@ -607,7 +607,7 @@ impl AgentDriver for GeminiDriver {
             return AuthStatus::ApiKey;
         }
         AuthStatus::Unauthenticated {
-            help: "Set `GEMINI_API_KEY` or `GOOGLE_API_KEY` and restart orchestrAI.".into(),
+            help: "Set `GEMINI_API_KEY` or `GOOGLE_API_KEY` and restart Branchwork.".into(),
         }
     }
 }
@@ -686,7 +686,7 @@ impl DriverRegistry {
     }
 
     /// Whether the driver resolved from `name` (falling back to the default)
-    /// auto-registers the orchestrAI MCP server with its CLI. Callers use
+    /// auto-registers the Branchwork MCP server with its CLI. Callers use
     /// this to decide whether a spawned agent can reach MCP tools like
     /// `update_task_status`, or whether the prompt needs to fall back to
     /// curl against the HTTP API.
@@ -765,7 +765,7 @@ mod tests {
         let driver = ClaudeDriver::new();
         let raw = driver.mcp_config_json(3100).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let entry = &parsed["mcpServers"]["orchestrai"];
+        let entry = &parsed["mcpServers"]["branchwork"];
         assert_eq!(entry["type"], "http");
         assert_eq!(entry["url"], "http://127.0.0.1:3100/mcp");
     }

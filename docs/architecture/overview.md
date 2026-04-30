@@ -1,19 +1,19 @@
 # Architecture overview
 
-orchestrAI ships as three cooperating binaries:
+Branchwork ships as three cooperating binaries:
 
-- **`orchestrai-server`** — the dashboard. Serves the SPA, the HTTP API
+- **`branchwork-server`** — the dashboard. Serves the SPA, the HTTP API
   (`/api/*`, `/hooks`, `/mcp`), and the WebSockets (`/ws` for dashboard
   events, `/terminal` for xterm.js, `/ws/runner` for remote runners in
-  SaaS mode). Also ships the `orchestrai-server session` subcommand.
+  SaaS mode). Also ships the `branchwork-server session` subcommand.
 - **`session_daemon`** — one per agent. Owns a PTY, forwards bytes over a
   local IPC socket, and survives server restarts. `session_daemon` and
-  `orchestrai-server session` are the same code (see
+  `branchwork-server session` are the same code (see
   [`supervisor.rs`](../../server-rs/src/agents/supervisor.rs)) invoked
   two different ways.
-- **`orchestrai-runner`** — SaaS only. Lives on the customer's machine,
+- **`branchwork-runner`** — SaaS only. Lives on the customer's machine,
   connects outbound to the hosted dashboard over an authenticated
-  WebSocket, and reuses `orchestrai-server session` as its per-agent
+  WebSocket, and reuses `branchwork-server session` as its per-agent
   supervisor.
 
 The diagram below shows both deployment shapes on one canvas so the
@@ -28,8 +28,8 @@ flowchart TB
   subgraph SH["Self-hosted"]
     direction LR
     BrowserA["Browser<br/>dashboard SPA"]
-    ServerA["orchestrai-server<br/>HTTP + WS"]
-    DaemonA["session_daemon<br/>= orchestrai-server session<br/>one per agent"]
+    ServerA["branchwork-server<br/>HTTP + WS"]
+    DaemonA["session_daemon<br/>= branchwork-server session<br/>one per agent"]
     PtyA["PTY<br/>portable_pty"]
     CliA["AI CLI<br/>claude / aider / codex / gemini"]
 
@@ -43,9 +43,9 @@ flowchart TB
   subgraph SAAS["SaaS"]
     direction LR
     BrowserB["Browser<br/>dashboard SPA"]
-    ServerB["orchestrai-server<br/>hosted (multi-tenant)"]
-    RunnerB["orchestrai-runner<br/>customer machine"]
-    DaemonB["session_daemon<br/>= orchestrai-server session"]
+    ServerB["branchwork-server<br/>hosted (multi-tenant)"]
+    RunnerB["branchwork-runner<br/>customer machine"]
+    DaemonB["session_daemon<br/>= branchwork-server session"]
     PtyB["PTY"]
     CliB["AI CLI<br/>claude / aider / codex / gemini"]
 
@@ -59,7 +59,7 @@ flowchart TB
   %% ── Filesystem touchpoints (shared shapes) ─────────────────────────
   Plans[("~/.claude/plans/*.yaml<br/>plan source of truth")]
   Logs[("~/.claude/sessions/agent.sock<br/>+ .log (PTY transcript) + .pid")]
-  Git[("project git worktree<br/>task branches: orchestrai/plan/task<br/>fix branches: orchestrai/fix/...")]
+  Git[("project git worktree<br/>task branches: branchwork/plan/task<br/>fix branches: branchwork/fix/...")]
 
   ServerA -. "notify watcher + CRUD" .-> Plans
   DaemonA -. "appends PTY bytes" .-> Logs
@@ -95,13 +95,13 @@ flowchart TB
   runtime state (agents, task status, cost, outbox) but not the plan
   definition itself.
 - **Task work is a git branch.** Agents run on a dedicated branch
-  (`orchestrai/<plan>/<task>`), and the merge button is gated on the
+  (`branchwork/<plan>/<task>`), and the merge button is gated on the
   branch having commits — nothing is persisted through the dashboard
   alone.
 - **SaaS adds a WebSocket hop, not a new protocol.** The
-  `orchestrai-runner` speaks a JSON
+  `branchwork-runner` speaks a JSON
   [`WireMessage`](../../server-rs/src/saas/runner_protocol.rs) envelope
-  upstream; downstream it reuses `orchestrai-server session` verbatim.
+  upstream; downstream it reuses `branchwork-server session` verbatim.
 
 ## See also
 

@@ -217,7 +217,7 @@ guaranteed by two independent mechanisms:
 Automated coverage: `web/src/stores/plan-store.test.ts` drives the exact
 T0.2 three-step transition in a `node`-environment vitest and asserts
 `doneCount === 3` and `isPlanDone(plan) === false` after the sequence.
-`pnpm --filter @orchestrai/web test` → 1 passed (confirmed during this
+`pnpm --filter @branchwork/web test` → 1 passed (confirmed during this
 task).
 
 **Sandbox caveat**: this task was executed from a headless environment,

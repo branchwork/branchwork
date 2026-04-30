@@ -18,7 +18,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::mcp::OrchestrAiMcp;
+use crate::mcp::BranchworkMcp;
 
 const VALID_STATUSES: &[&str] = &[
     "pending",
@@ -97,7 +97,7 @@ pub struct BlockerReport {
 // ── Tools ────────────────────────────────────────────────────────────────────
 
 #[tool_router(router = status_router, vis = "pub")]
-impl OrchestrAiMcp {
+impl BranchworkMcp {
     #[tool(
         description = "Update a task's status and broadcast the change to the dashboard. \
                        Valid statuses: pending, in_progress, completed, failed, skipped, \

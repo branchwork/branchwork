@@ -80,17 +80,17 @@ pub fn ensure_git_initialized(cwd: &std::path::Path) -> bool {
         .current_dir(cwd)
         .output();
     if !matches!(&init, Ok(o) if o.status.success()) {
-        eprintln!("[orchestrAI] git init failed in {}", cwd.display());
+        eprintln!("[Branchwork] git init failed in {}", cwd.display());
         return false;
     }
 
     // Set a minimal identity if none exists globally — git commit will refuse otherwise
     let _ = std::process::Command::new("git")
-        .args(["config", "user.email", "orchestrai@localhost"])
+        .args(["config", "user.email", "branchwork@localhost"])
         .current_dir(cwd)
         .output();
     let _ = std::process::Command::new("git")
-        .args(["config", "user.name", "orchestrAI"])
+        .args(["config", "user.name", "Branchwork"])
         .current_dir(cwd)
         .output();
 
@@ -104,17 +104,17 @@ pub fn ensure_git_initialized(cwd: &std::path::Path) -> bool {
             "commit",
             "--allow-empty",
             "-m",
-            "Initial commit (orchestrAI)",
+            "Initial commit (Branchwork)",
         ])
         .current_dir(cwd)
         .output();
     match commit {
         Ok(o) if o.status.success() => {
-            println!("[orchestrAI] Initialized git repo in {}", cwd.display());
+            println!("[Branchwork] Initialized git repo in {}", cwd.display());
             true
         }
         _ => {
-            eprintln!("[orchestrAI] initial commit failed in {}", cwd.display());
+            eprintln!("[Branchwork] initial commit failed in {}", cwd.display());
             false
         }
     }
@@ -165,12 +165,12 @@ pub fn git_checkout_branch(cwd: &std::path::Path, branch: &str, is_continue: boo
             .output();
         match status {
             Ok(output) if output.status.success() => {
-                println!("[orchestrAI] Checked out existing branch: {branch}");
+                println!("[Branchwork] Checked out existing branch: {branch}");
                 return true;
             }
             _ => {
                 // Branch doesn't exist yet — fall through to create it
-                println!("[orchestrAI] Branch {branch} not found for continue, creating it");
+                println!("[Branchwork] Branch {branch} not found for continue, creating it");
             }
         }
     }
@@ -182,7 +182,7 @@ pub fn git_checkout_branch(cwd: &std::path::Path, branch: &str, is_continue: boo
         .output();
     match status {
         Ok(output) if output.status.success() => {
-            println!("[orchestrAI] Created and checked out branch: {branch}");
+            println!("[Branchwork] Created and checked out branch: {branch}");
             true
         }
         _ => {
@@ -193,16 +193,16 @@ pub fn git_checkout_branch(cwd: &std::path::Path, branch: &str, is_continue: boo
                 .output();
             match fallback {
                 Ok(output) if output.status.success() => {
-                    println!("[orchestrAI] Checked out existing branch: {branch}");
+                    println!("[Branchwork] Checked out existing branch: {branch}");
                     true
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    eprintln!("[orchestrAI] Failed to checkout branch {branch}: {stderr}");
+                    eprintln!("[Branchwork] Failed to checkout branch {branch}: {stderr}");
                     false
                 }
                 Err(e) => {
-                    eprintln!("[orchestrAI] Failed to run git checkout: {e}");
+                    eprintln!("[Branchwork] Failed to run git checkout: {e}");
                     false
                 }
             }
@@ -225,7 +225,7 @@ pub struct AgentRegistry {
     /// `session` subcommand as a detached daemon.
     pub server_exe: PathBuf,
     /// TCP port the dashboard's HTTP listener (and MCP endpoint) is bound
-    /// to. Used by drivers that auto-register the orchestrAI MCP server
+    /// to. Used by drivers that auto-register the Branchwork MCP server
     /// with the spawned CLI.
     pub port: u16,
     /// Available agent drivers, keyed by name. Built once at startup with
@@ -341,7 +341,7 @@ impl AgentRegistry {
 
             if pty_agent::reattach_agent(self, &id, &socket_path, pid.unwrap_or(0) as u32).await {
                 println!(
-                    "[orchestrAI] Reattached agent {} → socket {}",
+                    "[Branchwork] Reattached agent {} → socket {}",
                     &id[..8.min(id.len())],
                     socket_path.display()
                 );
@@ -425,7 +425,7 @@ impl AgentRegistry {
                 }),
             );
             println!(
-                "[orchestrAI] Reverted stuck 'checking' on {plan_name}/{task_number} — \
+                "[Branchwork] Reverted stuck 'checking' on {plan_name}/{task_number} — \
                  no live check-agent"
             );
         }
@@ -487,7 +487,7 @@ impl AgentRegistry {
                 }),
             );
             println!(
-                "[orchestrAI] Cleared orphaned branch {branch} on agent {} — \
+                "[Branchwork] Cleared orphaned branch {branch} on agent {} — \
                  not in project git",
                 &agent_id[..8.min(agent_id.len())]
             );
@@ -526,7 +526,7 @@ impl AgentRegistry {
             }),
         );
         println!(
-            "[orchestrAI] Agent {} marked unreachable — heartbeat timeout",
+            "[Branchwork] Agent {} marked unreachable — heartbeat timeout",
             &agent_id[..8.min(agent_id.len())]
         );
     }
@@ -559,7 +559,7 @@ impl AgentRegistry {
             }),
         );
         println!(
-            "[orchestrAI] Agent {} marked orphaned — {detail}",
+            "[Branchwork] Agent {} marked orphaned — {detail}",
             &agent_id[..8.min(agent_id.len())]
         );
     }
@@ -905,13 +905,13 @@ pub fn build_task_prompt(
         .map(|c| format!("\n{c}\n"))
         .unwrap_or_default();
 
-    // Drivers that auto-register the orchestrAI MCP server (currently just
+    // Drivers that auto-register the Branchwork MCP server (currently just
     // Claude) get a terser "call the MCP tool" instruction; others fall back
     // to a curl against the HTTP API, which is always live as a backstop.
     let status_step = if mcp_available {
         format!(
             "4. Mark the task status by calling the `update_task_status` MCP tool \
-             (from the `orchestrai` server) with {{\"plan\": \"{plan_name}\", \
+             (from the `branchwork` server) with {{\"plan\": \"{plan_name}\", \
              \"task\": \"{task_num}\", \"status\": \"completed\"}}",
             plan_name = plan.name,
             task_num = task.number,
@@ -1180,7 +1180,7 @@ pub async fn try_auto_advance(
             cross_ctx.as_deref(),
             mcp_available,
         );
-        let branch_name = format!("orchestrai/{}/{}", plan_name, task.number);
+        let branch_name = format!("branchwork/{}/{}", plan_name, task.number);
 
         pty_agent::start_pty_agent(
             &registry,
@@ -1562,8 +1562,8 @@ mod tests {
             db,
             tx,
             None,
-            PathBuf::from("/tmp/orchestrai-test-sockets"),
-            PathBuf::from("/nonexistent/orchestrai-server"),
+            PathBuf::from("/tmp/branchwork-test-sockets"),
+            PathBuf::from("/nonexistent/branchwork-server"),
             3100,
         );
         (registry, rx)
@@ -1685,7 +1685,7 @@ mod tests {
             "pty",
             "running",
             Some(i32::MAX as i64),
-            Some("/tmp/orchestrai-test-sockets/does-not-exist.sock"),
+            Some("/tmp/branchwork-test-sockets/does-not-exist.sock"),
         );
 
         registry.cleanup_and_reattach().await;

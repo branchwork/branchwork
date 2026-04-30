@@ -1,9 +1,9 @@
-# orchestrAI Documentation
+# Branchwork Documentation
 
-orchestrAI ships as three cooperating binaries: the **dashboard server**
-(`orchestrai-server`), a per-session **supervisor daemon** (`orchestrai-server
+Branchwork ships as three cooperating binaries: the **dashboard server**
+(`branchwork-server`), a per-session **supervisor daemon** (`branchwork-server
 session`, also installable as the standalone `session_daemon`), and — in
-SaaS mode only — the **runner** (`orchestrai-runner`) that executes agents
+SaaS mode only — the **runner** (`branchwork-runner`) that executes agents
 on behalf of a remote dashboard. This index links every planned page so you
 can find what you need without reading the source.
 
@@ -43,11 +43,11 @@ The three-binary split, wire protocols, and storage model.
 Flag-level detail, file layouts, schemas.
 
 - [reference/cli.md](reference/cli.md) _(stub)_ — every flag and subcommand
-  across `orchestrai-server`, `orchestrai-server session`, and
-  `orchestrai-runner`.
+  across `branchwork-server`, `branchwork-server session`, and
+  `branchwork-runner`.
 - [reference/configuration.md](reference/configuration.md) _(stub)_ —
   `~/.claude/` layout, environment variables (SMTP, budgets, auth cookie,
-  etc.), `orchestrai.toml`.
+  etc.), `branchwork.toml`.
 - [reference/plan-schema.md](reference/plan-schema.md) _(stub)_ — canonical
   YAML plan schema; supersedes the root `plan.yaml` sample.
 - [reference/drivers.md](reference/drivers.md) _(stub)_ — `AgentDriver`

@@ -137,7 +137,7 @@ export function Sidebar({ view, onViewChange }: Props) {
         title="Back to project dashboard"
       >
         <h1 className="text-lg font-bold tracking-tight">
-          orchestr<span className="text-indigo-400">AI</span>
+          Branch<span className="text-indigo-400">work</span>
         </h1>
         <p className="text-xs text-gray-500 mt-0.5">Claude Code Dashboard</p>
       </button>

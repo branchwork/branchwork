@@ -1,4 +1,4 @@
-//! Transport glue: wraps [`OrchestrAiMcp`] in either a streamable-HTTP
+//! Transport glue: wraps [`BranchworkMcp`] in either a streamable-HTTP
 //! service (mounted on the axum router) or a stdio session (read
 //! line-delimited JSON-RPC from stdin, write to stdout).
 //!
@@ -17,13 +17,13 @@ use rmcp::{
     },
 };
 
-use super::{McpContext, OrchestrAiMcp};
+use super::{McpContext, BranchworkMcp};
 
-pub type McpService = StreamableHttpService<OrchestrAiMcp, LocalSessionManager>;
+pub type McpService = StreamableHttpService<BranchworkMcp, LocalSessionManager>;
 
 pub fn build_http_service(ctx: McpContext) -> McpService {
     StreamableHttpService::new(
-        move || Ok(OrchestrAiMcp::new(ctx.clone())),
+        move || Ok(BranchworkMcp::new(ctx.clone())),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     )
@@ -35,7 +35,7 @@ pub fn build_http_service(ctx: McpContext) -> McpService {
 /// to stderr. Callers are responsible for not writing to stdout
 /// themselves while this future is running.
 pub async fn run_stdio(ctx: McpContext) -> Result<(), Box<dyn std::error::Error>> {
-    let service = OrchestrAiMcp::new(ctx).serve(stdio()).await?;
+    let service = BranchworkMcp::new(ctx).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

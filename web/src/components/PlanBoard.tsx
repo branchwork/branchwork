@@ -548,7 +548,7 @@ interface StaleBranchesButtonProps {
   onDone: () => void;
 }
 
-/// Two-stage button: click it to load the list of `orchestrai/<plan>/*`
+/// Two-stage button: click it to load the list of `branchwork/<plan>/*`
 /// branches, then pick which to purge. Defaults to selecting only the
 /// branches with no unique commits (the "agent exited without committing"
 /// leftovers). Dangerous branches require a force opt-in.
@@ -612,7 +612,7 @@ function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonP
       <button
         onClick={openAndLoad}
         className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-red-600 hover:text-red-400 disabled:opacity-50 text-gray-300 rounded transition"
-        title="List and delete stale orchestrai/* branches"
+        title="List and delete stale branchwork/* branches"
       >
         Clean Branches
       </button>
@@ -631,7 +631,7 @@ function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonP
             {loading ? (
               <div className="text-gray-500 text-xs">Loading...</div>
             ) : branches.length === 0 ? (
-              <div className="text-gray-500 text-xs">No orchestrai/* branches found.</div>
+              <div className="text-gray-500 text-xs">No branchwork/* branches found.</div>
             ) : (
               <>
                 <table className="w-full text-xs">

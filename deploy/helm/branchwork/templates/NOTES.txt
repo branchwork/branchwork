@@ -1,4 +1,4 @@
-orchestrAI has been deployed!
+Branchwork has been deployed!
 
 {{- if .Values.ingress.enabled }}
 Access the dashboard at:
@@ -7,10 +7,10 @@ Access the dashboard at:
 {{- end }}
 {{- else if eq .Values.service.type "LoadBalancer" }}
 Get the external IP:
-  kubectl get svc {{ include "orchestrai.fullname" . }} -n {{ .Release.Namespace }}
+  kubectl get svc {{ include "branchwork.fullname" . }} -n {{ .Release.Namespace }}
 {{- else }}
 Port-forward to access the dashboard:
-  kubectl port-forward svc/{{ include "orchestrai.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+  kubectl port-forward svc/{{ include "branchwork.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }} -n {{ .Release.Namespace }}
   open http://localhost:{{ .Values.service.port }}
 {{- end }}
 

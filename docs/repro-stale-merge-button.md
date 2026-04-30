@@ -29,7 +29,7 @@ at the same SHA as its source." Any finished investigation/repro task
 whose agent didn't commit lands in this state. In the current dev DB,
 the agent for
 `fix-plan-done-in-progress` task `1.2` happens to be in that shape —
-branch `orchestrai/fix-plan-done-in-progress/1.2` points at the same
+branch `branchwork/fix-plan-done-in-progress/1.2` points at the same
 commit as `master`, and the agent row is `status=completed` with a
 `branch` set. That's sufficient to trigger both the banner (frontend)
 and the guard (backend) without spinning up a brand-new agent.
@@ -43,10 +43,10 @@ curl -s http://localhost:3100/api/agents | \
     a=[x for x in json.load(sys.stdin) \
        if x['id']=='06c8ffa1-662e-4f6e-8ee7-43f919b119ef'][0]; \
     print(a['status'], a['branch'], a['source_branch'])"
-# → completed orchestrai/fix-plan-done-in-progress/1.2 master
+# → completed branchwork/fix-plan-done-in-progress/1.2 master
 
 # Confirm branch has no commits ahead of source
-git rev-list --count master..orchestrai/fix-plan-done-in-progress/1.2
+git rev-list --count master..branchwork/fix-plan-done-in-progress/1.2
 # → 0
 ```
 
@@ -56,7 +56,7 @@ Open the Plan Board for plan `fix-plan-done-in-progress`, phase 1,
 task 1.2. The indigo merge/discard banner renders:
 
 ```
-⁋ orchestrai/fix-plan-done-in-progress/1.2
+⁋ branchwork/fix-plan-done-in-progress/1.2
   → master                          [Discard] [Merge]
 ```
 
@@ -77,7 +77,7 @@ HTTP/1.1 409 Conflict
 content-type: application/json
 content-length: 144
 
-{"branch":"orchestrai/fix-plan-done-in-progress/1.2",
+{"branch":"branchwork/fix-plan-done-in-progress/1.2",
  "error":"task branch has no commits — agent exited without committing",
  "target":"master"}
 ```

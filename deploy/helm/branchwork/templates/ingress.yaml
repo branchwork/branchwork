@@ -2,9 +2,9 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "orchestrai.fullname" . }}
+  name: {{ include "branchwork.fullname" . }}
   labels:
-    {{- include "orchestrai.labels" . | nindent 4 }}
+    {{- include "branchwork.labels" . | nindent 4 }}
   {{- with .Values.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -33,7 +33,7 @@ spec:
             pathType: {{ .pathType }}
             backend:
               service:
-                name: {{ include "orchestrai.fullname" $ }}
+                name: {{ include "branchwork.fullname" $ }}
                 port:
                   name: http
           {{- end }}

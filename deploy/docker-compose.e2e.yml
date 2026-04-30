@@ -1,22 +1,22 @@
-# E2E test environment for orchestrAI.
+# E2E test environment for Branchwork.
 # Used by the e2e test suite and CI — not for production.
 #
 #   docker compose -f deploy/docker-compose.e2e.yml up -d
 #   docker compose -f deploy/docker-compose.e2e.yml down -v
 
-name: orchestrai-e2e
+name: branchwork-e2e
 
 services:
-  orchestrai:
+  branchwork:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     ports:
       - "${E2E_PORT:-3199}:3100"
     volumes:
-      - orchestrai-e2e-data:/data
+      - branchwork-e2e-data:/data
     environment:
-      - ORCHESTRAI_DATA_DIR=/data
+      - BRANCHWORK_DATA_DIR=/data
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3100/health"]
       interval: 5s
@@ -25,4 +25,4 @@ services:
       start_period: 10s
 
 volumes:
-  orchestrai-e2e-data:
+  branchwork-e2e-data:

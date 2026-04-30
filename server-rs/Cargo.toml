@@ -1,5 +1,5 @@
 [package]
-name = "orchestrai-server"
+name = "branchwork-server"
 version = "0.3.0"
 edition = "2024"
 
@@ -39,8 +39,8 @@ flate2 = "1"
 sha2 = "0.10"
 
 [[bin]]
-name = "orchestrai-runner"
-path = "src/bin/orchestrai_runner.rs"
+name = "branchwork-runner"
+path = "src/bin/branchwork_runner.rs"
 
 [dev-dependencies]
 tempfile = "3"

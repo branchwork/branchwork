@@ -10,7 +10,7 @@ use crate::db::Db;
 pub const SESSION_TTL: Duration = Duration::days(7);
 
 /// Cookie name used on the HTTP boundary.
-pub const COOKIE_NAME: &str = "orchestrai_session";
+pub const COOKIE_NAME: &str = "branchwork_session";
 
 /// Server-side session record. The raw `token` is the opaque cookie value; we
 /// store it hashed-equivalent only because SQLite lookups on the primary key
@@ -109,7 +109,7 @@ pub fn token_from_cookie_header(header: &str) -> Option<String> {
 
 /// Render the `Set-Cookie` value for a newly issued token. HttpOnly + SameSite=Lax
 /// so the cookie survives a browser refresh but is not exposed to JS and isn't
-/// sent on cross-site POSTs. Not marked Secure — orchestrAI is typically run on
+/// sent on cross-site POSTs. Not marked Secure — Branchwork is typically run on
 /// `http://localhost` and a Secure cookie would never stick.
 pub fn set_cookie_value(token: &str) -> String {
     let max_age = SESSION_TTL.num_seconds();

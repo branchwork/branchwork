@@ -9,7 +9,7 @@ mod support;
 use serde_json::json;
 use support::TestDashboard;
 
-/// Plan YAML matching the orchestrAI YamlPlan schema.
+/// Plan YAML matching the Branchwork YamlPlan schema.
 ///
 /// `project` is the absolute path to the scratch repo. We use an
 /// absolute path here instead of a relative-to-HOME one because on
@@ -67,11 +67,11 @@ fn list_stale_branches_distinguishes_empty_from_populated() {
     // An empty branch (no commits ahead of master) — classic "agent exited
     // without committing" leftover.
     d.create_task_branch(
-        &format!("orchestrai/{plan}/1.1"),
+        &format!("branchwork/{plan}/1.1"),
         /* with_commit */ false,
     );
     // A branch with real work.
-    d.create_task_branch(&format!("orchestrai/{plan}/1.2"), true);
+    d.create_task_branch(&format!("branchwork/{plan}/1.2"), true);
 
     let (s, body) = d.get(&format!("/api/plans/{plan}/branches/stale"));
     assert_eq!(s, 200, "{body:?}");
@@ -98,8 +98,8 @@ fn purge_refuses_unique_commits_without_force_then_accepts() {
     let d = TestDashboard::new();
     let plan = d.create_plan("plan-c", &minimal_plan("plan-c", &d.project));
 
-    let empty_br = format!("orchestrai/{plan}/1.1");
-    let full_br = format!("orchestrai/{plan}/1.2");
+    let empty_br = format!("branchwork/{plan}/1.1");
+    let full_br = format!("branchwork/{plan}/1.2");
     d.create_task_branch(&empty_br, false);
     d.create_task_branch(&full_br, true);
 
@@ -171,7 +171,7 @@ fn dismiss_ci_run_hides_it_from_latest() {
     // merge endpoint to force a ci_runs row. But no remote exists so the
     // push fails. The simplest honest option: open the DB file from the
     // test.
-    let db_path = d.dir.path().join(".claude/orchestrai.db");
+    let db_path = d.dir.path().join(".claude/branchwork.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute(
         "INSERT INTO ci_runs (plan_name, task_number, status, commit_sha, updated_at) \
@@ -215,7 +215,7 @@ fn failure_log_serves_cached_text_and_404s_when_missing() {
     let d = TestDashboard::new();
     let plan = d.create_plan("plan-f", &minimal_plan("plan-f", &d.project));
 
-    let db_path = d.dir.path().join(".claude/orchestrai.db");
+    let db_path = d.dir.path().join(".claude/branchwork.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute(
         "INSERT INTO ci_runs (plan_name, task_number, status, commit_sha, run_id, failure_log) \
@@ -254,7 +254,7 @@ fn failure_log_serves_cached_text_and_404s_when_missing() {
 /// End-to-end for POST /api/actions/fix-ci. Verifies the validation branches
 /// (bad run id, non-failure run, missing SHA) and — for a valid failing run
 /// with a cached failure log and a real commit SHA in the scratch repo —
-/// that the endpoint creates the `orchestrai/fix/<plan>/<task>/<run_id>`
+/// that the endpoint creates the `branchwork/fix/<plan>/<task>/<run_id>`
 /// branch at the failing commit and records an agents row pointing at it.
 ///
 /// Side-steps needing `claude` on PATH: the endpoint spawns a session daemon
@@ -279,7 +279,7 @@ fn fix_ci_validates_run_state_and_creates_recovery_branch() {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
 
-    let db_path = d.dir.path().join(".claude/orchestrai.db");
+    let db_path = d.dir.path().join(".claude/branchwork.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     // Row 1: real failure with SHA + cached log — the happy path.
     conn.execute(
@@ -348,7 +348,7 @@ fn fix_ci_validates_run_state_and_creates_recovery_branch() {
         json!({"planName": plan, "taskNumber": "1.1", "ciRunId": good_id}),
     );
     assert_eq!(s, 200, "{body:?}");
-    let expected_branch = format!("orchestrai/fix/{plan}/1.1/{good_id}");
+    let expected_branch = format!("branchwork/fix/{plan}/1.1/{good_id}");
     assert_eq!(body["branch"], expected_branch);
     assert_eq!(body["ciRunId"], good_id);
     let agent_id = body["agentId"].as_str().expect("agentId in response");

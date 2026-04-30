@@ -158,8 +158,8 @@ fresh instead of returning `"existing (kept)"`.
 ```json
 {
     "plan": "scheduler",
-    "project": "orchestrAI",
-    "projectDir": "/home/cpo/orchestrAI",
+    "project": "Branchwork",
+    "projectDir": "/home/cpo/Branchwork",
     "results": [
         {"taskNumber": "1.1", "status": "completed", "reason": "2/2 files exist",
          "title": "Conflict check in `start_task`"},

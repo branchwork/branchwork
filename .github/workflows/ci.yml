@@ -62,7 +62,7 @@ jobs:
 
       # Runs unit tests AND integration tests under `tests/` — notably the
       # e2e suite (`tests/recovery.rs`, `tests/merge_guard.rs`) which spawns
-      # the real `orchestrai-server` binary against a scratch git repo and
+      # the real `branchwork-server` binary against a scratch git repo and
       # drives it over HTTP. These would have caught every shipped bug in
       # the dashboard-polish cycle.
       - name: cargo test (unit + e2e)
@@ -100,4 +100,4 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build
-        run: pnpm --filter @orchestrai/web build
+        run: pnpm --filter @branchwork/web build

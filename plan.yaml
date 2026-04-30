@@ -1,4 +1,4 @@
-# orchestrAI Plan Schema Reference
+# Branchwork Plan Schema Reference
 #
 # Plans can be written in YAML (.yaml/.yml) or Markdown (.md).
 # YAML is the preferred format for new plans. Both produce identical

@@ -1,7 +1,7 @@
-//! Tool implementations for the orchestrAI MCP server.
+//! Tool implementations for the Branchwork MCP server.
 //!
 //! Each submodule defines a `#[tool_router]` impl block on
-//! [`super::OrchestrAiMcp`] with a named router; `OrchestrAiMcp::new` combines
+//! [`super::BranchworkMcp`] with a named router; `BranchworkMcp::new` combines
 //! them.
 
 pub mod plans;

@@ -952,7 +952,7 @@ Just patch the file at `src/lib.rs` and move on.
     #[test]
     fn rust_rewrite_plan_structure() {
         let plan_path = match dirs::home_dir() {
-            Some(h) => h.join(".claude/plans/orchestrai-rust-rewrite.md"),
+            Some(h) => h.join(".claude/plans/branchwork-rust-rewrite.md"),
             None => return,
         };
         if !plan_path.exists() {
@@ -960,7 +960,7 @@ Just patch the file at `src/lib.rs` and move on.
         }
 
         let plan = parse_plan_file(&plan_path).unwrap();
-        assert_eq!(plan.title, "orchestrAI: Rust Server Rewrite");
+        assert_eq!(plan.title, "Branchwork: Rust Server Rewrite");
         assert_eq!(plan.phases.len(), 11);
 
         // Phase 0: 3 tasks
@@ -989,7 +989,7 @@ Just patch the file at `src/lib.rs` and move on.
         // Expected project assignments from the TypeScript server.
         // Plans with DB overrides are excluded — inference alone may differ.
         let expected: &[(&str, Option<&str>)] = &[
-            ("orchestrai-rust-rewrite", Some("orchestrAI")),
+            ("branchwork-rust-rewrite", Some("Branchwork")),
             ("warm-waddling-catmull", None),
             ("witty-wishing-nygaard", None),
         ];

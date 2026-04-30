@@ -113,7 +113,7 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     // If the driver supports MCP config injection, materialise the config
     // file alongside the agent's socket so `--mcp-config` can point at it.
     // Failure to write is non-fatal: the agent still runs, just without
-    // orchestrAI tool access. Log and continue.
+    // Branchwork tool access. Log and continue.
     let mcp_config_path = driver.mcp_config_json(registry.port).and_then(|json| {
         let path = registry.mcp_config_for(&id);
         match std::fs::write(&path, &json) {
@@ -614,7 +614,7 @@ async fn kill_plan_agents(registry: &AgentRegistry, plan_name: &str) {
             }),
         );
         println!(
-            "[orchestrAI] Killed agent {} -- plan '{}' exceeded budget",
+            "[Branchwork] Killed agent {} -- plan '{}' exceeded budget",
             &id[..8.min(id.len())],
             plan_name
         );
@@ -720,7 +720,7 @@ mod tests {
             tx,
             None,
             sockets_dir,
-            PathBuf::from("/nonexistent/orchestrai-server"),
+            PathBuf::from("/nonexistent/branchwork-server"),
             3100,
         );
         (registry, rx)

@@ -84,7 +84,7 @@ export function LoginPage() {
     }
   }
 
-  const title = mode === "login" ? "Sign in to orchestrAI" : "Create an orchestrAI account";
+  const title = mode === "login" ? "Sign in to Branchwork" : "Create an Branchwork account";
   const submitLabel = mode === "login" ? "Sign in" : "Sign up";
   const toggleLabel =
     mode === "login" ? "Need an account? Sign up" : "Already have an account? Sign in";

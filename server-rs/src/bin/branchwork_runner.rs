@@ -1,6 +1,6 @@
 //! Standalone agent runner binary.
 //!
-//! Runs on the customer's machine or CI, connects to the orchestrAI SaaS
+//! Runs on the customer's machine or CI, connects to the Branchwork SaaS
 //! dashboard via authenticated WebSocket, and executes agents locally.
 //! Events are reliably delivered via a local SQLite outbox; dropped
 //! connections trigger replay on reconnect.
@@ -8,17 +8,17 @@
 //! ## Usage
 //!
 //! ```bash
-//! orchestrai-runner \
-//!   --saas-url wss://app.orchestrai.dev \
+//! branchwork-runner \
+//!   --saas-url wss://app.branchwork.dev \
 //!   --token <api-token> \
 //!   --cwd /path/to/project
 //! ```
 //!
-//! The runner reuses `orchestrai-server session` as the per-agent supervisor
+//! The runner reuses `branchwork-server session` as the per-agent supervisor
 //! daemon — the server binary must be on `$PATH` or specified via `--server-bin`.
 
 // Pull in self-contained modules via #[path] so this binary compiles
-// independently of the main orchestrai-server crate.
+// independently of the main branchwork-server crate.
 #[path = "../saas/outbox.rs"]
 mod outbox;
 #[path = "../saas/runner_protocol.rs"]
@@ -41,16 +41,16 @@ use runner_protocol::{DriverAuthInfo, DriverAuthStatus, Envelope, WireMessage};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "orchestrai-runner",
-    about = "orchestrAI remote agent runner — connects to the SaaS dashboard and executes agents locally"
+    name = "branchwork-runner",
+    about = "Branchwork remote agent runner — connects to the SaaS dashboard and executes agents locally"
 )]
 struct Cli {
-    /// SaaS dashboard URL (e.g. wss://app.orchestrai.dev or ws://localhost:3100).
-    #[arg(long, env = "ORCHESTRAI_SAAS_URL")]
+    /// SaaS dashboard URL (e.g. wss://app.branchwork.dev or ws://localhost:3100).
+    #[arg(long, env = "BRANCHWORK_SAAS_URL")]
     saas_url: String,
 
     /// API token for authentication (from the dashboard's runner management).
-    #[arg(long, env = "ORCHESTRAI_RUNNER_TOKEN")]
+    #[arg(long, env = "BRANCHWORK_RUNNER_TOKEN")]
     token: String,
 
     /// Working directory for agents. Defaults to the current directory.
@@ -58,15 +58,15 @@ struct Cli {
     cwd: PathBuf,
 
     /// Stable runner ID. Auto-generated and persisted if not specified.
-    #[arg(long, env = "ORCHESTRAI_RUNNER_ID")]
+    #[arg(long, env = "BRANCHWORK_RUNNER_ID")]
     runner_id: Option<String>,
 
     /// Path to the local SQLite database for the outbox.
-    /// Defaults to `~/.orchestrai-runner/runner.db`.
+    /// Defaults to `~/.branchwork-runner/runner.db`.
     #[arg(long)]
     db_path: Option<PathBuf>,
 
-    /// Path to the `orchestrai-server` binary (needed for spawning session
+    /// Path to the `branchwork-server` binary (needed for spawning session
     /// daemons). Defaults to finding it on `$PATH`.
     #[arg(long)]
     server_bin: Option<PathBuf>,
@@ -116,7 +116,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = cli.db_path.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".orchestrai-runner")
+            .join(".branchwork-runner")
             .join("runner.db")
     });
     if let Some(parent) = db_path.parent() {
@@ -124,7 +124,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let server_bin = cli.server_bin.unwrap_or_else(|| {
-        which("orchestrai-server").unwrap_or_else(|| PathBuf::from("orchestrai-server"))
+        which("branchwork-server").unwrap_or_else(|| PathBuf::from("branchwork-server"))
     });
 
     // Init local DB.
@@ -507,12 +507,12 @@ async fn spawn_agent(
     _max_budget_usd: Option<f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Build socket path.
-    let sockets_dir = state.cwd.join(".orchestrai-runner-sessions");
+    let sockets_dir = state.cwd.join(".branchwork-runner-sessions");
     std::fs::create_dir_all(&sockets_dir)?;
     let socket_path = sockets_dir.join(format!("{agent_id}.sock"));
 
     // Build the command to spawn. The session daemon expects:
-    // orchestrai-server session --socket <path> --cwd <dir> [--cols C --rows R] -- <cmd...>
+    // branchwork-server session --socket <path> --cwd <dir> [--cols C --rows R] -- <cmd...>
     let binary = match driver {
         "claude" => "claude",
         "aider" => "aider",

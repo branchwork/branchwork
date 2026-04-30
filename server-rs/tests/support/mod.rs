@@ -1,11 +1,11 @@
-//! End-to-end test support: spawn the real `orchestrai-server` binary
+//! End-to-end test support: spawn the real `branchwork-server` binary
 //! against a scratch git repo and drive it over HTTP.
 //!
 //! Design:
 //! - Each test gets its own `tempdir` with `.claude/` (plans + db),
 //!   `project/` (git repo), and a random port.
 //! - The server binary is built in release mode by `cargo build` before
-//!   `cargo test`, then located via `CARGO_BIN_EXE_orchestrai-server`.
+//!   `cargo test`, then located via `CARGO_BIN_EXE_branchwork-server`.
 //! - `TestDashboard::new()` spawns the server, polls `/api/health` until
 //!   ready, and returns a handle with `post`, `get`, `delete` helpers.
 //! - `Drop` kills the server. The tempdir auto-cleans.
@@ -45,16 +45,16 @@ impl TestDashboard {
         run("git", &["init", "-q", "-b", "master"], &project);
         run(
             "git",
-            &["config", "user.email", "test@orchestrai.local"],
+            &["config", "user.email", "test@branchwork.local"],
             &project,
         );
-        run("git", &["config", "user.name", "orchestrAI Test"], &project);
+        run("git", &["config", "user.name", "Branchwork Test"], &project);
         std::fs::write(project.join("README.md"), "test project").unwrap();
         run("git", &["add", "README.md"], &project);
         run("git", &["commit", "-q", "-m", "initial"], &project);
 
         let port = free_port();
-        let bin = env!("CARGO_BIN_EXE_orchestrai-server");
+        let bin = env!("CARGO_BIN_EXE_branchwork-server");
         let child = Command::new(bin)
             .args([
                 "--port",
@@ -82,7 +82,7 @@ impl TestDashboard {
                 Stdio::null()
             })
             .spawn()
-            .expect("spawn orchestrai-server");
+            .expect("spawn branchwork-server");
 
         let base_url = format!("http://127.0.0.1:{port}");
         wait_healthy(&base_url);

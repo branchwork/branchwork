@@ -1,9 +1,9 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "orchestrai.fullname" . }}
+  name: {{ include "branchwork.fullname" . }}
   labels:
-    {{- include "orchestrai.labels" . | nindent 4 }}
+    {{- include "branchwork.labels" . | nindent 4 }}
 spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
@@ -14,7 +14,7 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      {{- include "orchestrai.selectorLabels" . | nindent 6 }}
+      {{- include "branchwork.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       annotations:
@@ -23,20 +23,20 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
-        {{- include "orchestrai.selectorLabels" . | nindent 8 }}
+        {{- include "branchwork.selectorLabels" . | nindent 8 }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "orchestrai.serviceAccountName" . }}
+      serviceAccountName: {{ include "branchwork.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ include "orchestrai.imageTag" . }}"
+          image: "{{ .Values.image.repository }}:{{ include "branchwork.imageTag" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--port"
@@ -63,7 +63,7 @@ spec:
             periodSeconds: 5
           env:
             {{- if .Values.config.webhookUrl }}
-            - name: ORCHESTRAI_WEBHOOK_URL
+            - name: BRANCHWORK_WEBHOOK_URL
               value: {{ .Values.config.webhookUrl | quote }}
             {{- end }}
             {{- if eq .Values.database.mode "postgres" }}
@@ -119,7 +119,7 @@ spec:
         - name: data
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ default (include "orchestrai.fullname" .) .Values.persistence.existingClaim }}
+            claimName: {{ default (include "branchwork.fullname" .) .Values.persistence.existingClaim }}
           {{- else }}
           emptyDir: {}
           {{- end }}
