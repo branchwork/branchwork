@@ -17,7 +17,7 @@ use rmcp::{
     },
 };
 
-use super::{McpContext, BranchworkMcp};
+use super::{BranchworkMcp, McpContext};
 
 pub type McpService = StreamableHttpService<BranchworkMcp, LocalSessionManager>;
 
