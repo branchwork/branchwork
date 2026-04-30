@@ -144,11 +144,7 @@ mod tests {
     fn some_files_present_is_in_progress() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.rs"), "").unwrap();
-        let (status, _) = infer_status(
-            dir.path(),
-            &["a.rs".into(), "missing.rs".into()],
-            &[],
-        );
+        let (status, _) = infer_status(dir.path(), &["a.rs".into(), "missing.rs".into()], &[]);
         assert_eq!(status, "in_progress");
     }
 
