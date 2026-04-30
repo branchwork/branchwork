@@ -347,3 +347,73 @@ will:
   ones (Task 2.2).
 - Provide a cleanup path for legacy bulk-inferred `completed` rows
   (Task 2.3).
+
+## Task 1.2 — Confirm `done_count` computation in `list_plans` API
+
+The read path that turns DB rows into the navbar's Done/Active split is
+covered end-to-end by three short pieces of code. None of them are
+buggy; both the false-positive and false-negative flows ride the same
+correct pipeline, so the only thing that decides which side a plan
+lands on is what `auto_status::infer_status` (Task 1.1) wrote into
+`task_status` for it.
+
+**1. `task_count` — comes straight from the YAML.**
+`server-rs/src/api/plans.rs:139` sets `task_count: s.task_count` from
+the `PlanSummary` returned by `plan_parser::list_plans`, which counts
+tasks across phases at parse time.
+
+**2. `done_count` — YAML × DB join.**
+`api/plans.rs:99-128` re-parses the plan file, loads every
+`task_status` row for that plan into a `HashMap<task_number, status>`,
+and counts tasks whose looked-up status is `"completed"` or
+`"skipped"`. Tasks with no DB row default to `"pending"` and are
+excluded. The two terminal statuses are explicit on line 124:
+
+```rust
+.filter(|t| {
+    let status = status_map
+        .get(&t.number)
+        .map(|s| s.as_str())
+        .unwrap_or("pending");
+    status == "completed" || status == "skipped"
+})
+.count()
+```
+
+**3. `isPlanDone` — pure arithmetic.**
+`web/src/components/Sidebar.tsx:19-21` is the entire predicate:
+
+```ts
+function isPlanDone(p: PlanSummary): boolean {
+  return p.taskCount > 0 && p.doneCount >= p.taskCount;
+}
+```
+
+The `> 0` guard is the only embellishment — empty plans never count as
+done. There is no second predicate, no cross-plan rollup, no inspection
+of `PlanTask.status`; the same function decides the fold for every
+plan in the navbar (`Sidebar.tsx:80`) and the project dashboard
+(`ProjectDashboard.tsx:17-19` is byte-identical).
+
+### Why both bug directions trace back to `auto_status`
+
+| Symptom | DB state | Read path output |
+|---|---|---|
+| False positive (e.g. `scheduler` plan flipped to Done) | All 7 tasks have `task_status.status = "completed"`, written by `infer_status` ≥0.8 branch | `done_count = 7`, `task_count = 7`, `7 >= 7` → Done fold |
+| False negative (real-completed plan stays in Active) | One or more tasks lack `completed`/`skipped` rows, or hold `in_progress` / `failed` | `done_count < task_count` → Active fold |
+
+The sidebar arithmetic is symmetric: it cannot distinguish a heuristic
+"completed" from a manual one, and it cannot distinguish a missing row
+from an in-progress one. Whatever `task_status` says, it shows.
+
+### Acceptance criteria for Task 1.2
+
+> Confirmed that the sidebar logic is correct; the bug is in the DB
+> data produced by `auto_status`.
+
+✅ Confirmed. `task_count` reflects the YAML, `done_count` reflects the
+DB, and `isPlanDone` is a single `doneCount >= taskCount` comparison.
+The fix surface for Phase 2 is upstream of all three: the value
+`auto_status::infer_status` writes at `auto_status.rs:113`, and the
+write-once gate at `api/plans.rs:775` that prevents corrected runs
+from overwriting bad rows.
