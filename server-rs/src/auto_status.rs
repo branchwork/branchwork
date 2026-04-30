@@ -80,17 +80,14 @@ pub fn check_git_for_task(project_dir: &Path, keywords: &[&str]) -> usize {
 
 /// Determine task status based on file existence.
 ///
-/// Git history matching by task title is unreliable (common keywords like
-/// "server", "driver", "agent" match too many existing commits and produce
-/// false positives). We use it only as a weak tie-breaker: a single-word grep
-/// is never enough to mark anything as done.
+/// File existence is evidence the task may have started (or that the listed
+/// files pre-existed) — never evidence it finished. Only explicit agent or
+/// user action sets "completed", so this function caps inferred status at
+/// "in_progress".
 ///
 /// Policy:
-/// - No file paths listed for the task → status is "pending". We can't infer
-///   progress from keywords alone.
-/// - All referenced files missing → "pending" regardless of git hits.
-/// - ≥80% of files exist → "completed".
-/// - Some files exist → "in_progress".
+/// - No file paths listed → "pending". No anchor to check against.
+/// - At least one file exists → "in_progress".
 /// - No files exist → "pending".
 pub fn infer_status(
     project_dir: &Path,
@@ -100,7 +97,6 @@ pub fn infer_status(
     let total_checked = file_paths.len();
 
     if total_checked == 0 {
-        // No anchor to verify against — don't guess.
         return ("pending", "no file paths to check".into());
     }
 
@@ -109,18 +105,91 @@ pub fn infer_status(
         .filter(|fp| find_file_in_project(project_dir, fp))
         .count();
 
-    let ratio = found_count as f64 / total_checked as f64;
-    if ratio >= 0.8 {
-        (
-            "completed",
-            format!("{found_count}/{total_checked} files exist"),
-        )
-    } else if found_count > 0 {
+    if found_count > 0 {
         (
             "in_progress",
             format!("{found_count}/{total_checked} files exist"),
         )
     } else {
         ("pending", format!("0/{total_checked} files exist"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn no_file_paths_is_pending() {
+        let dir = tempdir().unwrap();
+        let (status, reason) = infer_status(dir.path(), &[], &[]);
+        assert_eq!(status, "pending");
+        assert_eq!(reason, "no file paths to check");
+    }
+
+    #[test]
+    fn missing_files_is_pending() {
+        let dir = tempdir().unwrap();
+        let (status, _) = infer_status(
+            dir.path(),
+            &["does/not/exist.rs".into(), "also/missing.ts".into()],
+            &[],
+        );
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn some_files_present_is_in_progress() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "").unwrap();
+        let (status, _) = infer_status(
+            dir.path(),
+            &["a.rs".into(), "missing.rs".into()],
+            &[],
+        );
+        assert_eq!(status, "in_progress");
+    }
+
+    #[test]
+    fn all_files_present_is_in_progress_not_completed() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "").unwrap();
+        fs::write(dir.path().join("b.rs"), "").unwrap();
+        let (status, _) = infer_status(dir.path(), &["a.rs".into(), "b.rs".into()], &[]);
+        assert_eq!(status, "in_progress");
+    }
+
+    /// Acceptance criterion for Task 2.1: `infer_status` must never return
+    /// `"completed"`. Sweep the cases that previously triggered the ≥80%
+    /// branch (1/1, 2/2, 4/4, 4/5) and confirm none of them flip to done.
+    #[test]
+    fn infer_status_never_returns_completed() {
+        let dir = tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            fs::write(dir.path().join(name), "").unwrap();
+        }
+
+        let cases: &[Vec<String>] = &[
+            vec!["a.rs".into()],
+            vec!["a.rs".into(), "b.rs".into()],
+            vec!["a.rs".into(), "b.rs".into(), "c.rs".into(), "d.rs".into()],
+            vec![
+                "a.rs".into(),
+                "b.rs".into(),
+                "c.rs".into(),
+                "d.rs".into(),
+                "missing.rs".into(),
+            ],
+        ];
+
+        for files in cases {
+            let (status, _) = infer_status(dir.path(), files, &[]);
+            assert_ne!(
+                status, "completed",
+                "infer_status returned completed for {files:?}"
+            );
+        }
     }
 }
