@@ -419,6 +419,59 @@ fn migrate(conn: &Connection) {
 
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
+
+    // Clean up legacy bulk auto-inferred "completed" rows. Naturally
+    // idempotent: post-Task-2.2, no new row can satisfy the predicate.
+    cleanup_stale_auto_completed(conn);
+}
+
+/// Delete `task_status` rows for plans whose entire row set is legacy
+/// auto-inferred completions (`status='completed'` AND `source IS NULL`)
+/// AND no agent has ever been spawned for the plan. These are the bulk
+/// false positives produced by the pre-Task-2.1 `infer_status` heuristic
+/// (≥80% file existence ⇒ completed) and never corrected by a real agent
+/// or user action.
+///
+/// Safety: rows with `source='manual'` (explicit user/agent updates) and
+/// rows for plans with any agent activity are left untouched. After the
+/// rows are deleted, `done_count` collapses to 0 and the plan reverts to
+/// the active section of the navbar; the user can re-run auto-status to
+/// re-derive `pending` / `in_progress` (capped per Task 2.1).
+///
+/// Plans with agents but a stuck completed status (e.g. portable-agents-
+/// and-mcp) are out of scope here — the user resets them explicitly via
+/// `POST /api/plans/:name/reset-status`.
+fn cleanup_stale_auto_completed(conn: &Connection) {
+    let candidates: Vec<String> = match conn.prepare(
+        "SELECT plan_name
+           FROM task_status
+          GROUP BY plan_name
+         HAVING COUNT(*) > 0
+            AND SUM(CASE WHEN status = 'completed' AND source IS NULL THEN 1 ELSE 0 END) = COUNT(*)
+            AND plan_name NOT IN (
+                SELECT DISTINCT plan_name FROM agents WHERE plan_name IS NOT NULL
+            )",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+
+    for plan in &candidates {
+        match conn.execute(
+            "DELETE FROM task_status WHERE plan_name = ?1",
+            params![plan],
+        ) {
+            Ok(n) if n > 0 => {
+                eprintln!(
+                    "task_status cleanup: purged {n} stale auto-inferred completed row(s) for plan '{plan}'"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -753,5 +806,191 @@ mod tests {
         let nested = dir.path().join("a").join("b").join("c").join("test.db");
         let _db = init(&nested);
         assert!(nested.exists());
+    }
+
+    /// Re-run `cleanup_stale_auto_completed` (which already ran inside
+    /// `init` against an empty DB) after seeding. The function is meant to
+    /// be naturally idempotent; the test covers the seeded scenarios.
+    fn run_cleanup(conn: &Connection) {
+        super::cleanup_stale_auto_completed(conn);
+    }
+
+    #[test]
+    fn cleanup_purges_legacy_all_completed_no_agents_plan() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        // Legacy bulk-auto-inferred plan: every row completed with NULL source,
+        // no agent ever spawned. This is the prototypical false positive
+        // (e.g. the `scheduler` plan in production).
+        conn.execute_batch(
+            "INSERT INTO task_status (plan_name, task_number, status) VALUES
+               ('scheduler', '1.1', 'completed'),
+               ('scheduler', '1.2', 'completed'),
+               ('scheduler', '1.3', 'completed');",
+        )
+        .unwrap();
+
+        run_cleanup(&conn);
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_status WHERE plan_name = 'scheduler'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "scheduler rows should have been purged");
+    }
+
+    #[test]
+    fn cleanup_leaves_plans_with_agents_alone() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        // Plan has an agent row → the all-completed status might be the result
+        // of real work (or manual correction predating the source column).
+        // Conservative rule: leave it alone. The user can reset explicitly.
+        conn.execute_batch(
+            "INSERT INTO task_status (plan_name, task_number, status) VALUES
+               ('portable-agents-and-mcp', '0.1', 'completed'),
+               ('portable-agents-and-mcp', '0.2', 'completed'),
+               ('portable-agents-and-mcp', '1.1', 'completed');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, plan_name, task_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "agent-real-1",
+                "/tmp",
+                "completed",
+                "portable-agents-and-mcp",
+                "0.1"
+            ],
+        )
+        .unwrap();
+
+        run_cleanup(&conn);
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_status WHERE plan_name = 'portable-agents-and-mcp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 3, "agent-having plan must not be purged");
+    }
+
+    #[test]
+    fn cleanup_leaves_mixed_status_plans_alone() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        // Even with no agents, a mixed-status plan signals deliberate work
+        // in flight — never purge.
+        conn.execute_batch(
+            "INSERT INTO task_status (plan_name, task_number, status) VALUES
+               ('half-done', '1.1', 'completed'),
+               ('half-done', '1.2', 'in_progress'),
+               ('half-done', '1.3', 'pending');",
+        )
+        .unwrap();
+
+        run_cleanup(&conn);
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_status WHERE plan_name = 'half-done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 3, "mixed-status plan must not be purged");
+    }
+
+    #[test]
+    fn cleanup_leaves_manual_completed_rows_alone() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        // Post-Task-2.2 manual completions carry source='manual' — must
+        // never be purged, even when no agent was ever spawned (the user
+        // could have set status by hand via PUT or MCP).
+        conn.execute_batch(
+            "INSERT INTO task_status (plan_name, task_number, status, source) VALUES
+               ('hand-marked', '1.1', 'completed', 'manual'),
+               ('hand-marked', '1.2', 'completed', 'manual');",
+        )
+        .unwrap();
+
+        run_cleanup(&conn);
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_status WHERE plan_name = 'hand-marked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 2, "manual rows must survive cleanup");
+    }
+
+    #[test]
+    fn cleanup_only_purges_qualifying_plans() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        // Two plans in the DB: one qualifies, one doesn't. Cleanup must
+        // touch only the qualifying one.
+        conn.execute_batch(
+            "INSERT INTO task_status (plan_name, task_number, status) VALUES
+               ('purge-me', '1.1', 'completed'),
+               ('purge-me', '1.2', 'completed'),
+               ('keep-me', '1.1', 'completed'),
+               ('keep-me', '1.2', 'pending');",
+        )
+        .unwrap();
+
+        run_cleanup(&conn);
+
+        let purged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_status WHERE plan_name = 'purge-me'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_status WHERE plan_name = 'keep-me'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(purged, 0);
+        assert_eq!(kept, 2);
+    }
+
+    #[test]
+    fn cleanup_is_idempotent() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO task_status (plan_name, task_number, status) VALUES
+               ('scheduler', '1.1', 'completed');",
+        )
+        .unwrap();
+
+        run_cleanup(&conn);
+        run_cleanup(&conn);
+        run_cleanup(&conn);
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_status", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 0);
     }
 }
