@@ -377,11 +377,18 @@ function DiffView({
   const agentDiffs = useAgentStore((s) => s.agentDiffs);
   const fetchAgentDiff = useAgentStore((s) => s.fetchAgentDiff);
   const mergeAgentBranch = useAgentStore((s) => s.mergeAgentBranch);
+  const fetchMergeTargets = useAgentStore((s) => s.fetchMergeTargets);
   const discardAgentBranch = useAgentStore((s) => s.discardAgentBranch);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [mergeState, setMergeState] = useState<"idle" | "confirming" | "merging" | "merged" | "error">("idle");
   const [discardState, setDiscardState] = useState<"idle" | "confirming" | "discarding" | "discarded" | "error">("idle");
   const [actionError, setActionError] = useState<string | null>(null);
+  const [mergeTargets, setMergeTargets] = useState<{ default: string | null; available: string[] } | null>(null);
+  const [targetsLoading, setTargetsLoading] = useState(true);
+  const [targetsError, setTargetsError] = useState(false);
+  const [selectedTarget, setSelectedTarget] = useState<string | null>(null);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   const diffData = agentDiffs[agentId];
 
@@ -392,6 +399,37 @@ function DiffView({
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTargetsLoading(true);
+    setTargetsError(false);
+    fetchMergeTargets(agentId)
+      .then((res) => {
+        if (cancelled) return;
+        setMergeTargets(res);
+        setTargetsLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setTargetsError(true);
+        setTargetsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId, fetchMergeTargets]);
+
+  useEffect(() => {
+    if (!dropdownOpen) return;
+    function onMouseDown(e: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [dropdownOpen]);
 
   if (!diffData) {
     return (
@@ -428,6 +466,11 @@ function DiffView({
   const displayed = selectedFile
     ? fileDiffs.filter((f) => f.path === selectedFile)
     : fileDiffs;
+
+  const defaultTarget = mergeTargets?.default ?? sourceBranch ?? "main";
+  const resolvedTarget = selectedTarget ?? defaultTarget;
+  const showChevron =
+    !targetsLoading && !targetsError && (mergeTargets?.available.length ?? 0) > 0;
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -537,17 +580,20 @@ function DiffView({
                 </button>
               )}
 
-              {/* Merge button */}
+              {/* Merge button (split: main + chevron dropdown) */}
               {mergeState === "confirming" ? (
                 <div className="flex items-center gap-1">
                   <span className="text-[10px] text-amber-400">
-                    Merge into {sourceBranch ?? "main"}?
+                    Merge into {resolvedTarget}?
                   </span>
                   <button
                     onClick={async () => {
                       setMergeState("merging");
                       setActionError(null);
-                      const result = await mergeAgentBranch(agentId);
+                      const result = await mergeAgentBranch(
+                        agentId,
+                        selectedTarget ?? undefined
+                      );
                       if (result.ok) {
                         setMergeState("merged");
                       } else {
@@ -569,19 +615,84 @@ function DiffView({
               ) : mergeState === "merging" ? (
                 <span className="text-[10px] text-gray-500">Merging...</span>
               ) : (
-                <button
-                  onClick={() => setMergeState("confirming")}
-                  className="px-3 py-1 text-xs bg-emerald-900/50 text-emerald-400 hover:bg-emerald-900 rounded transition font-medium"
-                >
-                  Merge
-                </button>
+                <div className="relative" ref={dropdownRef}>
+                  <div className="flex items-center">
+                    <button
+                      onClick={() => {
+                        setDropdownOpen(false);
+                        setMergeState("confirming");
+                      }}
+                      className={`px-3 py-1 text-xs bg-emerald-900/50 text-emerald-400 hover:bg-emerald-900 ${
+                        showChevron ? "rounded-l" : "rounded"
+                      } transition font-medium`}
+                      title={targetsError ? "couldn't load alternates" : undefined}
+                    >
+                      Merge into {resolvedTarget}
+                    </button>
+                    {showChevron && (
+                      <button
+                        onClick={() => setDropdownOpen((o) => !o)}
+                        className="px-2 py-1 text-xs bg-emerald-900/50 text-emerald-400 hover:bg-emerald-900 rounded-r border-l border-emerald-700/40 transition"
+                        title="Choose target branch"
+                        aria-label="Choose target branch"
+                      >
+                        ∇
+                      </button>
+                    )}
+                  </div>
+                  {dropdownOpen && (
+                    <div className="absolute bottom-full right-0 mb-1 bg-gray-900 border border-gray-700 rounded shadow-lg min-w-[180px] py-1 z-20">
+                      {targetsLoading ? (
+                        <div className="px-3 py-1 text-[11px] text-gray-500 flex items-center gap-2">
+                          <span className="inline-block w-3 h-3 border-2 border-gray-600 border-t-gray-300 rounded-full animate-spin" />
+                          Loading…
+                        </div>
+                      ) : (
+                        <>
+                          {mergeTargets?.default && (
+                            <button
+                              onClick={() => {
+                                setSelectedTarget(null);
+                                setDropdownOpen(false);
+                              }}
+                              className={`block w-full text-left px-3 py-1 text-[11px] hover:bg-gray-800 transition ${
+                                selectedTarget === null
+                                  ? "text-emerald-400"
+                                  : "text-gray-300"
+                              }`}
+                            >
+                              {mergeTargets.default}{" "}
+                              <span className="text-gray-600">(default)</span>
+                            </button>
+                          )}
+                          {mergeTargets?.available.map((branch) => (
+                            <button
+                              key={branch}
+                              onClick={() => {
+                                setSelectedTarget(branch);
+                                setDropdownOpen(false);
+                              }}
+                              className={`block w-full text-left px-3 py-1 text-[11px] hover:bg-gray-800 transition ${
+                                selectedTarget === branch
+                                  ? "text-emerald-400"
+                                  : "text-gray-300"
+                              }`}
+                            >
+                              {branch}
+                            </button>
+                          ))}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           )}
 
           {mergeState === "merged" && (
             <span className="text-xs text-emerald-400 font-medium">
-              Merged into {sourceBranch ?? "main"}
+              Merged into {resolvedTarget}
             </span>
           )}
 
