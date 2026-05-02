@@ -58,6 +58,20 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Decide whether `trigger_after_merge` should record a CI
+/// run for a merge that landed on `target`. Pure — caller
+/// resolves `default_branch` (locally or via runner RPC) and
+/// passes it in.
+///
+/// Rule: only the canonical default branch is treated as
+/// CI-watched. A merge to anything else (dropdown override,
+/// stacked branch) doesn't get a row — the workflow won't
+/// fire on push, so the row would just sit at "pending"
+/// until MAX_RUN_AGE_SECS ages it out to "unknown".
+fn should_record_ci_run(target: &str, default_branch: Option<&str>) -> bool {
+    default_branch == Some(target)
+}
+
 // ── Push + record ───────────────────────────────────────────────────────────
 
 /// Kick off CI for a just-merged task: push to `origin/<branch>`, record a
@@ -97,6 +111,15 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
         println!(
             "[ci] no origin remote in {} — skipping CI trigger",
             cwd.display()
+        );
+        return;
+    }
+
+    let default = crate::agents::git_default_branch(&cwd);
+    if !should_record_ci_run(&source_branch, default.as_deref()) {
+        println!(
+            "[ci] merge target `{source_branch}` is not the default \
+             branch ({default:?}) — skipping push + ci_runs insert"
         );
         return;
     }
@@ -574,6 +597,14 @@ mod tests {
         assert!(terminal("unknown"));
         assert!(!terminal("pending"));
         assert!(!terminal("running"));
+    }
+
+    #[test]
+    fn should_record_ci_run_only_for_canonical_default() {
+        assert!(should_record_ci_run("master", Some("master")));
+        assert!(!should_record_ci_run("master", Some("main")));
+        assert!(!should_record_ci_run("feature/x", Some("master")));
+        assert!(!should_record_ci_run("master", None));
     }
 
     #[test]
