@@ -229,11 +229,8 @@ mod tests {
 
     /// Build a registered ConnectedRunner whose command_tx reads outgoing
     /// envelopes and resolves them via the supplied closure.
-    async fn install_echo_runner<F>(
-        registry: &RunnerRegistry,
-        runner_id: &str,
-        respond: F,
-    ) where
+    async fn install_echo_runner<F>(registry: &RunnerRegistry, runner_id: &str, respond: F)
+    where
         F: Fn(WireMessage) -> Option<RunnerResponse> + Send + Sync + 'static,
     {
         let pending: Arc<Mutex<HashMap<String, oneshot::Sender<RunnerResponse>>>> =
@@ -283,9 +280,9 @@ mod tests {
         }];
         let entries_for_responder = entries.clone();
         install_echo_runner(&registry, "runner-1", move |msg| match msg {
-            WireMessage::ListFolders { .. } => Some(RunnerResponse::FoldersListed(
-                entries_for_responder.clone(),
-            )),
+            WireMessage::ListFolders { .. } => {
+                Some(RunnerResponse::FoldersListed(entries_for_responder.clone()))
+            }
             _ => None,
         })
         .await;
@@ -293,15 +290,9 @@ mod tests {
         let req = WireMessage::ListFolders {
             req_id: "req-success".into(),
         };
-        let result = runner_request_inner(
-            &db,
-            &registry,
-            "org-1",
-            req,
-            Duration::from_millis(500),
-        )
-        .await
-        .expect("runner_request should succeed");
+        let result = runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(500))
+            .await
+            .expect("runner_request should succeed");
         match result {
             RunnerResponse::FoldersListed(got) => assert_eq!(got, entries),
             other => panic!("expected FoldersListed variant, got {other:?}"),
@@ -318,14 +309,8 @@ mod tests {
         let req = WireMessage::ListFolders {
             req_id: "req-timeout".into(),
         };
-        let result = runner_request_inner(
-            &db,
-            &registry,
-            "org-1",
-            req,
-            Duration::from_millis(50),
-        )
-        .await;
+        let result =
+            runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(50)).await;
         assert!(matches!(result, Err(RunnerRpcError::Timeout)));
     }
 
@@ -337,14 +322,8 @@ mod tests {
         let req = WireMessage::ListFolders {
             req_id: "req-norunner".into(),
         };
-        let result = runner_request_inner(
-            &db,
-            &registry,
-            "org-1",
-            req,
-            Duration::from_millis(500),
-        )
-        .await;
+        let result =
+            runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(500)).await;
         assert!(matches!(result, Err(RunnerRpcError::NoConnectedRunner)));
     }
 
@@ -358,14 +337,8 @@ mod tests {
         let req = WireMessage::ListFolders {
             req_id: "req-stale".into(),
         };
-        let result = runner_request_inner(
-            &db,
-            &registry,
-            "org-1",
-            req,
-            Duration::from_millis(500),
-        )
-        .await;
+        let result =
+            runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(500)).await;
         assert!(matches!(result, Err(RunnerRpcError::NoConnectedRunner)));
     }
 
@@ -376,14 +349,8 @@ mod tests {
         install_echo_runner(&registry, "runner-1", |_msg| None).await;
 
         let req = WireMessage::Ping {};
-        let result = runner_request_inner(
-            &db,
-            &registry,
-            "org-1",
-            req,
-            Duration::from_millis(500),
-        )
-        .await;
+        let result =
+            runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(500)).await;
         assert!(matches!(result, Err(RunnerRpcError::InvalidRequest)));
     }
 
@@ -426,5 +393,174 @@ mod tests {
             .expect("runner_request did not complete after disconnect")
             .expect("task panicked");
         assert!(matches!(result, Err(RunnerRpcError::RunnerDisconnected)));
+    }
+
+    /// Integration test for Task 1.4 acceptance criteria. Mounts the real
+    /// `runner_ws_handler` in an in-process Axum server, drives it with a
+    /// tokio-tungstenite WS client, and verifies that dropping the WS while a
+    /// `runner_request` is in flight wakes the awaiting receiver via the
+    /// `pending`-map drain in the `handle_runner_ws` cleanup block.
+    ///
+    /// The previous test (`runner_disconnect_mid_call_does_not_deadlock`)
+    /// simulates the cleanup by hand. This one exercises the production
+    /// cleanup code path end-to-end.
+    #[tokio::test]
+    async fn real_ws_disconnect_drains_pending_senders_and_wakes_receivers() {
+        use futures_util::SinkExt;
+        use std::path::PathBuf;
+        use tokio_tungstenite::tungstenite::Message;
+
+        // Full-schema DB on a tempfile so all tables (runners, runner_tokens,
+        // users, seq_tracker, …) exist for the production handler.
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::init(&tempdir.path().join("test.db"));
+
+        let user_id = "test-user";
+        let token = "test-token-real-ws-disconnect";
+        let org_id = "default-org"; // seeded by db::init -> ensure_default_org
+        let runner_id = "test-runner-real-ws";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                params![user_id, "test@test", "x"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runner_tokens (token_hash, runner_name, org_id, created_by) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![token, "test-runner", org_id, user_id],
+            )
+            .unwrap();
+        }
+
+        // Minimal AppState wired only with what runner_ws_handler reads from.
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/branchwork-test"),
+            0,
+        );
+        let runners = new_runner_registry();
+        let state = crate::state::AppState {
+            db: db.clone(),
+            plans_dir: PathBuf::from("/tmp"),
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners: runners.clone(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/ws/runner",
+                axum::routing::get(crate::saas::runner_ws::runner_ws_handler),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Connect a fake runner WS and send RunnerHello so the server
+        // registers us in the in-memory `runners` map.
+        let url = format!("ws://127.0.0.1:{port}/ws/runner?token={token}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect");
+        let hello = Envelope::reliable(
+            runner_id.into(),
+            1,
+            WireMessage::RunnerHello {
+                hostname: "test-host".into(),
+                version: "0.0.0".into(),
+                drivers: vec![],
+            },
+        );
+        ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+            .await
+            .unwrap();
+
+        // Wait for the server to register the runner.
+        let mut attempts = 0;
+        while attempts < 200 {
+            if runners.lock().await.contains_key(runner_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            attempts += 1;
+        }
+        assert!(
+            runners.lock().await.contains_key(runner_id),
+            "runner did not register after RunnerHello"
+        );
+
+        // Park a runner_request on the oneshot. Long timeout (30s) so a test
+        // failure caused by the cleanup *not* waking the receiver cannot be
+        // masked by a coincidental timeout.
+        let db_clone = db.clone();
+        let runners_clone = runners.clone();
+        let req_handle = tokio::spawn(async move {
+            runner_request_inner(
+                &db_clone,
+                &runners_clone,
+                org_id,
+                WireMessage::ListFolders {
+                    req_id: "req-real-ws-disconnect".into(),
+                },
+                Duration::from_secs(30),
+            )
+            .await
+        });
+
+        // Wait for runner_request to register its sender in pending.
+        let mut attempts = 0;
+        loop {
+            let inserted = {
+                let registry_guard = runners.lock().await;
+                match registry_guard.get(runner_id) {
+                    Some(runner) => !runner.pending.lock().await.is_empty(),
+                    None => false,
+                }
+            };
+            if inserted {
+                break;
+            }
+            attempts += 1;
+            assert!(
+                attempts <= 200,
+                "runner_request never inserted a pending entry"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Drop the WS — handle_runner_ws's reader loop breaks and runs the
+        // cleanup block, which drains the pending map.
+        let t0 = std::time::Instant::now();
+        drop(ws);
+
+        // The receiver should wake quickly with Closed, mapped to
+        // RunnerDisconnected. A 2-second budget is far below the 30s
+        // configured timeout, so a wake via timeout would not satisfy this.
+        let result = tokio::time::timeout(Duration::from_secs(2), req_handle)
+            .await
+            .expect("runner_request did not complete after disconnect")
+            .expect("task panicked");
+        let elapsed = t0.elapsed();
+        assert!(
+            matches!(result, Err(RunnerRpcError::RunnerDisconnected)),
+            "expected RunnerDisconnected, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "disconnect-wake took {elapsed:?}, should be < 2s"
+        );
+
+        server_handle.abort();
     }
 }
