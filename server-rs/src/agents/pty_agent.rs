@@ -22,7 +22,7 @@ use crate::agents::driver::{AgentDriver, SpawnOpts};
 use crate::agents::session_protocol::{self, Message as SessionMessage};
 use crate::agents::supervisor;
 use crate::agents::{
-    AgentRegistry, ManagedAgent, git_checkout_branch, git_current_branch, git_head_sha,
+    AgentRegistry, ManagedAgent, git_checkout_branch, git_default_branch, git_head_sha,
 };
 use crate::config::Effort;
 use crate::ws::broadcast_event;
@@ -67,17 +67,16 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    // Capture base commit and source branch BEFORE switching. If the tree
-    // is already on the target task branch (e.g. a previous agent left it
-    // there, or the caller pre-checked-out a recovery branch), recording
-    // that as `source_branch` would later make the merge guard compare
-    // `<task>..<task>` = 0 commits and 409 every legitimate merge. Treat
-    // that case as unknown — the merge path falls back to main/master.
+    // Capture base commit BEFORE switching to the task branch.
     let base_commit = git_head_sha(cwd);
-    let source_branch = git_current_branch(cwd).filter(|cur| match branch {
-        Some(target) => cur != target,
-        None => true,
-    });
+
+    // Record the canonical merge target rather than whatever
+    // branch HEAD happens to be on — see plan
+    // merge-target-canonical-default-branch. This field is now
+    // informational; the merge resolver re-resolves at merge
+    // time, but the UI uses this to seed the default selection
+    // in the merge dropdown.
+    let source_branch = git_default_branch(cwd);
 
     // Checkout the task branch if specified
     if let Some(branch_name) = branch {
