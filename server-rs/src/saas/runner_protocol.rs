@@ -115,6 +115,30 @@ pub enum WireMessage {
     /// Request terminal replay from a byte offset (reconnecting browser).
     TerminalReplay { agent_id: String, from_offset: u64 },
 
+    /// Dashboard requested the runner's folder listing (home dir, one level).
+    /// Best-effort: tied to a live HTTP caller, so outbox replay is useless.
+    ListFolders { req_id: String },
+
+    /// Runner reply with the folder entries.
+    FoldersListed {
+        req_id: String,
+        entries: Vec<FolderEntry>,
+    },
+
+    /// Dashboard requested folder creation on the runner.
+    /// Best-effort: tied to a live HTTP caller.
+    CreateFolder { req_id: String, path: String },
+
+    /// Runner reply with the create result.
+    FolderCreated {
+        req_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolved_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     // ── Bidirectional ───────────────────────────────────────────────────
     /// Acknowledge receipt of a sequenced message. The receiver sends this
     /// after persisting the event so the sender can prune its outbox.
@@ -135,6 +159,16 @@ pub enum WireMessage {
         /// Last seq the sender successfully processed from this peer.
         last_seen_seq: u64,
     },
+}
+
+// ── Folder entry ────────────────────────────────────────────────────────────
+
+/// One folder returned by `ListFolders`. Same shape as the inline struct in
+/// `api/settings.rs` (single-host listing); lives here so both sides share it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FolderEntry {
+    pub name: String,
+    pub path: String,
 }
 
 // ── Driver auth info ────────────────────────────────────────────────────────
@@ -178,6 +212,10 @@ impl WireMessage {
                 | WireMessage::AgentInput { .. }
                 | WireMessage::Ping {}
                 | WireMessage::Pong {}
+                | WireMessage::ListFolders { .. }
+                | WireMessage::FoldersListed { .. }
+                | WireMessage::CreateFolder { .. }
+                | WireMessage::FolderCreated { .. }
         )
     }
 
@@ -195,6 +233,10 @@ impl WireMessage {
             WireMessage::ResizeTerminal { .. } => "resize_terminal",
             WireMessage::AgentInput { .. } => "agent_input",
             WireMessage::TerminalReplay { .. } => "terminal_replay",
+            WireMessage::ListFolders { .. } => "list_folders",
+            WireMessage::FoldersListed { .. } => "folders_listed",
+            WireMessage::CreateFolder { .. } => "create_folder",
+            WireMessage::FolderCreated { .. } => "folder_created",
             WireMessage::Ack { .. } => "ack",
             WireMessage::Ping {} => "ping",
             WireMessage::Pong {} => "pong",
@@ -289,5 +331,141 @@ mod tests {
             }
             .is_best_effort()
         );
+    }
+
+    #[test]
+    fn list_folders_round_trip() {
+        let msg = WireMessage::ListFolders {
+            req_id: "req-1".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "list_folders");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::ListFolders { req_id } => assert_eq!(req_id, "req-1"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folders_listed_round_trip() {
+        let msg = WireMessage::FoldersListed {
+            req_id: "req-2".into(),
+            entries: vec![
+                FolderEntry {
+                    name: "projects".into(),
+                    path: "/home/user/projects".into(),
+                },
+                FolderEntry {
+                    name: "docs".into(),
+                    path: "/home/user/docs".into(),
+                },
+            ],
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "folders_listed");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::FoldersListed { req_id, entries } => {
+                assert_eq!(req_id, "req-2");
+                assert_eq!(
+                    entries,
+                    vec![
+                        FolderEntry {
+                            name: "projects".into(),
+                            path: "/home/user/projects".into(),
+                        },
+                        FolderEntry {
+                            name: "docs".into(),
+                            path: "/home/user/docs".into(),
+                        },
+                    ]
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_folder_round_trip() {
+        let msg = WireMessage::CreateFolder {
+            req_id: "req-3".into(),
+            path: "/home/user/new-project".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "create_folder");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CreateFolder { req_id, path } => {
+                assert_eq!(req_id, "req-3");
+                assert_eq!(path, "/home/user/new-project");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folder_created_round_trip_ok() {
+        let msg = WireMessage::FolderCreated {
+            req_id: "req-4".into(),
+            ok: true,
+            resolved_path: Some("/home/user/new-project".into()),
+            error: None,
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "folder_created");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        // `error: None` should be omitted in the wire form.
+        assert!(!json.contains("\"error\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::FolderCreated {
+                req_id,
+                ok,
+                resolved_path,
+                error,
+            } => {
+                assert_eq!(req_id, "req-4");
+                assert!(ok);
+                assert_eq!(resolved_path.as_deref(), Some("/home/user/new-project"));
+                assert!(error.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folder_created_round_trip_err() {
+        let msg = WireMessage::FolderCreated {
+            req_id: "req-5".into(),
+            ok: false,
+            resolved_path: None,
+            error: Some("permission denied".into()),
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"resolved_path\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::FolderCreated {
+                req_id,
+                ok,
+                resolved_path,
+                error,
+            } => {
+                assert_eq!(req_id, "req-5");
+                assert!(!ok);
+                assert!(resolved_path.is_none());
+                assert_eq!(error.as_deref(), Some("permission denied"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

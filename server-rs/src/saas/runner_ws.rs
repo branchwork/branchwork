@@ -481,13 +481,18 @@ async fn handle_runner_message(
             let _ = cmd_tx.send(serde_json::to_string(&pong).unwrap_or_default());
         }
 
-        // Server doesn't receive these from runners.
+        // Server doesn't receive these from runners (or doesn't act on them yet —
+        // FoldersListed/FolderCreated handlers land in a later phase).
         WireMessage::Pong {}
         | WireMessage::StartAgent { .. }
         | WireMessage::KillAgent { .. }
         | WireMessage::ResizeTerminal { .. }
         | WireMessage::AgentInput { .. }
-        | WireMessage::TerminalReplay { .. } => {}
+        | WireMessage::TerminalReplay { .. }
+        | WireMessage::ListFolders { .. }
+        | WireMessage::CreateFolder { .. }
+        | WireMessage::FoldersListed { .. }
+        | WireMessage::FolderCreated { .. } => {}
     }
 }
 
