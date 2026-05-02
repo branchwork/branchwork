@@ -197,6 +197,30 @@ pub fn git_default_branch(cwd: &std::path::Path) -> Option<String> {
     None
 }
 
+/// List local branches in the repo at `cwd` (no remotes).
+/// Sorted alphabetically. Empty `Vec` if `git` fails. Local-
+/// only — same SaaS swappability rules as `git_default_branch`.
+#[allow(dead_code)] // consumer lands in T3.2 (merge-target dropdown)
+pub fn git_list_branches(cwd: &std::path::Path) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["branch", "--format=%(refname:short)"])
+        .current_dir(cwd)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut branches: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    branches.sort();
+    branches
+}
+
 /// Create or checkout a git branch. Returns true if successful.
 /// For "start" mode: creates the branch (or checks it out if it already exists).
 /// For "continue" mode: checks out the existing branch.
@@ -1885,5 +1909,43 @@ mod tests {
             .unwrap_or(false);
         assert!(ok, "failed to set origin/HEAD symref");
         assert_eq!(git_default_branch(dir.path()), Some("trunk".to_string()));
+    }
+
+    #[test]
+    fn git_list_branches_single_master() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        assert_eq!(git_list_branches(dir.path()), vec!["master".to_string()]);
+    }
+
+    #[test]
+    fn git_list_branches_sorted_alphabetically() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["branch", "feature/x"]);
+        run(&["branch", "bw/1.1"]);
+        assert_eq!(
+            git_list_branches(dir.path()),
+            vec![
+                "bw/1.1".to_string(),
+                "feature/x".to_string(),
+                "master".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn git_list_branches_empty_when_not_a_git_repo() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(git_list_branches(dir.path()), Vec::<String>::new());
     }
 }
