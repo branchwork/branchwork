@@ -158,6 +158,39 @@ fn merge_with_empty_into_body_falls_back_to_default() {
 }
 
 #[test]
+fn merge_with_unresolvable_into_body_falls_back_to_default() {
+    // Acceptance for plan merge-target-canonical-default-branch T4.2:
+    // POST .../merge with {"into":"no/such/branch"} — an unresolvable
+    // ref (typo, deleted branch) must silently fall through to the
+    // canonical default (master here) instead of erroring. Codifies
+    // that a typo in the dropdown doesn't lock the merge.
+    //
+    // The positive case (explicit `into` that resolves wins over the
+    // default) is covered by `merge_with_explicit_into_body_targets_that_branch`,
+    // and the empty-string variant by
+    // `merge_with_empty_into_body_falls_back_to_default`. Together with
+    // this test those three pin the priority chain in
+    // `resolve_merge_target` (api/agents.rs):
+    // explicit-if-it-resolves → default → "main".
+    let d = TestDashboard::new();
+    d.create_plan("mp-typo", &minimal_plan("mp-typo", &d.project));
+
+    let br = "branchwork/mp-typo/1.1";
+    d.create_task_branch(br, /* with_commit */ true);
+    seed_agent(&d, "agent-typo", "mp-typo", "1.1", Some(br), Some("master"));
+
+    let (s, body) = d.post(
+        "/api/agents/agent-typo/merge",
+        json!({"into": "no/such/branch"}),
+    );
+    assert_eq!(s, 200, "expected 200, got {s}: {body}");
+    assert_eq!(
+        body["into"], "master",
+        "unresolvable into must fall back to canonical default"
+    );
+}
+
+#[test]
 fn self_referencing_source_branch_does_not_cause_500() {
     // Regression: b77d9c0 shipped Fix CI with source_branch recorded AS
     // the task branch (because start_pty_agent captured git_current_branch
