@@ -146,6 +146,8 @@ makes progress on the next attempt.
 | `AgentStopped { agent_id, status, cost_usd?, stop_reason? }` | yes (with one wart) | Agent process exited or was killed. Server updates the `agents` row, runs org-budget enforcement if `cost_usd` is set, and broadcasts `agent_stopped`. **Wart:** the spawn-failure path sends this reliably; the normal-exit path in `branchwork_runner.rs` currently sends it best-effort (`Envelope::best_effort`). See [runner.md](runner.md). |
 | `TaskStatusChanged { plan_name, task_number, status, reason? }` | yes | The agent reported a status change via MCP, or the runner detected one. Server upserts `task_status` with `source='manual'`, optionally appends `task_learnings`, and broadcasts `task_status_changed`. |
 | `DriverAuthReport { drivers }` | yes | Driver auth state changed (e.g. user finished an OAuth flow). Re-broadcast as `runner_drivers`. Also implicitly delivered by the `RunnerHello` `drivers` field. |
+| `FoldersListed { req_id, entries }` | **no** — req/resp | Reply to `ListFolders`. Carries one `FolderEntry { name, path }` per directory under the runner's home (one level deep, mirroring the local-mode listing in `api::settings::list_folders`). Server matches `req_id` to a pending oneshot to resolve the originating HTTP caller; late replies (post-timeout or post-reconnect) are silently discarded. See [Request/response frames](#requestresponse-frames). |
+| `FolderCreated { req_id, ok, resolved_path?, error? }` | **no** — req/resp | Reply to `CreateFolder`. `ok=true` ⇒ `resolved_path` is the canonical absolute path the runner created; `ok=false` ⇒ `error` carries a human-readable reason (permission denied, path traversal, etc.). Same `req_id` correlation as `FoldersListed`. |
 
 #### SaaS → Runner
 
@@ -156,6 +158,8 @@ makes progress on the next attempt.
 | `ResizeTerminal { agent_id, cols, rows }` | yes | Browser resized its xterm.js view. Runner forwards a `Resize` over the session IPC. **Note:** semantically idempotent — duplicated replays are harmless. |
 | `AgentInput { agent_id, data }` | **no** (best-effort) | Keystrokes from the browser (base64). Runner forwards as `Input` over the session IPC. Loss on disconnect matches user expectations: typed characters that never reached the agent are not replayed. |
 | `TerminalReplay { agent_id, from_offset }` | yes | A reconnecting browser asked the server for backfill from a byte offset; the runner serves the missing range from its local `<socket>.log`. |
+| `ListFolders { req_id }` | **no** — req/resp | Dashboard hit a synchronous folder-listing HTTP endpoint and the org has a runner attached. Server mints `req_id`, registers a oneshot, sends best-effort, awaits with a timeout. See [Request/response frames](#requestresponse-frames). |
+| `CreateFolder { req_id, path }` | **no** — req/resp | Dashboard hit a synchronous folder-creation HTTP endpoint with a target path. Same correlation pattern as `ListFolders`; the runner replies with `FolderCreated`. |
 
 #### Bidirectional
 
@@ -165,6 +169,45 @@ makes progress on the next attempt.
 | `Ping {}` | best-effort | Heartbeat probe. The runner sends one every ~15 s; the server replies inline. Missed pongs are not directly observable — the WS-level close on read timeout is what triggers reconnect. |
 | `Pong {}` | best-effort | Reply to `Ping`. |
 | `Resume { last_seen_seq }` | best-effort | Sent immediately after a (re)connect by **both** sides. Tells the peer "replay every reliable frame whose `seq > last_seen_seq`." `last_seen_seq` is read from the local `seq_tracker` row for the peer (or `0` for a fresh runner). |
+
+### Request/response frames
+
+`ListFolders`/`FoldersListed` and `CreateFolder`/`FolderCreated` form
+**request/response pairs** over the otherwise event-stream-only WS — a
+deliberate deviation from the rest of the catalogue, where every
+state-changing frame is reliable and every stream frame is fire-and-forget.
+These four are best-effort *and* explicitly correlated by `req_id`.
+
+The pattern:
+
+1. The dashboard hits a synchronous HTTP endpoint (e.g. the folder picker
+   for "new project on runner").
+2. The server mints a fresh `req_id`, registers a `tokio::sync::oneshot`
+   sender in a per-runner pending-requests map keyed by that `req_id`, and
+   sends the request frame **best-effort** (no outbox, no `seq`).
+3. The server `await`s the oneshot with a short timeout — a few seconds,
+   so the blocked HTTP caller hasn't given up yet.
+4. When the runner's reply arrives, the WS handler matches `req_id` to a
+   pending oneshot, removes the entry from the map, and forwards the
+   payload through the oneshot. The HTTP handler unblocks and returns.
+5. On timeout *or* on a successful reply, the entry is dropped from the
+   map. A late reply (e.g. delivered after a WS reconnect) finds nothing
+   waiting and is silently discarded.
+
+**Why not outbox-backed delivery?** The reliable variants above
+(`AgentStarted`, `TaskStatusChanged`, …) are durable side effects: the
+dashboard learns about them eventually even if the runner reconnects
+between sender and receiver. A folder listing is the opposite — it is
+tied to a *live HTTP caller* whose request will time out in single-digit
+seconds. Replaying it across a 30-second reconnect window would deliver
+an answer to a caller that is no longer there, while the new browser tab
+has already retried and gotten a fresher answer. The req-id-correlated
+best-effort design fails fast and lets the caller retry, which matches
+the user's actual expectation of a "Refresh" button.
+
+Today only the SaaS side initiates these pairs. The pattern is
+direction-agnostic — a runner-initiated request would mirror the same
+pending-requests map on the runner side.
 
 ### `DriverAuthStatus` states
 
