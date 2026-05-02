@@ -112,19 +112,9 @@ fn merge_with_explicit_into_body_targets_that_branch() {
     d.create_task_branch(br, /* with_commit */ true);
     let task_sha = rev_parse(&d.project, br);
     let master_sha_before = rev_parse(&d.project, "master");
-    seed_agent(
-        &d,
-        "agent-into",
-        "mp-into",
-        "1.1",
-        Some(br),
-        Some("master"),
-    );
+    seed_agent(&d, "agent-into", "mp-into", "1.1", Some(br), Some("master"));
 
-    let (s, body) = d.post(
-        "/api/agents/agent-into/merge",
-        json!({"into": "feature/x"}),
-    );
+    let (s, body) = d.post("/api/agents/agent-into/merge", json!({"into": "feature/x"}));
     assert_eq!(s, 200, "expected 200, got {s}: {body}");
     assert_eq!(body["into"], "feature/x", "merge should target feature/x");
     // feature/x fast-forwarded to the task commit; master never moved.
@@ -161,7 +151,10 @@ fn merge_with_empty_into_body_falls_back_to_default() {
 
     let (s, body) = d.post("/api/agents/agent-empty-into/merge", json!({"into": ""}));
     assert_eq!(s, 200, "expected 200, got {s}: {body}");
-    assert_eq!(body["into"], "master", "empty into should fall back to master");
+    assert_eq!(
+        body["into"], "master",
+        "empty into should fall back to master"
+    );
 }
 
 #[test]
@@ -551,7 +544,10 @@ fn list_merge_targets_empty_available_when_only_default_exists() {
     // No extra branches and no task branch — `available` is an empty
     // array (not omitted, not null), per the frozen contract.
     let d = TestDashboard::new();
-    d.create_plan("mp-only-default", &minimal_plan("mp-only-default", &d.project));
+    d.create_plan(
+        "mp-only-default",
+        &minimal_plan("mp-only-default", &d.project),
+    );
 
     // Seed an agent with no branch at all — the "no task branch yet"
     // case still answers the merge-targets question for the dropdown.
