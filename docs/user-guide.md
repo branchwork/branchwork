@@ -398,7 +398,7 @@ otherwise-manual coordination.
 `format_prompt()`, `is_ready()`, `parse_cost()`, `parse_verdict()`,
 `mcp_config_json()`. Register it in `DriverRegistry::with_defaults`.
 A reference page for this lives at
-[reference/drivers.md](reference/drivers.md) _(stub)_ and the trait
+[reference/drivers.md](reference/drivers.md) and the trait
 itself is in [`server-rs/src/agents/driver.rs`](../server-rs/src/agents/driver.rs).
 
 ---
@@ -646,8 +646,9 @@ configuration.
 - [reference/plan-schema.md](reference/plan-schema.md) _(stub)_ —
   field-by-field plan YAML reference, supersedes the inline schema
   in this guide.
-- [reference/drivers.md](reference/drivers.md) _(stub)_ — driver
-  trait, capabilities, MCP injection.
+- [reference/drivers.md](reference/drivers.md) — per-driver reference
+  for `claude`/`aider`/`codex`/`gemini`, the `AgentDriver` trait,
+  `DriverCapabilities`, and MCP auto-injection.
 - [troubleshooting.md](troubleshooting.md) _(stub)_ — common
   failures and how to fix them.
 - [design-produces-commit.md](design-produces-commit.md) — why the

@@ -59,9 +59,11 @@ Flag-level detail, file layouts, schemas.
   `YamlPlanTask`, the Markdown fallback's heuristics, `produces_commit`,
   project inference, `created_at`). Supersedes the in-repo sample at
   the root [`plan.yaml`](../plan.yaml).
-- [reference/drivers.md](reference/drivers.md) _(stub)_ — `AgentDriver`
-  trait, `DriverCapabilities`, authoring a new driver, registering in
-  `DriverRegistry`, MCP auto-injection.
+- [reference/drivers.md](reference/drivers.md) — per-driver reference
+  (Claude, Aider, Codex, Gemini): install command, auth probe,
+  ready signal, cost parser, graceful-exit sequence, known quirks.
+  Plus the `AgentDriver` trait, `DriverCapabilities`, and how to
+  author a fifth driver and register it in `DriverRegistry`.
 
 ## Operations
 
