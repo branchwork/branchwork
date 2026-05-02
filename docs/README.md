@@ -46,7 +46,7 @@ The three-binary split, wire protocols, and storage model.
 
 Flag-level detail, file layouts, schemas.
 
-- [reference/cli.md](reference/cli.md) _(stub)_ — every flag and subcommand
+- [reference/cli.md](reference/cli.md) — every flag and subcommand
   across `branchwork-server`, `branchwork-server session`, and
   `branchwork-runner`.
 - [reference/configuration.md](reference/configuration.md) _(stub)_ —
