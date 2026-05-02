@@ -35,7 +35,7 @@ use clap::Parser;
 use rusqlite::Connection;
 use tokio::sync::{Mutex, mpsc};
 
-use runner_protocol::{DriverAuthInfo, DriverAuthStatus, Envelope, WireMessage};
+use runner_protocol::{DriverAuthInfo, DriverAuthStatus, Envelope, FolderEntry, WireMessage};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -489,6 +489,20 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
             // Heartbeat response — connection is alive.
         }
 
+        WireMessage::ListFolders { req_id } => {
+            let entries = list_home_folders();
+            let reply = Envelope::best_effort(
+                state.runner_id.clone(),
+                WireMessage::FoldersListed {
+                    req_id: req_id.clone(),
+                    entries,
+                },
+            );
+            let _ = state
+                .ws_tx
+                .send(serde_json::to_string(&reply).unwrap_or_default());
+        }
+
         // Runner doesn't receive these from server (runner→saas direction
         // only; the server sending them would be a protocol violation).
         WireMessage::RunnerHello { .. }
@@ -502,9 +516,28 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         // saas→runner variants the runner doesn't act on yet (handlers
         // land in later phases of the folder-listing plan).
         | WireMessage::TerminalReplay { .. }
-        | WireMessage::ListFolders { .. }
         | WireMessage::CreateFolder { .. }
         | WireMessage::Ping {} => {}
+    }
+}
+
+/// List non-dot directories at the top level of the runner's home dir.
+/// Mirrors `api/settings.rs::list_folders` for SaaS folder picking.
+fn list_home_folders() -> Vec<FolderEntry> {
+    let home = dirs::home_dir().unwrap_or_default();
+    match std::fs::read_dir(&home) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| {
+                e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && !e.file_name().to_string_lossy().starts_with('.')
+            })
+            .map(|e| FolderEntry {
+                name: e.file_name().to_string_lossy().to_string(),
+                path: e.path().to_string_lossy().to_string(),
+            })
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
