@@ -29,8 +29,10 @@ The three-binary split, wire protocols, and storage model.
 - [architecture/session-daemon.md](architecture/session-daemon.md) —
   per-session supervisor: fork+setsid on Unix, DETACHED_PROCESS on
   Windows, PTY I/O, log-replay on reattach.
-- [architecture/runner.md](architecture/runner.md) _(stub)_ — SaaS runner:
-  WebSocket upstream, outbox/ACK, local agent spawning.
+- [architecture/runner.md](architecture/runner.md) — SaaS runner:
+  authenticated WebSocket upstream, runner ID persistence, driver auth
+  reporting, outbox/ACK with at-least-once delivery, local agent
+  spawning via the shared session daemon.
 - [architecture/protocols.md](architecture/protocols.md) _(stub)_ — session
   IPC frames, SaaS `WireMessage` JSON, dashboard WS events, hook POST
   shape.
