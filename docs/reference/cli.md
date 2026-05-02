@@ -209,10 +209,10 @@ branchwork-runner \
 
 ## See also
 
-- [reference/configuration.md](configuration.md) _(stub)_ — non-flag
-  configuration: `~/.claude/` layout, SMTP / budget / auth-cookie env
-  vars consumed by the server modules themselves (not by `clap`),
-  `branchwork.toml`.
+- [reference/configuration.md](configuration.md) — non-flag
+  configuration: `~/.claude/` layout, SMTP env vars (budget alerts),
+  driver API-key probes, and the variables that look like config but
+  aren't (`DATABASE_URL`, `JWT_SECRET`, `branchwork.toml`).
 - [architecture/overview.md](../architecture/overview.md) — which
   binary runs where, and how they cooperate.
 - [architecture/session-daemon.md](../architecture/session-daemon.md) —

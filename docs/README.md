@@ -49,9 +49,11 @@ Flag-level detail, file layouts, schemas.
 - [reference/cli.md](reference/cli.md) — every flag and subcommand
   across `branchwork-server`, `branchwork-server session`, and
   `branchwork-runner`.
-- [reference/configuration.md](reference/configuration.md) _(stub)_ —
-  `~/.claude/` layout, environment variables (SMTP, budgets, auth cookie,
-  etc.), `branchwork.toml`.
+- [reference/configuration.md](reference/configuration.md) —
+  `~/.claude/` layout, the runner's `~/.branchwork-runner/` and
+  `<cwd>/.branchwork-runner-sessions/`, every environment variable
+  the source actually reads (`BRANCHWORK_*`, `SMTP_*`, driver API
+  keys), and a list of variables that look like config but aren't.
 - [reference/plan-schema.md](reference/plan-schema.md) _(stub)_ — canonical
   YAML plan schema; supersedes the root `plan.yaml` sample.
 - [reference/drivers.md](reference/drivers.md) _(stub)_ — `AgentDriver`
