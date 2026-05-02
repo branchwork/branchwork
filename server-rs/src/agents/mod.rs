@@ -153,6 +153,50 @@ pub fn git_current_branch(cwd: &std::path::Path) -> Option<String> {
     }
 }
 
+/// Resolve the canonical default branch for the repo at `cwd`.
+/// Tries `origin/HEAD` first, then falls back to local `master` / `main`.
+/// Returns `None` if nothing resolves. Local-only — never fetches.
+///
+/// When git ops move to the runner, this helper's call site moves too —
+/// keep it pure git so the runner-side implementation can copy it verbatim.
+pub fn git_default_branch(cwd: &std::path::Path) -> Option<String> {
+    // Step 1: origin/HEAD via symbolic-ref (set by `git clone` and
+    // `git remote set-head --auto`). Exits 128, not 1, when absent —
+    // gate on status.success() rather than matching exit codes.
+    let out = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .current_dir(cwd)
+        .output();
+    if let Ok(o) = out
+        && o.status.success()
+    {
+        let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if let Some(name) = raw.strip_prefix("origin/")
+            && !name.is_empty()
+        {
+            return Some(name.to_string());
+        }
+    }
+
+    // Step 2: probe local master, then main. --quiet suppresses the
+    // "Needed a single revision" stderr that rev-parse writes on miss.
+    // Note: a freshly `git init -b master`d repo with no commits
+    // returns failure here — the symbolic HEAD exists but no ref does.
+    for name in ["master", "main"] {
+        let ok = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", name])
+            .current_dir(cwd)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(name.to_string());
+        }
+    }
+
+    None
+}
+
 /// Create or checkout a git branch. Returns true if successful.
 /// For "start" mode: creates the branch (or checks it out if it already exists).
 /// For "continue" mode: checks out the existing branch.
@@ -1772,5 +1816,74 @@ mod tests {
                 && e.contains("agent_stopped")),
             "terminal rows re-broadcast: {events:?}"
         );
+    }
+
+    fn git_init_with_commit(dir: &std::path::Path, initial_branch: &str) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed in {}", dir.display());
+        };
+        run(&["init", "-b", initial_branch]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["commit", "--allow-empty", "-m", "init"]);
+    }
+
+    #[test]
+    fn git_default_branch_master_via_local_probe() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        assert_eq!(git_default_branch(dir.path()), Some("master".to_string()));
+    }
+
+    #[test]
+    fn git_default_branch_main_via_local_probe() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "main");
+        assert_eq!(git_default_branch(dir.path()), Some("main".to_string()));
+    }
+
+    #[test]
+    fn git_default_branch_none_when_no_commits() {
+        let dir = TempDir::new().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-b", "master"])
+            .current_dir(dir.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok);
+        // No commit yet — `master` is the symbolic HEAD but no ref exists,
+        // so rev-parse --verify --quiet fails on both probes.
+        assert_eq!(git_default_branch(dir.path()), None);
+    }
+
+    #[test]
+    fn git_default_branch_uses_origin_head_when_set() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        // Seed a fake remote-tracking ref and point origin/HEAD at a
+        // non-trunk branch. No clone or fetch needed.
+        let head_sha = git_head_sha(dir.path()).unwrap();
+        let refs_dir = dir.path().join(".git/refs/remotes/origin");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(refs_dir.join("trunk"), format!("{head_sha}\n")).unwrap();
+        let ok = std::process::Command::new("git")
+            .args([
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to set origin/HEAD symref");
+        assert_eq!(git_default_branch(dir.path()), Some("trunk".to_string()));
     }
 }
