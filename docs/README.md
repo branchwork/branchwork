@@ -26,8 +26,8 @@ The three-binary split, wire protocols, and storage model.
   diagram, data flow, self-hosted vs. SaaS deployment shapes.
 - [architecture/server.md](architecture/server.md) — dashboard
   server: HTTP API, WebSocket fan-out, file watcher, auto-status, hooks.
-- [architecture/session-daemon.md](architecture/session-daemon.md) _(stub)_
-  — per-session supervisor: fork+setsid on Unix, DETACHED_PROCESS on
+- [architecture/session-daemon.md](architecture/session-daemon.md) —
+  per-session supervisor: fork+setsid on Unix, DETACHED_PROCESS on
   Windows, PTY I/O, log-replay on reattach.
 - [architecture/runner.md](architecture/runner.md) _(stub)_ — SaaS runner:
   WebSocket upstream, outbox/ACK, local agent spawning.
