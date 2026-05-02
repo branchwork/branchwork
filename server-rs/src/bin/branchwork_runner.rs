@@ -489,8 +489,22 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
             // Heartbeat response — connection is alive.
         }
 
-        // Runner doesn't receive these from server.
-        _ => {}
+        // Runner doesn't receive these from server (runner→saas direction
+        // only; the server sending them would be a protocol violation).
+        WireMessage::RunnerHello { .. }
+        | WireMessage::AgentStarted { .. }
+        | WireMessage::AgentOutput { .. }
+        | WireMessage::AgentStopped { .. }
+        | WireMessage::TaskStatusChanged { .. }
+        | WireMessage::DriverAuthReport { .. }
+        | WireMessage::FoldersListed { .. }
+        | WireMessage::FolderCreated { .. }
+        // saas→runner variants the runner doesn't act on yet (handlers
+        // land in later phases of the folder-listing plan).
+        | WireMessage::TerminalReplay { .. }
+        | WireMessage::ListFolders { .. }
+        | WireMessage::CreateFolder { .. }
+        | WireMessage::Ping {} => {}
     }
 }
 

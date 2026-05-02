@@ -500,8 +500,57 @@ async fn handle_runner_message(
             let _ = cmd_tx.send(serde_json::to_string(&pong).unwrap_or_default());
         }
 
-        // Server doesn't receive these from runners (or doesn't act on them yet —
-        // FoldersListed/FolderCreated handlers land in a later phase).
+        WireMessage::FoldersListed { req_id, entries } => {
+            let pending = state
+                .runners
+                .lock()
+                .await
+                .get(runner_id)
+                .map(|r| r.pending.clone());
+            let sender = match pending {
+                Some(pending) => pending.lock().await.remove(req_id),
+                None => None,
+            };
+            if let Some(tx) = sender {
+                let _ = tx.send(RunnerResponse::FoldersListed(entries.clone()));
+            } else {
+                eprintln!(
+                    "[runner-ws] dropped orphan folders_listed reply: runner_id={runner_id} req_id={req_id}"
+                );
+            }
+        }
+
+        WireMessage::FolderCreated {
+            req_id,
+            ok,
+            resolved_path,
+            error,
+        } => {
+            let pending = state
+                .runners
+                .lock()
+                .await
+                .get(runner_id)
+                .map(|r| r.pending.clone());
+            let sender = match pending {
+                Some(pending) => pending.lock().await.remove(req_id),
+                None => None,
+            };
+            if let Some(tx) = sender {
+                let _ = tx.send(RunnerResponse::FolderCreated {
+                    ok: *ok,
+                    resolved_path: resolved_path.clone(),
+                    error: error.clone(),
+                });
+            } else {
+                eprintln!(
+                    "[runner-ws] dropped orphan folder_created reply: runner_id={runner_id} req_id={req_id}"
+                );
+            }
+        }
+
+        // Server doesn't receive these from runners — the runner sending them
+        // would be a protocol violation (saas→runner direction only).
         WireMessage::Pong {}
         | WireMessage::StartAgent { .. }
         | WireMessage::KillAgent { .. }
@@ -509,9 +558,7 @@ async fn handle_runner_message(
         | WireMessage::AgentInput { .. }
         | WireMessage::TerminalReplay { .. }
         | WireMessage::ListFolders { .. }
-        | WireMessage::CreateFolder { .. }
-        | WireMessage::FoldersListed { .. }
-        | WireMessage::FolderCreated { .. } => {}
+        | WireMessage::CreateFolder { .. } => {}
     }
 }
 
