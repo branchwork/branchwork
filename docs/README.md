@@ -24,7 +24,7 @@ The three-binary split, wire protocols, and storage model.
 
 - [architecture/overview.md](architecture/overview.md) — three-binary
   diagram, data flow, self-hosted vs. SaaS deployment shapes.
-- [architecture/server.md](architecture/server.md) _(stub)_ — dashboard
+- [architecture/server.md](architecture/server.md) — dashboard
   server: HTTP API, WebSocket fan-out, file watcher, auto-status, hooks.
 - [architecture/session-daemon.md](architecture/session-daemon.md) _(stub)_
   — per-session supervisor: fork+setsid on Unix, DETACHED_PROCESS on
