@@ -15,16 +15,28 @@ use axum::{
 };
 use rusqlite::params;
 use serde::Deserialize;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::db::Db;
 use crate::state::AppState;
 use crate::ws::broadcast_event;
 
 use super::outbox;
-use super::runner_protocol::{Envelope, WireMessage};
+use super::runner_protocol::{Envelope, FolderEntry, WireMessage};
 
 // ── Runner registry (in-memory, lives in AppState) ──────────────────────────
+
+/// A response from a runner to a request/response WireMessage pair (e.g.
+/// `ListFolders` → `FoldersListed`). Routed back to the originating HTTP
+/// caller via a `oneshot` sender registered in `ConnectedRunner.pending`.
+pub enum RunnerResponse {
+    FoldersListed(Vec<FolderEntry>),
+    FolderCreated {
+        ok: bool,
+        resolved_path: Option<String>,
+        error: Option<String>,
+    },
+}
 
 /// A connected runner's server-side handle.
 pub struct ConnectedRunner {
@@ -33,6 +45,12 @@ pub struct ConnectedRunner {
     /// Runner metadata from the most recent `runner_hello`.
     pub hostname: Option<String>,
     pub version: Option<String>,
+    /// Pending request/response oneshots, keyed by `req_id`. The HTTP
+    /// caller registers a sender, sends the request frame best-effort, and
+    /// awaits the receiver with a short timeout. The WS reader resolves the
+    /// matching entry when the runner's reply arrives. Late replies (after
+    /// timeout or reconnect) find nothing waiting and are silently dropped.
+    pub pending: Arc<Mutex<HashMap<String, oneshot::Sender<RunnerResponse>>>>,
 }
 
 /// Registry of currently connected runners. Keyed by runner_id.
@@ -176,6 +194,7 @@ async fn handle_runner_ws(
                             command_tx: cmd_tx.clone(),
                             hostname: None,
                             version: None,
+                            pending: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
 
