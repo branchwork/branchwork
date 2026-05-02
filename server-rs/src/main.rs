@@ -221,6 +221,10 @@ async fn run_server(cli: Cli) {
             post(api::agents::merge_agent_branch),
         )
         .route(
+            "/api/agents/{id}/merge-targets",
+            get(api::agents::list_merge_targets),
+        )
+        .route(
             "/api/agents/{id}/discard",
             post(api::agents::discard_agent_branch),
         )

@@ -302,6 +302,61 @@ pub async fn get_agent_diff(
     .into_response()
 }
 
+/// `GET /api/agents/:id/merge-targets` — list candidate merge targets
+/// for the dropdown next to the Merge button.
+///
+/// Response: `{ "default": "master" | null, "available": [...] }`.
+/// `default` is the canonical default branch (highlighted in the UI);
+/// `available` is the alternatives — local branches except the default
+/// itself (it's the implicit choice) and the agent's own task branch
+/// (merging into yourself is nonsense and the empty-branch guard would
+/// 409 anyway).
+///
+/// SaaS path (future): the handler dispatches to the runner via two
+/// RPCs (`GetDefaultBranch`, `ListBranches`) and assembles the same
+/// JSON. The dashboard never knows the difference — keep the response
+/// shape frozen so the runner refactor stays an in-place swap.
+pub async fn list_merge_targets(
+    State(state): State<AppState>,
+    _auth: OptionalAuthUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let (cwd, task_branch): (String, Option<String>) = {
+        let db = state.db.lock().unwrap();
+        match db.query_row(
+            "SELECT cwd, branch FROM agents WHERE id = ?",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ) {
+            Ok(r) => r,
+            Err(_) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Agent not found"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let cwd_path = std::path::Path::new(&cwd);
+    let default = crate::agents::git_default_branch(cwd_path);
+    let mut branches = crate::agents::git_list_branches(cwd_path);
+
+    if let Some(task) = task_branch.as_deref() {
+        branches.retain(|b| b != task);
+    }
+    if let Some(d) = default.as_deref() {
+        branches.retain(|b| b != d);
+    }
+
+    Json(serde_json::json!({
+        "default": default,
+        "available": branches,
+    }))
+    .into_response()
+}
+
 pub async fn merge_agent_branch(
     State(state): State<AppState>,
     auth: OptionalAuthUser,

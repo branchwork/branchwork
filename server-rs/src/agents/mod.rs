@@ -200,7 +200,6 @@ pub fn git_default_branch(cwd: &std::path::Path) -> Option<String> {
 /// List local branches in the repo at `cwd` (no remotes).
 /// Sorted alphabetically. Empty `Vec` if `git` fails. Local-
 /// only — same SaaS swappability rules as `git_default_branch`.
-#[allow(dead_code)] // consumer lands in T3.2 (merge-target dropdown)
 pub fn git_list_branches(cwd: &std::path::Path) -> Vec<String> {
     let Ok(output) = std::process::Command::new("git")
         .args(["branch", "--format=%(refname:short)"])

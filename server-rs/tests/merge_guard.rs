@@ -498,6 +498,82 @@ fn merge_inserts_orphan_ci_runs_row_for_stale_target() {
     assert_eq!(count, 1, "expected exactly one ci_runs row, got {count}");
 }
 
+#[test]
+fn list_merge_targets_returns_default_and_alternatives() {
+    // Acceptance for plan merge-target-canonical-default-branch T3.2:
+    // GET /api/agents/:id/merge-targets returns the canonical default
+    // branch under "default" and every other local branch under
+    // "available", with the agent's own task branch and the default
+    // itself excluded from "available".
+    let d = TestDashboard::new();
+    d.create_plan("mp-targets", &minimal_plan("mp-targets", &d.project));
+
+    // Two extra branches alongside the implicit default (master).
+    git(&d.project, &["branch", "feature/x"]);
+    git(&d.project, &["branch", "stale/3.4"]);
+
+    let task = "branchwork/mp-targets/1.1";
+    d.create_task_branch(task, /* with_commit */ true);
+    seed_agent(
+        &d,
+        "agent-targets",
+        "mp-targets",
+        "1.1",
+        Some(task),
+        Some("master"),
+    );
+
+    let (s, body) = d.get("/api/agents/agent-targets/merge-targets");
+    assert_eq!(s, 200, "expected 200, got {s}: {body}");
+    assert_eq!(body["default"], "master");
+    let avail: Vec<String> = body["available"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        avail,
+        vec!["feature/x".to_string(), "stale/3.4".to_string()],
+        "available should be the alphabetical alternatives without master or the task branch"
+    );
+}
+
+#[test]
+fn list_merge_targets_404_for_unknown_agent() {
+    let d = TestDashboard::new();
+    let (s, _body) = d.get("/api/agents/does-not-exist/merge-targets");
+    assert_eq!(s, 404);
+}
+
+#[test]
+fn list_merge_targets_empty_available_when_only_default_exists() {
+    // No extra branches and no task branch — `available` is an empty
+    // array (not omitted, not null), per the frozen contract.
+    let d = TestDashboard::new();
+    d.create_plan("mp-only-default", &minimal_plan("mp-only-default", &d.project));
+
+    // Seed an agent with no branch at all — the "no task branch yet"
+    // case still answers the merge-targets question for the dropdown.
+    seed_agent(
+        &d,
+        "agent-only-default",
+        "mp-only-default",
+        "1.1",
+        None,
+        Some("master"),
+    );
+
+    let (s, body) = d.get("/api/agents/agent-only-default/merge-targets");
+    assert_eq!(s, 200, "expected 200, got {s}: {body}");
+    assert_eq!(body["default"], "master");
+    assert_eq!(
+        body["available"].as_array().map(|a| a.len()),
+        Some(0),
+        "available must be an empty array, not null/missing"
+    );
+}
+
 fn git(cwd: &std::path::Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .args(args)
