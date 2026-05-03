@@ -95,6 +95,20 @@ Open `http://<host>:3100` in any browser on your network. Nothing else to instal
   - Or: Aider, Codex, Gemini (their respective API keys)
 - Git (for branch isolation — Branchwork auto-inits repos that don't have one)
 
+#### Claude Code: pre-accept the bypass-permissions disclaimer
+
+Branchwork spawns agents with `--dangerously-skip-permissions` by default (toggle in the sidebar). On first use Claude Code shows an interactive "Bypass Permissions mode" disclaimer that requires a keyboard confirmation — when launched headlessly under Branchwork's PTY there's no one to press Enter, so the session ends immediately.
+
+Pre-accept it once by adding this to `~/.claude/settings.json` (top level, **not** under `permissions`):
+
+```json
+{
+  "skipDangerousModePermissionPrompt": true
+}
+```
+
+Branchwork can also run with the toggle off; in that mode Claude Code asks for per-tool approval inside the session and the disclaimer never appears.
+
 ## Project structure
 
 ```

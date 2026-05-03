@@ -130,12 +130,16 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
 
     // Build the CLI argv via the driver. No shell involved — `portable-pty`
     // spawns it directly in the daemon, so we don't need to escape spaces.
+    let skip_permissions = registry
+        .skip_permissions
+        .load(std::sync::atomic::Ordering::Relaxed);
     let cli_cmd = driver.spawn_args(&SpawnOpts {
         session_id: &session_id,
         cwd,
         effort,
         max_budget_usd,
         mcp_config_path: mcp_config_path.as_deref(),
+        skip_permissions,
     });
     let formatted_prompt = driver.format_prompt(&prompt);
 
@@ -525,7 +529,8 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
     // Webhook only when we cleanly completed; kill_agent owns user-visible
     // messaging for the kill path, and supervisor crashes are already
     // surfaced via the WS event.
-    if marked && !supervisor_crashed && registry.webhook_url.is_some() {
+    let webhook_snapshot = registry.webhook_url.read().unwrap().clone();
+    if marked && !supervisor_crashed && webhook_snapshot.is_some() {
         let (plan, task, branch) = meta.unwrap_or((None, None, None));
         let msg = crate::notifications::agent_completion_message(
             plan.as_deref(),
@@ -535,7 +540,7 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
             branch.as_deref(),
             cost_usd,
         );
-        crate::notifications::notify(registry.webhook_url.clone(), msg);
+        crate::notifications::notify(webhook_snapshot.clone(), msg);
     }
 
     if let Some(plan) = over_budget_plan {
@@ -554,7 +559,7 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
             )
             .ok();
         if let Some(org_id) = org_id {
-            crate::saas::billing::enforce_org_budget(&db, &org_id, registry.webhook_url.as_deref());
+            crate::saas::billing::enforce_org_budget(&db, &org_id, webhook_snapshot.as_deref());
         }
     }
 }
@@ -721,6 +726,7 @@ mod tests {
             sockets_dir,
             PathBuf::from("/nonexistent/branchwork-server"),
             3100,
+            true,
         );
         (registry, rx)
     }

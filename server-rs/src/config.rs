@@ -48,7 +48,7 @@ pub struct Cli {
     pub port: u16,
 
     /// Effort level for spawned agents
-    #[arg(long, value_enum, default_value_t = Effort::High)]
+    #[arg(long, value_enum, default_value_t = Effort::Max)]
     pub effort: Effort,
 
     /// Path to .claude directory
@@ -92,7 +92,12 @@ pub struct Config {
     pub claude_dir: PathBuf,
     pub plans_dir: PathBuf,
     pub db_path: PathBuf,
+    pub settings_path: PathBuf,
     pub webhook_url: Option<String>,
+    /// True if `effort` came from the persisted settings file (vs. the CLI
+    /// default). The `boot_with_persisted_overrides` helper sets this so the
+    /// admin UI can show "persisted" vs "default" provenance.
+    pub skip_permissions: bool,
 }
 
 impl Config {
@@ -103,8 +108,24 @@ impl Config {
             effort: cli.effort,
             plans_dir: claude_dir.join("plans"),
             db_path: claude_dir.join("branchwork.db"),
+            settings_path: claude_dir.join("branchwork-settings.json"),
             claude_dir,
             webhook_url: cli.webhook_url.filter(|s| !s.trim().is_empty()),
+            skip_permissions: true,
+        }
+    }
+
+    /// Layer the on-disk `PersistedSettings` over CLI defaults. Any field
+    /// present in the persisted file wins; missing fields keep the CLI value.
+    pub fn apply_persisted(&mut self, persisted: &crate::persisted_settings::PersistedSettings) {
+        if let Some(e) = persisted.effort {
+            self.effort = e;
+        }
+        if let Some(s) = persisted.skip_permissions {
+            self.skip_permissions = s;
+        }
+        if let Some(ref w) = persisted.webhook_url {
+            self.webhook_url = Some(w.clone()).filter(|s| !s.trim().is_empty());
         }
     }
 }

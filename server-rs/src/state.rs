@@ -19,6 +19,9 @@ pub struct AppState {
     pub registry: AgentRegistry,
     /// In-memory registry of currently connected remote runners.
     pub runners: RunnerRegistry,
+    /// Disk path for runtime-mutable settings overrides (effort,
+    /// skip_permissions, webhook_url). Lives next to `branchwork.db`.
+    pub settings_path: PathBuf,
 }
 
 impl AppState {
@@ -36,6 +39,7 @@ impl AppState {
             broadcast_tx,
             registry,
             runners: crate::saas::runner_ws::new_runner_registry(),
+            settings_path: config.settings_path.clone(),
         }
     }
 

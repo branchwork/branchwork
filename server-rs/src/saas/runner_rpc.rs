@@ -445,6 +445,7 @@ mod tests {
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp/branchwork-test"),
             0,
+            true,
         );
         let runners = new_runner_registry();
         let state = crate::state::AppState {
@@ -455,6 +456,7 @@ mod tests {
             broadcast_tx,
             registry,
             runners: runners.clone(),
+            settings_path: PathBuf::from("/tmp/branchwork-test-settings.json"),
         };
         let app = axum::Router::new()
             .route(

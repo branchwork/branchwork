@@ -21,8 +21,8 @@ function isPlanDone(p: PlanSummary): boolean {
 }
 
 interface Props {
-  view: "plans" | "agents" | "new-plan" | "audit";
-  onViewChange: (v: "plans" | "agents" | "new-plan" | "audit") => void;
+  view: "plans" | "agents" | "new-plan" | "audit" | "admin";
+  onViewChange: (v: "plans" | "agents" | "new-plan" | "audit" | "admin") => void;
 }
 
 export function Sidebar({ view, onViewChange }: Props) {
@@ -216,6 +216,20 @@ export function Sidebar({ view, onViewChange }: Props) {
       {/* Driver auth status */}
       <DriverStatusList />
 
+      {/* Admin link */}
+      <div className="px-2 pb-2">
+        <button
+          onClick={() => onViewChange("admin")}
+          className={`w-full text-left px-2 py-1 text-[10px] rounded transition ${
+            view === "admin"
+              ? "bg-gray-800 text-indigo-400"
+              : "text-gray-600 hover:text-gray-300 hover:bg-gray-800/50"
+          }`}
+        >
+          ⚙ Admin
+        </button>
+      </div>
+
       {/* Search */}
       <div className="px-2 pb-2">
         <input
@@ -312,24 +326,42 @@ const EFFORT_LEVELS: { value: EffortLevel; label: string; color: string }[] = [
 function EffortSelector() {
   const effort = useSettingsStore((s) => s.effort);
   const setEffort = useSettingsStore((s) => s.setEffort);
+  const skipPermissions = useSettingsStore((s) => s.skipPermissions);
+  const setSkipPermissions = useSettingsStore((s) => s.setSkipPermissions);
 
   return (
-    <div className="px-2 pb-2 flex items-center gap-1">
-      <span className="text-[10px] text-gray-600 mr-1">Effort</span>
-      {EFFORT_LEVELS.map((l) => (
-        <button
-          key={l.value}
-          onClick={() => setEffort(l.value)}
-          className={`px-1.5 py-0.5 text-[10px] rounded transition ${
-            effort === l.value
-              ? `${l.color} bg-gray-800 font-semibold`
-              : "text-gray-600 hover:text-gray-400"
-          }`}
-        >
-          {l.label}
-        </button>
-      ))}
-    </div>
+    <>
+      <div className="px-2 pb-2 flex items-center gap-1">
+        <span className="text-[10px] text-gray-600 mr-1">Effort</span>
+        {EFFORT_LEVELS.map((l) => (
+          <button
+            key={l.value}
+            onClick={() => setEffort(l.value)}
+            className={`px-1.5 py-0.5 text-[10px] rounded transition ${
+              effort === l.value
+                ? `${l.color} bg-gray-800 font-semibold`
+                : "text-gray-600 hover:text-gray-400"
+            }`}
+          >
+            {l.label}
+          </button>
+        ))}
+      </div>
+      <label
+        className="px-2 pb-2 flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-300 cursor-pointer select-none"
+        title={'Spawn agents with --dangerously-skip-permissions. Requires "skipDangerousModePermissionPrompt": true in ~/.claude/settings.json (see README).'}
+      >
+        <input
+          type="checkbox"
+          checked={skipPermissions}
+          onChange={(e) => setSkipPermissions(e.target.checked)}
+          className="accent-amber-500"
+        />
+        <span className={skipPermissions ? "text-amber-400" : ""}>
+          Skip permissions
+        </span>
+      </label>
+    </>
   );
 }
 

@@ -36,6 +36,10 @@ pub struct SpawnOpts<'a> {
     /// add the appropriate flag (e.g. `--mcp-config <path>`) to their argv.
     /// The caller is responsible for having written the file before spawn.
     pub mcp_config_path: Option<&'a Path>,
+    /// When true, drivers that support an unattended/skip-permissions mode
+    /// pass the corresponding flag (e.g. Claude's `--dangerously-skip-permissions`).
+    /// Drivers without such a concept ignore this.
+    pub skip_permissions: bool,
 }
 
 /// Verdict produced by a check-agent run. Mirrors the
@@ -253,6 +257,9 @@ impl AgentDriver for ClaudeDriver {
             "--effort".to_string(),
             opts.effort.to_string(),
         ];
+        if opts.skip_permissions {
+            cmd.push("--dangerously-skip-permissions".to_string());
+        }
         if let Some(v) = opts.max_budget_usd {
             cmd.push("--max-budget-usd".to_string());
             cmd.push(v.to_string());
@@ -717,6 +724,7 @@ mod tests {
             effort: Effort::High,
             max_budget_usd: None,
             mcp_config_path: None,
+            skip_permissions: true,
         });
         assert_eq!(args.first().map(String::as_str), Some("claude"));
         assert!(args.iter().any(|a| a == "--session-id"));
@@ -725,8 +733,24 @@ mod tests {
         assert!(args.iter().any(|a| a == "/tmp/project"));
         assert!(args.iter().any(|a| a == "--effort"));
         assert!(args.iter().any(|a| a == "high"));
+        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
         assert!(!args.iter().any(|a| a == "--max-budget-usd"));
         assert!(!args.iter().any(|a| a == "--mcp-config"));
+    }
+
+    #[test]
+    fn claude_spawn_args_omits_skip_permissions_when_disabled() {
+        let driver = ClaudeDriver::new();
+        let cwd = PathBuf::from("/tmp/project");
+        let args = driver.spawn_args(&SpawnOpts {
+            session_id: "s",
+            cwd: &cwd,
+            effort: Effort::High,
+            max_budget_usd: None,
+            mcp_config_path: None,
+            skip_permissions: false,
+        });
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
     }
 
     #[test]
@@ -739,6 +763,7 @@ mod tests {
             effort: Effort::Low,
             max_budget_usd: Some(2.50),
             mcp_config_path: None,
+            skip_permissions: true,
         });
         let i = args.iter().position(|a| a == "--max-budget-usd").unwrap();
         assert_eq!(args[i + 1], "2.5");
@@ -755,6 +780,7 @@ mod tests {
             effort: Effort::Low,
             max_budget_usd: None,
             mcp_config_path: Some(&mcp_path),
+            skip_permissions: true,
         });
         let i = args.iter().position(|a| a == "--mcp-config").unwrap();
         assert_eq!(args[i + 1], "/tmp/agent-abc.mcp.json");
@@ -865,6 +891,7 @@ mod tests {
             effort: Effort::High,
             max_budget_usd: Some(5.0),
             mcp_config_path: None,
+            skip_permissions: true,
         });
         assert_eq!(args, vec!["aider".to_string(), "--yes-always".to_string()]);
     }
@@ -915,6 +942,7 @@ Tokens: 200 sent, 75 received. Cost: $0.0150 message, $0.0250 session.
             effort: Effort::High,
             max_budget_usd: Some(1.0),
             mcp_config_path: None,
+            skip_permissions: true,
         };
         assert_eq!(CodexDriver::new().spawn_args(&opts), vec!["codex"]);
         assert_eq!(GeminiDriver::new().spawn_args(&opts), vec!["gemini"]);

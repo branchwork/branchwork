@@ -10,6 +10,7 @@ mod file_watcher;
 mod hooks;
 mod mcp;
 mod notifications;
+mod persisted_settings;
 mod plan_parser;
 mod saas;
 mod state;
@@ -86,6 +87,7 @@ fn main() {
                 sockets_dir,
                 server_exe,
                 config.port,
+                config.skip_permissions,
             );
 
             let ctx = mcp::McpContext {
@@ -107,7 +109,9 @@ fn main() {
 }
 
 async fn run_server(cli: Cli) {
-    let config = Config::from_cli(cli);
+    let mut config = Config::from_cli(cli);
+    let persisted = persisted_settings::PersistedSettings::load(&config.settings_path);
+    config.apply_persisted(&persisted);
     let db = db::init(&config.db_path);
     let (broadcast_tx, _rx) = ws::create_broadcast();
 
@@ -136,6 +140,7 @@ async fn run_server(cli: Cli) {
         sockets_dir,
         server_exe,
         config.port,
+        config.skip_permissions,
     );
     registry.cleanup_and_reattach().await;
 

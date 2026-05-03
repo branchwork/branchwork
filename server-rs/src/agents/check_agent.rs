@@ -128,7 +128,7 @@ pub async fn start_check_agent(
     let id_clone = id.clone();
     let plan_name_owned = plan_name.map(|s| s.to_string());
     let task_id_owned = task_id.map(|s| s.to_string());
-    let webhook = registry.webhook_url.clone();
+    let webhook = registry.webhook_url.read().unwrap().clone();
 
     thread::spawn(move || {
         let reader = std::io::BufReader::new(stdout);

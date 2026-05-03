@@ -47,25 +47,40 @@ const DEFAULT_CAPABILITIES: DriverCapabilities = {
 
 interface SettingsStore {
   effort: EffortLevel;
+  skipPermissions: boolean;
+  webhookUrl: string | null;
   loaded: boolean;
   drivers: DriverInfo[];
   defaultDriver: string;
   fetchSettings: () => Promise<void>;
   fetchDrivers: () => Promise<void>;
   setEffort: (level: EffortLevel) => Promise<void>;
+  setSkipPermissions: (value: boolean) => Promise<void>;
+  setWebhookUrl: (value: string | null) => Promise<void>;
   driverCapabilities: (name: string | null | undefined) => DriverCapabilities;
   driverAuth: (name: string | null | undefined) => AuthStatus | undefined;
 }
 
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   effort: "high",
+  skipPermissions: true,
+  webhookUrl: null,
   loaded: false,
   drivers: [],
   defaultDriver: "claude",
 
   fetchSettings: async () => {
-    const data = await fetchJson<{ effort: EffortLevel }>("/api/settings");
-    set({ effort: data.effort, loaded: true });
+    const data = await fetchJson<{
+      effort: EffortLevel;
+      skip_permissions: boolean;
+      webhook_url: string | null;
+    }>("/api/settings");
+    set({
+      effort: data.effort,
+      skipPermissions: data.skip_permissions,
+      webhookUrl: data.webhook_url ?? null,
+      loaded: true,
+    });
   },
 
   fetchDrivers: async () => {
@@ -78,6 +93,16 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setEffort: async (level) => {
     await putJson("/api/settings", { effort: level });
     set({ effort: level });
+  },
+
+  setSkipPermissions: async (value) => {
+    await putJson("/api/settings", { skip_permissions: value });
+    set({ skipPermissions: value });
+  },
+
+  setWebhookUrl: async (value) => {
+    await putJson("/api/settings", { webhook_url: value });
+    set({ webhookUrl: value });
   },
 
   // Look up capabilities by driver name. Falls back to the default driver's

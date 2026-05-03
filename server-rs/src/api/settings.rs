@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::auth::OptionalAuthUser;
 use crate::config::Effort;
+use crate::persisted_settings::PersistedSettings;
 use crate::saas::dispatch::org_has_runner;
 use crate::saas::runner_protocol::WireMessage;
 use crate::saas::runner_rpc::{RunnerRpcError, runner_request};
@@ -15,8 +16,7 @@ use crate::state::AppState;
 // ── GET /api/settings ────────────────────────────────────────────────────────
 
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
-    let effort = *state.effort.lock().unwrap();
-    Json(serde_json::json!({ "effort": effort }))
+    Json(snapshot(&state))
 }
 
 // ── PUT /api/settings ────────────────────────────────────────────────────────
@@ -24,6 +24,12 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
 #[derive(Deserialize)]
 pub struct SettingsBody {
     effort: Option<String>,
+    skip_permissions: Option<bool>,
+    /// Treated as set-or-clear: an explicit `null` clears the URL, an empty
+    /// string also clears it, and a non-empty string replaces it. Use
+    /// `serde_json::Value` so we can distinguish missing vs. null.
+    #[serde(default)]
+    webhook_url: serde_json::Value,
 }
 
 pub async fn put_settings(
@@ -52,8 +58,67 @@ pub async fn put_settings(
         }
     }
 
+    if let Some(skip) = body.skip_permissions {
+        state
+            .registry
+            .skip_permissions
+            .store(skip, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // webhook_url: missing → no change, null/"" → clear, string → set.
+    match &body.webhook_url {
+        serde_json::Value::Null => {
+            *state.registry.webhook_url.write().unwrap() = None;
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            *state.registry.webhook_url.write().unwrap() = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        _ => { /* missing or wrong type → leave alone */ }
+    }
+
+    // Persist the *current* in-memory state (not just the diff) so the file
+    // always reflects what the server is using right now.
+    let snap = snapshot_for_persist(&state);
+    if let Err(e) = snap.save(&state.settings_path) {
+        eprintln!(
+            "[settings] failed to persist to {}: {e}",
+            state.settings_path.display()
+        );
+    }
+
+    Json(snapshot(&state)).into_response()
+}
+
+fn snapshot(state: &AppState) -> serde_json::Value {
     let effort = *state.effort.lock().unwrap();
-    Json(serde_json::json!({ "effort": effort })).into_response()
+    let skip_permissions = state
+        .registry
+        .skip_permissions
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let webhook_url = state.registry.webhook_url.read().unwrap().clone();
+    serde_json::json!({
+        "effort": effort,
+        "skip_permissions": skip_permissions,
+        "webhook_url": webhook_url,
+    })
+}
+
+fn snapshot_for_persist(state: &AppState) -> PersistedSettings {
+    PersistedSettings {
+        effort: Some(*state.effort.lock().unwrap()),
+        skip_permissions: Some(
+            state
+                .registry
+                .skip_permissions
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        webhook_url: state.registry.webhook_url.read().unwrap().clone(),
+    }
 }
 
 // ── GET /api/folders ─────────────────────────────────────────────────────────

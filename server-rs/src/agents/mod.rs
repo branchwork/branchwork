@@ -8,6 +8,8 @@ pub mod terminal_ws;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::RwLock;
 use tokio::sync::Mutex;
 
 use crate::config::Effort;
@@ -284,7 +286,9 @@ pub struct AgentRegistry {
     pub broadcast_tx: tokio::sync::broadcast::Sender<String>,
     /// Optional Slack/webhook URL. When set, agent-completion and phase-advance
     /// events fan out a POST here in addition to the in-process WS broadcast.
-    pub webhook_url: Option<String>,
+    /// Wrapped in `RwLock` so `PUT /api/settings` can update it live without
+    /// a server restart; readers (notify call sites) take a brief read lock.
+    pub webhook_url: Arc<RwLock<Option<String>>>,
     /// Directory where per-agent supervisor sockets (and their `.log` / `.pid`
     /// siblings) live. Created on startup.
     pub sockets_dir: PathBuf,
@@ -298,6 +302,10 @@ pub struct AgentRegistry {
     /// Available agent drivers, keyed by name. Built once at startup with
     /// [`DriverRegistry::with_defaults`]; clones share the underlying Arc.
     pub drivers: DriverRegistry,
+    /// Whether to spawn agents with `--dangerously-skip-permissions` (or the
+    /// driver's equivalent). Toggled live from the dashboard via
+    /// `PUT /api/settings`.
+    pub skip_permissions: Arc<AtomicBool>,
 }
 
 /// In-process state for a live agent whose PTY runs inside a detached
@@ -325,16 +333,18 @@ impl AgentRegistry {
         sockets_dir: PathBuf,
         server_exe: PathBuf,
         port: u16,
+        skip_permissions: bool,
     ) -> Self {
         Self {
             agents: Arc::new(Mutex::new(HashMap::new())),
             db,
             broadcast_tx,
-            webhook_url,
+            webhook_url: Arc::new(RwLock::new(webhook_url)),
             sockets_dir,
             server_exe,
             port,
             drivers: DriverRegistry::with_defaults(),
+            skip_permissions: Arc::new(AtomicBool::new(skip_permissions)),
         }
     }
 
@@ -1278,7 +1288,8 @@ pub async fn try_auto_advance(
         }),
     );
 
-    if registry.webhook_url.is_some() {
+    let webhook_snapshot = registry.webhook_url.read().unwrap().clone();
+    if webhook_snapshot.is_some() {
         let msg = crate::notifications::phase_advance_message(
             &plan_name,
             current_phase.number,
@@ -1295,7 +1306,7 @@ pub async fn try_auto_advance(
                 })
                 .count(),
         );
-        crate::notifications::notify(registry.webhook_url.clone(), msg);
+        crate::notifications::notify(webhook_snapshot, msg);
     }
 }
 
@@ -1632,6 +1643,7 @@ mod tests {
             PathBuf::from("/tmp/branchwork-test-sockets"),
             PathBuf::from("/nonexistent/branchwork-server"),
             3100,
+            true,
         );
         (registry, rx)
     }
