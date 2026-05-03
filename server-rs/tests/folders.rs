@@ -15,6 +15,13 @@ mod support;
 use rusqlite::params;
 use support::TestDashboard;
 
+// Windows `dirs::home_dir()` reads `SHGetKnownFolderPath(FOLDERID_Profile)`
+// and ignores the `HOME`/`USERPROFILE` env vars the harness sets, so the scan
+// hits the real runner profile rather than our tempdir — same constraint that
+// drives `tests/recovery.rs` and `tests/merge_guard.rs` to use absolute paths.
+// The `saas_*` companion below still runs on Windows and covers the dispatch
+// branch we actually care about.
+#[cfg(not(windows))]
 #[test]
 fn standalone_returns_local_home_folders() {
     let d = TestDashboard::new();

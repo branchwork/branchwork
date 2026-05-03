@@ -64,9 +64,13 @@ impl TestDashboard {
             ])
             // HOME=tmpdir so `project_dir_for` (home.join(plan.project))
             // resolves to the scratch project when the YAML's `project:`
-            // field is a bare directory name. On Windows `dirs::home_dir`
-            // reads USERPROFILE instead, so set that too; also set
-            // HOMEDRIVE/HOMEPATH for the older fallback path.
+            // field is a bare directory name. USERPROFILE is set as a
+            // best-effort hedge for any caller that does read it, but
+            // `dirs::home_dir()` on Windows goes through
+            // `SHGetKnownFolderPath(FOLDERID_Profile)` and ignores both
+            // env vars — tests that need to redirect home-dir scans on
+            // Windows must use absolute paths or skip (see
+            // `tests/recovery.rs:16` and `tests/folders.rs`).
             .env("HOME", dir.path())
             .env("USERPROFILE", dir.path())
             // Silence server stdout/stderr during tests unless the user

@@ -675,14 +675,7 @@ fn merge_targets_endpoint_returns_default_and_alternatives() {
 
     let task = "branchwork/mp-tg/1.1";
     d.create_task_branch(task, true);
-    seed_agent(
-        &d,
-        "agent-tg",
-        "mp-tg",
-        "1.1",
-        Some(task),
-        Some("master"),
-    );
+    seed_agent(&d, "agent-tg", "mp-tg", "1.1", Some(task), Some("master"));
 
     let (s, body) = d.get("/api/agents/agent-tg/merge-targets");
     assert_eq!(s, 200, "{body}");
@@ -781,10 +774,7 @@ fn merge_to_non_default_skips_ci_run() {
     d.create_task_branch(task, /* with_commit */ true);
     seed_agent(&d, "agent-non", "mp-non", "1.1", Some(task), Some("master"));
 
-    let (s, body) = d.post(
-        "/api/agents/agent-non/merge",
-        json!({"into": "feature/x"}),
-    );
+    let (s, body) = d.post("/api/agents/agent-non/merge", json!({"into": "feature/x"}));
     assert_eq!(s, 200, "expected 200, got {s}: {body}");
     assert_eq!(body["into"], "feature/x");
 
