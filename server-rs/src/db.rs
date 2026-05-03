@@ -37,6 +37,92 @@ pub fn task_learnings(conn: &Connection, plan_name: &str, task_number: &str) -> 
     .unwrap_or_default()
 }
 
+/// Whether auto-mode should currently act on `plan_name`. True iff the
+/// user opted in (`enabled = 1`) AND the loop has not self-paused
+/// (`paused_reason IS NULL`). Mirrors `auto_advance_enabled`.
+#[allow(dead_code)] // wired in by later auto-mode-loop tasks
+pub fn auto_mode_enabled(db: &Db, plan_name: &str) -> bool {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT enabled FROM plan_auto_mode \
+         WHERE plan_name = ?1 AND paused_reason IS NULL",
+        params![plan_name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|v| v != 0)
+    .unwrap_or(false)
+}
+
+/// Record that auto-mode has self-paused for `plan_name`. UPSERT so a
+/// pause that races a row deletion still lands; `enabled` is left
+/// untouched on the conflict path so the user's opt-in state survives.
+#[allow(dead_code)] // wired in by later auto-mode-loop tasks
+pub fn auto_mode_pause(db: &Db, plan_name: &str, reason: &str) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO plan_auto_mode (plan_name, paused_reason, paused_at) \
+         VALUES (?1, ?2, datetime('now')) \
+         ON CONFLICT(plan_name) DO UPDATE SET \
+           paused_reason = excluded.paused_reason, \
+           paused_at = excluded.paused_at",
+        params![plan_name, reason],
+    )
+    .ok();
+}
+
+/// Clear `paused_reason` / `paused_at` for `plan_name`. No-op if no row
+/// exists — there is nothing to unpause.
+#[allow(dead_code)] // wired in by later auto-mode-loop tasks
+pub fn auto_mode_resume(db: &Db, plan_name: &str) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "UPDATE plan_auto_mode \
+         SET paused_reason = NULL, paused_at = NULL \
+         WHERE plan_name = ?1",
+        params![plan_name],
+    )
+    .ok();
+}
+
+/// Number of fix attempts already recorded for `(plan_name, task_number)`.
+/// The loop compares this against `plan_auto_mode.max_fix_attempts`
+/// before spawning another fix agent.
+#[allow(dead_code)] // wired in by later auto-mode-loop tasks
+pub fn task_fix_attempt_count(db: &Db, plan_name: &str, task_number: &str) -> u32 {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM task_fix_attempts \
+         WHERE plan_name = ?1 AND task_number = ?2",
+        params![plan_name, task_number],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0) as u32
+}
+
+/// Insert a fix-attempt row. The `(plan_name, task_number, attempt)` PK
+/// makes the call idempotent on retry: a duplicate triple is ignored,
+/// not overwritten, so the original `started_at` is preserved.
+/// `outcome` and `finished_at` stay NULL until the agent stops; a later
+/// helper will close the row out.
+#[allow(dead_code)] // wired in by later auto-mode-loop tasks
+pub fn record_fix_attempt(
+    db: &Db,
+    plan_name: &str,
+    task_number: &str,
+    attempt: u32,
+    agent_id: &str,
+) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO task_fix_attempts \
+           (plan_name, task_number, attempt, agent_id, started_at) \
+         VALUES (?1, ?2, ?3, ?4, datetime('now')) \
+         ON CONFLICT(plan_name, task_number, attempt) DO NOTHING",
+        params![plan_name, task_number, attempt as i64, agent_id],
+    )
+    .ok();
+}
+
 /// Open (or create) the database at `db_path` and run migrations.
 pub fn init(db_path: &Path) -> Db {
     if let Some(parent) = db_path.parent() {
@@ -136,6 +222,32 @@ fn migrate(conn: &Connection) {
             plan_name  TEXT PRIMARY KEY,
             enabled    INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Auto-mode: opt-in flag plus self-pause state. `enabled` is the
+        -- user's toggle; `paused_reason` is set by the loop when it self-
+        -- pauses (merge conflict, fix-cap reached, etc.). The actionable
+        -- check is `enabled = 1 AND paused_reason IS NULL`.
+        CREATE TABLE IF NOT EXISTS plan_auto_mode (
+            plan_name        TEXT PRIMARY KEY,
+            enabled          INTEGER NOT NULL DEFAULT 0,
+            max_fix_attempts INTEGER NOT NULL DEFAULT 3,
+            paused_reason    TEXT,
+            paused_at        TEXT
+        );
+
+        -- Per-task fix-agent attempt log. One row per fix run; the count
+        -- is what enforces `plan_auto_mode.max_fix_attempts`. PK ensures
+        -- the record-then-act flow is idempotent on retry.
+        CREATE TABLE IF NOT EXISTS task_fix_attempts (
+            plan_name   TEXT    NOT NULL,
+            task_number TEXT    NOT NULL,
+            attempt     INTEGER NOT NULL,
+            agent_id    TEXT,
+            started_at  TEXT,
+            finished_at TEXT,
+            outcome     TEXT,
+            PRIMARY KEY (plan_name, task_number, attempt)
         );
 
         CREATE TABLE IF NOT EXISTS task_learnings (
@@ -508,6 +620,8 @@ mod tests {
         assert!(tables.contains(&"users".to_string()));
         assert!(tables.contains(&"sessions".to_string()));
         assert!(tables.contains(&"plan_verdicts".to_string()));
+        assert!(tables.contains(&"plan_auto_mode".to_string()));
+        assert!(tables.contains(&"task_fix_attempts".to_string()));
         assert!(tables.contains(&"organizations".to_string()));
         assert!(tables.contains(&"org_members".to_string()));
         assert!(tables.contains(&"plan_org".to_string()));
@@ -992,5 +1106,275 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM task_status", [], |row| row.get(0))
             .unwrap();
         assert_eq!(total, 0);
+    }
+
+    // ── plan_auto_mode helpers ──────────────────────────────────────────
+
+    #[test]
+    fn auto_mode_default_off() {
+        let (db, _dir) = test_db();
+        assert!(!auto_mode_enabled(&db, "p1"));
+    }
+
+    #[test]
+    fn auto_mode_enabled_after_opt_in() {
+        let (db, _dir) = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+                params!["p1"],
+            )
+            .unwrap();
+        }
+        assert!(auto_mode_enabled(&db, "p1"));
+        assert!(!auto_mode_enabled(&db, "p2"));
+    }
+
+    #[test]
+    fn auto_mode_disabled_explicit_zero() {
+        let (db, _dir) = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 0)",
+                params!["p1"],
+            )
+            .unwrap();
+        }
+        assert!(!auto_mode_enabled(&db, "p1"));
+    }
+
+    #[test]
+    fn auto_mode_pause_blocks_enabled() {
+        let (db, _dir) = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+                params!["p1"],
+            )
+            .unwrap();
+        }
+        assert!(auto_mode_enabled(&db, "p1"));
+
+        auto_mode_pause(&db, "p1", "merge_conflict");
+        assert!(
+            !auto_mode_enabled(&db, "p1"),
+            "paused plan must report not-enabled"
+        );
+
+        // Inspect the row directly: paused_reason and paused_at landed,
+        // enabled is preserved.
+        let conn = db.lock().unwrap();
+        let (enabled, reason, paused_at): (i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT enabled, paused_reason, paused_at \
+                 FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["p1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1, "pause must not flip enabled");
+        assert_eq!(reason.as_deref(), Some("merge_conflict"));
+        assert!(paused_at.is_some(), "paused_at must be set");
+    }
+
+    #[test]
+    fn auto_mode_resume_clears_pause_state() {
+        let (db, _dir) = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+                params!["p1"],
+            )
+            .unwrap();
+        }
+
+        auto_mode_pause(&db, "p1", "fix_cap_reached");
+        assert!(!auto_mode_enabled(&db, "p1"));
+
+        auto_mode_resume(&db, "p1");
+        assert!(
+            auto_mode_enabled(&db, "p1"),
+            "resume must restore acting state"
+        );
+
+        let conn = db.lock().unwrap();
+        let (reason, paused_at): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT paused_reason, paused_at \
+                 FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["p1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, None);
+        assert_eq!(paused_at, None);
+    }
+
+    #[test]
+    fn auto_mode_pause_creates_row_when_missing() {
+        // Defensive: if the loop pauses before the user toggled (or after
+        // the row was deleted), the UPSERT must still record the reason.
+        let (db, _dir) = test_db();
+        auto_mode_pause(&db, "p1", "merge_conflict");
+
+        let conn = db.lock().unwrap();
+        let (enabled, reason): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT enabled, paused_reason \
+                 FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["p1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(enabled, 0, "default-on-insert is 0; user has not opted in");
+        assert_eq!(reason.as_deref(), Some("merge_conflict"));
+    }
+
+    #[test]
+    fn auto_mode_resume_no_op_when_missing() {
+        let (db, _dir) = test_db();
+        auto_mode_resume(&db, "p1");
+
+        let conn = db.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["p1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "resume must not create a row");
+    }
+
+    // ── task_fix_attempts helpers ───────────────────────────────────────
+
+    #[test]
+    fn fix_attempt_count_zero_for_no_rows() {
+        let (db, _dir) = test_db();
+        assert_eq!(task_fix_attempt_count(&db, "p1", "1.1"), 0);
+    }
+
+    #[test]
+    fn record_fix_attempt_and_count() {
+        let (db, _dir) = test_db();
+
+        record_fix_attempt(&db, "p1", "1.1", 1, "agent-a");
+        assert_eq!(task_fix_attempt_count(&db, "p1", "1.1"), 1);
+
+        record_fix_attempt(&db, "p1", "1.1", 2, "agent-b");
+        record_fix_attempt(&db, "p1", "1.1", 3, "agent-c");
+        assert_eq!(task_fix_attempt_count(&db, "p1", "1.1"), 3);
+
+        // Count is scoped per (plan, task).
+        assert_eq!(task_fix_attempt_count(&db, "p1", "1.2"), 0);
+        assert_eq!(task_fix_attempt_count(&db, "p2", "1.1"), 0);
+    }
+
+    #[test]
+    fn record_fix_attempt_idempotent_on_pk_conflict() {
+        let (db, _dir) = test_db();
+
+        record_fix_attempt(&db, "p1", "1.1", 1, "agent-a");
+        // Second insert with the same triple is a no-op; original
+        // started_at and agent_id survive.
+        record_fix_attempt(&db, "p1", "1.1", 1, "agent-different");
+        assert_eq!(task_fix_attempt_count(&db, "p1", "1.1"), 1);
+
+        let conn = db.lock().unwrap();
+        let agent: String = conn
+            .query_row(
+                "SELECT agent_id FROM task_fix_attempts \
+                 WHERE plan_name = ?1 AND task_number = ?2 AND attempt = ?3",
+                params!["p1", "1.1", 1i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent, "agent-a", "first writer wins");
+    }
+
+    #[test]
+    fn record_fix_attempt_persists_started_at() {
+        let (db, _dir) = test_db();
+        record_fix_attempt(&db, "p1", "1.1", 1, "agent-a");
+
+        let conn = db.lock().unwrap();
+        let (started_at, finished_at, outcome): (Option<String>, Option<String>, Option<String>) =
+            conn.query_row(
+                "SELECT started_at, finished_at, outcome FROM task_fix_attempts \
+                 WHERE plan_name = ?1 AND task_number = ?2 AND attempt = ?3",
+                params!["p1", "1.1", 1i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(started_at.is_some(), "started_at must be set on insert");
+        assert_eq!(finished_at, None, "finished_at stays NULL until close-out");
+        assert_eq!(outcome, None, "outcome stays NULL until close-out");
+    }
+
+    #[test]
+    fn plan_auto_mode_default_max_fix_attempts_is_three() {
+        // The default value is the policy ceiling; the loop reads it
+        // when deciding whether to spawn another fix agent. Pin it so
+        // future schema edits notice the implicit contract.
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+            params!["p1"],
+        )
+        .unwrap();
+        let max: i64 = conn
+            .query_row(
+                "SELECT max_fix_attempts FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["p1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(max, 3);
+    }
+
+    #[test]
+    fn plan_auto_mode_migration_preserves_data_across_init() {
+        // Acceptance: migrations apply on an existing DB without
+        // dropping data. Seed both new tables, re-init, observe rows
+        // survive.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let db = init(&path);
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled, max_fix_attempts) \
+                 VALUES (?1, 1, 5)",
+                params!["plan-a"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_fix_attempts \
+                   (plan_name, task_number, attempt, agent_id, started_at) \
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                params!["plan-a", "1.1", 1i64, "agent-a"],
+            )
+            .unwrap();
+        }
+
+        // Re-init: idempotent migration must not drop seeded rows.
+        let db2 = init(&path);
+        assert!(auto_mode_enabled(&db2, "plan-a"));
+        assert_eq!(task_fix_attempt_count(&db2, "plan-a", "1.1"), 1);
+        let conn = db2.lock().unwrap();
+        let max: i64 = conn
+            .query_row(
+                "SELECT max_fix_attempts FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["plan-a"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(max, 5, "user-set max_fix_attempts survives re-init");
     }
 }
