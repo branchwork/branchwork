@@ -19,12 +19,23 @@
 
 // Pull in self-contained modules via #[path] so this binary compiles
 // independently of the main branchwork-server crate.
+#[path = "../git_helpers.rs"]
+mod git_helpers;
 #[path = "../saas/outbox.rs"]
 mod outbox;
 #[path = "../saas/runner_protocol.rs"]
-mod runner_protocol;
+pub mod runner_protocol;
 #[path = "../agents/session_protocol.rs"]
 mod session_protocol;
+
+// `git_helpers.rs` references types via `crate::saas::runner_protocol` so
+// the same `use` statement compiles in both the server crate (where the
+// hierarchy actually exists) and this runner binary. Re-export the leaf
+// module under that path here — runner-internal callers keep using the
+// flat `runner_protocol` module name.
+mod saas {
+    pub use super::runner_protocol;
+}
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,7 +46,9 @@ use clap::Parser;
 use rusqlite::Connection;
 use tokio::sync::{Mutex, mpsc};
 
-use runner_protocol::{DriverAuthInfo, DriverAuthStatus, Envelope, FolderEntry, WireMessage};
+use runner_protocol::{
+    DriverAuthInfo, DriverAuthStatus, Envelope, FolderEntry, GhRun, MergeOutcome, WireMessage,
+};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -522,6 +535,154 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                 .send(serde_json::to_string(&env).unwrap_or_default());
         }
 
+        WireMessage::GetDefaultBranch { req_id, cwd } => {
+            let req_id = req_id.clone();
+            let reply = match validated_cwd(state, cwd) {
+                Ok(path) => {
+                    let branch =
+                        run_blocking_with_timeout(READ_TIMEOUT, move || {
+                            git_helpers::git_default_branch(&path)
+                        })
+                        .await
+                        .unwrap_or(None);
+                    WireMessage::DefaultBranchResolved {
+                        req_id,
+                        branch,
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[runner] get_default_branch rejected cwd: {e}");
+                    WireMessage::DefaultBranchResolved {
+                        req_id,
+                        branch: None,
+                    }
+                }
+            };
+            send_best_effort(state, reply);
+        }
+
+        WireMessage::ListBranches { req_id, cwd } => {
+            let req_id = req_id.clone();
+            let reply = match validated_cwd(state, cwd) {
+                Ok(path) => {
+                    let branches = run_blocking_with_timeout(READ_TIMEOUT, move || {
+                        git_helpers::git_list_branches(&path)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    WireMessage::BranchesListed { req_id, branches }
+                }
+                Err(e) => {
+                    eprintln!("[runner] list_branches rejected cwd: {e}");
+                    WireMessage::BranchesListed {
+                        req_id,
+                        branches: Vec::new(),
+                    }
+                }
+            };
+            send_best_effort(state, reply);
+        }
+
+        WireMessage::MergeBranch {
+            req_id,
+            cwd,
+            target,
+            task_branch,
+        } => {
+            let req_id = req_id.clone();
+            let target = target.clone();
+            let task_branch = task_branch.clone();
+            let outcome = match validated_cwd(state, cwd) {
+                Ok(path) => run_blocking_with_timeout(MERGE_TIMEOUT, move || {
+                    git_helpers::merge_branch_local(&path, &target, &task_branch)
+                })
+                .await
+                .unwrap_or_else(|| MergeOutcome::Other {
+                    stderr: format!(
+                        "merge timed out after {}s",
+                        MERGE_TIMEOUT.as_secs()
+                    ),
+                }),
+                Err(e) => MergeOutcome::Other { stderr: e },
+            };
+            send_best_effort(state, WireMessage::MergeResult { req_id, outcome });
+        }
+
+        WireMessage::PushBranch {
+            req_id,
+            cwd,
+            branch,
+        } => {
+            let req_id = req_id.clone();
+            let branch = branch.clone();
+            let (ok, stderr) = match validated_cwd(state, cwd) {
+                Ok(path) => {
+                    let result = run_blocking_with_timeout(PUSH_TIMEOUT, move || {
+                        git_helpers::push_branch_local(&path, &branch)
+                    })
+                    .await;
+                    match result {
+                        Some(Ok(())) => (true, None),
+                        Some(Err(e)) => (false, Some(e)),
+                        None => (
+                            false,
+                            Some(format!(
+                                "push timed out after {}s",
+                                PUSH_TIMEOUT.as_secs()
+                            )),
+                        ),
+                    }
+                }
+                Err(e) => (false, Some(e)),
+            };
+            send_best_effort(
+                state,
+                WireMessage::PushResult {
+                    req_id,
+                    ok,
+                    stderr,
+                },
+            );
+        }
+
+        WireMessage::GhRunList { req_id, cwd, sha } => {
+            let req_id = req_id.clone();
+            let sha = sha.clone();
+            let run: Option<GhRun> = match validated_cwd(state, cwd) {
+                Ok(path) => run_blocking_with_timeout(GH_TIMEOUT, move || {
+                    git_helpers::gh_run_list_local(&path, &sha)
+                })
+                .await
+                .unwrap_or(None),
+                Err(e) => {
+                    eprintln!("[runner] gh_run_list rejected cwd: {e}");
+                    None
+                }
+            };
+            send_best_effort(state, WireMessage::GhRunListed { req_id, run });
+        }
+
+        WireMessage::GhFailureLog {
+            req_id,
+            cwd,
+            run_id,
+        } => {
+            let req_id = req_id.clone();
+            let run_id = run_id.clone();
+            let log: Option<String> = match validated_cwd(state, cwd) {
+                Ok(path) => run_blocking_with_timeout(GH_TIMEOUT, move || {
+                    git_helpers::gh_failure_log_local(&path, &run_id)
+                })
+                .await
+                .unwrap_or(None),
+                Err(e) => {
+                    eprintln!("[runner] gh_failure_log rejected cwd: {e}");
+                    None
+                }
+            };
+            send_best_effort(state, WireMessage::GhFailureLogFetched { req_id, log });
+        }
+
         // Runner doesn't receive these from server (runner→saas direction
         // only; the server sending them would be a protocol violation).
         WireMessage::RunnerHello { .. }
@@ -541,14 +702,76 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         // saas→runner variants the runner doesn't act on yet (handlers
         // land in later phases).
         | WireMessage::TerminalReplay { .. }
-        | WireMessage::GetDefaultBranch { .. }
-        | WireMessage::ListBranches { .. }
-        | WireMessage::MergeBranch { .. }
-        | WireMessage::PushBranch { .. }
-        | WireMessage::GhRunList { .. }
-        | WireMessage::GhFailureLog { .. }
         | WireMessage::Ping {} => {}
     }
+}
+
+// ── Wall-clock caps for runner-side git/gh shell-outs ───────────────────────
+//
+// Each handler runs the helper on a blocking thread and races it against
+// these timeouts. On timeout the spawned task is detached (it keeps running
+// until the child process finishes), but the handler's req_id slot is freed
+// immediately so a hung `git` or `gh` invocation can't permanently park the
+// reply channel. The dispatcher on the SaaS side (saas/runner_rpc.rs) has
+// its own, longer timeout that wraps the round-trip.
+//
+// Numbers track the brief: 30 s for read/merge/gh, 60 s for push.
+
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
+const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+const GH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Validate a request-supplied `cwd` against the runner's canonical
+/// `--cwd`. Refuses anything outside the canonical root so a buggy or
+/// malicious server can't pivot the runner into an arbitrary directory.
+///
+/// The runner already canonicalises `state.cwd` once at startup. We
+/// canonicalise the request path here too — which doubles as an existence
+/// check, since `canonicalize` errors on missing components.
+fn validated_cwd(state: &RunnerState, requested: &str) -> Result<PathBuf, String> {
+    let req = PathBuf::from(requested);
+    let canonical = std::fs::canonicalize(&req)
+        .map_err(|e| format!("cwd not canonicalisable ({}): {e}", req.display()))?;
+    if !canonical.starts_with(&state.cwd) {
+        return Err(format!(
+            "cwd {} outside runner root {}",
+            canonical.display(),
+            state.cwd.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Run `f` on a blocking thread, racing it against `timeout`. Returns
+/// `Some(result)` if `f` completed in time, `None` on timeout (the spawned
+/// task is detached and the underlying child process is left to exit on its
+/// own). The handler always replies to the SaaS side regardless of which
+/// branch fires.
+async fn run_blocking_with_timeout<T, F>(timeout: Duration, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(f);
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(e)) => {
+            eprintln!("[runner] blocking task panicked: {e}");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// Send a best-effort reply over the WebSocket. Drops silently if the
+/// writer task is gone — the SaaS side will time out and the next reconnect
+/// is the right recovery.
+fn send_best_effort(state: &RunnerState, message: WireMessage) {
+    let env = Envelope::best_effort(state.runner_id.clone(), message);
+    let _ = state
+        .ws_tx
+        .send(serde_json::to_string(&env).unwrap_or_default());
 }
 
 /// Resolve a runner-side folder path. `~` and `~/...` expand against
@@ -1118,5 +1341,415 @@ mod tests {
             assert!(error.is_none());
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Phase 5.7 handler tests ─────────────────────────────────────────
+    //
+    // Drive each new RPC handler arm directly through `handle_server_message`
+    // and observe the reply on the writer channel. This exercises:
+    //   - cwd validation (path inside vs outside the canonical runner cwd),
+    //   - the wire shape of every reply variant,
+    //   - the underlying git/gh shell-out (via git_helpers).
+    //
+    // We intentionally do not stand up a real WS round-trip — the runner's
+    // protocol layer is already covered by saas/runner_rpc.rs's
+    // real_ws_disconnect_drains_pending_senders_and_wakes_receivers. What
+    // these tests guard is the correctness of the runner side of each pair.
+
+    use tempfile::TempDir;
+    use tokio::sync::{Mutex, mpsc};
+
+    /// Run a `git` command in `dir` and panic if it fails. Test-only helper.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {}: {}\n{}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// Initialise a repo at `dir` on `branch` with one empty commit. Mirrors
+    /// the helper that lives next to the git_helpers tests; copied here so
+    /// the runner-bin test file is self-contained.
+    fn git_init_with_commit(dir: &Path, branch: &str) {
+        git(dir, &["init", "-b", branch]);
+        git(dir, &["config", "user.email", "t@t"]);
+        git(dir, &["config", "user.name", "t"]);
+        git(dir, &["commit", "--allow-empty", "-m", "init"]);
+    }
+
+    /// Build a minimal `RunnerState` rooted at `cwd`. Returns the state
+    /// alongside the receive side of the writer channel so tests can read
+    /// envelopes the handler emits.
+    fn make_test_state(cwd: PathBuf) -> (Arc<RunnerState>, mpsc::UnboundedReceiver<String>) {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        outbox::init_runner_outbox(&conn);
+        outbox::init_seq_tracker(&conn);
+        let (ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
+        let canonical = std::fs::canonicalize(&cwd).expect("canonicalize tempdir");
+        let state = Arc::new(RunnerState {
+            runner_id: "runner-test".to_string(),
+            db: Arc::new(Mutex::new(conn)),
+            agents: Arc::new(Mutex::new(HashMap::new())),
+            ws_tx,
+            cwd: canonical,
+            server_bin: PathBuf::from("/usr/bin/true"),
+        });
+        (state, ws_rx)
+    }
+
+    /// Wrap `message` in a best-effort envelope and feed it to
+    /// `handle_server_message`. Returns the first reply parsed off the
+    /// writer channel.
+    async fn dispatch(
+        state: &Arc<RunnerState>,
+        rx: &mut mpsc::UnboundedReceiver<String>,
+        message: WireMessage,
+    ) -> WireMessage {
+        let env = Envelope::best_effort(state.runner_id.clone(), message);
+        handle_server_message(state, &env).await;
+        let raw = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("handler did not reply within 5s")
+            .expect("ws_tx channel closed");
+        let env: Envelope = serde_json::from_str(&raw).expect("reply parses");
+        env.message
+    }
+
+    #[tokio::test]
+    async fn get_default_branch_resolves_master() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::GetDefaultBranch {
+                req_id: "req-1".into(),
+                cwd: state.cwd.display().to_string(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::DefaultBranchResolved { req_id, branch } => {
+                assert_eq!(req_id, "req-1");
+                assert_eq!(branch.as_deref(), Some("master"));
+            }
+            other => panic!("expected DefaultBranchResolved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_branches_returns_alphabetical_no_remotes() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        git(dir.path(), &["branch", "feature/x"]);
+        git(dir.path(), &["branch", "bw/1.1"]);
+        // A fake remote-tracking ref must NOT show up — `git branch` without
+        // --all hides remotes by default; this just pins the contract.
+        std::fs::create_dir_all(dir.path().join(".git/refs/remotes/origin")).unwrap();
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(
+            dir.path().join(".git/refs/remotes/origin/main"),
+            head.stdout,
+        )
+        .unwrap();
+
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::ListBranches {
+                req_id: "req-2".into(),
+                cwd: state.cwd.display().to_string(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::BranchesListed { req_id, branches } => {
+                assert_eq!(req_id, "req-2");
+                assert_eq!(
+                    branches,
+                    vec![
+                        "bw/1.1".to_string(),
+                        "feature/x".to_string(),
+                        "master".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected BranchesListed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_branch_happy_path_replies_ok_with_sha() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        git(dir.path(), &["checkout", "-b", "feature/x"]);
+        std::fs::write(dir.path().join("foo.txt"), "hi").unwrap();
+        git(dir.path(), &["add", "foo.txt"]);
+        git(dir.path(), &["commit", "-m", "add foo"]);
+        git(dir.path(), &["checkout", "master"]);
+
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::MergeBranch {
+                req_id: "req-3".into(),
+                cwd: state.cwd.display().to_string(),
+                target: "master".into(),
+                task_branch: "feature/x".into(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::MergeResult {
+                req_id,
+                outcome: MergeOutcome::Ok { merged_sha },
+            } => {
+                assert_eq!(req_id, "req-3");
+                assert_eq!(merged_sha.len(), 40);
+            }
+            other => panic!("expected MergeResult::Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_branch_empty_replies_empty_branch() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        git(dir.path(), &["branch", "feature/empty"]);
+
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::MergeBranch {
+                req_id: "req-4".into(),
+                cwd: state.cwd.display().to_string(),
+                target: "master".into(),
+                task_branch: "feature/empty".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            reply,
+            WireMessage::MergeResult {
+                outcome: MergeOutcome::EmptyBranch,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn merge_branch_conflict_replies_conflict_and_aborts() {
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        std::fs::write(dir.path().join("c.txt"), "base\n").unwrap();
+        git(dir.path(), &["add", "c.txt"]);
+        git(dir.path(), &["commit", "-m", "base"]);
+        git(dir.path(), &["checkout", "-b", "feature/conflict"]);
+        std::fs::write(dir.path().join("c.txt"), "branch\n").unwrap();
+        git(dir.path(), &["add", "c.txt"]);
+        git(dir.path(), &["commit", "-m", "branch"]);
+        git(dir.path(), &["checkout", "master"]);
+        std::fs::write(dir.path().join("c.txt"), "master\n").unwrap();
+        git(dir.path(), &["add", "c.txt"]);
+        git(dir.path(), &["commit", "-m", "master"]);
+
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::MergeBranch {
+                req_id: "req-5".into(),
+                cwd: state.cwd.display().to_string(),
+                target: "master".into(),
+                task_branch: "feature/conflict".into(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::MergeResult {
+                req_id,
+                outcome: MergeOutcome::Conflict { stderr: _ },
+            } => assert_eq!(req_id, "req-5"),
+            other => panic!("expected MergeResult::Conflict, got {other:?}"),
+        }
+        // Acceptance: runner must have aborted cleanly — no leftover MERGE_HEAD.
+        // (git's CONFLICT message goes to stdout, so stderr may be empty here
+        // even though the conflict was correctly detected.)
+        assert!(
+            !dir.path().join(".git/MERGE_HEAD").exists(),
+            "MERGE_HEAD lingering after conflict reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_branch_to_local_bare_origin_replies_ok() {
+        let dir = TempDir::new().unwrap();
+        let origin = dir.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "master"])
+            .arg(&origin)
+            .status()
+            .unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_init_with_commit(&work, "master");
+        git(
+            &work,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+
+        let (state, mut rx) = make_test_state(work.clone());
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::PushBranch {
+                req_id: "req-6".into(),
+                cwd: state.cwd.display().to_string(),
+                branch: "master".into(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::PushResult { req_id, ok, stderr } => {
+                assert_eq!(req_id, "req-6");
+                assert!(ok, "push should succeed; stderr={stderr:?}");
+            }
+            other => panic!("expected PushResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gh_run_list_against_unknown_sha_replies_run_none() {
+        // No git repo at the cwd → gh exits non-zero → helper returns None.
+        // Acceptance criterion: `run: None`, NOT an error variant.
+        let dir = TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::GhRunList {
+                req_id: "req-7".into(),
+                cwd: state.cwd.display().to_string(),
+                sha: "deadbeef".into(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::GhRunListed { req_id, run } => {
+                assert_eq!(req_id, "req-7");
+                assert!(run.is_none(), "expected run: None, got {run:?}");
+            }
+            other => panic!("expected GhRunListed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gh_failure_log_for_unknown_run_replies_log_none() {
+        // Without a real failed gh run we can't get a tail back, so this
+        // covers the protocol shape (req_id round-trip + `log: None` when
+        // gh fails). The trim-tail logic is exercised by git_helpers in the
+        // server-bin test suite.
+        let dir = TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::GhFailureLog {
+                req_id: "req-8".into(),
+                cwd: state.cwd.display().to_string(),
+                run_id: "0".into(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::GhFailureLogFetched { req_id, log } => {
+                assert_eq!(req_id, "req-8");
+                assert!(log.is_none(), "expected log: None, got {log:?}");
+            }
+            other => panic!("expected GhFailureLogFetched, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cwd_outside_canonical_root_replies_with_safe_default() {
+        // Acceptance: cwd outside the runner's canonical --cwd must NOT
+        // execute. Reply uses the variant's "no result" shape (None/empty)
+        // rather than a free-form error so existing protocol parsers stay
+        // strict.
+        let root = TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(root.path().to_path_buf());
+
+        // Build a sibling tempdir that is OUTSIDE the runner's canonical root.
+        let outside = TempDir::new().unwrap();
+        git_init_with_commit(outside.path(), "master");
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::GetDefaultBranch {
+                req_id: "req-9".into(),
+                cwd: outside.path().display().to_string(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::DefaultBranchResolved { req_id, branch } => {
+                assert_eq!(req_id, "req-9");
+                assert!(
+                    branch.is_none(),
+                    "outside-root cwd must NOT resolve, got {branch:?}"
+                );
+            }
+            other => panic!("expected DefaultBranchResolved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cwd_outside_canonical_root_for_merge_replies_other_error() {
+        let root = TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(root.path().to_path_buf());
+        let outside = TempDir::new().unwrap();
+        git_init_with_commit(outside.path(), "master");
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::MergeBranch {
+                req_id: "req-10".into(),
+                cwd: outside.path().display().to_string(),
+                target: "master".into(),
+                task_branch: "feature/x".into(),
+            },
+        )
+        .await;
+        // Merge has no "no result" — it must surface the rejection as
+        // MergeOutcome::Other so the SaaS side can map it to 5xx.
+        match reply {
+            WireMessage::MergeResult {
+                req_id,
+                outcome: MergeOutcome::Other { stderr },
+            } => {
+                assert_eq!(req_id, "req-10");
+                assert!(stderr.contains("outside runner root"), "stderr={stderr}");
+            }
+            other => panic!("expected MergeResult::Other, got {other:?}"),
+        }
     }
 }

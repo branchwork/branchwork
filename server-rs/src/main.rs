@@ -7,6 +7,7 @@ mod ci;
 mod config;
 mod db;
 mod file_watcher;
+mod git_helpers;
 mod hooks;
 mod mcp;
 mod notifications;

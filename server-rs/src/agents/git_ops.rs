@@ -43,7 +43,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolve the canonical default branch.
 /// - SaaS path: dispatch [`WireMessage::GetDefaultBranch`] to the runner.
-/// - Standalone: shell out via [`crate::agents::git_default_branch`].
+/// - Standalone: shell out via [`crate::git_helpers::git_default_branch`].
 ///
 /// Inner `Option<String>` is `None` when no candidate resolved (no
 /// `origin/HEAD`, no local `master`/`main`). Outer `Result` is `Err` only
@@ -65,7 +65,7 @@ pub async fn default_branch(
             other => unexpected_response("default_branch_resolved", &other),
         }
     } else {
-        Ok(crate::agents::git_default_branch(cwd))
+        Ok(crate::git_helpers::git_default_branch(cwd))
     }
 }
 
@@ -73,7 +73,7 @@ pub async fn default_branch(
 
 /// List local branches (sorted, no remotes).
 /// - SaaS path: dispatch [`WireMessage::ListBranches`] to the runner.
-/// - Standalone: shell out via [`crate::agents::git_list_branches`].
+/// - Standalone: shell out via [`crate::git_helpers::git_list_branches`].
 pub async fn list_branches(
     db: &Db,
     runners: &RunnerRegistry,
@@ -91,7 +91,7 @@ pub async fn list_branches(
             other => unexpected_response("branches_listed", &other),
         }
     } else {
-        Ok(crate::agents::git_list_branches(cwd))
+        Ok(crate::git_helpers::git_list_branches(cwd))
     }
 }
 
@@ -127,92 +127,10 @@ pub async fn merge_branch(
     }
 }
 
-/// Run the five-step merge sequence locally:
-///
-///   1. `git rev-list --count <target>..<task_branch>` — empty-branch guard.
-///   2. `git checkout <target>`.
-///   3. `git merge <task_branch> --no-edit` (abort on conflict).
-///   4. `git branch -d <task_branch>` (best-effort cleanup).
-///   5. `git rev-parse HEAD` to capture `merged_sha`.
-///
-/// Returns a [`MergeOutcome`] mirroring the wire protocol so the same enum
-/// flows from both paths into the HTTP layer.
-///
-/// Public so the runner binary can include this module via `#[path]` in the
-/// SaaS-wired refactor and reuse the exact same logic on the runner side.
-pub fn merge_branch_local(cwd: &Path, target: &str, task_branch: &str) -> MergeOutcome {
-    use std::process::Command;
-
-    // 1. Empty-branch guard. If `rev-list` itself fails (deleted ref, detached
-    //    HEAD, etc) we fall through permissively — the merge below will
-    //    return its own clearer error.
-    let revlist = Command::new("git")
-        .args(["rev-list", "--count", &format!("{target}..{task_branch}")])
-        .current_dir(cwd)
-        .output();
-    if let Ok(output) = &revlist
-        && output.status.success()
-    {
-        let count: u64 = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        if count == 0 {
-            return MergeOutcome::EmptyBranch;
-        }
-    }
-
-    // 2. Checkout target.
-    let checkout = Command::new("git")
-        .args(["checkout", target])
-        .current_dir(cwd)
-        .output();
-    match checkout {
-        Ok(output) if !output.status.success() => {
-            return MergeOutcome::CheckoutFailed {
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            };
-        }
-        Err(e) => {
-            return MergeOutcome::Other {
-                stderr: format!("Failed to run git: {e}"),
-            };
-        }
-        _ => {}
-    }
-
-    // 3. Merge.
-    let merge = Command::new("git")
-        .args(["merge", task_branch, "--no-edit"])
-        .current_dir(cwd)
-        .output();
-    match merge {
-        Ok(output) if output.status.success() => {
-            // 4. Best-effort branch cleanup.
-            Command::new("git")
-                .args(["branch", "-d", task_branch])
-                .current_dir(cwd)
-                .output()
-                .ok();
-            // 5. Capture merged SHA.
-            let merged_sha = crate::agents::git_head_sha(cwd).unwrap_or_default();
-            MergeOutcome::Ok { merged_sha }
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            // Abort the failed merge so the working tree is clean.
-            Command::new("git")
-                .args(["merge", "--abort"])
-                .current_dir(cwd)
-                .output()
-                .ok();
-            MergeOutcome::Conflict { stderr }
-        }
-        Err(e) => MergeOutcome::Other {
-            stderr: format!("Failed to run git merge: {e}"),
-        },
-    }
-}
+/// Run the five-step merge sequence locally. Implementation lives in
+/// `crate::git_helpers` so the runner binary can pull it in via `#[path]`
+/// and call the exact same logic on the runner side.
+pub use crate::git_helpers::merge_branch_local;
 
 // ── push_branch ─────────────────────────────────────────────────────────────
 
@@ -249,21 +167,9 @@ pub async fn push_branch(
     }
 }
 
-/// Local implementation of `git push origin <branch>`. `Err(stderr)` carries
-/// the captured error so the caller can log it; the dashboard does not surface
-/// push failures to the user (CI will retry on the next merge).
-pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<(), String> {
-    use std::process::Command;
-    let push = Command::new("git")
-        .args(["push", "origin", branch])
-        .current_dir(cwd)
-        .output();
-    match push {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
-        Err(e) => Err(format!("failed to run git push: {e}")),
-    }
-}
+/// Local implementation of `git push origin <branch>`. Implementation lives
+/// in `crate::git_helpers` so the runner binary can reuse it.
+pub use crate::git_helpers::push_branch_local;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 

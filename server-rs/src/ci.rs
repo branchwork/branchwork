@@ -223,32 +223,13 @@ fn terminal(status: &str) -> bool {
 /// Runs in a blocking thread because `Command` is sync.
 ///
 /// Local (standalone) implementation. The SaaS path goes through
-/// [`fetch_run`] which dispatches via the runner.
+/// [`fetch_run`] which dispatches via the runner. Implementation lives in
+/// `crate::git_helpers::gh_run_list_local` so the runner binary reuses it.
 async fn fetch_run_local(cwd: PathBuf, sha: String) -> Option<GhRun> {
-    tokio::task::spawn_blocking(move || {
-        let out = Command::new("gh")
-            .args([
-                "run",
-                "list",
-                "--commit",
-                &sha,
-                "-L",
-                "1",
-                "--json",
-                "databaseId,status,conclusion,url",
-            ])
-            .current_dir(&cwd)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let runs: Vec<GhRun> = serde_json::from_slice(&out.stdout).ok()?;
-        runs.into_iter().next()
-    })
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(move || crate::git_helpers::gh_run_list_local(&cwd, &sha))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Mode-aware dispatcher for [`fetch_run_local`].
@@ -604,27 +585,13 @@ pub async fn fetch_failure_log(
 }
 
 /// Local `gh run view --log-failed` shell-out. Tail-trimmed at 8 KB.
+/// Implementation lives in `crate::git_helpers::gh_failure_log_local` so
+/// the runner binary reuses it.
 async fn fetch_failure_log_local(cwd: PathBuf, run_id: String) -> Option<String> {
-    const CAP_BYTES: usize = 8 * 1024;
-    tokio::task::spawn_blocking(move || {
-        let out = Command::new("gh")
-            .args(["run", "view", &run_id, "--log-failed"])
-            .current_dir(&cwd)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        // `--log-failed` can be hundreds of KB; keep the tail (failures
-        // accumulate there) and decode lossily so stray non-UTF8 doesn't
-        // drop the whole buffer.
-        let raw = out.stdout;
-        let start = raw.len().saturating_sub(CAP_BYTES);
-        Some(String::from_utf8_lossy(&raw[start..]).into_owned())
-    })
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(move || crate::git_helpers::gh_failure_log_local(&cwd, &run_id))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Resolve `org_id` for a `ci_runs` row by joining through `agents.agent_id`.
