@@ -11,8 +11,10 @@
 //! - [`outbox`] — SQLite-backed outbox for at-least-once delivery
 //! - [`runner_ws`] — server-side WebSocket handler + token management API
 //! - [`runner_rpc`] — request/response helper over the WS
+//! - [`dispatch`] — helpers for routing folder/fs ops via runner vs local fs
 
 pub mod billing;
+pub mod dispatch;
 pub mod outbox;
 pub mod runner_protocol;
 pub mod runner_rpc;
