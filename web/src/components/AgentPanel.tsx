@@ -365,7 +365,7 @@ function StreamJsonView({ agentId, isActive }: { agentId: string; isActive: bool
 
 // --- Diff View ---
 
-function DiffView({
+export function DiffView({
   agentId,
   canMerge,
   sourceBranch,
