@@ -274,6 +274,57 @@ issues per-task absolute paths (e.g. for monorepo subpackages) the
 runner spawns the daemon with that exact path and the runner's own
 `--cwd` is irrelevant for that agent.
 
+## Branch, merge, and CI handlers
+
+Beyond spawning agents, the runner is also the host for the side
+effects the SaaS dashboard used to perform directly on its own
+filesystem: resolving the canonical default branch, listing local
+branches, performing the merge, pushing to `origin`, and querying
+`gh` for CI run status and failure logs. Each one is implemented as
+an additional arm in the runner's `handle_server_message` match
+(`branchwork_runner.rs`); they all reply with a best-effort envelope
+correlated by `req_id`. The wire protocol for these eight
+request/response pairs is documented in
+[protocols.md](protocols.md#wiremessage-variants); this section covers
+the runner-side handler shape.
+
+| Variant | Shells out to | Validates / trims | Reply |
+|---|---|---|---|
+| `GetDefaultBranch` | `git symbolic-ref --short refs/remotes/origin/HEAD`; falls back to `git rev-parse --verify --quiet master` then `main`. Same three-step algo as the local `agents::git_default_branch` helper — never fetches. | `cwd` must be a git repo (otherwise every probe fails and the reply is `branch: None`). | `DefaultBranchResolved { branch }` |
+| `ListBranches` | `git branch --format='%(refname:short)'` | Trim and filter empty lines, alphabetical sort (mirrors `agents::git_list_branches`). | `BranchesListed { branches }` |
+| `MergeBranch` | Five-step git sequence in the same order as `api::agents::merge_agent_branch`: `git rev-list --count <target>..<task_branch>` → `git checkout <target>` → `git merge <task_branch> --no-edit` → best-effort `git branch -d <task_branch>` → `git rev-parse HEAD`. | Empty-branch guard happens *before* checkout (`rev-list --count == 0` ⇒ `MergeOutcome::EmptyBranch`); on conflict the runner runs `git merge --abort` so the working tree is clean before replying. | `MergeResult { outcome }` |
+| `PushBranch` | `git push origin <branch>` | The runner does not consult the default-branch policy — it only pushes when the SaaS side has already gated on `should_record_ci_run`. Captures stderr verbatim on non-zero exit. | `PushResult { ok, stderr? }` |
+| `GhRunList` | `gh run list --commit <sha> -L 1 --json databaseId,status,conclusion,url` | Decodes the JSON into the same `GhRun` struct the SaaS-side `ci.rs::fetch_run` uses; missing or empty array ⇒ `run: None`. | `GhRunListed { run }` |
+| `GhFailureLog` | `gh run view <run_id> --log-failed` | Tail-trim to 8 KiB (`CAP_BYTES`, mirroring `ci.rs::fetch_failure_log`); decode lossily to tolerate stray non-UTF-8. Non-zero exit or missing log ⇒ `log: None`. | `GhFailureLogFetched { log }` |
+
+Each handler runs the shell-out via `tokio::task::spawn_blocking` so
+the WS reader loop stays responsive while `git`/`gh` work. The
+**timeout is enforced on the SaaS side**, not the runner: the dispatch
+helper `saas::runner_rpc::runner_request` parks on a oneshot with a
+caller-supplied `Duration` (8 s for live HTTP callers like the merge
+endpoint and the merge-targets dropdown; the CI poller uses a longer
+budget that still fits inside its 30 s tick). When the timeout fires
+on the SaaS side the oneshot is dropped and any late reply that
+arrives over the WS finds nothing waiting — the WS handler logs and
+discards. The runner itself never cancels in-flight `git`/`gh`
+processes; a runaway `gh` call ties up one `spawn_blocking` slot until
+it exits naturally. This is the same shape the folder request/response
+pairs already use.
+
+The handler implementations land progressively. At the time of
+writing the wire variants exist (see
+[`runner_protocol.rs`](../../server-rs/src/saas/runner_protocol.rs)) and
+the folder pair `ListFolders` / `CreateFolder` is fully wired through
+the SaaS-side `runner_request` dispatch and the runner-side
+`check_or_create_folder` shell-out — that pair is the canonical
+precedent for the table above (spawn-blocking helper, best-effort
+`Envelope` reply via `state.ws_tx`, no outbox involvement, server-side
+oneshot keyed by `req_id`). The branch / merge / push / `gh` arms still
+sit in the runner's `handle_server_message` catch-all and on stub
+receivers in `runner_ws.rs`; until they ship, the dashboard surfaces a
+`runner_unavailable` 504 because the SaaS-side oneshot times out with
+no reply.
+
 ## Outbox and replay on reconnect
 
 This is the load-bearing reliability mechanism. The contract it offers
@@ -293,8 +344,8 @@ Concretely:
 
 | Direction          | Reliable (outbox + ACK)                                         | Best-effort (no outbox, no ACK) |
 |--------------------|------------------------------------------------------------------|--------------------------------|
-| Runner → SaaS      | `RunnerHello`, `AgentStarted`, `AgentStopped`†, `TaskStatusChanged`, `DriverAuthReport`, `Resume`, `Ack` | `AgentOutput`, `Ping`, `Pong` |
-| SaaS → Runner      | `StartAgent`, `KillAgent`, `TerminalReplay`, `Resume`, `Ack`     | `AgentInput`, `Ping`, `Pong`, `ResizeTerminal`‡ |
+| Runner → SaaS      | `RunnerHello`, `AgentStarted`, `AgentStopped`†, `TaskStatusChanged`, `DriverAuthReport`, `Resume`, `Ack` | `AgentOutput`, `Ping`, `Pong`, `FoldersListed`, `FolderCreated`, `DefaultBranchResolved`, `BranchesListed`, `MergeResult`, `PushResult`, `GhRunListed`, `GhFailureLogFetched` |
+| SaaS → Runner      | `StartAgent`, `KillAgent`, `TerminalReplay`, `Resume`, `Ack`     | `AgentInput`, `Ping`, `Pong`, `ResizeTerminal`‡, `ListFolders`, `CreateFolder`, `GetDefaultBranch`, `ListBranches`, `MergeBranch`, `PushBranch`, `GhRunList`, `GhFailureLog` |
 
 > † See [Failure modes](#failure-modes) — the *normal-exit* `AgentStopped`
 > in `forward_agent_io` is currently sent best-effort, while the
@@ -307,6 +358,16 @@ Concretely:
 > is sent through the same channel as `AgentInput` from the dashboard
 > side; small terminal resizes that get lost across a reconnect are
 > harmless because the dashboard re-emits them on the next render.
+
+The folder, branch/merge, and `gh` request/response pairs (`ListFolders`,
+`CreateFolder`, `GetDefaultBranch`, `ListBranches`, `MergeBranch`,
+`PushBranch`, `GhRunList`, `GhFailureLog` and their `…ed`/`…Result`
+replies) are state-changing on the runner host, but they are nonetheless
+classified best-effort: each is correlated to a *live HTTP caller* (or a
+~30 s polling tick, in the `GhRunList` case) whose retry loop is
+already the right backstop. Outbox replay would deliver an answer to a
+caller that has long since timed out. See [protocols.md — Request/response
+frames](protocols.md#requestresponse-frames) for the full rationale.
 
 ### Tables and seqs
 

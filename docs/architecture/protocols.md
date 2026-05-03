@@ -148,7 +148,12 @@ makes progress on the next attempt.
 | `DriverAuthReport { drivers }` | yes | Driver auth state changed (e.g. user finished an OAuth flow). Re-broadcast as `runner_drivers`. Also implicitly delivered by the `RunnerHello` `drivers` field. |
 | `FoldersListed { req_id, entries }` | **no** — req/resp | Reply to `ListFolders`. Carries one `FolderEntry { name, path }` per directory under the runner's home (one level deep, mirroring the local-mode listing in `api::settings::list_folders`). Server matches `req_id` to a pending oneshot to resolve the originating HTTP caller; late replies (post-timeout or post-reconnect) are silently discarded. See [Request/response frames](#requestresponse-frames). |
 | `FolderCreated { req_id, ok, resolved_path?, error? }` | **no** — req/resp | Reply to `CreateFolder`. `ok=true` ⇒ `resolved_path` is the canonical absolute path the runner created; `ok=false` ⇒ `error` carries a human-readable reason (permission denied, path traversal, etc.). Same `req_id` correlation as `FoldersListed`. |
+| `DefaultBranchResolved { req_id, branch? }` | **no** — req/resp | Reply to `GetDefaultBranch`. `branch=None` ⇒ no candidate resolved (no `origin/HEAD` symref and neither `master` nor `main` exists locally — see [Branch and merge round-trips](#branch-and-merge-round-trips)). |
+| `BranchesListed { req_id, branches }` | **no** — req/resp | Reply to `ListBranches`. Alphabetically sorted `git branch --format='%(refname:short)'` output for the requested cwd; the server filters out the default branch and the live task branch before returning the dropdown payload. |
+| `MergeResult { req_id, outcome }` | **no** — req/resp | Reply to `MergeBranch`. `outcome` is a tagged enum on `kind` with five arms — `ok { merged_sha }`, `empty_branch`, `checkout_failed { stderr }`, `conflict { stderr }`, `other { stderr }` — so the dispatcher can map each one to the HTTP response code that the local `merge_agent_branch` would have returned (409 for empty/conflict, 500 for other). |
 | `PushResult { req_id, ok, stderr? }` | **no** — req/resp | Reply to `PushBranch`. `ok=false` ⇒ `stderr` carries the captured `git push` error so the server can log it; the dashboard does not surface push failures to the user (CI will retry on the next merge). |
+| `GhRunListed { req_id, run? }` | **no** — req/resp | Reply to `GhRunList`. `run=None` ⇒ no workflow has fired yet for that commit (or `gh` is unavailable). Carries the gh-spelled `databaseId` field verbatim — see [CI status round-trips](#ci-status-round-trips). |
+| `GhFailureLogFetched { req_id, log? }` | **no** — req/resp | Reply to `GhFailureLog`. `log` is the trailing ~8 KB of `gh run view --log-failed` output (the same tail size `ci.rs::fetch_failure_log` keeps when running locally); `None` when the run has no failure log (still pending, no auth, etc). |
 
 #### SaaS → Runner
 
@@ -160,8 +165,13 @@ makes progress on the next attempt.
 | `AgentInput { agent_id, data }` | **no** (best-effort) | Keystrokes from the browser (base64). Runner forwards as `Input` over the session IPC. Loss on disconnect matches user expectations: typed characters that never reached the agent are not replayed. |
 | `TerminalReplay { agent_id, from_offset }` | yes | A reconnecting browser asked the server for backfill from a byte offset; the runner serves the missing range from its local `<socket>.log`. |
 | `ListFolders { req_id }` | **no** — req/resp | Dashboard hit a synchronous folder-listing HTTP endpoint and the org has a runner attached. Server mints `req_id`, registers a oneshot, sends best-effort, awaits with a timeout. See [Request/response frames](#requestresponse-frames). |
-| `CreateFolder { req_id, path }` | **no** — req/resp | Dashboard hit a synchronous folder-creation HTTP endpoint with a target path. Same correlation pattern as `ListFolders`; the runner replies with `FolderCreated`. |
+| `CreateFolder { req_id, path, create_if_missing? }` | **no** — req/resp | Dashboard hit a synchronous folder-creation HTTP endpoint with a target path. Same correlation pattern as `ListFolders`; the runner replies with `FolderCreated`. `create_if_missing=false` (the default for older runners that omit the field) means existence-check only; `true` does `mkdir -p`. |
+| `GetDefaultBranch { req_id, cwd }` | **no** — req/resp | Resolve the canonical default branch for `cwd` on the runner host. The runner runs the same three-step algo as the local `git_default_branch` helper: `git symbolic-ref --short refs/remotes/origin/HEAD` → strip `origin/`; fall back to `git rev-parse --verify --quiet master` then `main`; otherwise `None`. Used to seed the merge-target dropdown and to gate `should_record_ci_run` after a merge. See [Branch and merge round-trips](#branch-and-merge-round-trips). |
+| `ListBranches { req_id, cwd }` | **no** — req/resp | Enumerate local branches in `cwd` so the dashboard can populate the merge-target chevron dropdown. The runner runs `git branch --format='%(refname:short)'`, sorts alphabetically, and replies with the full list — the server filters out the default branch (implicit) and the agent's task branch (self-merge nonsense) before returning the JSON to the browser. |
+| `MergeBranch { req_id, cwd, target, task_branch }` | **no** — req/resp | Server-internal follow-up after the user clicks Merge. The runner runs the same five-step git sequence the local `merge_agent_branch` performs (`rev-list --count` → `checkout target` → `merge task_branch --no-edit` → best-effort `branch -d` → `rev-parse HEAD`) and replies with `MergeResult`. The server pre-resolves `target` via `resolve_merge_target` (a pure function) before sending. |
 | `PushBranch { req_id, cwd, branch }` | **no** — req/resp | Server-internal follow-up to a successful `MergeBranch`, conditionally sent when `ci::should_record_ci_run(target, default_branch) == true`. The runner runs `git push origin <branch>` and replies with `PushResult`. Split out from `MergeBranch` so the gate stays a pure function on the SaaS side and the side effect (and `gh` dependency) stays on the runner side. |
+| `GhRunList { req_id, cwd, sha }` | **no** — req/resp | The CI poller's per-row probe. The runner runs `gh run list --commit <sha> -L 1 --json databaseId,status,conclusion,url` and replies with `GhRunListed`. Sent from a background tokio task on a ~30 s cadence, not a live HTTP caller — see [CI status round-trips](#ci-status-round-trips). |
+| `GhFailureLog { req_id, cwd, run_id }` | **no** — req/resp | The dashboard's "view CI failure" path. The runner runs `gh run view <run_id> --log-failed`, tail-trims to ~8 KB (mirroring `ci.rs::fetch_failure_log`), and replies with `GhFailureLogFetched`. Used by the Fix-CI flow to embed the failure tail in the recovery agent's prompt. |
 
 #### Bidirectional
 
@@ -211,15 +221,91 @@ Today only the SaaS side initiates these pairs. The pattern is
 direction-agnostic — a runner-initiated request would mirror the same
 pending-requests map on the runner side.
 
-**Deferred: `gh` / CI poller migration.** The CI poller in `ci.rs`
-(`fetch_run`) and the failure-log fetcher (`fetch_failure_log`) still
-shell out to `gh` directly on the SaaS host. A matching `GhRunList` /
-`GhRunListed` request/response pair would mirror the patterns above and
-move the last server-side `gh` dependency onto the runner, but it is
-intentionally out of scope for the merge-target plan. The runner already
-shells out to `git` for `MergeBranch` and `PushBranch`, so adding `gh`
-for the poller is a follow-up that reuses the same dispatch shape rather
-than a new capability.
+### Branch and merge round-trips
+
+These six variants — `GetDefaultBranch`/`DefaultBranchResolved`,
+`ListBranches`/`BranchesListed`, `MergeBranch`/`MergeResult`,
+`PushBranch`/`PushResult` (eight wire variants total) — implement the
+merge button + branch-picker dropdown when the org's project lives on a
+runner instead of the SaaS host. They all follow the
+[request/response pattern](#requestresponse-frames); only the
+SaaS-side glue and the runner-side side effects are specific.
+
+End-to-end flow for a single merge:
+
+1. **Dropdown population.** The dashboard hits
+   `GET /api/agents/<id>/merge-targets`. The server checks
+   `dispatch::org_has_runner`; if true it sends `GetDefaultBranch` and
+   `ListBranches` to the runner (in parallel — the two oneshots have
+   independent `req_id`s) and folds the replies into the JSON response
+   `{ default, available[] }`.
+2. **User clicks Merge.** The dashboard `POST`s
+   `/api/agents/<id>/merge` with an optional `{ "into": "<branch>" }`
+   body. Server resolves the actual target via the pure
+   `resolve_merge_target(explicit, default, cwd)` function — explicit
+   wins if it resolves, otherwise the default, otherwise `"main"`.
+3. **MergeBranch.** Server sends `MergeBranch { target, task_branch }`
+   to the runner. The runner walks the five-step sequence
+   (`merge_agent_branch` mirror) and replies with a tagged
+   `MergeResult.outcome`. The server maps the arms:
+   - `ok { merged_sha }` → 200, broadcast `agent_branch_merged`, fall
+     through to step 4.
+   - `empty_branch` → 409 with the canonical "task branch has no
+     commits" message.
+   - `conflict { stderr }` → 409 with the captured conflict text.
+   - `checkout_failed { stderr }` / `other { stderr }` → 500.
+4. **PushBranch (gated).** Only if
+   `ci::should_record_ci_run(target, default_branch) == true` — i.e. the
+   merge landed on the canonical default branch — does the server send
+   `PushBranch`. The runner runs `git push origin <branch>` and replies
+   with `PushResult`. The server logs failures but does not surface
+   them to the dashboard (CI will retry on the next merge).
+5. **ci_runs row + poller arming.** Server inserts the `ci_runs` row
+   keyed on `merged_sha`. The CI poller picks it up on the next 30 s
+   tick and starts the [CI status round-trips](#ci-status-round-trips)
+   below.
+
+The split between `MergeBranch` and `PushBranch` is deliberate:
+`should_record_ci_run` is a pure function over the resolved target plus
+the canonical default, so it stays on the SaaS side; the side effect
+(and the `git push` dependency) stays on the runner side. The runner
+never decides whether to push.
+
+### CI status round-trips
+
+These four variants — `GhRunList`/`GhRunListed` and
+`GhFailureLog`/`GhFailureLogFetched` — move the last `gh`-CLI
+dependencies off the SaaS host and onto the runner. They follow the
+same [request/response pattern](#requestresponse-frames), with one
+twist: the senders are not live HTTP callers, so the rationale for
+best-effort delivery is different.
+
+| Pair | Sender | Cadence |
+|---|---|---|
+| `GhRunList` / `GhRunListed` | the CI poller in `ci.rs::poll_once` | one frame per pending `ci_runs` row, every `POLL_INTERVAL_SECS` (30 s) |
+| `GhFailureLog` / `GhFailureLogFetched` | `api/ci.rs::failure_log` (HTTP `GET /api/ci/<run_id>/failure-log`) | on demand, with a write-through cache in `ci_runs.failure_log` |
+
+`GhRunList` is best-effort because the next 30 s tick will retry the
+same query — outbox-backed delivery would buy at most one cycle of
+latency at the cost of replaying stale probes after a long
+disconnect. `GhFailureLog` is tied to a live HTTP caller exactly like
+the folder pairs.
+
+The runner-side handlers shell out to `gh` directly and stream the
+JSON / log bytes back unchanged. `GhRun` carries gh's native
+`databaseId` field name across the wire so a runner that piped
+`gh run list ...` straight to the WS would also work — the SaaS
+`fetch_run` keeps the same struct definition, so there's no
+double-translation. `GhFailureLogFetched.log` is tail-trimmed on the
+runner to the same 8 KiB cap (`CAP_BYTES`) the local `fetch_failure_log`
+uses; further trimming on the SaaS side is unnecessary.
+
+Cache and persistence semantics are unchanged from the local path:
+`ci_runs.status` advances through `pending` → terminal on the next
+poll cycle that sees a non-`in_progress` `conclusion`, and the failure
+log is written through to `ci_runs.failure_log` on the first successful
+`gh` call so subsequent dashboard fetches return immediately without a
+runner round-trip.
 
 ### `DriverAuthStatus` states
 
