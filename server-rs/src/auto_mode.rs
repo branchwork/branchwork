@@ -15,16 +15,19 @@
 //! sites unconditional.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 use rusqlite::params;
 
+use crate::agents::pty_agent::StartPtyOpts;
+use crate::agents::spawn_ops::start_agent_dispatch;
 use crate::audit;
 use crate::db;
 use crate::saas::dispatch::{
-    CiStatusError, get_ci_run_status_dispatch, has_github_actions_dispatch,
-    merge_agent_branch_dispatch,
+    CiStatusError, fetch_failure_log_dispatch, get_ci_run_status_dispatch,
+    has_github_actions_dispatch, merge_agent_branch_dispatch,
 };
 use crate::saas::runner_protocol::CiAggregate;
 use crate::state::AppState;
@@ -75,6 +78,17 @@ pub async fn on_task_agent_completed(
     task_id: &str,
 ) {
     if !db::auto_mode_enabled(&state.db, plan_name) {
+        return;
+    }
+
+    // Fix agents (`task_id` carries the `-fix-<n>` suffix that
+    // [`spawn_fix_agent`] stamps on) complete via a different codepath:
+    // their fix branch must be merged back into the original task branch
+    // and CI re-polled there, not into the canonical default. That
+    // codepath lands in T3.2; until then, fix-agent completion is a
+    // deliberate no-op so we don't run the standard merge → CI →
+    // advance state machine on a fix branch.
+    if task_id.contains("-fix-") {
         return;
     }
 
@@ -613,6 +627,174 @@ fn jittered_interval(interval: Duration, jitter_window: Duration) -> Duration {
     Duration::from_millis((interval_ms + offset_ms).max(1) as u64)
 }
 
+// ── Phase 3: fix-on-red ─────────────────────────────────────────────────────
+
+/// Spawn a fix agent to recover from a Red CI outcome.
+///
+/// Looks up the original task agent's cwd, builds the fix branch name
+/// `branchwork/<plan>/<task>-fix-<attempt>`, fetches the failing-job log
+/// via [`fetch_failure_log_dispatch`] (passing the explicit
+/// `failing_run_id` rather than `None` so the loop never depends on the
+/// runner-side cache lookup as the primary path), and dispatches the
+/// spawn through [`start_agent_dispatch`] so SaaS mode emits a
+/// `StartAgent` envelope to the runner and standalone mode delegates to
+/// `start_pty_agent`.
+///
+/// A `task_fix_attempts` row is inserted **before** the spawn so the
+/// count survives an in-flight kill — that count feeds the cap check in
+/// T3.3. The agent_id is backfilled onto the same row once the dispatch
+/// returns.
+///
+/// Returns `Some(agent_id)` on a successful spawn dispatch; `None` if
+/// the original task agent could not be found in the `agents` table
+/// (the fix loop has nowhere to point the new agent's cwd, so it bails).
+///
+/// The retry cap, the wiring from `on_ci_failed`, and the fix-merge
+/// codepath all land in T3.2 / T3.3 — this function is the spawn
+/// primitive they build on.
+#[allow(dead_code)] // wired into on_ci_failed in T3.3 once the cap check lands
+pub async fn spawn_fix_agent(
+    state: &AppState,
+    org_id: &str,
+    plan_name: &str,
+    task_id: &str,
+    failing_run_id: &str,
+    attempt: u32,
+) -> Option<String> {
+    // 1. Look up the original task agent's cwd. We filter out fix-agent
+    //    rows so a re-entrant spawn (attempt N > 1) doesn't accidentally
+    //    pick up a previous fix agent's cwd.
+    let cwd: PathBuf = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT cwd FROM agents \
+             WHERE plan_name = ?1 AND task_id = ?2 AND task_id NOT LIKE '%-fix-%' \
+             ORDER BY started_at DESC LIMIT 1",
+            params![plan_name, task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .map(PathBuf::from)?
+    };
+
+    // 2. Branch + fix-task-id naming. The completion handler in
+    //    `on_task_agent_completed` keys off the `-fix-` substring to
+    //    route fix agents through the T3.2 merge codepath instead of the
+    //    standard advance state machine.
+    let fix_branch = format!("branchwork/{plan_name}/{task_id}-fix-{attempt}");
+    let fix_task_id = format!("{task_id}-fix-{attempt}");
+
+    // 3. Fetch the failing-job log. Pass the explicit run id rather than
+    //    None so the loop is never at the mercy of the runner-side cache
+    //    lookup; assert the dispatcher echoes that id back so a future
+    //    refactor can't quietly swap it for a different run.
+    let (log, run_id_used) =
+        fetch_failure_log_dispatch(state, org_id, plan_name, Some(failing_run_id)).await;
+    debug_assert_eq!(
+        run_id_used.as_deref(),
+        Some(failing_run_id),
+        "fetch_failure_log_dispatch should echo the explicit run id"
+    );
+
+    let prompt = build_fix_prompt(
+        plan_name,
+        task_id,
+        &fix_branch,
+        failing_run_id,
+        log.as_deref(),
+    );
+
+    // 4. Record the attempt BEFORE the spawn. agent_id stays NULL until
+    //    the dispatcher returns; the count is what enforces the cap in
+    //    T3.3, so a kill mid-spawn must still leave the count incremented.
+    //    PK = (plan_name, task_number, attempt) makes this idempotent on
+    //    retry — duplicate triples are ignored, not overwritten.
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_fix_attempts \
+                (plan_name, task_number, attempt, started_at) \
+             VALUES (?1, ?2, ?3, datetime('now')) \
+             ON CONFLICT(plan_name, task_number, attempt) DO NOTHING",
+            params![plan_name, task_id, attempt as i64],
+        )
+        .ok();
+    }
+
+    // 5. Mode-aware spawn. `is_continue=false` because the fix branch is
+    //    fresh — there is no prior session to resume. driver/effort/budget
+    //    inherit defaults so the fix agent looks identical to a task agent
+    //    on the wire (the fix-marker lives only in `task_id`).
+    let opts = StartPtyOpts {
+        prompt,
+        cwd: &cwd,
+        plan_name: Some(plan_name),
+        task_id: Some(&fix_task_id),
+        effort: *state.effort.lock().unwrap(),
+        branch: Some(&fix_branch),
+        is_continue: false,
+        max_budget_usd: None,
+        driver: None,
+        user_id: None,
+        org_id: Some(org_id),
+    };
+    let agent_id = start_agent_dispatch(state, org_id, opts).await;
+
+    // 6. Backfill agent_id onto the just-recorded row so the T3.2
+    //    completion handler can join from agent_id back to its attempt.
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE task_fix_attempts SET agent_id = ?1 \
+             WHERE plan_name = ?2 AND task_number = ?3 AND attempt = ?4",
+            params![agent_id, plan_name, task_id, attempt as i64],
+        )
+        .ok();
+    }
+
+    Some(agent_id)
+}
+
+/// Compose the fix-agent prompt. Task-specific block first, then the
+/// unattended-execution contract block from T0.7 appended verbatim so
+/// the fix agent inherits the same commit-don't-push-don't-ask rules
+/// every other auto-mode-spawned agent gets. Do NOT instruct the agent
+/// to push or merge here — Branchwork's loop owns both, and the contract
+/// block already forbids it.
+#[allow(dead_code)] // exercised via spawn_fix_agent and a unit test
+fn build_fix_prompt(
+    plan_name: &str,
+    task_id: &str,
+    fix_branch: &str,
+    failing_run_id: &str,
+    log: Option<&str>,
+) -> String {
+    let log_block = match log {
+        Some(l) if !l.is_empty() => l.to_string(),
+        _ => "(failure log unavailable — runner could not resolve it; \
+              re-run `gh run view <id> --log-failed` manually if you need it)"
+            .to_string(),
+    };
+    let contract = crate::agents::prompt::unattended_contract_block(fix_branch);
+    format!(
+        "CI failed on the merge of task {task_id} (plan {plan_name}) after the \
+         auto-mode loop merged it into the canonical default branch.\n\
+         \n\
+         Root-cause CI run id: {failing_run_id}.\n\
+         Other downstream workflows (e.g. deploy) may show as `skipped` because \
+         of this failure — fix the root cause and the rest will re-run \
+         automatically.\n\
+         \n\
+         Failing job log (truncated to ~8 KB tail):\n\
+         {log_block}\n\
+         \n\
+         Goal: fix the regression on this branch ({fix_branch}). When CI passes \
+         for the merged commit, the loop continues with the next task.\n\
+         \n\
+         {contract}",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     //! Integration-style tests for the auto-mode merge-on-completion hook.
@@ -848,7 +1030,8 @@ mod tests {
             | WireMessage::MergeBranch { req_id, .. }
             | WireMessage::PushBranch { req_id, .. }
             | WireMessage::HasGithubActions { req_id, .. }
-            | WireMessage::GetCiRunStatus { req_id, .. } => Some(req_id),
+            | WireMessage::GetCiRunStatus { req_id, .. }
+            | WireMessage::CiFailureLog { req_id, .. } => Some(req_id),
             _ => None,
         }
     }
@@ -2065,5 +2248,319 @@ mod tests {
             plan_actions.iter().any(|a| a == actions::AUTO_MODE_PAUSED),
             "expected AUTO_MODE_PAUSED in plan actions: {plan_actions:?}"
         );
+    }
+
+    // ── Phase 3.1: spawn_fix_agent ──────────────────────────────────────────
+    //
+    // Two tests, one per mode:
+    //   - Standalone: stub the Red CI outcome by passing a known
+    //     `failing_run_id`, call `spawn_fix_agent`, and assert a fresh
+    //     agent row appears with branch `branchwork/<plan>/<task>-fix-1`,
+    //     a `task_fix_attempts` row was recorded for the same triple, and
+    //     the prompt embeds the unattended-execution contract block from
+    //     T0.7. The standalone path goes through `start_pty_agent`, which
+    //     inserts the row before failing fast on the fake server-exe path
+    //     — same inserts-then-fails pattern the merge-state-machine tests
+    //     above rely on.
+    //   - SaaS: stub the runner so `CiFailureLog` returns a known log
+    //     substring, then assert the dispatcher emits a `StartAgent`
+    //     envelope to the runner with the fix branch + task_id, the
+    //     `task_fix_attempts` row, and the prompt carries both the
+    //     failure-log substring AND the literal contract-block text.
+
+    /// The text we expect the prompt's contract-block section to include.
+    /// Pulled from `unattended_contract_block` so the test fails loudly if
+    /// T0.7's wording drifts without the fix-prompt builder picking up the
+    /// new block.
+    const CONTRACT_NEEDLE: &str = "Unattended-execution contract";
+
+    /// The fix-prompt template's task-specific header — proves the prompt
+    /// was built by `build_fix_prompt` and not by some unrelated path.
+    const PROMPT_TASK_HEADER: &str = "CI failed on the merge of task";
+
+    fn task_fix_attempt_row(
+        db: &Db,
+        plan: &str,
+        task: &str,
+        attempt: u32,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT agent_id, started_at FROM task_fix_attempts \
+             WHERE plan_name = ?1 AND task_number = ?2 AND attempt = ?3",
+            params![plan, task, attempt as i64],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .ok()
+    }
+
+    /// Standalone-mode acceptance: spawn_fix_agent inserts a fix agent
+    /// row with the expected branch + task_id, records a
+    /// `task_fix_attempts` row, and writes a prompt that embeds both
+    /// the fix-prompt header and the unattended-execution contract.
+    /// `start_pty_agent` fails fast on the fake server-exe path; the
+    /// row stuck in 'failed' is exactly the signal the assertion needs.
+    #[tokio::test]
+    async fn standalone_spawn_fix_agent_inserts_row_and_records_attempt() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        // Original task agent row — gives spawn_fix_agent a cwd to point
+        // the fix branch at. status='completed' so the lookup picks it up.
+        seed_agent(&db, "agent-1", &cwd, "p", "1.1", "branchwork/p/1.1");
+
+        let agent_id = spawn_fix_agent(&state, "default-org", "p", "1.1", "555", 1)
+            .await
+            .expect("spawn_fix_agent should return a fresh agent_id");
+
+        // ── Fix agent row exists with the expected branch + task_id ────
+        let (branch, task_id, prompt): (Option<String>, Option<String>, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT branch, task_id, prompt FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(branch.as_deref(), Some("branchwork/p/1.1-fix-1"));
+        assert_eq!(task_id.as_deref(), Some("1.1-fix-1"));
+
+        // ── Prompt embeds the fix-prompt header AND the contract block ─
+        let prompt = prompt.expect("agent row should carry the fix prompt");
+        assert!(
+            prompt.contains(PROMPT_TASK_HEADER),
+            "prompt should carry the fix-prompt task header: {prompt}"
+        );
+        assert!(
+            prompt.contains(CONTRACT_NEEDLE),
+            "prompt should embed the unattended-execution contract block: {prompt}"
+        );
+        assert!(
+            prompt.contains("branchwork/p/1.1-fix-1"),
+            "prompt should reference the fix branch (so the contract block \
+             names the right branch to commit to): {prompt}"
+        );
+        assert!(
+            prompt.contains("555"),
+            "prompt should reference the failing run id: {prompt}"
+        );
+
+        // ── task_fix_attempts row is recorded with the agent_id backfill
+        let row = task_fix_attempt_row(&db, "p", "1.1", 1)
+            .expect("task_fix_attempts row should exist for attempt 1");
+        assert_eq!(
+            row.0.as_deref(),
+            Some(agent_id.as_str()),
+            "agent_id should be backfilled onto the attempt row"
+        );
+        assert!(row.1.is_some(), "started_at should be set");
+    }
+
+    /// Re-entrant spawn (attempt N>1) must not clobber an earlier
+    /// attempt's row. The (plan, task, attempt) PK + ON CONFLICT DO
+    /// NOTHING is what enforces that — the test asserts both rows
+    /// coexist and the original attempt-1 agent_id is preserved.
+    #[tokio::test]
+    async fn standalone_spawn_fix_agent_idempotent_on_conflict() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        seed_agent(&db, "agent-1", &cwd, "p", "1.1", "branchwork/p/1.1");
+
+        let attempt_1_agent = spawn_fix_agent(&state, "default-org", "p", "1.1", "100", 1)
+            .await
+            .expect("attempt 1 should succeed");
+        let attempt_2_agent = spawn_fix_agent(&state, "default-org", "p", "1.1", "100", 2)
+            .await
+            .expect("attempt 2 should succeed");
+        assert_ne!(
+            attempt_1_agent, attempt_2_agent,
+            "each attempt should yield a distinct agent_id"
+        );
+
+        // Both attempt rows exist and carry their respective agent_ids.
+        let row_1 = task_fix_attempt_row(&db, "p", "1.1", 1).expect("attempt 1 row must persist");
+        let row_2 = task_fix_attempt_row(&db, "p", "1.1", 2).expect("attempt 2 row must persist");
+        assert_eq!(row_1.0.as_deref(), Some(attempt_1_agent.as_str()));
+        assert_eq!(row_2.0.as_deref(), Some(attempt_2_agent.as_str()));
+
+        // db::task_fix_attempt_count returns the cap-feeding value.
+        assert_eq!(
+            crate::db::task_fix_attempt_count(&db, "p", "1.1"),
+            2,
+            "attempt count should match the number of distinct attempts"
+        );
+    }
+
+    /// SaaS-mode acceptance: spawn_fix_agent → `start_agent_dispatch` →
+    /// SaaS branch emits a `StartAgent` envelope to the registered
+    /// runner. The stub runner replies to `CiFailureLog` with a known
+    /// log substring; the assertion proves the log lands inside the
+    /// `StartAgent.prompt` alongside the contract block.
+    #[tokio::test]
+    async fn saas_spawn_fix_agent_emits_start_agent_envelope_with_log_and_contract() {
+        let (db, _dir) = fresh_db();
+        let org_id = "default-org";
+        seed_runner_row(&db, "runner-1", org_id);
+
+        let runner_log = "RUNNER-MOCK-FAILURE-LOG: assertion failed at line 42";
+        let runner_log_owned = runner_log.to_string();
+        let runners = new_runner_registry();
+        let mut outgoing = install_echo_runner(&runners, "runner-1", move |msg| match msg {
+            WireMessage::CiFailureLog { run_id, .. } => Some(RunnerResponse::CiFailureLogFetched {
+                log: Some(runner_log_owned.clone()),
+                run_id_used: run_id.clone(),
+            }),
+            _ => None,
+        })
+        .await;
+
+        let (state, _rx) = test_app_state(
+            db.clone(),
+            runners,
+            PathBuf::from("/tmp/auto-mode-saas-fix-plans"),
+        );
+        seed_agent(
+            &db,
+            "agent-1",
+            Path::new("/runner/projects/demo"),
+            "p",
+            "1.1",
+            "branchwork/p/1.1",
+        );
+
+        let agent_id = spawn_fix_agent(&state, org_id, "p", "1.1", "555", 1)
+            .await
+            .expect("spawn_fix_agent should return a fresh agent_id");
+
+        // Drain runner-bound payloads, find the StartAgent envelope.
+        let mut start_agent_payload: Option<String> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), outgoing.recv()).await
+            {
+                Ok(Some(payload)) => {
+                    if payload.contains("\"type\":\"start_agent\"") {
+                        start_agent_payload = Some(payload);
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let payload = start_agent_payload.expect("expected a start_agent envelope on the wire");
+
+        // ── StartAgent envelope shape: agent_id + branch + task_id ────
+        let envelope: crate::saas::runner_protocol::Envelope =
+            serde_json::from_str(&payload).expect("envelope must parse");
+        match envelope.message {
+            WireMessage::StartAgent {
+                agent_id: got_id,
+                plan_name,
+                task_id,
+                prompt,
+                cwd,
+                ..
+            } => {
+                assert_eq!(
+                    got_id, agent_id,
+                    "envelope agent_id should match dispatch return"
+                );
+                assert_eq!(plan_name, "p");
+                assert_eq!(task_id, "1.1-fix-1");
+                assert_eq!(cwd, "/runner/projects/demo");
+                assert!(
+                    prompt.contains(runner_log),
+                    "prompt should embed the runner-supplied failure log: {prompt}"
+                );
+                assert!(
+                    prompt.contains(CONTRACT_NEEDLE),
+                    "prompt should embed the unattended-execution contract: {prompt}"
+                );
+                assert!(
+                    prompt.contains("branchwork/p/1.1-fix-1"),
+                    "prompt should reference the fix branch: {prompt}"
+                );
+            }
+            other => panic!("expected StartAgent variant, got {other:?}"),
+        }
+
+        // ── task_fix_attempts row recorded for (plan, task, 1) ────────
+        let row = task_fix_attempt_row(&db, "p", "1.1", 1)
+            .expect("task_fix_attempts row should exist for attempt 1");
+        assert_eq!(
+            row.0.as_deref(),
+            Some(agent_id.as_str()),
+            "agent_id should be backfilled onto the attempt row"
+        );
+    }
+
+    /// `on_task_agent_completed` short-circuits when the task_id carries
+    /// the `-fix-` marker — the standard merge → CI → advance state
+    /// machine must NOT run on a fix branch (T3.2 will wire the
+    /// fix-merge codepath in its place). Asserts: no auto_mode_*
+    /// broadcasts and the plan stays unpaused after the call returns.
+    #[tokio::test]
+    async fn fix_agent_completion_skips_state_machine() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        git_create_task_branch(&cwd, "branchwork/p/1.1-fix-1", true);
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        seed_agent(
+            &db,
+            "fix-agent-1",
+            &cwd,
+            "p",
+            "1.1-fix-1",
+            "branchwork/p/1.1-fix-1",
+        );
+        enable_auto_mode(&db, "p");
+
+        on_task_agent_completed(&state, "fix-agent-1", "p", "1.1-fix-1").await;
+        // Allow any spawned task a moment to no-op.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = drain_event_types(&mut rx);
+        assert!(
+            !events.iter().any(|e| e.starts_with("auto_mode_")),
+            "no auto_mode_* events expected for a fix-agent completion: {events:?}"
+        );
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "plan should stay unpaused — fix-agent completion is a deliberate no-op"
+        );
+    }
+
+    /// `build_fix_prompt` falls back to a placeholder when the failure-log
+    /// fetch returns None (gh unavailable / runner cache miss / no run).
+    /// Asserts the placeholder is descriptive enough to be useful and the
+    /// contract block still lands.
+    #[test]
+    fn build_fix_prompt_falls_back_when_log_is_none() {
+        let prompt = build_fix_prompt("p", "1.1", "branchwork/p/1.1-fix-1", "555", None);
+        assert!(prompt.contains("failure log unavailable"));
+        assert!(prompt.contains(CONTRACT_NEEDLE));
+        assert!(prompt.contains("branchwork/p/1.1-fix-1"));
+        assert!(prompt.contains("555"));
     }
 }
