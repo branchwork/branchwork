@@ -22,14 +22,14 @@ use crate::state::AppState;
 use crate::ws::broadcast_event;
 
 use super::outbox;
-use super::runner_protocol::{Envelope, FolderEntry, WireMessage};
+use super::runner_protocol::{Envelope, FolderEntry, GhRun, MergeOutcome, WireMessage};
 
 // ── Runner registry (in-memory, lives in AppState) ──────────────────────────
 
 /// A response from a runner to a request/response WireMessage pair (e.g.
 /// `ListFolders` → `FoldersListed`). Routed back to the originating HTTP
 /// caller via a `oneshot` sender registered in `ConnectedRunner.pending`.
-#[allow(dead_code)] // payload fields read by HTTP consumers in Phase 2 of saas-folder-listing-via-runner
+#[allow(dead_code)] // payload fields read by dispatchers in agents/git_ops.rs and ci.rs
 #[derive(Debug)]
 pub enum RunnerResponse {
     FoldersListed(Vec<FolderEntry>),
@@ -38,6 +38,25 @@ pub enum RunnerResponse {
         resolved_path: Option<String>,
         error: Option<String>,
     },
+    /// Reply to `GetDefaultBranch`. `None` ≡ no candidate resolved.
+    DefaultBranchResolved(Option<String>),
+    /// Reply to `ListBranches`. Always sorted; may be empty.
+    BranchesListed(Vec<String>),
+    /// Reply to `MergeBranch`. The outcome arm tells the dispatcher
+    /// which HTTP status to map to.
+    MergeResult(MergeOutcome),
+    /// Reply to `PushBranch`. `ok=false` ⇒ `stderr` carries the error
+    /// for logging; the dashboard does not surface push failures.
+    PushResult {
+        ok: bool,
+        stderr: Option<String>,
+    },
+    /// Reply to `GhRunList`. `None` ≡ no workflow has fired for this
+    /// commit yet, or `gh` is unavailable on the runner.
+    GhRunListed(Option<GhRun>),
+    /// Reply to `GhFailureLog`. `None` ≡ run still pending or `gh`
+    /// unavailable.
+    GhFailureLogFetched(Option<String>),
 }
 
 /// A connected runner's server-side handle.
@@ -508,23 +527,14 @@ async fn handle_runner_message(
         }
 
         WireMessage::FoldersListed { req_id, entries } => {
-            let pending = state
-                .runners
-                .lock()
-                .await
-                .get(runner_id)
-                .map(|r| r.pending.clone());
-            let sender = match pending {
-                Some(pending) => pending.lock().await.remove(req_id),
-                None => None,
-            };
-            if let Some(tx) = sender {
-                let _ = tx.send(RunnerResponse::FoldersListed(entries.clone()));
-            } else {
-                eprintln!(
-                    "[runner-ws] dropped orphan folders_listed reply: runner_id={runner_id} req_id={req_id}"
-                );
-            }
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "folders_listed",
+                RunnerResponse::FoldersListed(entries.clone()),
+            )
+            .await;
         }
 
         WireMessage::FolderCreated {
@@ -533,38 +543,88 @@ async fn handle_runner_message(
             resolved_path,
             error,
         } => {
-            let pending = state
-                .runners
-                .lock()
-                .await
-                .get(runner_id)
-                .map(|r| r.pending.clone());
-            let sender = match pending {
-                Some(pending) => pending.lock().await.remove(req_id),
-                None => None,
-            };
-            if let Some(tx) = sender {
-                let _ = tx.send(RunnerResponse::FolderCreated {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "folder_created",
+                RunnerResponse::FolderCreated {
                     ok: *ok,
                     resolved_path: resolved_path.clone(),
                     error: error.clone(),
-                });
-            } else {
-                eprintln!(
-                    "[runner-ws] dropped orphan folder_created reply: runner_id={runner_id} req_id={req_id}"
-                );
-            }
+                },
+            )
+            .await;
         }
 
-        // runner→saas reply variants whose handler will route through the
-        // pending request map in a later phase task. Stubbed for now so the
-        // wire format lands without dragging dispatch wiring in.
-        WireMessage::DefaultBranchResolved { .. }
-        | WireMessage::BranchesListed { .. }
-        | WireMessage::MergeResult { .. }
-        | WireMessage::PushResult { .. }
-        | WireMessage::GhRunListed { .. }
-        | WireMessage::GhFailureLogFetched { .. } => {}
+        WireMessage::DefaultBranchResolved { req_id, branch } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "default_branch_resolved",
+                RunnerResponse::DefaultBranchResolved(branch.clone()),
+            )
+            .await;
+        }
+
+        WireMessage::BranchesListed { req_id, branches } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "branches_listed",
+                RunnerResponse::BranchesListed(branches.clone()),
+            )
+            .await;
+        }
+
+        WireMessage::MergeResult { req_id, outcome } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "merge_result",
+                RunnerResponse::MergeResult(outcome.clone()),
+            )
+            .await;
+        }
+
+        WireMessage::PushResult { req_id, ok, stderr } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "push_result",
+                RunnerResponse::PushResult {
+                    ok: *ok,
+                    stderr: stderr.clone(),
+                },
+            )
+            .await;
+        }
+
+        WireMessage::GhRunListed { req_id, run } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "gh_run_listed",
+                RunnerResponse::GhRunListed(run.clone()),
+            )
+            .await;
+        }
+
+        WireMessage::GhFailureLogFetched { req_id, log } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "gh_failure_log_fetched",
+                RunnerResponse::GhFailureLogFetched(log.clone()),
+            )
+            .await;
+        }
 
         // Server doesn't receive these from runners — the runner sending them
         // would be a protocol violation (saas→runner direction only).
@@ -687,4 +747,33 @@ fn generate_token() -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Send `response` to the request's oneshot sender registered in the runner's
+/// `pending` map, or log + drop if no caller is waiting (timeout, late reply,
+/// runner re-registered after disconnect).
+async fn resolve_pending(
+    state: &AppState,
+    runner_id: &str,
+    req_id: &str,
+    label: &'static str,
+    response: RunnerResponse,
+) {
+    let pending = state
+        .runners
+        .lock()
+        .await
+        .get(runner_id)
+        .map(|r| r.pending.clone());
+    let sender = match pending {
+        Some(pending) => pending.lock().await.remove(req_id),
+        None => None,
+    };
+    if let Some(tx) = sender {
+        let _ = tx.send(response);
+    } else {
+        eprintln!(
+            "[runner-ws] dropped orphan {label} reply: runner_id={runner_id} req_id={req_id}"
+        );
+    }
 }

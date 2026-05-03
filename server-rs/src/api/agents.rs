@@ -7,17 +7,24 @@ use axum::{
 use rusqlite::params;
 use serde::Deserialize;
 
+use crate::agents::git_ops;
 use crate::auth::OptionalAuthUser;
+use crate::saas::runner_protocol::MergeOutcome;
+use crate::saas::runner_rpc::RunnerRpcError;
 use crate::state::AppState;
 
-/// Decide the merge target. Pure — git probes happen in the caller
-/// (the runner in SaaS, the local helper in standalone) and pass
-/// results in. `explicit_into` is the dropdown selection from the
-/// merge endpoint's `into` body field; `default_branch` is the
-/// canonical-default-branch resolution (see
-/// [`crate::agents::git_default_branch`]).
+/// Decide the merge target. **Pure** — all git probes happen in dispatchers
+/// (the runner in SaaS, [`crate::agents::git_default_branch`] /
+/// [`crate::agents::git_list_branches`] in standalone) and pass resolved
+/// inputs in.
 ///
-/// Priority: explicit (if it resolves) → default → "main".
+/// Priority: explicit (if it appears in `available_branches`) → default → "main".
+///
+/// `available_branches` is the runner-side branch list used to validate
+/// `explicit_into`: the dropdown UI picks from this list, but the form-encoded
+/// path could theoretically pass a typo. When `available_branches` is `None`
+/// the validation is skipped (caller knows the input is trusted, e.g. the
+/// no-override default-merge case).
 ///
 /// The agent's stored `source_branch` is intentionally NOT consulted:
 /// a stale auto-captured value (from whichever branch the user happened
@@ -27,26 +34,45 @@ use crate::state::AppState;
 fn resolve_merge_target(
     explicit_into: Option<&str>,
     default_branch: Option<&str>,
-    cwd: &std::path::Path,
+    available_branches: Option<&[String]>,
 ) -> String {
-    let resolves = |name: &str| -> bool {
-        std::process::Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", name])
-            .current_dir(cwd)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
-
-    if let Some(into) = explicit_into
-        && resolves(into)
-    {
-        return into.to_string();
+    if let Some(into) = explicit_into {
+        let resolves = match available_branches {
+            Some(branches) => branches.iter().any(|b| b == into),
+            None => true,
+        };
+        if resolves {
+            return into.to_string();
+        }
     }
     if let Some(d) = default_branch {
         return d.to_string();
     }
     "main".to_string()
+}
+
+/// Map a [`RunnerRpcError`] to the canonical HTTP response. The conventions
+/// (503 no_runner_connected / 504 runner_unavailable / 500 other) match what
+/// `api/settings.rs::list_folders` and `api/plans.rs::create_plan` already
+/// return so the dashboard can use a single error-handling path.
+fn rpc_error_response(e: RunnerRpcError) -> axum::response::Response {
+    match e {
+        RunnerRpcError::NoConnectedRunner => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no_runner_connected" })),
+        )
+            .into_response(),
+        RunnerRpcError::Timeout | RunnerRpcError::RunnerDisconnected => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": "runner_unavailable" })),
+        )
+            .into_response(),
+        RunnerRpcError::InvalidRequest | RunnerRpcError::SendFailed => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "runner_request_failed" })),
+        )
+            .into_response(),
+    }
 }
 
 /// Body for `POST /api/agents/{id}/merge`. `into` is the optional
@@ -321,12 +347,12 @@ pub async fn list_merge_targets(
     _auth: OptionalAuthUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let (cwd, task_branch): (String, Option<String>) = {
+    let (cwd, task_branch, org_id): (String, Option<String>, String) = {
         let db = state.db.lock().unwrap();
         match db.query_row(
-            "SELECT cwd, branch FROM agents WHERE id = ?",
+            "SELECT cwd, branch, org_id FROM agents WHERE id = ?",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ) {
             Ok(r) => r,
             Err(_) => {
@@ -340,8 +366,16 @@ pub async fn list_merge_targets(
     };
 
     let cwd_path = std::path::Path::new(&cwd);
-    let default = crate::agents::git_default_branch(cwd_path);
-    let mut branches = crate::agents::git_list_branches(cwd_path);
+    let default = match git_ops::default_branch(&state.db, &state.runners, &org_id, cwd_path).await
+    {
+        Ok(d) => d,
+        Err(e) => return rpc_error_response(e),
+    };
+    let mut branches =
+        match git_ops::list_branches(&state.db, &state.runners, &org_id, cwd_path).await {
+            Ok(b) => b,
+            Err(e) => return rpc_error_response(e),
+        };
 
     if let Some(task) = task_branch.as_deref() {
         branches.retain(|b| b != task);
@@ -365,18 +399,28 @@ pub async fn merge_agent_branch(
 ) -> impl IntoResponse {
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Look up agent details (need plan/task for CI bookkeeping too)
-    let (cwd, branch, plan_name, task_id): (
+    // Look up agent details (need plan/task for CI bookkeeping too).
+    // org_id picks the runner in SaaS mode and is logged in audit.
+    let (cwd, branch, plan_name, task_id, org_id): (
         String,
         Option<String>,
         Option<String>,
         Option<String>,
+        String,
     ) = {
         let db = state.db.lock().unwrap();
         match db.query_row(
-            "SELECT cwd, branch, plan_name, task_id FROM agents WHERE id = ?",
+            "SELECT cwd, branch, plan_name, task_id, org_id FROM agents WHERE id = ?",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         ) {
             Ok(r) => r,
             Err(_) => {
@@ -401,76 +445,67 @@ pub async fn merge_agent_branch(
     };
 
     let cwd_path = std::path::Path::new(&cwd);
-    let default = crate::agents::git_default_branch(cwd_path);
+
+    // Resolve canonical default + (only when needed) available branches via
+    // dispatcher. SaaS mode round-trips to the runner; standalone shells out.
+    let default = match git_ops::default_branch(&state.db, &state.runners, &org_id, cwd_path).await
+    {
+        Ok(d) => d,
+        Err(e) => return rpc_error_response(e),
+    };
+
     // Treat `Some("")` the same as `None` — an empty `into` means
     // "no override, use the canonical default". Defensive against a
     // future form-encoded path where empty strings sneak through; the
     // current JSON UI already coerces empty selections to `null`.
     let explicit = body.into.filter(|s| !s.is_empty());
-    let target = resolve_merge_target(explicit.as_deref(), default.as_deref(), cwd_path);
 
-    // Guard: refuse to merge a branch with no commits ahead of its source.
-    // Agents that exit before committing leave a branch that points at the
-    // same SHA as the source — merging it is a silent no-op that hides the
-    // real problem (the agent did no work). Return 409 so the UI can tell
-    // the user to retry or commit manually.
-    //
-    // If git can't resolve the range (stale branch reference, missing
-    // trunk, detached HEAD, etc) we fall through permissively — the
-    // actual `git merge` below will fail with its own clear error and
-    // that's better than blocking the user on an inscrutable guard.
-    let revlist = std::process::Command::new("git")
-        .args(["rev-list", "--count", &format!("{target}..{task_branch}")])
-        .current_dir(&cwd)
-        .output();
+    // Validate explicit only when it's actually provided — saves a
+    // round-trip in the common no-override case.
+    let available = if explicit.is_some() {
+        match git_ops::list_branches(&state.db, &state.runners, &org_id, cwd_path).await {
+            Ok(b) => Some(b),
+            Err(e) => return rpc_error_response(e),
+        }
+    } else {
+        None
+    };
+    let target = resolve_merge_target(
+        explicit.as_deref(),
+        default.as_deref(),
+        available.as_deref(),
+    );
 
-    match revlist {
-        Ok(output) if output.status.success() => {
-            let count: u64 = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .parse()
-                .unwrap_or(0);
-            if count == 0 {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "task branch has no commits — agent exited without committing",
-                        "branch": task_branch,
-                        "target": target,
-                    })),
-                )
-                    .into_response();
-            }
-        }
-        Ok(output) => {
-            // `rev-list` failed — most likely one of the refs doesn't resolve
-            // (deleted branch, typo, detached HEAD). Log and proceed; `git
-            // merge` below will return the same or better error.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!(
-                "[merge] rev-list {target}..{task_branch} failed, skipping empty-branch guard: {stderr}"
-            );
-        }
-        Err(e) => {
+    // Dispatch the merge. SaaS: runner runs the five-step sequence and
+    // replies with a MergeOutcome. Standalone: run the five steps locally.
+    let outcome = match git_ops::merge_branch(
+        &state.db,
+        &state.runners,
+        &org_id,
+        cwd_path,
+        &target,
+        &task_branch,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return rpc_error_response(e),
+    };
+
+    let merged_sha = match outcome {
+        MergeOutcome::Ok { merged_sha } => merged_sha,
+        MergeOutcome::EmptyBranch => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": format!("Failed to run git rev-list: {e}")
+                    "error": "task branch has no commits — agent exited without committing",
+                    "branch": task_branch,
+                    "target": target,
                 })),
             )
                 .into_response();
         }
-    }
-
-    // Checkout the target branch
-    let checkout = std::process::Command::new("git")
-        .args(["checkout", &target])
-        .current_dir(&cwd)
-        .output();
-
-    match checkout {
-        Ok(output) if !output.status.success() => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        MergeOutcome::CheckoutFailed { stderr } => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -479,110 +514,8 @@ pub async fn merge_agent_branch(
             )
                 .into_response();
         }
-        Err(e) => {
+        MergeOutcome::Conflict { stderr } => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Failed to run git: {e}")
-                })),
-            )
-                .into_response();
-        }
-        _ => {}
-    }
-
-    // Merge the task branch
-    let merge = std::process::Command::new("git")
-        .args(["merge", &task_branch, "--no-edit"])
-        .current_dir(&cwd)
-        .output();
-
-    match merge {
-        Ok(output) if output.status.success() => {
-            // Delete the task branch after successful merge
-            std::process::Command::new("git")
-                .args(["branch", "-d", &task_branch])
-                .current_dir(&cwd)
-                .output()
-                .ok();
-
-            // Capture merged SHA for CI tracking before we kick off side work
-            let merged_sha = crate::agents::git_head_sha(std::path::Path::new(&cwd));
-
-            // Clear branch in DB for ALL agents with this branch — siblings
-            // (killed retries, check agents) shouldn't keep advertising it.
-            {
-                let db = state.db.lock().unwrap();
-                db.execute(
-                    "UPDATE agents SET branch = NULL WHERE branch = ?",
-                    params![task_branch],
-                )
-                .ok();
-                crate::audit::log(
-                    &db,
-                    auth.org_id(),
-                    auth.0.as_ref().map(|u| u.id.as_str()),
-                    auth.0.as_ref().map(|u| u.email.as_str()),
-                    crate::audit::actions::BRANCH_MERGE,
-                    crate::audit::resources::AGENT,
-                    Some(&id),
-                    Some(
-                        &serde_json::json!({
-                            "branch": task_branch,
-                            "into": target,
-                            "plan": plan_name,
-                            "task": task_id,
-                        })
-                        .to_string(),
-                    ),
-                );
-            }
-
-            // Broadcast so connected dashboards update immediately
-            crate::ws::broadcast_event(
-                &state.broadcast_tx,
-                "agent_branch_merged",
-                serde_json::json!({
-                    "id": id,
-                    "merged": task_branch,
-                    "into": target,
-                }),
-            );
-
-            // Kick off CI pipeline (push to origin, record pending run).
-            // Only possible when we know which task this agent was for.
-            if let (Some(plan), Some(task), Some(sha)) =
-                (plan_name.clone(), task_id.clone(), merged_sha)
-            {
-                tokio::spawn(crate::ci::trigger_after_merge(crate::ci::TriggerArgs {
-                    db: state.db.clone(),
-                    broadcast_tx: state.broadcast_tx.clone(),
-                    cwd: std::path::PathBuf::from(&cwd),
-                    plan_name: plan,
-                    task_number: task,
-                    agent_id: id.clone(),
-                    source_branch: target.clone(),
-                    task_branch: task_branch.clone(),
-                    merged_sha: sha,
-                }));
-            }
-
-            Json(serde_json::json!({
-                "ok": true,
-                "merged": task_branch,
-                "into": target,
-            }))
-            .into_response()
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            // Abort the failed merge
-            std::process::Command::new("git")
-                .args(["merge", "--abort"])
-                .current_dir(&cwd)
-                .output()
-                .ok();
-            (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": format!("Merge conflict: {stderr}"),
@@ -590,16 +523,87 @@ pub async fn merge_agent_branch(
                     "target": target,
                 })),
             )
-                .into_response()
+                .into_response();
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Failed to run git merge: {e}")
-            })),
+        MergeOutcome::Other { stderr } => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to run git merge: {stderr}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Clear branch in DB for ALL agents with this branch — siblings
+    // (killed retries, check agents) shouldn't keep advertising it.
+    {
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "UPDATE agents SET branch = NULL WHERE branch = ?",
+            params![task_branch],
         )
-            .into_response(),
+        .ok();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::BRANCH_MERGE,
+            crate::audit::resources::AGENT,
+            Some(&id),
+            Some(
+                &serde_json::json!({
+                    "branch": task_branch,
+                    "into": target,
+                    "plan": plan_name,
+                    "task": task_id,
+                })
+                .to_string(),
+            ),
+        );
     }
+
+    // Broadcast so connected dashboards update immediately
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "agent_branch_merged",
+        serde_json::json!({
+            "id": id,
+            "merged": task_branch,
+            "into": target,
+        }),
+    );
+
+    // Kick off CI pipeline (push to origin, record pending run).
+    // Only possible when we know which task this agent was for, and when
+    // the merged SHA is non-empty (runner-side cleanup may leave it blank
+    // on edge cases).
+    if let (Some(plan), Some(task)) = (plan_name.clone(), task_id.clone())
+        && !merged_sha.is_empty()
+    {
+        tokio::spawn(crate::ci::trigger_after_merge(crate::ci::TriggerArgs {
+            db: state.db.clone(),
+            runners: state.runners.clone(),
+            org_id: org_id.clone(),
+            broadcast_tx: state.broadcast_tx.clone(),
+            cwd: std::path::PathBuf::from(&cwd),
+            plan_name: plan,
+            task_number: task,
+            agent_id: id.clone(),
+            source_branch: target.clone(),
+            task_branch: task_branch.clone(),
+            merged_sha,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "merged": task_branch,
+        "into": target,
+    }))
+    .into_response()
 }
 
 pub async fn discard_agent_branch(
@@ -608,12 +612,12 @@ pub async fn discard_agent_branch(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Look up agent details
-    let (cwd, branch): (String, Option<String>) = {
+    let (cwd, branch, org_id): (String, Option<String>, String) = {
         let db = state.db.lock().unwrap();
         match db.query_row(
-            "SELECT cwd, branch FROM agents WHERE id = ?",
+            "SELECT cwd, branch, org_id FROM agents WHERE id = ?",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ) {
             Ok(r) => r,
             Err(_) => {
@@ -637,12 +641,28 @@ pub async fn discard_agent_branch(
         }
     };
 
+    // Discard's checkout + branch-delete shell-outs aren't yet wired through
+    // a runner RPC pair (out of scope for the merge-target plan; the 6 RPC
+    // pairs in T5.6 cover read/merge/push/CI but not discard). In SaaS mode
+    // we'd silently shell out on the SaaS server's filesystem and get
+    // confusing git errors; surface a clean 503 instead and revisit when
+    // the discard RPC lands.
+    if crate::saas::dispatch::org_has_runner(&state.db, &org_id) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "discard_not_supported_for_saas_runners"
+            })),
+        )
+            .into_response();
+    }
+
     // Discard has no `into` body field today (future "discard and switch
     // to X" UI hooks here). Passing `None` falls through to the canonical
     // default branch.
     let cwd_path = std::path::Path::new(&cwd);
     let default = crate::agents::git_default_branch(cwd_path);
-    let target = resolve_merge_target(None, default.as_deref(), cwd_path);
+    let target = resolve_merge_target(None, default.as_deref(), None);
 
     // Checkout the target branch first
     let checkout = std::process::Command::new("git")

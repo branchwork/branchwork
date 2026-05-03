@@ -13,12 +13,17 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use rusqlite::params;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use crate::db::Db;
-use crate::saas::runner_protocol::GhRun;
+use crate::saas::dispatch::org_has_runner;
+use crate::saas::runner_protocol::{GhRun, WireMessage};
+use crate::saas::runner_rpc::{RunnerRpcError, runner_request_with_registry};
+use crate::saas::runner_ws::{RunnerRegistry, RunnerResponse};
 use crate::ws::broadcast_event;
 
 const POLL_INTERVAL_SECS: u64 = 30;
@@ -38,15 +43,6 @@ fn has_github_actions(cwd: &Path) -> bool {
             .extension()
             .is_some_and(|x| x == "yml" || x == "yaml")
     })
-}
-
-fn has_gh() -> bool {
-    // Try `gh --version` to confirm the binary works.
-    Command::new("gh")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 fn has_remote(cwd: &Path, name: &str) -> bool {
@@ -81,6 +77,12 @@ fn should_record_ci_run(target: &str, default_branch: Option<&str>) -> bool {
 /// clippy (correctly) doesn't love nine free-floating positional args.
 pub struct TriggerArgs {
     pub db: Db,
+    /// Used by [`crate::agents::git_ops::default_branch`] +
+    /// [`crate::agents::git_ops::push_branch`] to dispatch through the
+    /// runner in SaaS mode. Always-present even in standalone (where it's
+    /// an empty registry).
+    pub runners: RunnerRegistry,
+    pub org_id: String,
     pub broadcast_tx: broadcast::Sender<String>,
     pub cwd: PathBuf,
     pub plan_name: String,
@@ -94,6 +96,8 @@ pub struct TriggerArgs {
 pub async fn trigger_after_merge(args: TriggerArgs) {
     let TriggerArgs {
         db,
+        runners,
+        org_id,
         broadcast_tx,
         cwd,
         plan_name,
@@ -103,19 +107,34 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
         task_branch,
         merged_sha,
     } = args;
-    // Detect: need GitHub Actions workflows, an `origin` remote, and `gh`.
-    if !has_github_actions(&cwd) {
-        return;
-    }
-    if !has_remote(&cwd, "origin") {
-        println!(
-            "[ci] no origin remote in {} — skipping CI trigger",
-            cwd.display()
-        );
-        return;
+
+    // In standalone mode, gate on local-fs detection (workflow + origin).
+    // In SaaS mode, the cwd lives on the runner — these checks would
+    // always return false on the SaaS server's filesystem, so we skip
+    // them and trust the runner-side push to fail noisily if there's no
+    // remote. Workflow absence is harmless: the ci_runs row would just
+    // age out to "unknown".
+    let saas_mode = org_has_runner(&db, &org_id);
+    if !saas_mode {
+        if !has_github_actions(&cwd) {
+            return;
+        }
+        if !has_remote(&cwd, "origin") {
+            println!(
+                "[ci] no origin remote in {} — skipping CI trigger",
+                cwd.display()
+            );
+            return;
+        }
     }
 
-    let default = crate::agents::git_default_branch(&cwd);
+    let default = match crate::agents::git_ops::default_branch(&db, &runners, &org_id, &cwd).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[ci] default-branch dispatch failed: {e} — skipping CI trigger");
+            return;
+        }
+    };
     if !should_record_ci_run(&source_branch, default.as_deref()) {
         println!(
             "[ci] merge target `{source_branch}` is not the default \
@@ -125,22 +144,18 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
     }
 
     // Push the source branch so CI on the remote can fire.
-    let push = Command::new("git")
-        .args(["push", "origin", &source_branch])
-        .current_dir(&cwd)
-        .output();
-
+    let push =
+        crate::agents::git_ops::push_branch(&db, &runners, &org_id, &cwd, &source_branch).await;
     match push {
-        Ok(out) if out.status.success() => {
+        Ok(Ok(())) => {
             println!("[ci] pushed {source_branch} ({merged_sha}) to origin");
         }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+        Ok(Err(stderr)) => {
             eprintln!("[ci] push failed for {source_branch}: {stderr}");
             return;
         }
         Err(e) => {
-            eprintln!("[ci] failed to run git push: {e}");
+            eprintln!("[ci] push dispatch failed for {source_branch}: {e}");
             return;
         }
     }
@@ -150,9 +165,16 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
         let conn = db.lock().unwrap();
         conn.execute(
             "INSERT INTO ci_runs \
-               (plan_name, task_number, agent_id, provider, commit_sha, branch, status) \
-             VALUES (?1, ?2, ?3, 'github', ?4, ?5, 'pending')",
-            params![plan_name, task_number, agent_id, merged_sha, task_branch],
+               (plan_name, task_number, agent_id, provider, commit_sha, branch, status, org_id) \
+             VALUES (?1, ?2, ?3, 'github', ?4, ?5, 'pending', ?6)",
+            params![
+                plan_name,
+                task_number,
+                agent_id,
+                merged_sha,
+                task_branch,
+                org_id
+            ],
         )
         .ok();
         conn.last_insert_rowid()
@@ -199,7 +221,10 @@ fn terminal(status: &str) -> bool {
 
 /// Ask `gh` for the most recent workflow run against a given commit.
 /// Runs in a blocking thread because `Command` is sync.
-async fn fetch_run(cwd: PathBuf, sha: String) -> Option<GhRun> {
+///
+/// Local (standalone) implementation. The SaaS path goes through
+/// [`fetch_run`] which dispatches via the runner.
+async fn fetch_run_local(cwd: PathBuf, sha: String) -> Option<GhRun> {
     tokio::task::spawn_blocking(move || {
         let out = Command::new("gh")
             .args([
@@ -226,16 +251,66 @@ async fn fetch_run(cwd: PathBuf, sha: String) -> Option<GhRun> {
     .flatten()
 }
 
+/// Mode-aware dispatcher for [`fetch_run_local`].
+///
+/// - SaaS path (org has any `runners` row): dispatch
+///   [`WireMessage::GhRunList`] to a connected runner. The poll cadence
+///   is ~30s and the next pass will retry, so a longer-than-read timeout
+///   is fine.
+/// - Standalone: shell out via [`fetch_run_local`].
+///
+/// Outer `Result` is `Err` only when the SaaS path failed to reach the
+/// runner (caller logs and skips this pass — does NOT age out the row).
+/// Inner `Option<GhRun>` is `None` when no workflow has fired yet for
+/// the commit, or `gh` is unavailable on the runner.
+pub async fn fetch_run(
+    db: &Db,
+    runners: &RunnerRegistry,
+    org_id: &str,
+    cwd: &Path,
+    sha: &str,
+) -> Result<Option<GhRun>, RunnerRpcError> {
+    if org_has_runner(db, org_id) {
+        let req_id = Uuid::new_v4().to_string();
+        let msg = WireMessage::GhRunList {
+            req_id,
+            cwd: cwd.to_string_lossy().to_string(),
+            sha: sha.to_string(),
+        };
+        match runner_request_with_registry(db, runners, org_id, msg, Duration::from_secs(15))
+            .await?
+        {
+            RunnerResponse::GhRunListed(run) => Ok(run),
+            other => {
+                eprintln!("[ci] expected gh_run_listed, got {other:?}");
+                Err(RunnerRpcError::InvalidRequest)
+            }
+        }
+    } else {
+        Ok(fetch_run_local(cwd.to_path_buf(), sha.to_string()).await)
+    }
+}
+
 /// One pass: look up every pending/running `ci_runs` row, query `gh`, and
 /// update rows + broadcast when status changes. Rows older than
 /// `MAX_RUN_AGE_SECS` with no success are marked `unknown` so the dashboard
 /// doesn't show a permanent spinner for a commit that never kicked off CI.
+///
+/// SaaS-aware: each row's `org_id` is resolved by joining through
+/// `agents.id` (`ci_runs.agent_id`), and the gh shell-out is dispatched
+/// through the runner. A `RunnerRpcError::NoConnectedRunner` (or any other
+/// transport failure) logs `runner offline, retrying` and **skips the row
+/// without aging it** — a brief reconnect window must not flip rows to
+/// `unknown` just because the runner was disconnected for a few minutes.
 async fn poll_once(
     db: &Db,
+    runners: &RunnerRegistry,
     broadcast_tx: &broadcast::Sender<String>,
     project_dirs: &std::collections::HashMap<String, PathBuf>,
 ) {
-    // Snapshot open rows — hold the lock only briefly.
+    // Snapshot open rows — hold the lock only briefly. Joining through
+    // agents to pick up org_id; rows with NULL agent_id (legacy/manual
+    // inserts) get NULL here and we skip them.
     struct Row {
         id: i64,
         plan_name: String,
@@ -243,14 +318,18 @@ async fn poll_once(
         commit_sha: Option<String>,
         status: String,
         age_secs: i64,
+        org_id: Option<String>,
     }
     let rows: Vec<Row> = {
         let conn = db.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, plan_name, task_number, commit_sha, status, \
-                    CAST(strftime('%s','now') - strftime('%s', created_at) AS INTEGER) \
-             FROM ci_runs WHERE status IN ('pending','running') \
-             ORDER BY id ASC",
+            "SELECT c.id, c.plan_name, c.task_number, c.commit_sha, c.status, \
+                    CAST(strftime('%s','now') - strftime('%s', c.created_at) AS INTEGER), \
+                    a.org_id \
+             FROM ci_runs c \
+             LEFT JOIN agents a ON c.agent_id = a.id \
+             WHERE c.status IN ('pending','running') \
+             ORDER BY c.id ASC",
         ) {
             Ok(s) => s,
             Err(_) => return,
@@ -263,6 +342,7 @@ async fn poll_once(
                 commit_sha: r.get(3)?,
                 status: r.get(4)?,
                 age_secs: r.get(5)?,
+                org_id: r.get(6)?,
             })
         })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
@@ -294,8 +374,25 @@ async fn poll_once(
             }
             continue;
         };
+        // Default to 'default-org' for legacy rows where the JOIN returned
+        // NULL — matches the column default that pre-multi-tenancy inserts
+        // would have hit.
+        let org_id = row.org_id.clone().unwrap_or_else(|| "default-org".into());
 
-        let run = fetch_run(cwd.clone(), sha.clone()).await;
+        let run = match fetch_run(db, runners, &org_id, &cwd, &sha).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Runner offline / timeout / disconnect — skip this pass
+                // and try again next cycle. Crucially, do NOT age out the
+                // row: the runner could be back in seconds and we'd lose
+                // a real success/failure status.
+                eprintln!(
+                    "[ci] runner offline, retrying next cycle (plan={}, task={}): {e}",
+                    row.plan_name, row.task_number
+                );
+                continue;
+            }
+        };
         match run {
             Some(r) => {
                 let new_status = normalize(r.status.as_deref(), r.conclusion.as_deref());
@@ -373,11 +470,19 @@ fn update_row(
 
 /// Spawn the background poller. Runs forever; cancellation happens on process
 /// exit. Safe to call once from main.
-pub fn spawn_poller(db: Db, broadcast_tx: broadcast::Sender<String>, plans_dir: PathBuf) {
-    if !has_gh() {
-        println!("[ci] `gh` CLI not available — CI status polling disabled");
-        return;
-    }
+///
+/// `has_gh()` is intentionally NOT a gate here: in SaaS deployments the gh
+/// shell-out happens on the runner, not the server, so the server's `$PATH`
+/// is irrelevant. Standalone deployments without `gh` installed still spin
+/// the poller but every dispatch returns `Ok(None)` (the runner-less branch
+/// of `fetch_run` calls `fetch_run_local` which fails fast on a missing gh
+/// binary), so there's no harm.
+pub fn spawn_poller(
+    db: Db,
+    runners: RunnerRegistry,
+    broadcast_tx: broadcast::Sender<String>,
+    plans_dir: PathBuf,
+) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
@@ -386,7 +491,7 @@ pub fn spawn_poller(db: Db, broadcast_tx: broadcast::Sender<String>, plans_dir: 
             // enough given the poll cadence, and avoids caching that could go
             // stale when the user edits a plan's `project` field.
             let project_dirs = resolve_project_dirs(&plans_dir, &db);
-            poll_once(&db, &broadcast_tx, &project_dirs).await;
+            poll_once(&db, &runners, &broadcast_tx, &project_dirs).await;
         }
     });
 }
@@ -419,10 +524,17 @@ pub fn project_dir_for(plans_dir: &Path, db: &Db, plan_name: &str) -> Option<Pat
 /// Capped at ~8 KB (last slice — failures usually accumulate at the tail),
 /// cached back into `ci_runs.failure_log` so repeat fetches don't re-hit
 /// GitHub. Returns `None` when the run is still pending, the project has
-/// no remote, or `gh` isn't installed.
-pub async fn fetch_failure_log(db: &Db, plans_dir: PathBuf, ci_run_id: i64) -> Option<String> {
-    const CAP_BYTES: usize = 8 * 1024;
-
+/// no remote, `gh` isn't installed, or the SaaS runner is unreachable.
+///
+/// Mode-aware: SaaS deployments dispatch the actual `gh` shell-out to a
+/// connected runner via [`WireMessage::GhFailureLog`]; standalone runs the
+/// shell-out locally. Cache reads/writes always happen on the server.
+pub async fn fetch_failure_log(
+    db: &Db,
+    runners: &RunnerRegistry,
+    plans_dir: PathBuf,
+    ci_run_id: i64,
+) -> Option<String> {
     // Cache hit?
     let cached: Option<String> = {
         let conn = db.lock().unwrap();
@@ -451,7 +563,50 @@ pub async fn fetch_failure_log(db: &Db, plans_dir: PathBuf, ci_run_id: i64) -> O
     let run_id = provider_run_id?;
     let cwd = project_dir_for(&plans_dir, db, &plan_name)?;
 
-    let log = tokio::task::spawn_blocking(move || {
+    // Resolve the org_id by joining through agents — same JOIN-via-agent_id
+    // pattern that poll_once uses, since ci_runs.org_id is left at its
+    // 'default-org' default when trigger_after_merge inserts the row.
+    let org_id = ci_run_org_id(db, ci_run_id)?;
+
+    let log = if org_has_runner(db, &org_id) {
+        let req_id = Uuid::new_v4().to_string();
+        let msg = WireMessage::GhFailureLog {
+            req_id,
+            cwd: cwd.to_string_lossy().to_string(),
+            run_id: run_id.clone(),
+        };
+        match runner_request_with_registry(db, runners, &org_id, msg, Duration::from_secs(30)).await
+        {
+            Ok(RunnerResponse::GhFailureLogFetched(log)) => log?,
+            Ok(other) => {
+                eprintln!("[ci] expected gh_failure_log_fetched, got {other:?}");
+                return None;
+            }
+            Err(e) => {
+                eprintln!("[ci] failure-log dispatch failed: {e}");
+                return None;
+            }
+        }
+    } else {
+        fetch_failure_log_local(cwd, run_id).await?
+    };
+
+    // Write-through cache so the next call is free.
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE ci_runs SET failure_log = ?1 WHERE id = ?2",
+            rusqlite::params![log, ci_run_id],
+        )
+        .ok();
+    }
+    Some(log)
+}
+
+/// Local `gh run view --log-failed` shell-out. Tail-trimmed at 8 KB.
+async fn fetch_failure_log_local(cwd: PathBuf, run_id: String) -> Option<String> {
+    const CAP_BYTES: usize = 8 * 1024;
+    tokio::task::spawn_blocking(move || {
         let out = Command::new("gh")
             .args(["run", "view", &run_id, "--log-failed"])
             .current_dir(&cwd)
@@ -469,18 +624,21 @@ pub async fn fetch_failure_log(db: &Db, plans_dir: PathBuf, ci_run_id: i64) -> O
     })
     .await
     .ok()
-    .flatten()?;
+    .flatten()
+}
 
-    // Write-through cache so the next call is free.
-    {
-        let conn = db.lock().unwrap();
-        conn.execute(
-            "UPDATE ci_runs SET failure_log = ?1 WHERE id = ?2",
-            rusqlite::params![log, ci_run_id],
-        )
-        .ok();
-    }
-    Some(log)
+/// Resolve `org_id` for a `ci_runs` row by joining through `agents.agent_id`.
+/// Returns `None` when `ci_runs.agent_id` is NULL or the agent row is gone —
+/// in that case the caller skips the row rather than guessing.
+fn ci_run_org_id(db: &Db, ci_run_id: i64) -> Option<String> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT a.org_id FROM ci_runs c INNER JOIN agents a ON c.agent_id = a.id \
+         WHERE c.id = ?1",
+        rusqlite::params![ci_run_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
 }
 
 fn resolve_project_dirs(plans_dir: &Path, db: &Db) -> std::collections::HashMap<String, PathBuf> {

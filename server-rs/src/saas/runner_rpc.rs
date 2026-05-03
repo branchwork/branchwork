@@ -78,10 +78,14 @@ pub async fn runner_request(
     message: WireMessage,
     timeout: Duration,
 ) -> Result<RunnerResponse, RunnerRpcError> {
-    runner_request_inner(&state.db, &state.runners, org_id, message, timeout).await
+    runner_request_with_registry(&state.db, &state.runners, org_id, message, timeout).await
 }
 
-async fn runner_request_inner(
+/// Same as [`runner_request`] but takes the DB + registry directly instead of
+/// going through `&AppState`. Used by dispatchers (e.g. `agents::git_ops`,
+/// `ci`) that don't always have an `AppState` in scope — most prominently the
+/// CI poller, which is spawned with just `(db, broadcast_tx, plans_dir)`.
+pub async fn runner_request_with_registry(
     db: &Db,
     runners: &RunnerRegistry,
     org_id: &str,
@@ -169,7 +173,19 @@ fn req_id_for(msg: &WireMessage) -> Option<&str> {
         WireMessage::ListFolders { req_id }
         | WireMessage::CreateFolder { req_id, .. }
         | WireMessage::FoldersListed { req_id, .. }
-        | WireMessage::FolderCreated { req_id, .. } => Some(req_id),
+        | WireMessage::FolderCreated { req_id, .. }
+        | WireMessage::GetDefaultBranch { req_id, .. }
+        | WireMessage::DefaultBranchResolved { req_id, .. }
+        | WireMessage::ListBranches { req_id, .. }
+        | WireMessage::BranchesListed { req_id, .. }
+        | WireMessage::MergeBranch { req_id, .. }
+        | WireMessage::MergeResult { req_id, .. }
+        | WireMessage::PushBranch { req_id, .. }
+        | WireMessage::PushResult { req_id, .. }
+        | WireMessage::GhRunList { req_id, .. }
+        | WireMessage::GhRunListed { req_id, .. }
+        | WireMessage::GhFailureLog { req_id, .. }
+        | WireMessage::GhFailureLogFetched { req_id, .. } => Some(req_id),
         _ => None,
     }
 }
@@ -292,9 +308,10 @@ mod tests {
         let req = WireMessage::ListFolders {
             req_id: "req-success".into(),
         };
-        let result = runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(500))
-            .await
-            .expect("runner_request should succeed");
+        let result =
+            runner_request_with_registry(&db, &registry, "org-1", req, Duration::from_millis(500))
+                .await
+                .expect("runner_request should succeed");
         match result {
             RunnerResponse::FoldersListed(got) => assert_eq!(got, entries),
             other => panic!("expected FoldersListed variant, got {other:?}"),
@@ -312,7 +329,8 @@ mod tests {
             req_id: "req-timeout".into(),
         };
         let result =
-            runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(50)).await;
+            runner_request_with_registry(&db, &registry, "org-1", req, Duration::from_millis(50))
+                .await;
         assert!(matches!(result, Err(RunnerRpcError::Timeout)));
     }
 
@@ -325,7 +343,8 @@ mod tests {
             req_id: "req-norunner".into(),
         };
         let result =
-            runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(500)).await;
+            runner_request_with_registry(&db, &registry, "org-1", req, Duration::from_millis(500))
+                .await;
         assert!(matches!(result, Err(RunnerRpcError::NoConnectedRunner)));
     }
 
@@ -340,7 +359,8 @@ mod tests {
             req_id: "req-stale".into(),
         };
         let result =
-            runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(500)).await;
+            runner_request_with_registry(&db, &registry, "org-1", req, Duration::from_millis(500))
+                .await;
         assert!(matches!(result, Err(RunnerRpcError::NoConnectedRunner)));
     }
 
@@ -352,7 +372,8 @@ mod tests {
 
         let req = WireMessage::Ping {};
         let result =
-            runner_request_inner(&db, &registry, "org-1", req, Duration::from_millis(500)).await;
+            runner_request_with_registry(&db, &registry, "org-1", req, Duration::from_millis(500))
+                .await;
         assert!(matches!(result, Err(RunnerRpcError::InvalidRequest)));
     }
 
@@ -366,7 +387,7 @@ mod tests {
         let db_task = db.clone();
         let registry_task = registry.clone();
         let handle = tokio::spawn(async move {
-            runner_request_inner(
+            runner_request_with_registry(
                 &db_task,
                 &registry_task,
                 "org-1",
@@ -510,7 +531,7 @@ mod tests {
         let db_clone = db.clone();
         let runners_clone = runners.clone();
         let req_handle = tokio::spawn(async move {
-            runner_request_inner(
+            runner_request_with_registry(
                 &db_clone,
                 &runners_clone,
                 org_id,

@@ -1,5 +1,6 @@
 pub mod check_agent;
 pub mod driver;
+pub mod git_ops;
 pub mod pty_agent;
 pub mod session_protocol;
 pub mod supervisor;

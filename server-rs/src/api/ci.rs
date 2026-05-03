@@ -76,7 +76,14 @@ pub async fn failure_log(
     State(state): State<AppState>,
     Path(ci_run_id): Path<i64>,
 ) -> impl IntoResponse {
-    match crate::ci::fetch_failure_log(&state.db, state.plans_dir.clone(), ci_run_id).await {
+    match crate::ci::fetch_failure_log(
+        &state.db,
+        &state.runners,
+        state.plans_dir.clone(),
+        ci_run_id,
+    )
+    .await
+    {
         Some(log) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -201,10 +208,14 @@ pub async fn fix_ci(
     // 4. Fetch the failure log (cached if available). A missing log is a
     //    soft failure — we still spawn the agent with a stub, so the user
     //    can pick up from the task card even if `gh` isn't available.
-    let failure_log =
-        crate::ci::fetch_failure_log(&state.db, state.plans_dir.clone(), body.ci_run_id)
-            .await
-            .unwrap_or_else(|| "(no failure log available — check the CI run URL)".to_string());
+    let failure_log = crate::ci::fetch_failure_log(
+        &state.db,
+        &state.runners,
+        state.plans_dir.clone(),
+        body.ci_run_id,
+    )
+    .await
+    .unwrap_or_else(|| "(no failure log available — check the CI run URL)".to_string());
 
     // 5. Capture the current branch BEFORE we switch — start_pty_agent
     //    derives source_branch from `git_current_branch()`, so without this
