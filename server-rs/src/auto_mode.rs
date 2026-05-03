@@ -14,11 +14,19 @@
 //! or has self-paused — checking that gate is cheap and keeps the call
 //! sites unconditional.
 
+use std::future::Future;
+use std::time::{Duration, Instant};
+
+use rand::Rng;
 use rusqlite::params;
 
 use crate::audit;
 use crate::db;
-use crate::saas::dispatch::merge_agent_branch_dispatch;
+use crate::saas::dispatch::{
+    CiStatusError, get_ci_run_status_dispatch, has_github_actions_dispatch,
+    merge_agent_branch_dispatch,
+};
+use crate::saas::runner_protocol::CiAggregate;
 use crate::state::AppState;
 use crate::ws::broadcast_event;
 
@@ -150,6 +158,186 @@ async fn run_merge_step(
         Some(plan_name),
         Some(&payload.to_string()),
     );
+}
+
+// ── Phase 2: CI poll loop ───────────────────────────────────────────────────
+
+/// Outcome of [`wait_for_ci`] — what the loop should do next for a merged
+/// SHA. The loop body in Phase 2.x consumes this to decide between
+/// advancing to the next task (Green / NotConfigured), spawning a fix
+/// agent (Red), or pausing the plan (Stalled).
+#[allow(dead_code)] // wired into the auto-mode loop in Phase 2.x of this plan
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiOutcome {
+    /// CI ran every workflow for the SHA and they all passed (or were
+    /// intentionally skipped — the upstream-poison rule in
+    /// `ci::aggregate` already collapses benign skips into `success`).
+    Green,
+    /// CI ran and at least one workflow failed / was cancelled / timed
+    /// out. `failing_run_id` is the root-cause run id (the aggregator
+    /// guarantees it's set for these conclusions); the loop hands it to
+    /// the fix-prompt builder so the agent loads the right log.
+    Red { failing_run_id: Option<String> },
+    /// No terminal verdict before the total timeout (~20 min). Loop pauses
+    /// the plan with reason `"ci_stalled"` so a human can investigate.
+    Stalled,
+    /// Project has no GitHub Actions configured. Treated as green by the
+    /// loop — there is no CI to gate on.
+    NotConfigured,
+}
+
+/// Poll-loop tuning. Hard-coded for now per the task brief; a plan-level
+/// override is a later iteration. Pulled out as a struct so unit tests can
+/// shorten the timeouts without exercising real wall-clock behaviour.
+#[allow(dead_code)] // wired into the auto-mode loop in Phase 2.x of this plan
+#[derive(Debug, Clone, Copy)]
+struct WaitForCiConfig {
+    /// Base interval between polls (jittered ± `jitter_window`).
+    poll_interval: Duration,
+    /// Symmetric jitter window applied around `poll_interval` per tick.
+    jitter_window: Duration,
+    /// Hard cap on the total wait. After this elapses the loop returns
+    /// [`CiOutcome::Stalled`] regardless of the in-flight aggregate.
+    total_timeout: Duration,
+}
+
+impl Default for WaitForCiConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(15),
+            jitter_window: Duration::from_secs(2),
+            total_timeout: Duration::from_secs(20 * 60),
+        }
+    }
+}
+
+/// Poll CI status for `merged_sha` until it lands a terminal verdict, the
+/// total timeout (20 min) elapses, or it turns out the project has no
+/// GitHub Actions configured.
+///
+/// Mode-aware via [`crate::saas::dispatch`]: the standalone path resolves
+/// CI state from the local `gh` shell-out, the SaaS path round-trips
+/// through the runner. Callers stay mode-agnostic.
+///
+/// `agent_id` is only used by [`has_github_actions_dispatch`] to look up
+/// the agent's cwd; the actual CI poll is keyed by `(plan_name, task_id,
+/// merged_sha)`.
+#[allow(dead_code)] // wired into the auto-mode loop in Phase 2.x of this plan
+pub async fn wait_for_ci(
+    state: &AppState,
+    org_id: &str,
+    plan_name: &str,
+    task_id: &str,
+    agent_id: &str,
+    merged_sha: &str,
+) -> CiOutcome {
+    wait_for_ci_inner(
+        plan_name,
+        task_id,
+        merged_sha,
+        || has_github_actions_dispatch(state, org_id, agent_id),
+        || get_ci_run_status_dispatch(state, org_id, plan_name, task_id, merged_sha),
+        WaitForCiConfig::default(),
+    )
+    .await
+}
+
+/// Body of [`wait_for_ci`] with the dispatch closures injected. Lets unit
+/// tests stub all four outcomes without setting up a runner registry, a
+/// `gh` binary, or a real `ci_runs` row. Each closure may be invoked many
+/// times across the lifetime of the call.
+#[allow(dead_code)] // wired into the auto-mode loop in Phase 2.x of this plan
+async fn wait_for_ci_inner<HasFn, GetFn, HasFut, GetFut>(
+    plan_name: &str,
+    task_id: &str,
+    merged_sha: &str,
+    has_actions: HasFn,
+    get_status: GetFn,
+    config: WaitForCiConfig,
+) -> CiOutcome
+where
+    HasFn: Fn() -> HasFut,
+    HasFut: Future<Output = bool>,
+    GetFn: Fn() -> GetFut,
+    GetFut: Future<Output = Result<Option<CiAggregate>, CiStatusError>>,
+{
+    if !has_actions().await {
+        return CiOutcome::NotConfigured;
+    }
+
+    let deadline = Instant::now() + config.total_timeout;
+    loop {
+        match get_status().await {
+            Ok(Some(agg)) if agg.status == "completed" => {
+                return classify_aggregate(plan_name, task_id, merged_sha, &agg);
+            }
+            Ok(Some(_)) => {
+                // Aggregate exists but at least one workflow is still
+                // queued/in_progress — keep polling.
+            }
+            Ok(None) => {
+                // No workflow runs for this SHA yet (or `gh` returned
+                // nothing). The brief is explicit: keep polling.
+            }
+            Err(e) => {
+                // Transport failure (RPC) or schema drift (InvalidResponse).
+                // The brief is explicit: retry on the next tick without
+                // surfacing the error to the caller.
+                eprintln!(
+                    "[auto_mode] CI status fetch failed for {plan_name}/{task_id}@{merged_sha}: {e} — retrying"
+                );
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return CiOutcome::Stalled;
+        }
+
+        let sleep = jittered_interval(config.poll_interval, config.jitter_window);
+        tokio::time::sleep(sleep).await;
+    }
+}
+
+/// Map a `CiAggregate` with `status=="completed"` to the loop outcome.
+/// The aggregator (in `ci::aggregate::compute`) is the single place the
+/// upstream-poison rule lives — the loop just consumes its verdict and
+/// **must not** re-interpret raw per-run skips. Defensive: any conclusion
+/// outside the documented set degrades to Stalled so the plan pauses
+/// rather than silently advancing on an unknown verdict.
+#[allow(dead_code)] // wired into the auto-mode loop in Phase 2.x of this plan
+fn classify_aggregate(
+    plan_name: &str,
+    task_id: &str,
+    merged_sha: &str,
+    agg: &CiAggregate,
+) -> CiOutcome {
+    match agg.conclusion.as_deref() {
+        Some("success") => CiOutcome::Green,
+        Some("failure") | Some("cancelled") | Some("timed_out") => CiOutcome::Red {
+            failing_run_id: agg.failing_run_id.clone(),
+        },
+        other => {
+            eprintln!(
+                "[auto_mode] unexpected CI conclusion {other:?} for {plan_name}/{task_id}@{merged_sha} — treating as Stalled"
+            );
+            CiOutcome::Stalled
+        }
+    }
+}
+
+/// Add ±`jitter_window` to `interval` for the next sleep tick. Matches the
+/// brief: "15 s, jittered ± 2 s". Clamped to a minimum of 1 ms so a
+/// degenerate config can't busy-spin.
+#[allow(dead_code)] // wired into the auto-mode loop in Phase 2.x of this plan
+fn jittered_interval(interval: Duration, jitter_window: Duration) -> Duration {
+    let interval_ms = interval.as_millis() as i64;
+    let window_ms = jitter_window.as_millis() as i64;
+    let offset_ms = if window_ms == 0 {
+        0
+    } else {
+        rand::rng().random_range(-window_ms..=window_ms)
+    };
+    Duration::from_millis((interval_ms + offset_ms).max(1) as u64)
 }
 
 #[cfg(test)]
@@ -377,14 +565,17 @@ mod tests {
     }
 
     /// Test-local copy of `runner_rpc::req_id_for` for the variants the
-    /// auto-mode merge path actually uses. The production fn is private;
-    /// duplicating just-what-we-need here keeps the test self-contained.
+    /// auto-mode merge + CI-poll paths actually use. The production fn is
+    /// private; duplicating just-what-we-need here keeps the test
+    /// self-contained.
     fn req_id_for(msg: &WireMessage) -> Option<&str> {
         match msg {
             WireMessage::GetDefaultBranch { req_id, .. }
             | WireMessage::ListBranches { req_id, .. }
             | WireMessage::MergeBranch { req_id, .. }
-            | WireMessage::PushBranch { req_id, .. } => Some(req_id),
+            | WireMessage::PushBranch { req_id, .. }
+            | WireMessage::HasGithubActions { req_id, .. }
+            | WireMessage::GetCiRunStatus { req_id, .. } => Some(req_id),
             _ => None,
         }
     }
@@ -738,5 +929,499 @@ mod tests {
             }
         }
         assert!(saw_merge, "expected a merge_branch envelope on the wire");
+    }
+
+    // ── wait_for_ci: closure-stubbed unit tests ─────────────────────────────
+
+    use crate::saas::runner_protocol::{CiAggregate, CiRunSummary};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Tight config for unit tests so the loop ticks fast and the Stalled
+    /// branch fires within ~100 ms instead of 20 minutes.
+    fn fast_config() -> WaitForCiConfig {
+        WaitForCiConfig {
+            poll_interval: Duration::from_millis(5),
+            jitter_window: Duration::from_millis(2),
+            total_timeout: Duration::from_millis(80),
+        }
+    }
+
+    fn aggregate_success() -> CiAggregate {
+        CiAggregate {
+            status: "completed".to_string(),
+            conclusion: Some("success".to_string()),
+            runs: vec![CiRunSummary {
+                run_id: "1".into(),
+                workflow_name: "tests".into(),
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                skipped_due_to_upstream: false,
+            }],
+            failing_run_id: None,
+        }
+    }
+
+    fn aggregate_failure(failing: &str) -> CiAggregate {
+        CiAggregate {
+            status: "completed".to_string(),
+            conclusion: Some("failure".to_string()),
+            runs: vec![CiRunSummary {
+                run_id: failing.to_string(),
+                workflow_name: "tests".into(),
+                status: "completed".into(),
+                conclusion: Some("failure".into()),
+                skipped_due_to_upstream: false,
+            }],
+            failing_run_id: Some(failing.to_string()),
+        }
+    }
+
+    fn aggregate_in_progress() -> CiAggregate {
+        CiAggregate {
+            status: "in_progress".to_string(),
+            conclusion: None,
+            runs: vec![CiRunSummary {
+                run_id: "1".into(),
+                workflow_name: "tests".into(),
+                status: "in_progress".into(),
+                conclusion: None,
+                skipped_due_to_upstream: false,
+            }],
+            failing_run_id: None,
+        }
+    }
+
+    /// The Reglyze fixture: tests=failure, lint=success, deploy=skipped.
+    /// `mark_upstream_skips` (in `ci::aggregate`) flips `deploy.skipped_due_to_upstream`,
+    /// `compute` then picks `failing_run_id="100"` (tests, not deploy).
+    fn aggregate_reglyze_three_runs() -> CiAggregate {
+        let mut runs = vec![
+            CiRunSummary {
+                run_id: "100".into(),
+                workflow_name: "tests".into(),
+                status: "completed".into(),
+                conclusion: Some("failure".into()),
+                skipped_due_to_upstream: false,
+            },
+            CiRunSummary {
+                run_id: "101".into(),
+                workflow_name: "lint".into(),
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                skipped_due_to_upstream: false,
+            },
+            CiRunSummary {
+                run_id: "102".into(),
+                workflow_name: "deploy".into(),
+                status: "completed".into(),
+                conclusion: Some("skipped".into()),
+                skipped_due_to_upstream: false,
+            },
+        ];
+        crate::ci::aggregate::mark_upstream_skips(&mut runs);
+        crate::ci::aggregate::compute(&runs)
+    }
+
+    #[tokio::test]
+    async fn wait_for_ci_inner_returns_not_configured_when_has_actions_false() {
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let get_calls_inner = get_calls.clone();
+
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-1",
+            || async { false },
+            move || {
+                let count = get_calls_inner.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                }
+            },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(outcome, CiOutcome::NotConfigured);
+        assert_eq!(
+            get_calls.load(Ordering::SeqCst),
+            0,
+            "get_status must not be called when has_actions returns false"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ci_inner_returns_green_on_success_aggregate() {
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-1",
+            || async { true },
+            || async { Ok(Some(aggregate_success())) },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(outcome, CiOutcome::Green);
+    }
+
+    #[tokio::test]
+    async fn wait_for_ci_inner_returns_red_with_failing_run_id_on_failure_aggregate() {
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-1",
+            || async { true },
+            || async { Ok(Some(aggregate_failure("42"))) },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            CiOutcome::Red {
+                failing_run_id: Some("42".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ci_inner_returns_red_for_cancelled_conclusion() {
+        let mut agg = aggregate_failure("99");
+        agg.conclusion = Some("cancelled".to_string());
+
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-1",
+            || async { true },
+            move || {
+                let agg = agg.clone();
+                async move { Ok(Some(agg)) }
+            },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            CiOutcome::Red {
+                failing_run_id: Some("99".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ci_inner_returns_red_for_timed_out_conclusion() {
+        let mut agg = aggregate_failure("77");
+        agg.conclusion = Some("timed_out".to_string());
+
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-1",
+            || async { true },
+            move || {
+                let agg = agg.clone();
+                async move { Ok(Some(agg)) }
+            },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            CiOutcome::Red {
+                failing_run_id: Some("77".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ci_inner_returns_stalled_after_timeout() {
+        // get_status always returns Ok(None) (no runs yet) — the loop must
+        // keep polling until total_timeout, then surface Stalled.
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-1",
+            || async { true },
+            || async { Ok(None) },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(outcome, CiOutcome::Stalled);
+    }
+
+    #[tokio::test]
+    async fn wait_for_ci_inner_keeps_polling_on_in_progress_then_returns_terminal() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-1",
+            || async { true },
+            move || {
+                let count = calls_inner.clone();
+                async move {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(if n == 0 {
+                        aggregate_in_progress()
+                    } else {
+                        aggregate_success()
+                    }))
+                }
+            },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(outcome, CiOutcome::Green);
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "loop must have polled at least twice (in_progress then completed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ci_inner_keeps_polling_on_rpc_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-1",
+            || async { true },
+            move || {
+                let count = calls_inner.clone();
+                async move {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Err(CiStatusError::InvalidResponse)
+                    } else {
+                        Ok(Some(aggregate_success()))
+                    }
+                }
+            },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(outcome, CiOutcome::Green);
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "loop must have retried after the RPC error"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ci_inner_unknown_conclusion_treats_as_stalled() {
+        let mut agg = aggregate_success();
+        agg.conclusion = Some("action_required".to_string());
+
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-1",
+            || async { true },
+            move || {
+                let agg = agg.clone();
+                async move { Ok(Some(agg)) }
+            },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(outcome, CiOutcome::Stalled);
+    }
+
+    /// Headline regression test from the brief: stub the dispatch to return
+    /// the three-runs aggregate from 0.4's regression test (tests=failure,
+    /// lint=success, deploy=skipped-due-to-upstream). The loop must emit
+    /// `CiOutcome::Red { failing_run_id: Some("100") }` — NOT Green and
+    /// NOT `failing_run_id: Some("102")` (the skipped deploy).
+    #[tokio::test]
+    async fn wait_for_ci_inner_reglyze_three_runs_returns_red_with_tests_id_not_deploy_id() {
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-reglyze",
+            || async { true },
+            || async { Ok(Some(aggregate_reglyze_three_runs())) },
+            fast_config(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            CiOutcome::Red {
+                failing_run_id: Some("100".to_string()),
+            },
+            "loop must surface the root-cause failing run id (tests=100), \
+             not the upstream-skipped deploy=102 — this is the Reglyze bug"
+        );
+    }
+
+    // ── wait_for_ci: integration tests ──────────────────────────────────────
+
+    /// Standalone branch: project has no `.github/workflows/` directory —
+    /// `has_github_actions_dispatch` returns false, the loop short-circuits
+    /// to NotConfigured without calling `get_ci_run_status_dispatch`.
+    /// Exercises the full real dispatch path, no closure injection.
+    #[tokio::test]
+    async fn wait_for_ci_standalone_no_workflows_returns_not_configured() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        seed_agent(&db, "agent-1", &cwd, "p", "1.1", "branchwork/p/1.1");
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, _rx) = test_app_state(db, new_runner_registry(), plans_dir);
+
+        let outcome = wait_for_ci(&state, "default-org", "p", "1.1", "agent-1", "sha-1").await;
+
+        assert_eq!(outcome, CiOutcome::NotConfigured);
+    }
+
+    /// Standalone branch: `.github/workflows/ci.yml` is present (so
+    /// `has_github_actions_dispatch` returns true) AND a real `ci_runs`
+    /// row exists for the merged SHA (the kind `ci::trigger_after_merge`
+    /// would have written). The dispatcher's `gh run list` shell-out
+    /// returns nothing in the test environment (no `gh` auth), so the
+    /// loop polls until `total_timeout` elapses and surfaces `Stalled`.
+    /// Uses a tight config to bound the wall-clock cost.
+    #[tokio::test]
+    async fn wait_for_ci_standalone_workflows_present_eventually_stalls() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(cwd.join(".github").join("workflows")).unwrap();
+        std::fs::write(
+            cwd.join(".github").join("workflows").join("ci.yml"),
+            "name: ci\non: [push]\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n",
+        )
+        .unwrap();
+        seed_agent(&db, "agent-1", &cwd, "p", "1.1", "branchwork/p/1.1");
+
+        // Real ci_runs row, as ci::trigger_after_merge would have written.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO ci_runs \
+                   (plan_name, task_number, agent_id, provider, commit_sha, branch, status, org_id) \
+                 VALUES ('p', '1.1', 'agent-1', 'github', 'sha-merged', 'branchwork/p/1.1', 'pending', 'default-org')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, _rx) = test_app_state(db, new_runner_registry(), plans_dir);
+
+        let outcome = wait_for_ci_inner(
+            "p",
+            "1.1",
+            "sha-merged",
+            || has_github_actions_dispatch(&state, "default-org", "agent-1"),
+            || get_ci_run_status_dispatch(&state, "default-org", "p", "1.1", "sha-merged"),
+            // Tight timeout so this test stays under a second; the real
+            // 20-min cap would be ridiculous in CI.
+            WaitForCiConfig {
+                poll_interval: Duration::from_millis(10),
+                jitter_window: Duration::from_millis(2),
+                total_timeout: Duration::from_millis(150),
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, CiOutcome::Stalled);
+    }
+
+    /// SaaS branch: registered runner replies to both `HasGithubActions`
+    /// (with `present=true`) and `GetCiRunStatus` (with a canned
+    /// success-conclusion `CiAggregate`). The loop must surface `Green`.
+    #[tokio::test]
+    async fn wait_for_ci_saas_runner_returns_green_aggregate_drives_green_outcome() {
+        let (db, _dir) = fresh_db();
+        seed_runner_row(&db, "runner-1", "default-org");
+        seed_agent(
+            &db,
+            "agent-1",
+            Path::new("/runner/cwd"),
+            "p",
+            "1.1",
+            "branchwork/p/1.1",
+        );
+
+        let runners = new_runner_registry();
+        let _outgoing = install_echo_runner(&runners, "runner-1", |msg| match msg {
+            WireMessage::HasGithubActions { .. } => {
+                Some(RunnerResponse::GithubActionsDetected(true))
+            }
+            WireMessage::GetCiRunStatus { .. } => Some(RunnerResponse::CiRunStatusResolved(Some(
+                aggregate_success(),
+            ))),
+            _ => None,
+        })
+        .await;
+
+        let (state, _rx) =
+            test_app_state(db, runners, PathBuf::from("/tmp/auto-mode-saas-wait-plans"));
+
+        let outcome = wait_for_ci(&state, "default-org", "p", "1.1", "agent-1", "sha-merged").await;
+
+        assert_eq!(outcome, CiOutcome::Green);
+    }
+
+    /// SaaS branch: runner replies with the Reglyze failure aggregate. The
+    /// loop must surface `Red { failing_run_id: Some("100") }` — the
+    /// root-cause `tests` run id, not the upstream-skipped `deploy`.
+    /// Pairs with the closure-stubbed Reglyze test above to prove the
+    /// regression is caught both via direct injection and via the live
+    /// dispatch round-trip.
+    #[tokio::test]
+    async fn wait_for_ci_saas_runner_returns_failure_aggregate_drives_red_with_failing_run_id() {
+        let (db, _dir) = fresh_db();
+        seed_runner_row(&db, "runner-1", "default-org");
+        seed_agent(
+            &db,
+            "agent-1",
+            Path::new("/runner/cwd"),
+            "p",
+            "1.1",
+            "branchwork/p/1.1",
+        );
+
+        let runners = new_runner_registry();
+        let _outgoing = install_echo_runner(&runners, "runner-1", |msg| match msg {
+            WireMessage::HasGithubActions { .. } => {
+                Some(RunnerResponse::GithubActionsDetected(true))
+            }
+            WireMessage::GetCiRunStatus { .. } => Some(RunnerResponse::CiRunStatusResolved(Some(
+                aggregate_reglyze_three_runs(),
+            ))),
+            _ => None,
+        })
+        .await;
+
+        let (state, _rx) =
+            test_app_state(db, runners, PathBuf::from("/tmp/auto-mode-saas-wait-plans"));
+
+        let outcome = wait_for_ci(&state, "default-org", "p", "1.1", "agent-1", "sha-merged").await;
+
+        assert_eq!(
+            outcome,
+            CiOutcome::Red {
+                failing_run_id: Some("100".to_string()),
+            },
+            "SaaS round-trip must surface tests run id (100), not the \
+             upstream-skipped deploy run id (102)"
+        );
     }
 }
