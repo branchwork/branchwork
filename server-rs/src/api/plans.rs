@@ -7,12 +7,18 @@ use axum::{
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
+use uuid::Uuid;
 
 use crate::agents::{check_agent, ensure_git_initialized, pty_agent};
 use crate::auth::OptionalAuthUser;
 use crate::auth::orgs;
 use crate::auto_status;
 use crate::plan_parser;
+use crate::saas::dispatch::org_has_runner;
+use crate::saas::runner_protocol::WireMessage;
+use crate::saas::runner_rpc::{RunnerRpcError, runner_request};
+use crate::saas::runner_ws::RunnerResponse;
 use crate::state::AppState;
 use crate::templates;
 
@@ -1745,38 +1751,121 @@ pub async fn create_plan(
             .into_response();
     }
 
-    let home = dirs::home_dir().unwrap();
-    let resolved = if body.folder.starts_with('~') {
-        home.join(body.folder[1..].trim_start_matches('/'))
+    let resolved: std::path::PathBuf = if org_has_runner(&state.db, auth.org_id()) {
+        // SaaS path: ask the runner to check or create the folder. The
+        // runner-resolved absolute path comes back as a string and becomes
+        // the cwd we hand to the agent — `StartAgent { cwd }` will be
+        // resolved on the runner side later.
+        let create_if_missing = body.create_folder.unwrap_or(false);
+        let req_id = Uuid::new_v4().to_string();
+        let message = WireMessage::CreateFolder {
+            req_id,
+            path: body.folder.clone(),
+            create_if_missing,
+        };
+        match runner_request(&state, auth.org_id(), message, Duration::from_secs(8)).await {
+            Ok(RunnerResponse::FolderCreated {
+                ok: true,
+                resolved_path: Some(path),
+                ..
+            }) => std::path::PathBuf::from(path),
+            Ok(RunnerResponse::FolderCreated {
+                ok: false,
+                resolved_path,
+                error,
+            }) => {
+                let err = error.unwrap_or_default();
+                let display_path = resolved_path.as_deref().unwrap_or(body.folder.as_str());
+                if err == "folder_not_found" {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "folder_not_found",
+                            "resolvedFolder": resolved_path,
+                            "message": format!("Directory does not exist: {display_path}"),
+                        })),
+                    )
+                        .into_response();
+                }
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "create_failed",
+                        "resolvedFolder": resolved_path,
+                        "message": err,
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "unexpected_runner_response"})),
+                )
+                    .into_response();
+            }
+            Err(RunnerRpcError::NoConnectedRunner) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "no_runner_connected"})),
+                )
+                    .into_response();
+            }
+            Err(RunnerRpcError::Timeout | RunnerRpcError::RunnerDisconnected) => {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({"error": "runner_unavailable"})),
+                )
+                    .into_response();
+            }
+            Err(RunnerRpcError::InvalidRequest | RunnerRpcError::SendFailed) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "runner_request_failed"})),
+                )
+                    .into_response();
+            }
+        }
     } else {
-        std::path::PathBuf::from(&body.folder)
-    };
+        let home = dirs::home_dir().unwrap();
+        let resolved = if body.folder.starts_with('~') {
+            home.join(body.folder[1..].trim_start_matches('/'))
+        } else {
+            std::path::PathBuf::from(&body.folder)
+        };
 
-    if !resolved.exists() {
-        if body.create_folder != Some(true) {
+        if !resolved.exists() {
+            if body.create_folder != Some(true) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "folder_not_found",
+                        "message": format!("Directory does not exist: {}", resolved.display()),
+                        "resolvedFolder": resolved.to_str(),
+                    })),
+                )
+                    .into_response();
+            }
+            std::fs::create_dir_all(&resolved).ok();
+        }
+
+        if !resolved.is_dir() {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "folder_not_found",
-                    "message": format!("Directory does not exist: {}", resolved.display()),
-                    "resolvedFolder": resolved.to_str(),
-                })),
+                Json(
+                    serde_json::json!({"error": format!("Not a directory: {}", resolved.display())}),
+                ),
             )
                 .into_response();
         }
-        std::fs::create_dir_all(&resolved).ok();
-    }
 
-    if !resolved.is_dir() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("Not a directory: {}", resolved.display())})),
-        )
-            .into_response();
-    }
+        // Ensure git is initialized — branch isolation + diff features need it.
+        // Skipped on the runner branch above: the runner host owns the
+        // working tree, and the agent runs `git init` itself when needed.
+        ensure_git_initialized(&resolved);
 
-    // Ensure git is initialized — branch isolation + diff features need it
-    ensure_git_initialized(&resolved);
+        resolved
+    };
 
     let plans_dir = state.plans_dir.display();
 

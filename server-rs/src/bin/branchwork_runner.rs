@@ -503,21 +503,18 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                 .send(serde_json::to_string(&reply).unwrap_or_default());
         }
 
-        WireMessage::CreateFolder { req_id, path } => {
-            let resolved = resolve_runner_path(path);
-            let reply = match std::fs::create_dir_all(&resolved) {
-                Ok(()) => WireMessage::FolderCreated {
-                    req_id: req_id.clone(),
-                    ok: true,
-                    resolved_path: Some(resolved.display().to_string()),
-                    error: None,
-                },
-                Err(e) => WireMessage::FolderCreated {
-                    req_id: req_id.clone(),
-                    ok: false,
-                    resolved_path: None,
-                    error: Some(e.to_string()),
-                },
+        WireMessage::CreateFolder {
+            req_id,
+            path,
+            create_if_missing,
+        } => {
+            let (ok, resolved_path, error) =
+                check_or_create_folder(path, *create_if_missing);
+            let reply = WireMessage::FolderCreated {
+                req_id: req_id.clone(),
+                ok,
+                resolved_path,
+                error,
             };
             let env = Envelope::best_effort(state.runner_id.clone(), reply);
             let _ = state
@@ -552,6 +549,33 @@ fn resolve_runner_path(path: &str) -> PathBuf {
         dirs::home_dir().unwrap_or_default()
     } else {
         PathBuf::from(path)
+    }
+}
+
+/// Existence-check or `mkdir -p` on a runner-side path. Always returns the
+/// resolved absolute path string in `resolved_path` so the caller can echo it
+/// back to the dashboard regardless of outcome (which is what the
+/// `folder_not_found` UX flow needs to render the prompt).
+fn check_or_create_folder(
+    path: &str,
+    create_if_missing: bool,
+) -> (bool, Option<String>, Option<String>) {
+    let resolved = resolve_runner_path(path);
+    let resolved_str = Some(resolved.display().to_string());
+    if create_if_missing {
+        match std::fs::create_dir_all(&resolved) {
+            Ok(()) if resolved.is_dir() => (true, resolved_str, None),
+            Ok(()) => (
+                false,
+                resolved_str,
+                Some(format!("not a directory: {}", resolved.display())),
+            ),
+            Err(e) => (false, resolved_str, Some(e.to_string())),
+        }
+    } else if resolved.is_dir() {
+        (true, resolved_str, None)
+    } else {
+        (false, resolved_str, Some("folder_not_found".to_string()))
     }
 }
 
@@ -1031,6 +1055,56 @@ mod tests {
         // mkdir -p semantics: a second call must succeed too.
         std::fs::create_dir_all(&resolved).expect("second create");
         assert!(resolved.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_or_create_folder_existing_dir_without_creation_returns_ok() {
+        let tmp =
+            std::env::temp_dir().join(format!("branchwork-cof-existing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (ok, resolved, error) = check_or_create_folder(&tmp.display().to_string(), false);
+        assert!(ok);
+        assert_eq!(resolved, Some(tmp.display().to_string()));
+        assert!(error.is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_or_create_folder_missing_without_creation_returns_folder_not_found() {
+        let tmp =
+            std::env::temp_dir().join(format!("branchwork-cof-missing-{}", uuid::Uuid::new_v4()));
+        // Do NOT create the dir — caller must see folder_not_found.
+        let (ok, resolved, error) = check_or_create_folder(&tmp.display().to_string(), false);
+        assert!(!ok);
+        assert_eq!(resolved, Some(tmp.display().to_string()));
+        assert_eq!(error.as_deref(), Some("folder_not_found"));
+    }
+
+    #[test]
+    fn check_or_create_folder_missing_with_creation_makes_dir() {
+        let tmp =
+            std::env::temp_dir().join(format!("branchwork-cof-create-{}", uuid::Uuid::new_v4()));
+        let nested = tmp.join("a/b/c");
+        let (ok, resolved, error) = check_or_create_folder(&nested.display().to_string(), true);
+        assert!(ok);
+        assert_eq!(resolved, Some(nested.display().to_string()));
+        assert!(error.is_none());
+        assert!(nested.is_dir());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_or_create_folder_with_creation_is_idempotent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "branchwork-cof-idempotent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for _ in 0..2 {
+            let (ok, _, error) = check_or_create_folder(&tmp.display().to_string(), true);
+            assert!(ok);
+            assert!(error.is_none());
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

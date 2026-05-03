@@ -125,9 +125,17 @@ pub enum WireMessage {
         entries: Vec<FolderEntry>,
     },
 
-    /// Dashboard requested folder creation on the runner.
+    /// Dashboard requested folder creation/check on the runner.
+    /// When `create_if_missing` is `false` the runner performs an existence
+    /// check only and replies with `ok: false, error: "folder_not_found"` if
+    /// the path is not a directory. When `true` it does `mkdir -p`.
     /// Best-effort: tied to a live HTTP caller.
-    CreateFolder { req_id: String, path: String },
+    CreateFolder {
+        req_id: String,
+        path: String,
+        #[serde(default)]
+        create_if_missing: bool,
+    },
 
     /// Runner reply with the create result.
     FolderCreated {
@@ -395,6 +403,7 @@ mod tests {
         let msg = WireMessage::CreateFolder {
             req_id: "req-3".into(),
             path: "/home/user/new-project".into(),
+            create_if_missing: true,
         };
         assert!(msg.is_best_effort());
         assert_eq!(msg.event_type(), "create_folder");
@@ -402,9 +411,34 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         let back: Envelope = serde_json::from_str(&json).unwrap();
         match back.message {
-            WireMessage::CreateFolder { req_id, path } => {
+            WireMessage::CreateFolder {
+                req_id,
+                path,
+                create_if_missing,
+            } => {
                 assert_eq!(req_id, "req-3");
                 assert_eq!(path, "/home/user/new-project");
+                assert!(create_if_missing);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_folder_default_create_if_missing_is_false() {
+        // Older runners may have been built before the create_if_missing field
+        // existed — verify the serde default keeps deserialization working.
+        let json = r#"{"type":"create_folder","req_id":"req-x","path":"/tmp/x"}"#;
+        let msg: WireMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WireMessage::CreateFolder {
+                req_id,
+                path,
+                create_if_missing,
+            } => {
+                assert_eq!(req_id, "req-x");
+                assert_eq!(path, "/tmp/x");
+                assert!(!create_if_missing);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
