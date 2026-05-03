@@ -15,10 +15,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rusqlite::params;
-use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use crate::db::Db;
+use crate::saas::runner_protocol::GhRun;
 use crate::ws::broadcast_event;
 
 const POLL_INTERVAL_SECS: u64 = 30;
@@ -174,15 +174,6 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
 }
 
 // ── Polling ─────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct GhRun {
-    #[serde(rename = "databaseId")]
-    database_id: Option<i64>,
-    status: Option<String>,
-    conclusion: Option<String>,
-    url: Option<String>,
-}
 
 /// Normalize GitHub Actions status + conclusion to our vocabulary.
 fn normalize(status: Option<&str>, conclusion: Option<&str>) -> &'static str {

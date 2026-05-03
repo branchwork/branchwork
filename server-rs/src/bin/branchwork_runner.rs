@@ -536,6 +536,8 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         | WireMessage::BranchesListed { .. }
         | WireMessage::MergeResult { .. }
         | WireMessage::PushResult { .. }
+        | WireMessage::GhRunListed { .. }
+        | WireMessage::GhFailureLogFetched { .. }
         // saas→runner variants the runner doesn't act on yet (handlers
         // land in later phases).
         | WireMessage::TerminalReplay { .. }
@@ -543,6 +545,8 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         | WireMessage::ListBranches { .. }
         | WireMessage::MergeBranch { .. }
         | WireMessage::PushBranch { .. }
+        | WireMessage::GhRunList { .. }
+        | WireMessage::GhFailureLog { .. }
         | WireMessage::Ping {} => {}
     }
 }

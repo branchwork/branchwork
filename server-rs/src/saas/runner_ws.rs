@@ -562,7 +562,9 @@ async fn handle_runner_message(
         WireMessage::DefaultBranchResolved { .. }
         | WireMessage::BranchesListed { .. }
         | WireMessage::MergeResult { .. }
-        | WireMessage::PushResult { .. } => {}
+        | WireMessage::PushResult { .. }
+        | WireMessage::GhRunListed { .. }
+        | WireMessage::GhFailureLogFetched { .. } => {}
 
         // Server doesn't receive these from runners — the runner sending them
         // would be a protocol violation (saas→runner direction only).
@@ -577,7 +579,9 @@ async fn handle_runner_message(
         | WireMessage::GetDefaultBranch { .. }
         | WireMessage::ListBranches { .. }
         | WireMessage::MergeBranch { .. }
-        | WireMessage::PushBranch { .. } => {}
+        | WireMessage::PushBranch { .. }
+        | WireMessage::GhRunList { .. }
+        | WireMessage::GhFailureLog { .. } => {}
     }
 }
 

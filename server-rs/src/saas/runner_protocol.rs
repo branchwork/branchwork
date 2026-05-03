@@ -222,6 +222,45 @@ pub enum WireMessage {
         stderr: Option<String>,
     },
 
+    /// Server-side CI poller asked the runner for the most recent workflow
+    /// run against `sha` in `cwd`. The runner shells out to
+    /// `gh run list --commit <sha> -L 1 --json databaseId,status,conclusion,url`
+    /// and replies with a [`GhRunListed`]. The poller fires from a
+    /// background tokio task, not an HTTP caller — but treating this as
+    /// best-effort is still correct: the next poll cycle (~30s later) will
+    /// retry, so outbox replay buys nothing.
+    GhRunList {
+        req_id: String,
+        cwd: String,
+        sha: String,
+    },
+    /// Runner reply with the resolved run, or `None` when no workflow has
+    /// fired yet for that commit (or when `gh` is unavailable).
+    GhRunListed {
+        req_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run: Option<GhRun>,
+    },
+
+    /// Server-side failure-log endpoint asked the runner for the
+    /// `--log-failed` output of a finished run. The runner shells out to
+    /// `gh run view <run_id> --log-failed`, tail-trims to ~8 KB (mirroring
+    /// `ci.rs::fetch_failure_log`), and replies with a [`GhFailureLogFetched`].
+    /// Best-effort: tied to a live HTTP caller waiting on the failure log,
+    /// so outbox replay would land after the caller has timed out.
+    GhFailureLog {
+        req_id: String,
+        cwd: String,
+        run_id: String,
+    },
+    /// Runner reply with the failure-log tail, or `None` when the run has
+    /// no failure log (still pending, gh unavailable, no auth, etc).
+    GhFailureLogFetched {
+        req_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        log: Option<String>,
+    },
+
     // ── Bidirectional ───────────────────────────────────────────────────
     /// Acknowledge receipt of a sequenced message. The receiver sends this
     /// after persisting the event so the sender can prune its outbox.
@@ -252,6 +291,31 @@ pub enum WireMessage {
 pub struct FolderEntry {
     pub name: String,
     pub path: String,
+}
+
+// ── GitHub Actions run ──────────────────────────────────────────────────────
+
+/// One workflow run as returned by `gh run list --json
+/// databaseId,status,conclusion,url`. Lives in the wire module so the runner
+/// (which actually shells out to `gh`) and the SaaS-side poller share a
+/// single definition; the poller used to keep this private to `ci.rs`.
+///
+/// The `databaseId` rename is preserved because that is the spelling `gh`
+/// emits — the runner deserializes `gh`'s JSON into this struct directly,
+/// then re-serializes it across the wire, and the SaaS side deserializes
+/// using the same struct definition. Keeping the rename means the wire
+/// representation is byte-for-byte identical to `gh`'s output, with no
+/// double-translation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GhRun {
+    #[serde(rename = "databaseId", skip_serializing_if = "Option::is_none")]
+    pub database_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 // ── Merge outcome ───────────────────────────────────────────────────────────
@@ -334,6 +398,10 @@ impl WireMessage {
                 | WireMessage::MergeResult { .. }
                 | WireMessage::PushBranch { .. }
                 | WireMessage::PushResult { .. }
+                | WireMessage::GhRunList { .. }
+                | WireMessage::GhRunListed { .. }
+                | WireMessage::GhFailureLog { .. }
+                | WireMessage::GhFailureLogFetched { .. }
         )
     }
 
@@ -363,6 +431,10 @@ impl WireMessage {
             WireMessage::MergeResult { .. } => "merge_result",
             WireMessage::PushBranch { .. } => "push_branch",
             WireMessage::PushResult { .. } => "push_result",
+            WireMessage::GhRunList { .. } => "gh_run_list",
+            WireMessage::GhRunListed { .. } => "gh_run_listed",
+            WireMessage::GhFailureLog { .. } => "gh_failure_log",
+            WireMessage::GhFailureLogFetched { .. } => "gh_failure_log_fetched",
             WireMessage::Ack { .. } => "ack",
             WireMessage::Ping {} => "ping",
             WireMessage::Pong {} => "pong",
@@ -940,6 +1012,190 @@ mod tests {
                     stderr.as_deref(),
                     Some("error: failed to push some refs to 'origin'")
                 );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gh_run_round_trip_preserves_database_id_rename() {
+        // The wire format must spell the field `databaseId` (gh's own JSON
+        // shape) so a runner that piped gh's stdout straight onto the wire
+        // would also work — and so the SaaS-side poller decodes both gh
+        // output and runner replies with one struct.
+        let run = GhRun {
+            database_id: Some(123_456_789),
+            status: Some("completed".into()),
+            conclusion: Some("success".into()),
+            url: Some("https://github.com/o/r/actions/runs/123456789".into()),
+        };
+        let json = serde_json::to_string(&run).unwrap();
+        assert!(json.contains("\"databaseId\":123456789"));
+        assert!(!json.contains("\"database_id\""));
+        let back: GhRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, run);
+    }
+
+    #[test]
+    fn gh_run_decodes_native_gh_output() {
+        // Smoke-check the original ci.rs use case: deserialize whatever gh
+        // emits today. Empty JSON object decodes to all-None.
+        let raw = r#"{"databaseId":42,"status":"in_progress","conclusion":null,"url":"https://x"}"#;
+        let run: GhRun = serde_json::from_str(raw).unwrap();
+        assert_eq!(run.database_id, Some(42));
+        assert_eq!(run.status.as_deref(), Some("in_progress"));
+        assert!(run.conclusion.is_none());
+        assert_eq!(run.url.as_deref(), Some("https://x"));
+
+        let empty: GhRun = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.database_id, None);
+        assert_eq!(empty.status, None);
+        assert_eq!(empty.conclusion, None);
+        assert_eq!(empty.url, None);
+    }
+
+    #[test]
+    fn gh_run_list_round_trip() {
+        let msg = WireMessage::GhRunList {
+            req_id: "req-20".into(),
+            cwd: "/home/user/proj".into(),
+            sha: "deadbeef".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "gh_run_list");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"gh_run_list\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::GhRunList { req_id, cwd, sha } => {
+                assert_eq!(req_id, "req-20");
+                assert_eq!(cwd, "/home/user/proj");
+                assert_eq!(sha, "deadbeef");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gh_run_listed_round_trip_some() {
+        let msg = WireMessage::GhRunListed {
+            req_id: "req-21".into(),
+            run: Some(GhRun {
+                database_id: Some(987),
+                status: Some("completed".into()),
+                conclusion: Some("failure".into()),
+                url: Some("https://github.com/o/r/actions/runs/987".into()),
+            }),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "gh_run_listed");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"gh_run_listed\""));
+        // Must keep the gh-spelled field name across the wire.
+        assert!(json.contains("\"databaseId\":987"));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::GhRunListed { req_id, run } => {
+                assert_eq!(req_id, "req-21");
+                let run = run.expect("run should round-trip");
+                assert_eq!(run.database_id, Some(987));
+                assert_eq!(run.status.as_deref(), Some("completed"));
+                assert_eq!(run.conclusion.as_deref(), Some("failure"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gh_run_listed_round_trip_none() {
+        // No workflow has fired yet for this commit. `run: None` should be
+        // omitted from the wire form.
+        let msg = WireMessage::GhRunListed {
+            req_id: "req-22".into(),
+            run: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"run\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::GhRunListed { req_id, run } => {
+                assert_eq!(req_id, "req-22");
+                assert!(run.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gh_failure_log_round_trip() {
+        let msg = WireMessage::GhFailureLog {
+            req_id: "req-23".into(),
+            cwd: "/home/user/proj".into(),
+            run_id: "987654321".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "gh_failure_log");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"gh_failure_log\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::GhFailureLog {
+                req_id,
+                cwd,
+                run_id,
+            } => {
+                assert_eq!(req_id, "req-23");
+                assert_eq!(cwd, "/home/user/proj");
+                assert_eq!(run_id, "987654321");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gh_failure_log_fetched_round_trip_some() {
+        let msg = WireMessage::GhFailureLogFetched {
+            req_id: "req-24".into(),
+            log: Some("error: cargo test failed at line 42\n".into()),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "gh_failure_log_fetched");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"gh_failure_log_fetched\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::GhFailureLogFetched { req_id, log } => {
+                assert_eq!(req_id, "req-24");
+                assert_eq!(
+                    log.as_deref(),
+                    Some("error: cargo test failed at line 42\n")
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gh_failure_log_fetched_round_trip_none() {
+        // Run is still pending or gh is unavailable. `log: None` should be
+        // omitted from the wire form.
+        let msg = WireMessage::GhFailureLogFetched {
+            req_id: "req-25".into(),
+            log: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"log\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::GhFailureLogFetched { req_id, log } => {
+                assert_eq!(req_id, "req-25");
+                assert!(log.is_none());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
