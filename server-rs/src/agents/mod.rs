@@ -11,6 +11,7 @@ pub mod terminal_ws;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex;
@@ -249,6 +250,18 @@ pub struct AgentRegistry {
     /// driver's equivalent). Toggled live from the dashboard via
     /// `PUT /api/settings`.
     pub skip_permissions: Arc<AtomicBool>,
+    /// Lazily-set reference to the global [`crate::state::AppState`].
+    /// `main.rs` populates it after `AppState::new()` returns; remains
+    /// unset in test fixtures that build only an `AgentRegistry`. The
+    /// auto-mode completion hook reads this to dispatch the merge with
+    /// the shared runner registry + broadcast/db handles.
+    ///
+    /// Holds `Arc<OnceLock<AppState>>` rather than `Weak`: the registry
+    /// and `AppState` both live for the process lifetime, and a `Weak`
+    /// would trade graceful liveness for a one-time leak that never
+    /// matters. Tests that don't set this skip the auto-mode hook
+    /// silently.
+    pub app_state: Arc<OnceLock<crate::state::AppState>>,
 }
 
 /// In-process state for a live agent whose PTY runs inside a detached
@@ -288,6 +301,7 @@ impl AgentRegistry {
             port,
             drivers: DriverRegistry::with_defaults(),
             skip_permissions: Arc::new(AtomicBool::new(skip_permissions)),
+            app_state: Arc::new(OnceLock::new()),
         }
     }
 

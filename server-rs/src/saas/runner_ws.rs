@@ -451,6 +451,29 @@ async fn handle_runner_message(
             cost_usd,
             stop_reason,
         } => {
+            // Capture plan + task before the row update so the auto-mode
+            // hook below can fire without a second SELECT. Captured up
+            // front because `status` is a `&String` borrow of the message
+            // and we need plain owned strings to outlive the lock.
+            let plan_task: Option<(String, String)> = {
+                let conn = state.db.lock().unwrap();
+                conn.query_row(
+                    "SELECT plan_name, task_id FROM agents WHERE id = ?1",
+                    params![agent_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .ok()
+                .and_then(|(p, t)| match (p, t) {
+                    (Some(p), Some(t)) => Some((p, t)),
+                    _ => None,
+                })
+            };
+
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
@@ -485,6 +508,19 @@ async fn handle_runner_message(
                     "runner_id": runner_id,
                 }),
             );
+
+            // Auto-mode merge-on-completion hook. Mirrors the standalone
+            // path in `pty_agent::on_agent_exit`; the helper itself gates
+            // on `auto_mode_enabled`, so we just need plan/task and a
+            // clean stop. `stop_reason` is `None` on a normal exit; any
+            // explicit reason (kill, supervisor_unreachable, budget) means
+            // the loop should not auto-merge.
+            if status == "completed"
+                && stop_reason.is_none()
+                && let Some((plan, task)) = plan_task
+            {
+                crate::auto_mode::on_task_agent_completed(state, agent_id, &plan, &task).await;
+            }
         }
 
         WireMessage::TaskStatusChanged {

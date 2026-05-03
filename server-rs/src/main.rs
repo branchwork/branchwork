@@ -2,6 +2,7 @@ mod agents;
 mod api;
 mod audit;
 mod auth;
+mod auto_mode;
 mod ci;
 mod config;
 mod db;
@@ -145,6 +146,11 @@ async fn run_server(cli: Cli) {
     registry.cleanup_and_reattach().await;
 
     let state = AppState::new(&config, db.clone(), broadcast_tx.clone(), registry.clone());
+    // Populate the registry's lazy back-reference so completion-side code
+    // (e.g. `auto_mode::on_task_agent_completed` in `pty_agent::on_agent_exit`)
+    // can dispatch through the shared runner registry. Set-once: the second
+    // call would be a programmer error, so swallow the result silently.
+    let _ = registry.app_state.set(state.clone());
 
     // Background: monitor detached agents (check PIDs every 30s)
     let db_monitor = db;

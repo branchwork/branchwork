@@ -576,6 +576,19 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
         }
     }
 
+    // Auto-mode merge-on-completion hook. Fires only on clean exit with
+    // both `plan_name` and `task_id` present; the auto-mode helper itself
+    // gates on `auto_mode_enabled` so this is a no-op for plans that
+    // haven't opted in. `app_state` is unset in test fixtures that build
+    // only an `AgentRegistry`, so those tests skip the hook silently.
+    if marked
+        && !supervisor_crashed
+        && let Some((Some(plan), Some(task), _)) = meta.as_ref()
+        && let Some(state) = registry.app_state.get()
+    {
+        crate::auto_mode::on_task_agent_completed(state, agent_id, plan, task).await;
+    }
+
     // Webhook only when we cleanly completed; kill_agent owns user-visible
     // messaging for the kill path, and supervisor crashes are already
     // surfaced via the WS event.
