@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::agents::git_ops;
 use crate::auth::OptionalAuthUser;
-use crate::saas::runner_protocol::MergeOutcome;
+use crate::saas::runner_protocol::MergeOutcome as WireMergeOutcome;
 use crate::saas::runner_rpc::RunnerRpcError;
 use crate::state::AppState;
 
@@ -391,16 +391,68 @@ pub async fn list_merge_targets(
     .into_response()
 }
 
-pub async fn merge_agent_branch(
-    State(state): State<AppState>,
-    auth: OptionalAuthUser,
-    Path(id): Path<String>,
-    body: Option<Json<MergeBody>>,
-) -> impl IntoResponse {
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+/// Outcome of [`merge_agent_branch_inner`]. Used by the HTTP wrapper at
+/// [`merge_agent_branch`] (mapped onto the existing JSON response shape)
+/// and by background callers like the auto-mode loop in T1.2 (which
+/// reacts to `had_conflict` and `merged_sha.is_some()` to decide whether
+/// to advance or pause).
+///
+/// `task_branch` is included alongside `target_branch` so the HTTP
+/// wrapper can echo it in the `merged` / `branch` JSON fields without a
+/// second DB lookup. Both are empty for early-return failures (agent
+/// not found, no task branch — before target resolution).
+pub struct MergeOutcome {
+    /// Merge commit SHA on `target_branch`. `None` for any failure.
+    pub merged_sha: Option<String>,
+    /// Branch the merge targeted (resolved canonical default or the
+    /// validated `into` override).
+    pub target_branch: String,
+    /// The agent's task branch — the one that was merged.
+    pub task_branch: String,
+    /// `git merge` reported a conflict; the working tree is clean
+    /// (the runner ran `git merge --abort`). Auto-mode pauses the
+    /// plan when this is true.
+    pub had_conflict: bool,
+    /// User-facing error message, if any. Sentinel values the HTTP
+    /// wrapper recognizes for status-code mapping:
+    /// - `"Agent not found"` → 404
+    /// - `"Agent has no task branch"` → 400
+    /// - starts with `"task branch has no commits"` → 409 (empty branch)
+    /// - `"no_runner_connected"` → 503
+    /// - `"runner_unavailable"` → 504
+    /// - `"runner_request_failed"` → 500
+    /// - other (checkout/merge failures) → 500
+    pub error: Option<String>,
+}
 
+/// Run the merge flow for an agent's task branch — the body of
+/// [`merge_agent_branch`] with the HTTP/auth/audit shell peeled off so
+/// background callers (T1.2 auto-mode loop) can invoke it directly.
+///
+/// `into = None` selects the canonical default branch; `into = Some(b)`
+/// is the dropdown override. An empty string is treated like `None`. An
+/// unresolvable override falls through to the default (matches the HTTP
+/// behaviour codified by `merge_with_unresolvable_into_body_falls_back_to_default`).
+///
+/// Side effects on success:
+/// - Clears `branch` in the `agents` table for *every* row matching the
+///   merged branch (siblings — killed retries, check agents — must stop
+///   advertising the merged ref).
+/// - Broadcasts an `agent_branch_merged` event so connected dashboards
+///   refresh immediately.
+/// - Spawns [`crate::ci::trigger_after_merge`] if the agent has a
+///   plan/task and the merge SHA is non-empty.
+///
+/// Audit logging is **not** done here — the caller knows whose action
+/// this is. The HTTP wrapper logs the user; the auto-mode loop will log
+/// a system actor.
+pub async fn merge_agent_branch_inner(
+    state: &AppState,
+    agent_id: &str,
+    into: Option<&str>,
+) -> MergeOutcome {
     // Look up agent details (need plan/task for CI bookkeeping too).
-    // org_id picks the runner in SaaS mode and is logged in audit.
+    // org_id picks the runner in SaaS mode.
     let (cwd, branch, plan_name, task_id, org_id): (
         String,
         Option<String>,
@@ -411,7 +463,7 @@ pub async fn merge_agent_branch(
         let db = state.db.lock().unwrap();
         match db.query_row(
             "SELECT cwd, branch, plan_name, task_id, org_id FROM agents WHERE id = ?",
-            params![id],
+            params![agent_id],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -424,11 +476,13 @@ pub async fn merge_agent_branch(
         ) {
             Ok(r) => r,
             Err(_) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "Agent not found"})),
-                )
-                    .into_response();
+                return MergeOutcome {
+                    merged_sha: None,
+                    target_branch: String::new(),
+                    task_branch: String::new(),
+                    had_conflict: false,
+                    error: Some("Agent not found".to_string()),
+                };
             }
         }
     };
@@ -436,11 +490,13 @@ pub async fn merge_agent_branch(
     let task_branch = match branch {
         Some(b) => b,
         None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Agent has no task branch"})),
-            )
-                .into_response();
+            return MergeOutcome {
+                merged_sha: None,
+                target_branch: String::new(),
+                task_branch: String::new(),
+                had_conflict: false,
+                error: Some("Agent has no task branch".to_string()),
+            };
         }
     };
 
@@ -451,34 +507,46 @@ pub async fn merge_agent_branch(
     let default = match git_ops::default_branch(&state.db, &state.runners, &org_id, cwd_path).await
     {
         Ok(d) => d,
-        Err(e) => return rpc_error_response(e),
+        Err(e) => {
+            return MergeOutcome {
+                merged_sha: None,
+                target_branch: String::new(),
+                task_branch,
+                had_conflict: false,
+                error: Some(rpc_error_string(e)),
+            };
+        }
     };
 
     // Treat `Some("")` the same as `None` — an empty `into` means
     // "no override, use the canonical default". Defensive against a
     // future form-encoded path where empty strings sneak through; the
     // current JSON UI already coerces empty selections to `null`.
-    let explicit = body.into.filter(|s| !s.is_empty());
+    let explicit = into.filter(|s| !s.is_empty());
 
     // Validate explicit only when it's actually provided — saves a
     // round-trip in the common no-override case.
     let available = if explicit.is_some() {
         match git_ops::list_branches(&state.db, &state.runners, &org_id, cwd_path).await {
             Ok(b) => Some(b),
-            Err(e) => return rpc_error_response(e),
+            Err(e) => {
+                return MergeOutcome {
+                    merged_sha: None,
+                    target_branch: String::new(),
+                    task_branch,
+                    had_conflict: false,
+                    error: Some(rpc_error_string(e)),
+                };
+            }
         }
     } else {
         None
     };
-    let target = resolve_merge_target(
-        explicit.as_deref(),
-        default.as_deref(),
-        available.as_deref(),
-    );
+    let target = resolve_merge_target(explicit, default.as_deref(), available.as_deref());
 
     // Dispatch the merge. SaaS: runner runs the five-step sequence and
-    // replies with a MergeOutcome. Standalone: run the five steps locally.
-    let outcome = match git_ops::merge_branch(
+    // replies with a WireMergeOutcome. Standalone: run the five steps locally.
+    let wire_outcome = match git_ops::merge_branch(
         &state.db,
         &state.runners,
         &org_id,
@@ -489,50 +557,56 @@ pub async fn merge_agent_branch(
     .await
     {
         Ok(o) => o,
-        Err(e) => return rpc_error_response(e),
+        Err(e) => {
+            return MergeOutcome {
+                merged_sha: None,
+                target_branch: target,
+                task_branch,
+                had_conflict: false,
+                error: Some(rpc_error_string(e)),
+            };
+        }
     };
 
-    let merged_sha = match outcome {
-        MergeOutcome::Ok { merged_sha } => merged_sha,
-        MergeOutcome::EmptyBranch => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "task branch has no commits — agent exited without committing",
-                    "branch": task_branch,
-                    "target": target,
-                })),
-            )
-                .into_response();
+    let merged_sha = match wire_outcome {
+        WireMergeOutcome::Ok { merged_sha } => merged_sha,
+        WireMergeOutcome::EmptyBranch => {
+            return MergeOutcome {
+                merged_sha: None,
+                target_branch: target,
+                task_branch,
+                had_conflict: false,
+                error: Some(
+                    "task branch has no commits — agent exited without committing".to_string(),
+                ),
+            };
         }
-        MergeOutcome::CheckoutFailed { stderr } => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Failed to checkout {target}: {stderr}")
-                })),
-            )
-                .into_response();
+        WireMergeOutcome::CheckoutFailed { stderr } => {
+            return MergeOutcome {
+                merged_sha: None,
+                target_branch: target.clone(),
+                task_branch,
+                had_conflict: false,
+                error: Some(format!("Failed to checkout {target}: {stderr}")),
+            };
         }
-        MergeOutcome::Conflict { stderr } => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("Merge conflict: {stderr}"),
-                    "branch": task_branch,
-                    "target": target,
-                })),
-            )
-                .into_response();
+        WireMergeOutcome::Conflict { stderr } => {
+            return MergeOutcome {
+                merged_sha: None,
+                target_branch: target,
+                task_branch,
+                had_conflict: true,
+                error: Some(format!("Merge conflict: {stderr}")),
+            };
         }
-        MergeOutcome::Other { stderr } => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Failed to run git merge: {stderr}")
-                })),
-            )
-                .into_response();
+        WireMergeOutcome::Other { stderr } => {
+            return MergeOutcome {
+                merged_sha: None,
+                target_branch: target,
+                task_branch,
+                had_conflict: false,
+                error: Some(format!("Failed to run git merge: {stderr}")),
+            };
         }
     };
 
@@ -545,24 +619,6 @@ pub async fn merge_agent_branch(
             params![task_branch],
         )
         .ok();
-        crate::audit::log(
-            &db,
-            auth.org_id(),
-            auth.0.as_ref().map(|u| u.id.as_str()),
-            auth.0.as_ref().map(|u| u.email.as_str()),
-            crate::audit::actions::BRANCH_MERGE,
-            crate::audit::resources::AGENT,
-            Some(&id),
-            Some(
-                &serde_json::json!({
-                    "branch": task_branch,
-                    "into": target,
-                    "plan": plan_name,
-                    "task": task_id,
-                })
-                .to_string(),
-            ),
-        );
     }
 
     // Broadcast so connected dashboards update immediately
@@ -570,7 +626,7 @@ pub async fn merge_agent_branch(
         &state.broadcast_tx,
         "agent_branch_merged",
         serde_json::json!({
-            "id": id,
+            "id": agent_id,
             "merged": task_branch,
             "into": target,
         }),
@@ -580,7 +636,7 @@ pub async fn merge_agent_branch(
     // Only possible when we know which task this agent was for, and when
     // the merged SHA is non-empty (runner-side cleanup may leave it blank
     // on edge cases).
-    if let (Some(plan), Some(task)) = (plan_name.clone(), task_id.clone())
+    if let (Some(plan), Some(task)) = (plan_name, task_id)
         && !merged_sha.is_empty()
     {
         tokio::spawn(crate::ci::trigger_after_merge(crate::ci::TriggerArgs {
@@ -591,19 +647,131 @@ pub async fn merge_agent_branch(
             cwd: std::path::PathBuf::from(&cwd),
             plan_name: plan,
             task_number: task,
-            agent_id: id.clone(),
+            agent_id: agent_id.to_string(),
             source_branch: target.clone(),
             task_branch: task_branch.clone(),
-            merged_sha,
+            merged_sha: merged_sha.clone(),
         }));
     }
 
-    Json(serde_json::json!({
-        "ok": true,
-        "merged": task_branch,
-        "into": target,
-    }))
-    .into_response()
+    MergeOutcome {
+        merged_sha: Some(merged_sha),
+        target_branch: target,
+        task_branch,
+        had_conflict: false,
+        error: None,
+    }
+}
+
+/// Translate a [`RunnerRpcError`] into the sentinel string the HTTP
+/// wrapper recognizes for status-code mapping. Keeps [`MergeOutcome`]
+/// transport-agnostic — background callers see a plain `String` and
+/// don't need to import [`RunnerRpcError`].
+fn rpc_error_string(e: RunnerRpcError) -> String {
+    match e {
+        RunnerRpcError::NoConnectedRunner => "no_runner_connected".to_string(),
+        RunnerRpcError::Timeout | RunnerRpcError::RunnerDisconnected => {
+            "runner_unavailable".to_string()
+        }
+        RunnerRpcError::InvalidRequest | RunnerRpcError::SendFailed => {
+            "runner_request_failed".to_string()
+        }
+    }
+}
+
+pub async fn merge_agent_branch(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(id): Path<String>,
+    body: Option<Json<MergeBody>>,
+) -> impl IntoResponse {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let outcome = merge_agent_branch_inner(&state, &id, body.into.as_deref()).await;
+
+    if outcome.merged_sha.is_some() {
+        // Audit-log the user-initiated merge. Re-fetch plan/task — the
+        // helper consumed them when spawning the CI trigger and doesn't
+        // expose them on the outcome (auto-mode tracks its own context).
+        let (plan_name, task_id): (Option<String>, Option<String>) = {
+            let db = state.db.lock().unwrap();
+            db.query_row(
+                "SELECT plan_name, task_id FROM agents WHERE id = ?",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((None, None))
+        };
+
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::BRANCH_MERGE,
+            crate::audit::resources::AGENT,
+            Some(&id),
+            Some(
+                &serde_json::json!({
+                    "branch": outcome.task_branch,
+                    "into": outcome.target_branch,
+                    "plan": plan_name,
+                    "task": task_id,
+                })
+                .to_string(),
+            ),
+        );
+        drop(db);
+
+        return Json(serde_json::json!({
+            "ok": true,
+            "merged": outcome.task_branch,
+            "into": outcome.target_branch,
+        }))
+        .into_response();
+    }
+
+    if outcome.had_conflict {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": outcome.error.unwrap_or_default(),
+                "branch": outcome.task_branch,
+                "target": outcome.target_branch,
+            })),
+        )
+            .into_response();
+    }
+
+    let error = outcome.error.unwrap_or_default();
+    let (status, json_body) = match error.as_str() {
+        "Agent not found" => (StatusCode::NOT_FOUND, serde_json::json!({ "error": error })),
+        "Agent has no task branch" => (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": error }),
+        ),
+        "no_runner_connected" => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": error }),
+        ),
+        "runner_unavailable" => (
+            StatusCode::GATEWAY_TIMEOUT,
+            serde_json::json!({ "error": error }),
+        ),
+        s if s.starts_with("task branch has no commits") => (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": error,
+                "branch": outcome.task_branch,
+                "target": outcome.target_branch,
+            }),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": error }),
+        ),
+    };
+    (status, Json(json_body)).into_response()
 }
 
 pub async fn discard_agent_branch(
