@@ -600,10 +600,26 @@ mod tests {
     }
 
     #[test]
-    fn should_record_ci_run_only_for_canonical_default() {
+    fn should_record_ci_run_true_when_target_matches_default() {
         assert!(should_record_ci_run("master", Some("master")));
+    }
+
+    #[test]
+    fn should_record_ci_run_false_when_default_is_different_canonical() {
+        // Repo's canonical default is `main` but the merge landed on `master`
+        // (e.g. a stale local branch). Do not record CI.
         assert!(!should_record_ci_run("master", Some("main")));
+    }
+
+    #[test]
+    fn should_record_ci_run_false_for_non_default_target() {
         assert!(!should_record_ci_run("feature/x", Some("master")));
+    }
+
+    #[test]
+    fn should_record_ci_run_false_when_default_unknown() {
+        // No origin/HEAD and no master/main probe hit — be conservative and
+        // skip the CI insert rather than guessing.
         assert!(!should_record_ci_run("master", None));
     }
 
