@@ -147,6 +147,29 @@ pub enum WireMessage {
         error: Option<String>,
     },
 
+    /// Dashboard requested the canonical default branch for a runner-side cwd.
+    /// Best-effort: tied to a live HTTP caller, so outbox replay is useless.
+    GetDefaultBranch { req_id: String, cwd: String },
+
+    /// Runner reply with the resolved default branch (`None` when no candidate
+    /// resolves: no `origin/HEAD` symref and neither `master` nor `main`
+    /// exists locally).
+    DefaultBranchResolved {
+        req_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
+
+    /// Dashboard requested the local branch list for a runner-side cwd.
+    /// Best-effort: tied to a live HTTP caller.
+    ListBranches { req_id: String, cwd: String },
+
+    /// Runner reply with the local branch list, alphabetically sorted.
+    BranchesListed {
+        req_id: String,
+        branches: Vec<String>,
+    },
+
     // ── Bidirectional ───────────────────────────────────────────────────
     /// Acknowledge receipt of a sequenced message. The receiver sends this
     /// after persisting the event so the sender can prune its outbox.
@@ -224,6 +247,10 @@ impl WireMessage {
                 | WireMessage::FoldersListed { .. }
                 | WireMessage::CreateFolder { .. }
                 | WireMessage::FolderCreated { .. }
+                | WireMessage::GetDefaultBranch { .. }
+                | WireMessage::DefaultBranchResolved { .. }
+                | WireMessage::ListBranches { .. }
+                | WireMessage::BranchesListed { .. }
         )
     }
 
@@ -245,6 +272,10 @@ impl WireMessage {
             WireMessage::FoldersListed { .. } => "folders_listed",
             WireMessage::CreateFolder { .. } => "create_folder",
             WireMessage::FolderCreated { .. } => "folder_created",
+            WireMessage::GetDefaultBranch { .. } => "get_default_branch",
+            WireMessage::DefaultBranchResolved { .. } => "default_branch_resolved",
+            WireMessage::ListBranches { .. } => "list_branches",
+            WireMessage::BranchesListed { .. } => "branches_listed",
             WireMessage::Ack { .. } => "ack",
             WireMessage::Ping {} => "ping",
             WireMessage::Pong {} => "pong",
@@ -498,6 +529,122 @@ mod tests {
                 assert!(!ok);
                 assert!(resolved_path.is_none());
                 assert_eq!(error.as_deref(), Some("permission denied"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_default_branch_round_trip() {
+        let msg = WireMessage::GetDefaultBranch {
+            req_id: "req-6".into(),
+            cwd: "/home/user/proj".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "get_default_branch");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        // Pin the discriminator name so a future rename can't silently break the wire.
+        assert!(json.contains("\"type\":\"get_default_branch\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::GetDefaultBranch { req_id, cwd } => {
+                assert_eq!(req_id, "req-6");
+                assert_eq!(cwd, "/home/user/proj");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_branch_resolved_round_trip_some() {
+        let msg = WireMessage::DefaultBranchResolved {
+            req_id: "req-7".into(),
+            branch: Some("master".into()),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "default_branch_resolved");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"default_branch_resolved\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::DefaultBranchResolved { req_id, branch } => {
+                assert_eq!(req_id, "req-7");
+                assert_eq!(branch.as_deref(), Some("master"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_branch_resolved_round_trip_none() {
+        // `None` should be omitted from the wire form.
+        let msg = WireMessage::DefaultBranchResolved {
+            req_id: "req-8".into(),
+            branch: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"branch\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::DefaultBranchResolved { req_id, branch } => {
+                assert_eq!(req_id, "req-8");
+                assert!(branch.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_branches_round_trip() {
+        let msg = WireMessage::ListBranches {
+            req_id: "req-9".into(),
+            cwd: "/home/user/proj".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "list_branches");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"list_branches\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::ListBranches { req_id, cwd } => {
+                assert_eq!(req_id, "req-9");
+                assert_eq!(cwd, "/home/user/proj");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branches_listed_round_trip() {
+        let msg = WireMessage::BranchesListed {
+            req_id: "req-10".into(),
+            branches: vec![
+                "feature/x".into(),
+                "main".into(),
+                "master".into(),
+            ],
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "branches_listed");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"branches_listed\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::BranchesListed { req_id, branches } => {
+                assert_eq!(req_id, "req-10");
+                assert_eq!(
+                    branches,
+                    vec![
+                        "feature/x".to_string(),
+                        "main".to_string(),
+                        "master".to_string()
+                    ]
+                );
             }
             other => panic!("unexpected variant: {other:?}"),
         }

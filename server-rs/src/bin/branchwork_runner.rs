@@ -532,9 +532,13 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         | WireMessage::DriverAuthReport { .. }
         | WireMessage::FoldersListed { .. }
         | WireMessage::FolderCreated { .. }
+        | WireMessage::DefaultBranchResolved { .. }
+        | WireMessage::BranchesListed { .. }
         // saas→runner variants the runner doesn't act on yet (handlers
-        // land in later phases of the folder-listing plan).
+        // land in later phases).
         | WireMessage::TerminalReplay { .. }
+        | WireMessage::GetDefaultBranch { .. }
+        | WireMessage::ListBranches { .. }
         | WireMessage::Ping {} => {}
     }
 }

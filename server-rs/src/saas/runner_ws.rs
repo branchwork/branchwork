@@ -556,6 +556,11 @@ async fn handle_runner_message(
             }
         }
 
+        // runner→saas reply variants whose handler will route through the
+        // pending request map in a later phase task. Stubbed for now so the
+        // wire format lands without dragging dispatch wiring in.
+        WireMessage::DefaultBranchResolved { .. } | WireMessage::BranchesListed { .. } => {}
+
         // Server doesn't receive these from runners — the runner sending them
         // would be a protocol violation (saas→runner direction only).
         WireMessage::Pong {}
@@ -565,7 +570,9 @@ async fn handle_runner_message(
         | WireMessage::AgentInput { .. }
         | WireMessage::TerminalReplay { .. }
         | WireMessage::ListFolders { .. }
-        | WireMessage::CreateFolder { .. } => {}
+        | WireMessage::CreateFolder { .. }
+        | WireMessage::GetDefaultBranch { .. }
+        | WireMessage::ListBranches { .. } => {}
     }
 }
 
