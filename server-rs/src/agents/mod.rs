@@ -1,6 +1,7 @@
 pub mod check_agent;
 pub mod driver;
 pub mod git_ops;
+pub mod prompt;
 pub mod pty_agent;
 pub mod session_protocol;
 pub mod supervisor;
@@ -945,6 +946,9 @@ pub fn build_task_prompt(
         )
     };
 
+    let task_branch = format!("branchwork/{}/{}", plan.name, task.number);
+    let contract = prompt::unattended_contract_block(&task_branch);
+
     format!(
         "{intro}\n\n\
          Plan: {plan_title}\n\
@@ -954,6 +958,7 @@ pub fn build_task_prompt(
          {files}{acceptance}\n\
          {context}\n\
          {instruction}\n\n\
+         {contract}\n\n\
          IMPORTANT: When you think you are done, do NOT stop. Instead:\n\
          1. Summarize what you did\n\
          2. Record one short learning other tasks in this project should know (file paths established, key decisions, gotchas) by running: curl -s -X POST http://localhost:{port}/api/plans/{plan_name}/tasks/{task_num}/learnings -H \"Content-Type: application/json\" -d '{{\"learning\":\"...\"}}'\n\
@@ -981,6 +986,7 @@ pub fn build_task_prompt(
             "Please implement this task. When done, summarize what you changed."
         },
         plan_name = plan.name,
+        contract = contract,
     )
 }
 
@@ -1550,6 +1556,33 @@ mod tests {
             !prompt.contains("update_task_status"),
             "MCP tool should not be mentioned when unavailable: {prompt}"
         );
+    }
+
+    #[test]
+    fn build_task_prompt_embeds_unattended_contract_block() {
+        let (plan, phase, task) = sample_plan_for_prompt();
+        // Both MCP and curl branches must carry the contract — auto-mode
+        // can spawn either flavour and the no-push / no-ask rules apply
+        // uniformly.
+        for mcp in [true, false] {
+            let prompt = build_task_prompt(&plan, &phase, &task, false, 3100, None, mcp);
+            assert!(
+                prompt.contains("Unattended-execution contract"),
+                "contract heading missing (mcp={mcp}): {prompt}"
+            );
+            assert!(
+                prompt.contains("branchwork/portable-agents/2.6"),
+                "task branch must be interpolated literally (mcp={mcp}): {prompt}"
+            );
+            assert!(
+                prompt.contains("Do not run `git push`"),
+                "no-push rule missing (mcp={mcp}): {prompt}"
+            );
+            assert!(
+                prompt.contains("Do not ask the user"),
+                "no-ask rule missing (mcp={mcp}): {prompt}"
+            );
+        }
     }
 
     #[test]

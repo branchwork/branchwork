@@ -422,6 +422,25 @@ fn spawn_heartbeat_task(
     });
 }
 
+/// Returns `Some(true)` if `branch` has zero commits ahead of the canonical
+/// default branch in `cwd`, `Some(false)` if it has at least one, and `None`
+/// if either branch fails to resolve (default unknown, branch missing, repo
+/// not a git workdir, …). Sole consumer is the unattended-contract
+/// diagnostic in [`on_agent_exit`].
+fn branch_has_no_commits_ahead_of_trunk(cwd: &Path, branch: &str) -> Option<bool> {
+    let default = git_default_branch(cwd)?;
+    let out = std::process::Command::new("git")
+        .args(["rev-list", "--count", &format!("{default}..{branch}")])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let count: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(count == 0)
+}
+
 /// Shared exit handler for both "supervisor closed the socket on us" and
 /// explicit kill paths. Updates status, parses cost, emits WS events,
 /// optionally notifies a webhook, and enforces plan budgets.
@@ -524,6 +543,37 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
             payload["exit_code"] = serde_json::Value::from(0);
         }
         broadcast_event(&registry.broadcast_tx, "agent_stopped", payload);
+    }
+
+    // Auto-mode unattended-contract diagnostic. If the agent exited cleanly
+    // (no supervisor crash, row freshly flipped to `completed`) but its
+    // task branch has no commits ahead of the canonical default, log a
+    // visible line so the cause shows up in the server log without needing
+    // to inspect the diff. The actual pause is owned by the no-commit
+    // guard wired in by the auto-mode-loop completion handler — this is
+    // diagnostics only.
+    if marked
+        && !supervisor_crashed
+        && let Some((_, _, Some(branch))) = meta.as_ref()
+    {
+        let cwd: Option<String> = {
+            let db = registry.db.lock().unwrap();
+            db.query_row(
+                "SELECT cwd FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        if let Some(cwd) = cwd
+            && let Some(true) =
+                branch_has_no_commits_ahead_of_trunk(std::path::Path::new(&cwd), branch)
+        {
+            eprintln!(
+                "[auto_mode] agent {agent_id} exited clean but left no commits — likely violated the unattended contract"
+            );
+        }
     }
 
     // Webhook only when we cleanly completed; kill_agent owns user-visible
@@ -830,6 +880,76 @@ mod tests {
         assert!(
             !supervisor::pidfile_path(&socket).exists(),
             "on_agent_exit should remove the stale pidfile"
+        );
+    }
+
+    fn git_init_master_with_initial_commit(dir: &Path) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed in {}", dir.display());
+        };
+        run(&["init", "-b", "master"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["commit", "--allow-empty", "-m", "init"]);
+    }
+
+    /// Diagnostic predicate: a task branch sitting at master's tip has zero
+    /// commits ahead of trunk and should trip the unattended-contract log.
+    #[test]
+    fn branch_has_no_commits_ahead_when_branch_at_trunk_tip() {
+        let dir = TempDir::new().unwrap();
+        git_init_master_with_initial_commit(dir.path());
+        let ok = std::process::Command::new("git")
+            .args(["branch", "feature/empty"])
+            .current_dir(dir.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to create feature branch");
+        assert_eq!(
+            branch_has_no_commits_ahead_of_trunk(dir.path(), "feature/empty"),
+            Some(true)
+        );
+    }
+
+    /// Inverse: a branch with at least one commit should NOT trip the
+    /// diagnostic. Guards against false positives that would spam the log
+    /// for every well-behaved agent.
+    #[test]
+    fn branch_has_commits_returns_some_false() {
+        let dir = TempDir::new().unwrap();
+        git_init_master_with_initial_commit(dir.path());
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok);
+        };
+        run(&["checkout", "-b", "feature/work"]);
+        run(&["commit", "--allow-empty", "-m", "real work"]);
+        assert_eq!(
+            branch_has_no_commits_ahead_of_trunk(dir.path(), "feature/work"),
+            Some(false)
+        );
+    }
+
+    /// Non-git cwd: the predicate must return None so the diagnostic stays
+    /// silent (default branch is unknown — we can't make a claim).
+    #[test]
+    fn branch_has_no_commits_returns_none_for_non_git_cwd() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            branch_has_no_commits_ahead_of_trunk(dir.path(), "anything"),
+            None
         );
     }
 
