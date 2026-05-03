@@ -470,6 +470,148 @@ pub async fn set_auto_advance(
     )
 }
 
+// ── GET/PUT /api/plans/:name/config ──────────────────────────────────────────
+//
+// Unified config endpoint covering `auto_advance` (existing) plus the
+// auto-mode companion toggles (`auto_mode`, `max_fix_attempts`). GET also
+// surfaces `paused_reason` so the UI can show a banner explaining why the
+// loop self-paused. The dedicated `/auto-advance` route stays unchanged.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanConfig {
+    auto_advance: bool,
+    auto_mode: bool,
+    max_fix_attempts: u32,
+    paused_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanConfigBody {
+    auto_advance: Option<bool>,
+    auto_mode: Option<bool>,
+    max_fix_attempts: Option<u32>,
+}
+
+fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
+    let auto_advance = db
+        .query_row(
+            "SELECT enabled FROM plan_auto_advance WHERE plan_name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false);
+
+    let (auto_mode, max_fix_attempts, paused_reason) = db
+        .query_row(
+            "SELECT enabled, max_fix_attempts, paused_reason \
+             FROM plan_auto_mode WHERE plan_name = ?1",
+            params![name],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? != 0,
+                    row.get::<_, i64>(1)? as u32,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .unwrap_or((false, 3, None));
+
+    PlanConfig {
+        auto_advance,
+        auto_mode,
+        max_fix_attempts,
+        paused_reason,
+    }
+}
+
+pub async fn get_plan_config(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+    let cfg = read_plan_config(&db, &name);
+    Json(cfg).into_response()
+}
+
+pub async fn put_plan_config(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(name): Path<String>,
+    Json(body): Json<PlanConfigBody>,
+) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+
+    if let Some(enabled) = body.auto_advance {
+        db.execute(
+            "INSERT INTO plan_auto_advance (plan_name, enabled, updated_at) \
+             VALUES (?1, ?2, datetime('now')) \
+             ON CONFLICT(plan_name) \
+             DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
+            params![name, enabled as i64],
+        )
+        .ok();
+
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::CONFIG_AUTO_ADVANCE,
+            crate::audit::resources::PLAN,
+            Some(&name),
+            Some(&serde_json::json!({"enabled": enabled}).to_string()),
+        );
+    }
+
+    if body.auto_mode.is_some() || body.max_fix_attempts.is_some() {
+        // UPSERT each provided field independently so partial updates
+        // don't clobber the other column. COALESCE keeps the existing
+        // value when the caller omits it.
+        if let Some(enabled) = body.auto_mode {
+            db.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(plan_name) DO UPDATE SET enabled = excluded.enabled",
+                params![name, enabled as i64],
+            )
+            .ok();
+        }
+        if let Some(max) = body.max_fix_attempts {
+            db.execute(
+                "INSERT INTO plan_auto_mode (plan_name, max_fix_attempts) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(plan_name) DO UPDATE SET max_fix_attempts = excluded.max_fix_attempts",
+                params![name, max as i64],
+            )
+            .ok();
+        }
+
+        let mut audit_payload = serde_json::Map::new();
+        if let Some(enabled) = body.auto_mode {
+            audit_payload.insert("enabled".to_string(), serde_json::json!(enabled));
+        }
+        if let Some(max) = body.max_fix_attempts {
+            audit_payload.insert("maxFixAttempts".to_string(), serde_json::json!(max));
+        }
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::CONFIG_AUTO_MODE,
+            crate::audit::resources::PLAN,
+            Some(&name),
+            Some(&serde_json::Value::Object(audit_payload).to_string()),
+        );
+    }
+
+    let cfg = read_plan_config(&db, &name);
+    (StatusCode::OK, Json(cfg)).into_response()
+}
+
 // ── PUT /api/plans/:name/tasks/:num/status ───────────────────────────────────
 
 #[derive(Deserialize)]

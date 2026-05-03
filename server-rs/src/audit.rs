@@ -20,6 +20,7 @@ pub mod actions {
     pub const CONFIG_EFFORT_CHANGE: &str = "config.effort_change";
     pub const CONFIG_BUDGET_CHANGE: &str = "config.budget_change";
     pub const CONFIG_AUTO_ADVANCE: &str = "config.auto_advance";
+    pub const CONFIG_AUTO_MODE: &str = "config.auto_mode";
     pub const CONFIG_PROJECT_CHANGE: &str = "config.project_change";
     pub const CONFIG_KILL_SWITCH: &str = "config.kill_switch";
     pub const ORG_MEMBER_ADD: &str = "org.member_add";
