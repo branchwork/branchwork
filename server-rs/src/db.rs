@@ -123,6 +123,38 @@ pub fn record_fix_attempt(
     .ok();
 }
 
+/// Close a fix-attempt row out with a final `outcome` ("green" / "red" /
+/// "stalled" / "merge_failed"). Idempotent — a second call updates the
+/// outcome string (the loop never re-uses an attempt id, so the only way
+/// this fires twice is during a manual retry or testing).
+#[allow(dead_code)] // wired into the auto-mode fix-completion handler
+pub fn close_fix_attempt(db: &Db, plan_name: &str, task_number: &str, attempt: u32, outcome: &str) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "UPDATE task_fix_attempts \
+            SET outcome = ?4, finished_at = datetime('now') \
+          WHERE plan_name = ?1 AND task_number = ?2 AND attempt = ?3",
+        params![plan_name, task_number, attempt as i64, outcome],
+    )
+    .ok();
+}
+
+/// Recover the `(task_number, attempt)` mapping for a fix agent — the
+/// original task id is stored on the row alongside the fix agent's id, so
+/// the auto-mode completion handler can find both from the agent_id alone
+/// without parsing the `-fix-<n>` suffix off the fix task id.
+#[allow(dead_code)] // wired into the auto-mode fix-completion handler
+pub fn fix_attempt_for_agent(db: &Db, plan_name: &str, agent_id: &str) -> Option<(String, u32)> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT task_number, attempt FROM task_fix_attempts \
+          WHERE plan_name = ?1 AND agent_id = ?2",
+        params![plan_name, agent_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32)),
+    )
+    .ok()
+}
+
 /// Open (or create) the database at `db_path` and run migrations.
 pub fn init(db_path: &Path) -> Db {
     if let Some(parent) = db_path.parent() {

@@ -33,8 +33,7 @@ use crate::saas::runner_protocol::CiAggregate;
 use crate::state::AppState;
 use crate::ws::broadcast_event;
 
-/// Audit-log action constants for auto-mode transitions. Phase 3 will add
-/// `auto_mode_fix_spawned` for the fix-on-red retry path.
+/// Audit-log action constants for auto-mode transitions.
 pub mod actions {
     /// A task agent completed and the loop merged its branch.
     pub const AUTO_MODE_MERGED: &str = "auto_mode.merged";
@@ -42,8 +41,10 @@ pub mod actions {
     pub const AUTO_MODE_PAUSED: &str = "auto_mode.paused";
     /// CI came back green (or wasn't configured) — loop advanced.
     pub const AUTO_MODE_CI_PASSED: &str = "auto_mode.ci_passed";
-    /// CI came back red — loop paused (Phase 3 will spawn a fix agent).
+    /// CI came back red — loop paused or spawned a fix agent.
     pub const AUTO_MODE_CI_FAILED: &str = "auto_mode.ci_failed";
+    /// A fix agent was spawned for a Red CI outcome.
+    pub const AUTO_MODE_FIX_SPAWNED: &str = "auto_mode.fix_spawned";
 }
 
 /// Phase labels broadcast on the `auto_mode_state` event so the UI pill can
@@ -81,17 +82,6 @@ pub async fn on_task_agent_completed(
         return;
     }
 
-    // Fix agents (`task_id` carries the `-fix-<n>` suffix that
-    // [`spawn_fix_agent`] stamps on) complete via a different codepath:
-    // their fix branch must be merged back into the original task branch
-    // and CI re-polled there, not into the canonical default. That
-    // codepath lands in T3.2; until then, fix-agent completion is a
-    // deliberate no-op so we don't run the standard merge → CI →
-    // advance state machine on a fix branch.
-    if task_id.contains("-fix-") {
-        return;
-    }
-
     // Look up `org_id` for the audit log. The merge dispatcher reads its
     // own org_id off the agent row, so we don't need to pass it through
     // — but the audit log is org-scoped and we want `auto_mode_merged` /
@@ -110,8 +100,20 @@ pub async fn on_task_agent_completed(
     let agent_id = agent_id.to_string();
     let plan_name = plan_name.to_string();
     let task_id = task_id.to_string();
+
+    // Fix agents (`task_id` carries the `-fix-<n>` suffix that
+    // [`spawn_fix_agent`] stamps on) flow through `on_fix_agent_completed`:
+    // their fix branch is merged into the canonical default and CI is
+    // re-polled on the new SHA. On Green the original task is marked
+    // completed in `task_status` and `try_auto_advance` fires for the
+    // original task id; on Red the loop spawns the next fix attempt.
+    let is_fix_agent = task_id.contains("-fix-");
     tokio::spawn(async move {
-        run_state_machine(&state, &org_id, &agent_id, &plan_name, &task_id).await;
+        if is_fix_agent {
+            on_fix_agent_completed(&state, &org_id, &agent_id, &plan_name, &task_id).await;
+        } else {
+            run_state_machine(&state, &org_id, &agent_id, &plan_name, &task_id).await;
+        }
     });
 }
 
@@ -793,6 +795,403 @@ fn build_fix_prompt(
          \n\
          {contract}",
     )
+}
+
+/// Called when a fix agent completes cleanly (its task_id carries the
+/// `-fix-<n>` marker that [`spawn_fix_agent`] stamps on). Merges the fix
+/// branch into the canonical default (NOT the original task branch — the
+/// fix lands straight on trunk), re-polls CI on the resulting SHA, and
+/// chains:
+///
+///   - Green / NotConfigured → close the `task_fix_attempts` row with
+///     `outcome="green"`, mark the original task `completed` in
+///     `task_status`, and call `try_auto_advance` for the original task
+///     so the next phase / next-task spawn fires.
+///   - Red → close the row with `outcome="red"`, audit
+///     `AUTO_MODE_CI_FAILED`, and loop into the next fix attempt
+///     (`spawn_fix_agent` with `attempt+1`). The retry cap lands in T3.3.
+///   - Stalled → close with `outcome="stalled"`, pause `ci_stalled`.
+///   - Conflict / merge failure → close with `outcome="merge_failed"`,
+///     pause with reason `"fix_merge_failed: <detail>"`.
+///
+/// The original task id is recovered from the `task_fix_attempts` row
+/// keyed by `(plan_name, agent_id)` — `spawn_fix_agent` stores the
+/// original task id as `task_number` and the fix agent id as `agent_id`,
+/// so the mapping is implicit but durable. This avoids parsing the
+/// `-fix-<n>` suffix off the fix task id (the format could in principle
+/// change without breaking the loop).
+async fn on_fix_agent_completed(
+    state: &AppState,
+    org_id: &str,
+    fix_agent_id: &str,
+    plan_name: &str,
+    fix_task_id: &str,
+) {
+    let (original_task, attempt) =
+        match db::fix_attempt_for_agent(&state.db, plan_name, fix_agent_id) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "[auto_mode] fix-agent {fix_agent_id} ({plan_name}/{fix_task_id}) \
+                     has no task_fix_attempts row — skipping fix-merge"
+                );
+                return;
+            }
+        };
+
+    broadcast_state(
+        state,
+        plan_name,
+        fix_task_id,
+        state_labels::MERGING,
+        None,
+        None,
+    );
+
+    // Merge fix branch → canonical default. `into = None` resolves
+    // canonical default at merge time (master / main). The fix branch
+    // does NOT land back on the original task branch — fixes go straight
+    // to trunk so try_auto_advance can immediately move to the next task
+    // once CI is green.
+    let outcome = merge_agent_branch_dispatch(state, org_id, fix_agent_id, None).await;
+
+    let merged_sha = match outcome.merged_sha.clone() {
+        Some(sha) => {
+            let payload = serde_json::json!({
+                "plan": plan_name,
+                "task": fix_task_id,
+                "original_task": original_task,
+                "attempt": attempt,
+                "sha": sha,
+                "target": outcome.target_branch,
+            });
+            broadcast_event(&state.broadcast_tx, "auto_mode_merged", payload.clone());
+            let conn = state.db.lock().unwrap();
+            audit::log(
+                &conn,
+                org_id,
+                None,
+                Some("branchwork-auto-mode"),
+                actions::AUTO_MODE_MERGED,
+                audit::resources::AGENT,
+                Some(fix_agent_id),
+                Some(&payload.to_string()),
+            );
+            sha
+        }
+        None => {
+            // Conflict or merge dispatch error. Close the attempt row
+            // with `merge_failed` and pause with the brief's literal
+            // reason prefix `fix_merge_failed`.
+            db::close_fix_attempt(
+                &state.db,
+                plan_name,
+                &original_task,
+                attempt,
+                "merge_failed",
+            );
+
+            let detail = if outcome.had_conflict {
+                "merge_conflict".to_string()
+            } else {
+                outcome
+                    .error
+                    .as_deref()
+                    .unwrap_or("merge dispatch returned no merged_sha")
+                    .to_string()
+            };
+            let reason = format!("fix_merge_failed: {detail}");
+            db::auto_mode_pause(&state.db, plan_name, &reason);
+
+            let payload = serde_json::json!({
+                "plan": plan_name,
+                "task": fix_task_id,
+                "original_task": original_task,
+                "attempt": attempt,
+                "reason": reason,
+                "target": outcome.target_branch,
+            });
+            broadcast_event(&state.broadcast_tx, "auto_mode_paused", payload.clone());
+            broadcast_state(
+                state,
+                plan_name,
+                fix_task_id,
+                state_labels::PAUSED,
+                None,
+                Some(&reason),
+            );
+            let conn = state.db.lock().unwrap();
+            audit::log(
+                &conn,
+                org_id,
+                None,
+                Some("branchwork-auto-mode"),
+                actions::AUTO_MODE_PAUSED,
+                audit::resources::PLAN,
+                Some(plan_name),
+                Some(&payload.to_string()),
+            );
+            return;
+        }
+    };
+
+    broadcast_state(
+        state,
+        plan_name,
+        fix_task_id,
+        state_labels::AWAITING_CI,
+        Some(&merged_sha),
+        None,
+    );
+
+    let ci_outcome = wait_for_ci(
+        state,
+        org_id,
+        plan_name,
+        fix_task_id,
+        fix_agent_id,
+        &merged_sha,
+    )
+    .await;
+
+    match ci_outcome {
+        CiOutcome::Green | CiOutcome::NotConfigured => {
+            db::close_fix_attempt(&state.db, plan_name, &original_task, attempt, "green");
+            on_fix_ci_passed(
+                state,
+                org_id,
+                plan_name,
+                &original_task,
+                fix_task_id,
+                &merged_sha,
+                &ci_outcome,
+            )
+            .await;
+        }
+        CiOutcome::Red { failing_run_id } => {
+            db::close_fix_attempt(&state.db, plan_name, &original_task, attempt, "red");
+            on_fix_ci_failed(
+                state,
+                org_id,
+                plan_name,
+                &original_task,
+                fix_task_id,
+                &merged_sha,
+                attempt,
+                failing_run_id.as_deref(),
+            )
+            .await;
+        }
+        CiOutcome::Stalled => {
+            db::close_fix_attempt(&state.db, plan_name, &original_task, attempt, "stalled");
+            on_ci_stalled(state, org_id, plan_name, fix_task_id, &merged_sha).await;
+        }
+    }
+}
+
+/// Green / NotConfigured branch on a fix-agent CI: mark the original
+/// task `completed` in `task_status` (source `auto`), audit
+/// `AUTO_MODE_CI_PASSED`, then call `try_auto_advance` for the **original**
+/// task id so phase progression proceeds from the right anchor.
+async fn on_fix_ci_passed(
+    state: &AppState,
+    org_id: &str,
+    plan_name: &str,
+    original_task: &str,
+    fix_task_id: &str,
+    merged_sha: &str,
+    ci_outcome: &CiOutcome,
+) {
+    broadcast_state(
+        state,
+        plan_name,
+        fix_task_id,
+        state_labels::ADVANCING,
+        Some(merged_sha),
+        None,
+    );
+
+    // Mark the original task completed. The fix branch has been merged
+    // into trunk, so the project has the work that was originally
+    // attempted on the task branch — `task_status[original_task]` should
+    // reflect that. source='auto' so a future user manual-edit can still
+    // override; a future auto-status sync also can since auto rows are
+    // overwriteable (T2.3 of the navbar plan).
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_status (plan_name, task_number, status, source, updated_at) \
+             VALUES (?1, ?2, 'completed', 'auto', datetime('now')) \
+             ON CONFLICT(plan_name, task_number) \
+             DO UPDATE SET status = excluded.status, \
+                           source = 'auto', \
+                           updated_at = excluded.updated_at",
+            params![plan_name, original_task],
+        )
+        .ok();
+    }
+    broadcast_event(
+        &state.broadcast_tx,
+        "task_status_changed",
+        serde_json::json!({
+            "plan_name": plan_name,
+            "task_number": original_task,
+            "status": "completed",
+            "reason": "auto_mode: fix agent landed CI green",
+        }),
+    );
+
+    let outcome_label = match ci_outcome {
+        CiOutcome::Green => "green",
+        CiOutcome::NotConfigured => "not_configured",
+        _ => "unknown",
+    };
+    let payload = serde_json::json!({
+        "plan": plan_name,
+        "task": original_task,
+        "fix_task": fix_task_id,
+        "sha": merged_sha,
+        "outcome": outcome_label,
+    });
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            actions::AUTO_MODE_CI_PASSED,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(&payload.to_string()),
+        );
+    }
+
+    let registry = state.registry.clone();
+    let plans_dir = state.plans_dir.clone();
+    let plan_name_owned = plan_name.to_string();
+    let original_task_owned = original_task.to_string();
+    let effort = *state.effort.lock().unwrap();
+    let port = state.config_port();
+    crate::agents::try_auto_advance(
+        registry,
+        plans_dir,
+        plan_name_owned,
+        original_task_owned,
+        effort,
+        port,
+    )
+    .await;
+}
+
+/// Red branch on a fix-agent CI: audit `AUTO_MODE_CI_FAILED` and loop
+/// into the next fix attempt (`attempt + 1`). T3.3 will gate this on the
+/// per-plan retry cap; for T3.2 each Red simply spawns another fix agent.
+///
+/// If [`spawn_fix_agent`] returns `None` (the original task agent row
+/// has gone — defensive only, this should never happen in practice), the
+/// loop pauses with `fix_spawn_failed` so the dashboard can surface the
+/// degenerate state instead of silently dropping the run.
+#[allow(clippy::too_many_arguments)] // step in the loop pipeline, not API
+async fn on_fix_ci_failed(
+    state: &AppState,
+    org_id: &str,
+    plan_name: &str,
+    original_task: &str,
+    fix_task_id: &str,
+    merged_sha: &str,
+    prior_attempt: u32,
+    failing_run_id: Option<&str>,
+) {
+    let id_str = failing_run_id.unwrap_or("unknown");
+    let payload = serde_json::json!({
+        "plan": plan_name,
+        "task": original_task,
+        "fix_task": fix_task_id,
+        "sha": merged_sha,
+        "ci_run_id": failing_run_id,
+        "prior_attempt": prior_attempt,
+    });
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            actions::AUTO_MODE_CI_FAILED,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(&payload.to_string()),
+        );
+    }
+
+    let next_attempt = prior_attempt.saturating_add(1);
+    let new_fix_agent = spawn_fix_agent(
+        state,
+        org_id,
+        plan_name,
+        original_task,
+        id_str,
+        next_attempt,
+    )
+    .await;
+
+    if let Some(new_id) = new_fix_agent {
+        let next_fix_task = format!("{original_task}-fix-{next_attempt}");
+        let payload = serde_json::json!({
+            "plan": plan_name,
+            "task": original_task,
+            "fix_task": next_fix_task,
+            "fix_agent_id": new_id,
+            "attempt": next_attempt,
+            "ci_run_id": failing_run_id,
+        });
+        broadcast_event(
+            &state.broadcast_tx,
+            "auto_mode_fix_spawned",
+            payload.clone(),
+        );
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            actions::AUTO_MODE_FIX_SPAWNED,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(&payload.to_string()),
+        );
+    } else {
+        let reason = "fix_spawn_failed: original task agent row missing".to_string();
+        db::auto_mode_pause(&state.db, plan_name, &reason);
+        let payload = serde_json::json!({
+            "plan": plan_name,
+            "task": original_task,
+            "reason": reason,
+        });
+        broadcast_event(&state.broadcast_tx, "auto_mode_paused", payload.clone());
+        broadcast_state(
+            state,
+            plan_name,
+            fix_task_id,
+            state_labels::PAUSED,
+            Some(merged_sha),
+            Some(&reason),
+        );
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            actions::AUTO_MODE_PAUSED,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(&payload.to_string()),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2510,13 +2909,16 @@ mod tests {
         );
     }
 
-    /// `on_task_agent_completed` short-circuits when the task_id carries
-    /// the `-fix-` marker — the standard merge → CI → advance state
-    /// machine must NOT run on a fix branch (T3.2 will wire the
-    /// fix-merge codepath in its place). Asserts: no auto_mode_*
-    /// broadcasts and the plan stays unpaused after the call returns.
+    /// `on_task_agent_completed` for a fix agent that has no
+    /// `task_fix_attempts` row recorded short-circuits silently. The
+    /// fix-completion handler can't recover the original task id from a
+    /// missing row, so it must bail rather than guess. Defensive: this
+    /// state should never happen in practice because [`spawn_fix_agent`]
+    /// inserts the row BEFORE the dispatch; a row-less fix agent
+    /// indicates the row was deleted out of band or the test set up the
+    /// agent directly without going through spawn_fix_agent.
     #[tokio::test]
-    async fn fix_agent_completion_skips_state_machine() {
+    async fn fix_agent_completion_without_attempt_row_is_silent_no_op() {
         let (db, dir) = fresh_db();
         let cwd = dir.path().join("project");
         git_init_master(&cwd);
@@ -2543,11 +2945,344 @@ mod tests {
         let events = drain_event_types(&mut rx);
         assert!(
             !events.iter().any(|e| e.starts_with("auto_mode_")),
-            "no auto_mode_* events expected for a fix-agent completion: {events:?}"
+            "no auto_mode_* events expected when the fix-attempt row is missing: {events:?}"
         );
         assert!(
             paused_reason(&db, "p").is_none(),
-            "plan should stay unpaused — fix-agent completion is a deliberate no-op"
+            "plan should stay unpaused — missing-row short-circuit is silent"
+        );
+    }
+
+    // ── Phase 3.2: on_fix_agent_completed ───────────────────────────────────
+    //
+    // The headline acceptance test from the brief:
+    //
+    //   completion → red CI → fix agent → fix agent completes → merge →
+    //   green CI → next task spawns. Assert the task_fix_attempts row is
+    //   updated with outcome="green" and the original task is marked
+    //   complete in task_status.
+    //
+    // Three tests cover the fix-completion branches:
+    //   - Green: original task marked completed, attempt closed=green,
+    //     advance fires (next-phase agent row exists).
+    //   - Red:   attempt closed=red, AUTO_MODE_FIX_SPAWNED audit, a
+    //     fresh fix agent (attempt+1) row exists, and a second
+    //     task_fix_attempts row was recorded for the next attempt.
+    //   - Conflict: attempt closed=merge_failed, plan paused with reason
+    //     starting `fix_merge_failed`.
+    //
+    // All three drive `on_fix_agent_completed` directly with seeded DB
+    // state and an echo runner that stubs the merge + CI dispatches —
+    // mirrors the Phase 2 state-machine tests above.
+
+    fn fix_attempt_outcome(db: &Db, plan: &str, task: &str, attempt: u32) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT outcome FROM task_fix_attempts \
+             WHERE plan_name = ?1 AND task_number = ?2 AND attempt = ?3",
+            params![plan, task, attempt as i64],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn task_status_value(db: &Db, plan: &str, task: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT status FROM task_status \
+             WHERE plan_name = ?1 AND task_number = ?2",
+            params![plan, task],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    fn count_agents_for_plan_task(db: &Db, plan: &str, task: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM agents WHERE plan_name = ?1 AND task_id = ?2",
+            params![plan, task],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Headline acceptance test: completion → red CI → fix agent → fix
+    /// agent completes → merge → green CI → next-task agent spawns. The
+    /// task_fix_attempts row carries `outcome="green"` and `task_status`
+    /// for the original task is `completed`.
+    #[tokio::test]
+    async fn fix_agent_green_marks_original_task_completed_and_advances() {
+        let (db, dir) = fresh_db();
+        let org_id = "default-org";
+        seed_runner_row(&db, "runner-1", org_id);
+
+        let plans_dir = dir.path().join("plans");
+        let fake_project = format!(
+            "branchwork-test-{}-fix-green",
+            uuid::Uuid::new_v4().simple()
+        );
+        write_two_phase_plan(&plans_dir, "p", &fake_project);
+
+        // Stub runner: merge succeeds with a fresh sha; CI is green.
+        let runners = new_runner_registry();
+        let _outgoing = install_echo_runner(&runners, "runner-1", |msg| match msg {
+            WireMessage::GetDefaultBranch { .. } => {
+                Some(RunnerResponse::DefaultBranchResolved(Some("master".into())))
+            }
+            WireMessage::MergeBranch { .. } => {
+                Some(RunnerResponse::MergeResult(WireMergeOutcome::Ok {
+                    merged_sha: "fixsha".into(),
+                }))
+            }
+            WireMessage::PushBranch { .. } => Some(RunnerResponse::PushResult {
+                ok: true,
+                stderr: None,
+            }),
+            WireMessage::HasGithubActions { .. } => {
+                Some(RunnerResponse::GithubActionsDetected(true))
+            }
+            WireMessage::GetCiRunStatus { .. } => Some(RunnerResponse::CiRunStatusResolved(Some(
+                aggregate_success(),
+            ))),
+            _ => None,
+        })
+        .await;
+
+        let (state, _rx) = test_app_state(db.clone(), runners, plans_dir);
+
+        // Seed: original task agent (carries the cwd that spawn_fix_agent
+        // would otherwise look up, but for this test we drive
+        // on_fix_agent_completed directly so the cwd lookup happens via
+        // the fix agent's own agents row).
+        seed_agent(
+            &db,
+            "agent-original",
+            Path::new("/runner/cwd"),
+            "p",
+            "0.1",
+            "branchwork/p/0.1",
+        );
+        // Seed: fix agent (already completed). The fix branch is what
+        // gets merged into the canonical default in this test.
+        seed_agent(
+            &db,
+            "fix-agent-1",
+            Path::new("/runner/cwd"),
+            "p",
+            "0.1-fix-1",
+            "branchwork/p/0.1-fix-1",
+        );
+        // Seed: task_fix_attempts row (attempt 1, agent_id = fix agent),
+        // simulating that spawn_fix_agent ran. task_number is the
+        // ORIGINAL task id (0.1), not the fix task id.
+        crate::db::record_fix_attempt(&db, "p", "0.1", 1, "fix-agent-1");
+        enable_auto_mode(&db, "p");
+
+        on_fix_agent_completed(&state, org_id, "fix-agent-1", "p", "0.1-fix-1").await;
+
+        // Acceptance #1: outcome = "green" on the attempt row.
+        assert_eq!(
+            fix_attempt_outcome(&db, "p", "0.1", 1).as_deref(),
+            Some("green"),
+            "task_fix_attempts row should be closed with outcome=green"
+        );
+
+        // Acceptance #2: original task is marked completed in task_status.
+        assert_eq!(
+            task_status_value(&db, "p", "0.1").as_deref(),
+            Some("completed"),
+            "original task_status[0.1] should be 'completed' after fix → green CI"
+        );
+
+        // Acceptance #3: next-phase task (1.1) spawned via try_auto_advance.
+        // start_pty_agent inserts the agents row before the daemon spawn,
+        // so even though the spawn fails on the fake binary path the row
+        // sticks (status='failed') — that's the signal the brief asks for.
+        assert_eq!(
+            count_agents_for_plan_task(&db, "p", "1.1"),
+            1,
+            "expected the next-phase task (1.1) to have spawned an agent row"
+        );
+
+        // Plan stays unpaused on green.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "plan should not be paused on green fix CI"
+        );
+    }
+
+    /// Companion: fix-agent CI comes back Red → outcome=red on the
+    /// closed attempt row, a fresh attempt-2 fix agent is spawned (the
+    /// loop into T3.3), and AUTO_MODE_FIX_SPAWNED is audited.
+    #[tokio::test]
+    async fn fix_agent_red_loops_into_next_attempt() {
+        let (db, dir) = fresh_db();
+        let org_id = "default-org";
+        seed_runner_row(&db, "runner-1", org_id);
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        let runners = new_runner_registry();
+        let _outgoing = install_echo_runner(&runners, "runner-1", |msg| match msg {
+            WireMessage::GetDefaultBranch { .. } => {
+                Some(RunnerResponse::DefaultBranchResolved(Some("master".into())))
+            }
+            WireMessage::MergeBranch { .. } => {
+                Some(RunnerResponse::MergeResult(WireMergeOutcome::Ok {
+                    merged_sha: "fixsha".into(),
+                }))
+            }
+            WireMessage::PushBranch { .. } => Some(RunnerResponse::PushResult {
+                ok: true,
+                stderr: None,
+            }),
+            WireMessage::HasGithubActions { .. } => {
+                Some(RunnerResponse::GithubActionsDetected(true))
+            }
+            WireMessage::GetCiRunStatus { .. } => Some(RunnerResponse::CiRunStatusResolved(Some(
+                aggregate_failure("999"),
+            ))),
+            // Failure-log fetch fires from spawn_fix_agent for the
+            // next attempt — return the canned reply.
+            WireMessage::CiFailureLog { run_id, .. } => Some(RunnerResponse::CiFailureLogFetched {
+                log: Some("the failing log".into()),
+                run_id_used: run_id.clone(),
+            }),
+            _ => None,
+        })
+        .await;
+
+        let (state, _rx) = test_app_state(db.clone(), runners, plans_dir);
+
+        // Seed original + fix-1 agent rows; original carries the cwd
+        // that spawn_fix_agent (fired from on_fix_ci_failed) reuses.
+        seed_agent(
+            &db,
+            "agent-original",
+            Path::new("/runner/cwd"),
+            "p",
+            "0.1",
+            "branchwork/p/0.1",
+        );
+        seed_agent(
+            &db,
+            "fix-agent-1",
+            Path::new("/runner/cwd"),
+            "p",
+            "0.1-fix-1",
+            "branchwork/p/0.1-fix-1",
+        );
+        crate::db::record_fix_attempt(&db, "p", "0.1", 1, "fix-agent-1");
+        enable_auto_mode(&db, "p");
+
+        on_fix_agent_completed(&state, org_id, "fix-agent-1", "p", "0.1-fix-1").await;
+
+        // outcome=red on attempt-1.
+        assert_eq!(
+            fix_attempt_outcome(&db, "p", "0.1", 1).as_deref(),
+            Some("red"),
+            "task_fix_attempts row should be closed with outcome=red"
+        );
+
+        // attempt-2 row was inserted by spawn_fix_agent inside the loop.
+        assert_eq!(
+            crate::db::task_fix_attempt_count(&db, "p", "0.1"),
+            2,
+            "expected a second fix-attempt row recorded by the loop"
+        );
+
+        // Original task NOT marked completed — Red doesn't advance.
+        assert!(
+            task_status_value(&db, "p", "0.1").is_none(),
+            "task_status[0.1] should not be set on red CI"
+        );
+
+        // AUTO_MODE_CI_FAILED + AUTO_MODE_FIX_SPAWNED on the plan.
+        let plan_actions = audit_actions_for(&db, "p");
+        assert!(
+            plan_actions
+                .iter()
+                .any(|a| a == actions::AUTO_MODE_CI_FAILED),
+            "expected AUTO_MODE_CI_FAILED in plan actions: {plan_actions:?}"
+        );
+        assert!(
+            plan_actions
+                .iter()
+                .any(|a| a == actions::AUTO_MODE_FIX_SPAWNED),
+            "expected AUTO_MODE_FIX_SPAWNED in plan actions: {plan_actions:?}"
+        );
+    }
+
+    /// Conflict / merge failure on the fix branch → outcome=merge_failed,
+    /// plan paused with reason starting `fix_merge_failed`. Mirrors the
+    /// task-merge `merge_failed:` pattern but uses the brief's specific
+    /// `fix_merge_failed` prefix to distinguish the two paths in the UI.
+    #[tokio::test]
+    async fn fix_agent_merge_conflict_pauses_with_fix_merge_failed_reason() {
+        let (db, _dir) = fresh_db();
+        let org_id = "default-org";
+        seed_runner_row(&db, "runner-1", org_id);
+
+        let runners = new_runner_registry();
+        let _outgoing = install_echo_runner(&runners, "runner-1", |msg| match msg {
+            WireMessage::GetDefaultBranch { .. } => {
+                Some(RunnerResponse::DefaultBranchResolved(Some("master".into())))
+            }
+            WireMessage::MergeBranch { .. } => {
+                Some(RunnerResponse::MergeResult(WireMergeOutcome::Conflict {
+                    stderr: "CONFLICT (content): Merge conflict in foo.txt".into(),
+                }))
+            }
+            _ => None,
+        })
+        .await;
+
+        let (state, mut rx) = test_app_state(
+            db.clone(),
+            runners,
+            PathBuf::from("/tmp/auto-mode-fix-conflict-plans"),
+        );
+        seed_agent(
+            &db,
+            "fix-agent-1",
+            Path::new("/runner/cwd"),
+            "p",
+            "0.1-fix-1",
+            "branchwork/p/0.1-fix-1",
+        );
+        crate::db::record_fix_attempt(&db, "p", "0.1", 1, "fix-agent-1");
+        enable_auto_mode(&db, "p");
+
+        on_fix_agent_completed(&state, org_id, "fix-agent-1", "p", "0.1-fix-1").await;
+
+        // outcome=merge_failed on the attempt row.
+        assert_eq!(
+            fix_attempt_outcome(&db, "p", "0.1", 1).as_deref(),
+            Some("merge_failed"),
+            "task_fix_attempts row should be closed with outcome=merge_failed"
+        );
+
+        // Plan paused with `fix_merge_failed` prefix.
+        let reason = paused_reason(&db, "p").expect("plan should be paused");
+        assert!(
+            reason.starts_with("fix_merge_failed"),
+            "expected fix_merge_failed prefix, got: {reason}"
+        );
+
+        // auto_mode_paused broadcast.
+        let events = drain_event_types(&mut rx);
+        assert!(
+            events.contains(&"auto_mode_paused".to_string()),
+            "expected auto_mode_paused in {events:?}"
+        );
+
+        // Original task NOT marked completed.
+        assert!(
+            task_status_value(&db, "p", "0.1").is_none(),
+            "task_status[0.1] should not be set on merge conflict"
         );
     }
 
