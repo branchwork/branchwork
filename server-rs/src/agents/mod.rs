@@ -1080,7 +1080,15 @@ pub async fn try_auto_advance(
     effort: Effort,
     port: u16,
 ) {
-    if !auto_advance_enabled(&registry.db, &plan_name) {
+    // Either auto-advance (phase-level opt-in) or auto-mode (the
+    // merge-CI-advance loop's master gate, which already excludes paused
+    // plans via paused_reason IS NULL) is enough to advance. The
+    // auto-mode loop relies on this branch to spawn the next phase's
+    // tasks after a green CI without requiring a separate auto_advance
+    // toggle.
+    if !auto_advance_enabled(&registry.db, &plan_name)
+        && !crate::db::auto_mode_enabled(&registry.db, &plan_name)
+    {
         return;
     }
 
