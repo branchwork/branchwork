@@ -273,7 +273,7 @@ pub async fn list_audit_log(
         let conn = state.db.lock().unwrap();
         match conn
             .query_row(
-                "SELECT id FROM organizations WHERE slug = ?1",
+                "SELECT id FROM organizations WHERE slug = ?1 OR id = ?1",
                 params![slug],
                 |row| row.get::<_, String>(0),
             )
@@ -348,7 +348,7 @@ pub async fn export_audit_log(
         let conn = state.db.lock().unwrap();
         match conn
             .query_row(
-                "SELECT id FROM organizations WHERE slug = ?1",
+                "SELECT id FROM organizations WHERE slug = ?1 OR id = ?1",
                 params![slug],
                 |row| row.get::<_, String>(0),
             )
