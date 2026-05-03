@@ -170,6 +170,34 @@ pub enum WireMessage {
         branches: Vec<String>,
     },
 
+    /// Dashboard asked the runner to merge `task_branch` into `target` in
+    /// `cwd`. The runner runs the same five-step sequence that
+    /// `merge_agent_branch` performs locally in api/agents.rs:392-528:
+    ///
+    ///   1. `git rev-list --count <target>..<task_branch>` (empty-branch
+    ///      guard — replies with `MergeOutcome::EmptyBranch`).
+    ///   2. `git checkout <target>` (failure → `CheckoutFailed`).
+    ///   3. `git merge <task_branch> --no-edit` (conflict →
+    ///      `Conflict`; runner already ran `git merge --abort`).
+    ///   4. `git branch -d <task_branch>` (best-effort cleanup on success).
+    ///   5. `git rev-parse HEAD` to capture `merged_sha` for `Ok`.
+    ///
+    /// Best-effort: tied to a live HTTP caller, so outbox replay is useless.
+    MergeBranch {
+        req_id: String,
+        cwd: String,
+        target: String,
+        task_branch: String,
+    },
+
+    /// Runner reply with the merge outcome. The outcome is an exhaustively
+    /// matchable enum so the server can map each arm to its existing HTTP
+    /// response code without parsing free-form strings.
+    MergeResult {
+        req_id: String,
+        outcome: MergeOutcome,
+    },
+
     // ── Bidirectional ───────────────────────────────────────────────────
     /// Acknowledge receipt of a sequenced message. The receiver sends this
     /// after persisting the event so the sender can prune its outbox.
@@ -200,6 +228,33 @@ pub enum WireMessage {
 pub struct FolderEntry {
     pub name: String,
     pub path: String,
+}
+
+// ── Merge outcome ───────────────────────────────────────────────────────────
+
+/// Outcome of a runner-side merge attempt. Mirrors the cases that
+/// `merge_agent_branch` already handles in api/agents.rs:392-528 — same
+/// branches, same error strings, just transposed across the wire so the
+/// dispatcher in the SaaS server can map each arm to the HTTP status it
+/// would have returned in the standalone path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MergeOutcome {
+    /// `git merge` succeeded; `merged_sha` is the new HEAD on `target`.
+    Ok { merged_sha: String },
+    /// `git rev-list --count <target>..<task_branch>` returned 0 — the
+    /// agent exited without committing. Server returns HTTP 409.
+    EmptyBranch,
+    /// `git checkout <target>` failed (dirty tree, missing branch, etc).
+    /// Server returns HTTP 500 with the captured stderr.
+    CheckoutFailed { stderr: String },
+    /// `git merge` reported a conflict; the runner already ran
+    /// `git merge --abort` so the working tree is clean. Server returns
+    /// HTTP 409.
+    Conflict { stderr: String },
+    /// Anything else that went wrong (process spawn failed, rev-parse
+    /// returned no SHA, runtime error). Server returns HTTP 500.
+    Other { stderr: String },
 }
 
 // ── Driver auth info ────────────────────────────────────────────────────────
@@ -251,6 +306,8 @@ impl WireMessage {
                 | WireMessage::DefaultBranchResolved { .. }
                 | WireMessage::ListBranches { .. }
                 | WireMessage::BranchesListed { .. }
+                | WireMessage::MergeBranch { .. }
+                | WireMessage::MergeResult { .. }
         )
     }
 
@@ -276,6 +333,8 @@ impl WireMessage {
             WireMessage::DefaultBranchResolved { .. } => "default_branch_resolved",
             WireMessage::ListBranches { .. } => "list_branches",
             WireMessage::BranchesListed { .. } => "branches_listed",
+            WireMessage::MergeBranch { .. } => "merge_branch",
+            WireMessage::MergeResult { .. } => "merge_result",
             WireMessage::Ack { .. } => "ack",
             WireMessage::Ping {} => "ping",
             WireMessage::Pong {} => "pong",
@@ -644,5 +703,142 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_branch_round_trip() {
+        let msg = WireMessage::MergeBranch {
+            req_id: "req-11".into(),
+            cwd: "/home/user/proj".into(),
+            target: "master".into(),
+            task_branch: "branchwork/fix/foo/1.2".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "merge_branch");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"merge_branch\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::MergeBranch {
+                req_id,
+                cwd,
+                target,
+                task_branch,
+            } => {
+                assert_eq!(req_id, "req-11");
+                assert_eq!(cwd, "/home/user/proj");
+                assert_eq!(target, "master");
+                assert_eq!(task_branch, "branchwork/fix/foo/1.2");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    fn assert_merge_result_round_trip(req_id: &str, outcome: MergeOutcome) -> MergeOutcome {
+        let msg = WireMessage::MergeResult {
+            req_id: req_id.into(),
+            outcome,
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "merge_result");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"merge_result\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::MergeResult {
+                req_id: rid,
+                outcome,
+            } => {
+                assert_eq!(rid, req_id);
+                outcome
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_result_ok_round_trip() {
+        let outcome = assert_merge_result_round_trip(
+            "req-12",
+            MergeOutcome::Ok {
+                merged_sha: "abc123def456".into(),
+            },
+        );
+        assert_eq!(
+            outcome,
+            MergeOutcome::Ok {
+                merged_sha: "abc123def456".into(),
+            }
+        );
+        // Pin the outcome discriminator so a future rename can't silently
+        // break the wire (server matches on `kind`, not free-form strings).
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"kind\":\"ok\""));
+    }
+
+    #[test]
+    fn merge_result_empty_branch_round_trip() {
+        let outcome = assert_merge_result_round_trip("req-13", MergeOutcome::EmptyBranch);
+        assert_eq!(outcome, MergeOutcome::EmptyBranch);
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"kind\":\"empty_branch\""));
+    }
+
+    #[test]
+    fn merge_result_checkout_failed_round_trip() {
+        let outcome = assert_merge_result_round_trip(
+            "req-14",
+            MergeOutcome::CheckoutFailed {
+                stderr: "error: pathspec 'master' did not match any file(s) known to git".into(),
+            },
+        );
+        assert_eq!(
+            outcome,
+            MergeOutcome::CheckoutFailed {
+                stderr: "error: pathspec 'master' did not match any file(s) known to git".into(),
+            }
+        );
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"kind\":\"checkout_failed\""));
+    }
+
+    #[test]
+    fn merge_result_conflict_round_trip() {
+        let outcome = assert_merge_result_round_trip(
+            "req-15",
+            MergeOutcome::Conflict {
+                stderr: "Auto-merging README.md\nCONFLICT (content): Merge conflict in README.md"
+                    .into(),
+            },
+        );
+        assert_eq!(
+            outcome,
+            MergeOutcome::Conflict {
+                stderr: "Auto-merging README.md\nCONFLICT (content): Merge conflict in README.md"
+                    .into(),
+            }
+        );
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"kind\":\"conflict\""));
+    }
+
+    #[test]
+    fn merge_result_other_round_trip() {
+        let outcome = assert_merge_result_round_trip(
+            "req-16",
+            MergeOutcome::Other {
+                stderr: "Failed to spawn git: No such file or directory".into(),
+            },
+        );
+        assert_eq!(
+            outcome,
+            MergeOutcome::Other {
+                stderr: "Failed to spawn git: No such file or directory".into(),
+            }
+        );
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"kind\":\"other\""));
     }
 }
