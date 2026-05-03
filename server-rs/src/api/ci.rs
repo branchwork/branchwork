@@ -13,6 +13,7 @@ use rusqlite::params;
 use serde::Deserialize;
 
 use crate::agents::pty_agent;
+use crate::auth::OptionalAuthUser;
 use crate::state::AppState;
 
 /// DELETE /api/ci/{run_id}
@@ -119,6 +120,7 @@ pub struct FixCiBody {
 /// fresh `ci_runs` row that eventually supersedes the red badge.
 pub async fn fix_ci(
     State(state): State<AppState>,
+    auth: OptionalAuthUser,
     Json(body): Json<FixCiBody>,
 ) -> impl IntoResponse {
     // 1. Load the failing run's SHA + status. Bail if the run isn't a
@@ -317,12 +319,19 @@ pub async fn fix_ci(
         log = failure_log,
     );
 
-    // 7. Spawn the agent. `is_continue=true` so start_pty_agent just
-    //    checks out the (now-existing) fix branch instead of trying to
-    //    create it again.
+    // 7. Spawn the agent. `is_continue=true` so the standalone path
+    //    just checks out the (now-existing) fix branch instead of
+    //    trying to create it again. SaaS path goes through the runner
+    //    via start_agent_dispatch — note the standalone-only git dance
+    //    above (master/main checkout, `git checkout -b <fix_branch>`)
+    //    will fail silently in SaaS mode today; full SaaS Fix-CI
+    //    parity is tracked separately (see saas-compat-audit
+    //    group 3).
     let effort = *state.effort.lock().unwrap();
-    let agent_id = pty_agent::start_pty_agent(
-        &state.registry,
+    let org_id_str = auth.org_id().to_string();
+    let agent_id = crate::agents::spawn_ops::start_agent_dispatch(
+        &state,
+        &org_id_str,
         pty_agent::StartPtyOpts {
             prompt,
             cwd: &cwd,
@@ -334,7 +343,7 @@ pub async fn fix_ci(
             max_budget_usd: None,
             driver: body.driver.as_deref(),
             user_id: None,
-            org_id: None,
+            org_id: Some(&org_id_str),
         },
     )
     .await;

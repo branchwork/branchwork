@@ -402,13 +402,19 @@ async fn handle_runner_message(
             driver,
             cwd,
         } => {
-            // Insert agent row in server DB.
+            // Upsert the agent row. The new `start_agent_dispatch` path
+            // (agents/spawn_ops.rs) pre-inserts the row with
+            // status='starting' so the dashboard can show the agent
+            // immediately; the runner's confirmation here flips it to
+            // 'running'. Older callers that bypass the dispatcher land
+            // straight on this insert.
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
-                    "INSERT OR IGNORE INTO agents \
+                    "INSERT INTO agents \
                      (id, plan_name, task_id, cwd, status, mode, driver, org_id) \
-                     VALUES (?1, ?2, ?3, ?4, 'running', 'remote', ?5, ?6)",
+                     VALUES (?1, ?2, ?3, ?4, 'running', 'remote', ?5, ?6) \
+                     ON CONFLICT(id) DO UPDATE SET status = 'running'",
                     params![agent_id, plan_name, task_id, cwd, driver, org_id],
                 )
                 .ok();

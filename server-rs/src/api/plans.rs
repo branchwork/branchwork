@@ -1056,14 +1056,21 @@ pub async fn start_task(
         .and_then(|e| e.parse().ok())
         .unwrap_or(*state.effort.lock().unwrap());
 
-    // Ensure git is initialized — required for branch isolation and diffs
-    ensure_git_initialized(&work_dir);
+    // Ensure git is initialized — required for branch isolation and diffs.
+    // SaaS mode: skipped because work_dir lives on the runner, not on this
+    // server. The agent itself initializes git via its prompt instructions
+    // (same precedent as create_plan in SaaS mode — see saas-folder-listing
+    // task 3.3).
+    if !crate::saas::dispatch::org_has_runner(&state.db, &org_id_str) {
+        ensure_git_initialized(&work_dir);
+    }
 
     // Create a dedicated branch for this task
     let branch_name = format!("branchwork/{}/{}", body.plan_name, body.task_number);
 
-    let agent_id = pty_agent::start_pty_agent(
-        &state.registry,
+    let agent_id = crate::agents::spawn_ops::start_agent_dispatch(
+        &state,
+        &org_id_str,
         pty_agent::StartPtyOpts {
             prompt,
             cwd: &work_dir,
@@ -1268,8 +1275,11 @@ pub async fn start_phase_tasks(
         .and_then(|e| e.parse().ok())
         .unwrap_or(*state.effort.lock().unwrap());
 
-    // Ensure git is initialized — required for branch isolation and diffs
-    ensure_git_initialized(&work_dir);
+    // Ensure git is initialized — required for branch isolation and diffs.
+    // SaaS mode: skipped (work_dir is on the runner — see start_task above).
+    if !crate::saas::dispatch::org_has_runner(&state.db, &org_id_str) {
+        ensure_git_initialized(&work_dir);
+    }
 
     let port = state.config_port();
     let mcp_available = state
@@ -1296,8 +1306,9 @@ pub async fn start_phase_tasks(
         );
         let branch_name = format!("branchwork/{}/{}", plan_name, task.number);
 
-        let agent_id = pty_agent::start_pty_agent(
-            &state.registry,
+        let agent_id = crate::agents::spawn_ops::start_agent_dispatch(
+            &state,
+            &org_id_str,
             pty_agent::StartPtyOpts {
                 prompt,
                 cwd: &work_dir,
@@ -1847,8 +1858,10 @@ pub async fn create_plan(
     );
 
     let effort = *state.effort.lock().unwrap();
-    let agent_id = pty_agent::start_pty_agent(
-        &state.registry,
+    let org_id_str = auth.org_id().to_string();
+    let agent_id = crate::agents::spawn_ops::start_agent_dispatch(
+        &state,
+        &org_id_str,
         pty_agent::StartPtyOpts {
             prompt,
             cwd: &resolved,
@@ -1860,7 +1873,7 @@ pub async fn create_plan(
             max_budget_usd: None,
             driver: None,
             user_id: None,
-            org_id: None,
+            org_id: Some(&org_id_str),
         },
     )
     .await;

@@ -4,6 +4,7 @@ pub mod git_ops;
 pub mod prompt;
 pub mod pty_agent;
 pub mod session_protocol;
+pub mod spawn_ops;
 pub mod supervisor;
 pub mod terminal_ws;
 
