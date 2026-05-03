@@ -37,6 +37,21 @@ mod saas {
     pub use super::runner_protocol;
 }
 
+// Same trick for `crate::ci::aggregate`: the runner pulls in the
+// aggregation rule via `#[path]` so the Reglyze regression test (in
+// ci/aggregate.rs) is the single place that exercises it for both
+// modes. Server crate has the real `mod ci { pub mod aggregate; }`
+// hierarchy in ci.rs. Use a flat `#[path]` mod plus a re-export so
+// `crate::ci::aggregate::*` resolves identically in both crates;
+// nested `#[path]` inside an inline module resolves the path
+// relative to the synthetic `<parent>/<mod_name>/` directory and
+// breaks for files outside that subtree.
+#[path = "../ci/aggregate.rs"]
+pub mod ci_aggregate;
+mod ci {
+    pub use super::ci_aggregate as aggregate;
+}
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1294,37 +1309,18 @@ fn compute_ci_aggregate(cwd: &Path, sha: &str) -> Option<CiAggregate> {
     Some(aggregate_runs(runs))
 }
 
-/// Apply the auto-mode CI aggregation rule to a list of `gh run list`
-/// rows. Pure function so the Reglyze regression test can hit it directly
-/// without standing up `gh` on the test runner.
-///
-/// ## Rules
-/// - If any run has `conclusion in {failure, cancelled, timed_out}` →
-///   aggregate `conclusion = "failure"`.
-/// - If all runs have `status == "completed"` AND aggregate didn't fail →
-///   `status = "completed"`; otherwise `status = "in_progress"`.
-/// - `failing_run_id` is the first non-skipped failing run by `created_at`
-///   ascending. If no `created_at` is available, fall back to the first
-///   matching row's order in the input vec.
-/// - A run with `conclusion = "skipped"` has `skipped_due_to_upstream =
-///   true` iff the SHA's run set has any failing run. This collapses the
-///   precise "needs:/workflow_run failure" detection (which `gh` doesn't
-///   expose cleanly) into the conservative "skip-when-set-failed" — the
-///   bug we're guarding against is the loop reading a downstream
-///   `deploy: skipped` as success while `tests: failure` is in the same
-///   run set; either heuristic catches that case.
-/// - When there is no failure and any skipped runs are non-upstream-skip,
-///   conclusion is `success` only when every run is `success` or
-///   `skipped`. Otherwise `conclusion = None` (still polling).
-fn aggregate_runs(runs: Vec<GhRunDetail>) -> CiAggregate {
-    let any_failing = runs.iter().any(|r| {
-        matches!(
-            r.conclusion.as_deref(),
-            Some("failure") | Some("cancelled") | Some("timed_out")
-        )
-    });
+/// Build the per-SHA aggregate from `gh run list` rows. Sorts inputs by
+/// `createdAt` ascending so the shared rule in [`ci::aggregate::compute`]
+/// picks the root-cause failure as `failing_run_id` rather than a
+/// downstream one. Mode-shared aggregation rule (Reglyze regression test
+/// lives in `ci::aggregate::tests`).
+fn aggregate_runs(mut runs: Vec<GhRunDetail>) -> CiAggregate {
+    // Sort by createdAt ascending. `gh` emits ISO-8601 strings which sort
+    // lexicographically into chronological order; missing timestamps stay
+    // in input order via `Option`'s default `Ord` (None < Some(_)).
+    runs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-    let summaries: Vec<CiRunSummary> = runs
+    let mut summaries: Vec<CiRunSummary> = runs
         .iter()
         .map(|r| CiRunSummary {
             run_id: r.database_id.to_string(),
@@ -1335,55 +1331,14 @@ fn aggregate_runs(runs: Vec<GhRunDetail>) -> CiAggregate {
                 r.status.clone()
             },
             conclusion: r.conclusion.clone(),
-            skipped_due_to_upstream: r.conclusion.as_deref() == Some("skipped") && any_failing,
+            // mark_upstream_skips below sets this — initialize to false so
+            // the rule has a single source of truth.
+            skipped_due_to_upstream: false,
         })
         .collect();
 
-    let all_completed = summaries.iter().all(|s| s.status == "completed");
-    let agg_status = if all_completed {
-        "completed".to_string()
-    } else {
-        "in_progress".to_string()
-    };
-
-    let agg_conclusion = if any_failing {
-        Some("failure".to_string())
-    } else if all_completed
-        && summaries
-            .iter()
-            .all(|s| matches!(s.conclusion.as_deref(), Some("success") | Some("skipped")))
-    {
-        Some("success".to_string())
-    } else {
-        None
-    };
-
-    let failing_run_id = pick_failing_run_id(&runs);
-
-    CiAggregate {
-        status: agg_status,
-        conclusion: agg_conclusion,
-        runs: summaries,
-        failing_run_id,
-    }
-}
-
-/// First non-skipped failing run by `created_at` ascending. Falls back to
-/// the input order when timestamps are missing or equal — `gh` always
-/// emits ISO-8601 strings that sort lexicographically, so this is
-/// chronological for any real `gh` output.
-fn pick_failing_run_id(runs: &[GhRunDetail]) -> Option<String> {
-    let mut failing: Vec<&GhRunDetail> = runs
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.conclusion.as_deref(),
-                Some("failure") | Some("cancelled") | Some("timed_out")
-            )
-        })
-        .collect();
-    failing.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    failing.first().map(|r| r.database_id.to_string())
+    ci::aggregate::mark_upstream_skips(&mut summaries);
+    ci::aggregate::compute(&summaries)
 }
 
 /// List non-dot directories at the top level of the runner's home dir.

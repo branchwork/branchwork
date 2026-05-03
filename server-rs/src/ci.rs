@@ -11,6 +11,8 @@
 //! Status vocabulary exposed to the dashboard:
 //!   pending | running | success | failure | cancelled | unknown
 
+pub mod aggregate;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;

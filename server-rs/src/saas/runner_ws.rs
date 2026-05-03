@@ -22,7 +22,9 @@ use crate::state::AppState;
 use crate::ws::broadcast_event;
 
 use super::outbox;
-use super::runner_protocol::{Envelope, FolderEntry, GhRun, MergeOutcome, WireMessage};
+use super::runner_protocol::{
+    CiAggregate, Envelope, FolderEntry, GhRun, MergeOutcome, WireMessage,
+};
 
 // ── Runner registry (in-memory, lives in AppState) ──────────────────────────
 
@@ -57,6 +59,35 @@ pub enum RunnerResponse {
     /// Reply to `GhFailureLog`. `None` ≡ run still pending or `gh`
     /// unavailable.
     GhFailureLogFetched(Option<String>),
+
+    // ── Auto-mode high-level RPC replies ────────────────────────────────────
+    /// Reply to `MergeAgentBranch`. The runner has done the full agent-aware
+    /// merge sequence (target resolution + 5-step git) on its side; the
+    /// dispatch shim translates this into the server-side `MergeOutcome`
+    /// shape and decides on broadcast / CI trigger / DB cleanup.
+    AgentBranchMerged {
+        ok: bool,
+        merged_sha: Option<String>,
+        target_branch: String,
+        had_conflict: bool,
+        error: Option<String>,
+    },
+    /// Reply to `HasGithubActions`. Single bool — the auto-mode CI gate
+    /// uses it to decide whether to skip CI polling and advance to the
+    /// next task immediately.
+    GithubActionsDetected(bool),
+    /// Reply to `GetCiRunStatus`. `None` ≡ no workflow has fired for the
+    /// SHA yet, or `gh` is unavailable on the runner. The aggregate is
+    /// pre-computed runner-side so the auto-mode loop receives the same
+    /// shape regardless of mode.
+    CiRunStatusResolved(Option<CiAggregate>),
+    /// Reply to `CiFailureLog`. Both fields are `None` when the runner
+    /// couldn't resolve a failing run id (still polling, no cached
+    /// aggregate for the plan, etc).
+    CiFailureLogFetched {
+        log: Option<String>,
+        run_id_used: Option<String>,
+    },
 }
 
 /// A connected runner's server-side handle.
@@ -626,6 +657,70 @@ async fn handle_runner_message(
             .await;
         }
 
+        WireMessage::AgentBranchMerged {
+            req_id,
+            ok,
+            merged_sha,
+            target_branch,
+            had_conflict,
+            error,
+        } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "agent_branch_merged",
+                RunnerResponse::AgentBranchMerged {
+                    ok: *ok,
+                    merged_sha: merged_sha.clone(),
+                    target_branch: target_branch.clone(),
+                    had_conflict: *had_conflict,
+                    error: error.clone(),
+                },
+            )
+            .await;
+        }
+
+        WireMessage::GithubActionsDetected { req_id, present } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "github_actions_detected",
+                RunnerResponse::GithubActionsDetected(*present),
+            )
+            .await;
+        }
+
+        WireMessage::CiRunStatusResolved { req_id, aggregate } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "ci_run_status_resolved",
+                RunnerResponse::CiRunStatusResolved(aggregate.clone()),
+            )
+            .await;
+        }
+
+        WireMessage::CiFailureLogResolved {
+            req_id,
+            log,
+            run_id_used,
+        } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "ci_failure_log_resolved",
+                RunnerResponse::CiFailureLogFetched {
+                    log: log.clone(),
+                    run_id_used: run_id_used.clone(),
+                },
+            )
+            .await;
+        }
+
         // Server doesn't receive these from runners — the runner sending them
         // would be a protocol violation (saas→runner direction only).
         WireMessage::Pong {}
@@ -645,15 +740,7 @@ async fn handle_runner_message(
         | WireMessage::MergeAgentBranch { .. }
         | WireMessage::HasGithubActions { .. }
         | WireMessage::GetCiRunStatus { .. }
-        | WireMessage::CiFailureLog { .. }
-        // Reply variants from the runner — handlers in saas/runner_ws.rs
-        // route these via resolve_pending in auto-mode 0.4. Until then
-        // they're stubbed alongside the other reply-not-yet-routed
-        // variants so the build stays green.
-        | WireMessage::AgentBranchMerged { .. }
-        | WireMessage::GithubActionsDetected { .. }
-        | WireMessage::CiRunStatusResolved { .. }
-        | WireMessage::CiFailureLogResolved { .. } => {}
+        | WireMessage::CiFailureLog { .. } => {}
     }
 }
 

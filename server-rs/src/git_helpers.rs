@@ -253,6 +253,57 @@ pub fn gh_run_list_local(cwd: &Path, sha: &str) -> Option<GhRun> {
     runs.into_iter().next()
 }
 
+/// One workflow run as parsed from `gh run list --json
+/// databaseId,workflowName,status,conclusion,createdAt`. Used by the
+/// auto-mode CI gate (multi-run aggregation) on both the runner and the
+/// standalone server. Fields beyond `databaseId` are best-effort:
+/// defaulted on absent JSON keys so a stub `gh` (or a future schema
+/// change) doesn't turn the whole aggregate into `None`.
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct GhRunDetail {
+    #[serde(rename = "databaseId")]
+    pub database_id: i64,
+    #[serde(rename = "workflowName", default)]
+    pub workflow_name: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    /// ISO-8601 timestamp from `gh`. Used for sorting before passing into
+    /// `ci::aggregate::compute` so `failing_run_id` resolves to the
+    /// chronologically-earliest failure (the root cause).
+    #[serde(rename = "createdAt", default)]
+    pub created_at: Option<String>,
+}
+
+/// `gh run list --commit <sha> --json
+/// databaseId,workflowName,status,conclusion,createdAt --limit 50` in
+/// `cwd`. Returns the full set of workflow runs for the SHA so callers
+/// can apply the auto-mode aggregation rule. Returns `None` only when
+/// the call itself failed (gh not installed, no auth, etc); an empty
+/// result set comes back as `Some(vec![])` so callers can distinguish
+/// "still polling" from "tooling broken."
+pub fn gh_run_list_full_local(cwd: &Path, sha: &str) -> Option<Vec<GhRunDetail>> {
+    let out = Command::new("gh")
+        .args([
+            "run",
+            "list",
+            "--commit",
+            sha,
+            "--json",
+            "databaseId,workflowName,status,conclusion,createdAt",
+            "--limit",
+            "50",
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
 /// `gh run view <run_id> --log-failed` in `cwd`. The `--log-failed` output
 /// can be hundreds of KB; keep the **tail** (failures accumulate at the end)
 /// trimmed to ~8 KB and decode lossily so stray non-UTF-8 bytes don't drop
