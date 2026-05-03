@@ -658,6 +658,56 @@ fn list_merge_targets_empty_available_when_only_default_exists() {
     );
 }
 
+#[test]
+fn merge_targets_endpoint_returns_default_and_alternatives() {
+    // Acceptance for plan merge-target-canonical-default-branch T4.5:
+    // pin the JSON contract for GET /api/agents/:id/merge-targets with
+    // committed alternative branches (different setup from the
+    // `list_merge_targets_returns_default_and_alternatives` test above
+    // which uses bare `git branch`). The shape contract is the same:
+    // `default` is the canonical default branch, `available` is the
+    // alphabetical list of every other local branch with the agent's
+    // own task branch and the default itself excluded.
+    let d = TestDashboard::new();
+    d.create_plan("mp-tg", &minimal_plan("mp-tg", &d.project));
+    d.create_task_branch("feature/x", true);
+    d.create_task_branch("feature/y", true);
+
+    let task = "branchwork/mp-tg/1.1";
+    d.create_task_branch(task, true);
+    seed_agent(
+        &d,
+        "agent-tg",
+        "mp-tg",
+        "1.1",
+        Some(task),
+        Some("master"),
+    );
+
+    let (s, body) = d.get("/api/agents/agent-tg/merge-targets");
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["default"], "master");
+    let avail: Vec<String> = body["available"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    // alphabetical, no master, no task branch
+    assert_eq!(avail, vec!["feature/x", "feature/y"]);
+}
+
+#[test]
+fn merge_targets_endpoint_404s_for_unknown_agent() {
+    // Acceptance for plan merge-target-canonical-default-branch T4.5:
+    // sibling to `list_merge_targets_404_for_unknown_agent`, kept
+    // verbatim from the plan brief so the spec test names are
+    // grep-able from the YAML.
+    let d = TestDashboard::new();
+    let (s, _) = d.get("/api/agents/no-such/merge-targets");
+    assert_eq!(s, 404);
+}
+
 /// Count `ci_runs` rows for a given plan, used to assert whether
 /// `trigger_after_merge` did or did not fire for the merge under test.
 fn ci_run_count(d: &TestDashboard, plan_name: &str) -> i64 {
