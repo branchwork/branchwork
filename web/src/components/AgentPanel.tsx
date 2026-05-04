@@ -232,7 +232,22 @@ function PtyTerminal({ agentId }: { agentId: string }) {
 
     return () => {
       resizeObserver.disconnect();
-      ws.close();
+      // Detach handlers first so any orphan messages from a still-connecting
+      // socket don't write to a disposed terminal — and defer close() until
+      // the socket is actually open. Calling close() on a CONNECTING socket
+      // produces the dev-only "WebSocket is closed before the connection is
+      // established" error during React StrictMode's mount/unmount/remount
+      // cycle. The deferred close keeps the orphan WS quiet without
+      // leaking it.
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      if (ws.readyState === WebSocket.CONNECTING) {
+        ws.addEventListener("open", () => ws.close(), { once: true });
+      } else {
+        ws.close();
+      }
       term.dispose();
     };
   }, [agentId]);
