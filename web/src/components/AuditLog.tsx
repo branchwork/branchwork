@@ -34,6 +34,7 @@ const ACTION_LABELS: Record<string, string> = {
   "config.effort_change": "Changed effort level",
   "config.budget_change": "Changed budget",
   "config.auto_advance": "Toggled auto-advance",
+  "config.auto_mode": "Configured auto-mode",
   "config.project_change": "Changed project",
   "config.kill_switch": "Toggled kill switch",
   "org.member_add": "Added member",
@@ -43,6 +44,12 @@ const ACTION_LABELS: Record<string, string> = {
   "plan.update": "Updated plan",
   "auth.signup": "Signed up",
   "auth.login": "Logged in",
+  "auto_mode.merged": "Auto-merged task",
+  "auto_mode.paused": "Auto-mode paused",
+  "auto_mode.fix_spawned": "Spawned fix agent",
+  "auto_mode.ci_passed": "CI passed (advanced)",
+  "auto_mode.ci_failed": "CI failed",
+  "auto_mode.resumed": "Resumed auto-mode",
 };
 
 const ACTION_COLORS: Record<string, string> = {
@@ -60,6 +67,25 @@ const ACTION_COLORS: Record<string, string> = {
   "plan.update": "text-blue-400",
   "auth.signup": "text-emerald-400",
   "auth.login": "text-gray-400",
+  "auto_mode.merged": "text-emerald-400",
+  "auto_mode.paused": "text-orange-400",
+  "auto_mode.fix_spawned": "text-amber-400",
+  "auto_mode.ci_passed": "text-sky-400",
+  "auto_mode.ci_failed": "text-red-400",
+  "auto_mode.resumed": "text-emerald-400",
+};
+
+// Single-glyph icon per auto-mode action. Unicode escapes (no emoji
+// presentation) — same convention as the Check Plan verdict badge in
+// PlanBoard.tsx. Anything not in this map renders an empty placeholder
+// so the column still aligns.
+const ACTION_ICONS: Record<string, string> = {
+  "auto_mode.merged": "✓", // CHECK MARK
+  "auto_mode.paused": "■", // BLACK SQUARE
+  "auto_mode.fix_spawned": "↺", // ANTICLOCKWISE OPEN CIRCLE ARROW
+  "auto_mode.ci_passed": "→", // RIGHTWARDS ARROW
+  "auto_mode.ci_failed": "✗", // BALLOT X
+  "auto_mode.resumed": "▸", // BLACK RIGHT-POINTING SMALL TRIANGLE
 };
 
 function formatTimestamp(iso: string): string {
@@ -150,6 +176,72 @@ function DiffSummary({ diff, action }: { diff: string | null; action: string }) 
       <span className="text-gray-500">
         {parsed.active ? "activated" : "deactivated"}
         {parsed.reason ? ` — ${String(parsed.reason)}` : ""}
+      </span>
+    );
+  }
+  if (action === "config.auto_mode") {
+    const parts: string[] = [];
+    if (typeof parsed.enabled === "boolean") {
+      parts.push(parsed.enabled ? "enabled" : "disabled");
+    }
+    if (parsed.maxFixAttempts != null) {
+      parts.push(`max fix attempts ${String(parsed.maxFixAttempts)}`);
+    }
+    return <span className="text-gray-500 truncate">{parts.join(", ")}</span>;
+  }
+  if (action === "auto_mode.merged") {
+    const sha = typeof parsed.sha === "string" ? parsed.sha.slice(0, 7) : "";
+    const target = parsed.target ? String(parsed.target) : "";
+    return (
+      <span className="text-gray-500 truncate">
+        T{String(parsed.task ?? "?")}{" "}
+        {sha && (
+          <>
+            <span className="font-mono">{sha}</span>{" "}
+          </>
+        )}
+        &rarr; {target || "default"}
+      </span>
+    );
+  }
+  if (action === "auto_mode.paused") {
+    return (
+      <span className="text-gray-500 truncate">
+        T{String(parsed.task ?? "?")} — {String(parsed.reason ?? "paused")}
+      </span>
+    );
+  }
+  if (action === "auto_mode.fix_spawned") {
+    const parts: string[] = [`T${String(parsed.task ?? "?")}`];
+    if (parsed.attempt != null) parts.push(`attempt ${String(parsed.attempt)}`);
+    if (parsed.ci_run_id) parts.push(`run ${String(parsed.ci_run_id)}`);
+    return <span className="text-gray-500 truncate">{parts.join(" / ")}</span>;
+  }
+  if (action === "auto_mode.ci_passed") {
+    const sha = typeof parsed.sha === "string" ? parsed.sha.slice(0, 7) : "";
+    const outcome = parsed.outcome ? String(parsed.outcome) : "green";
+    return (
+      <span className="text-gray-500 truncate">
+        T{String(parsed.task ?? "?")} {sha && <span className="font-mono">{sha}</span>}{" "}
+        ({outcome})
+      </span>
+    );
+  }
+  if (action === "auto_mode.ci_failed") {
+    const sha = typeof parsed.sha === "string" ? parsed.sha.slice(0, 7) : "";
+    return (
+      <span className="text-gray-500 truncate">
+        T{String(parsed.task ?? "?")}{" "}
+        {sha && <span className="font-mono">{sha}</span>}
+        {parsed.ci_run_id ? ` — run ${String(parsed.ci_run_id)}` : ""}
+      </span>
+    );
+  }
+  if (action === "auto_mode.resumed") {
+    const last = parsed.last_completed_task;
+    return (
+      <span className="text-gray-500 truncate">
+        {last ? `from T${String(last)}` : "from start"}
       </span>
     );
   }
@@ -358,6 +450,14 @@ export function AuditLog() {
                         ACTION_COLORS[e.action] ?? "text-gray-400"
                       }
                     >
+                      {ACTION_ICONS[e.action] && (
+                        <span
+                          aria-hidden="true"
+                          className="inline-block w-3 mr-1 text-center"
+                        >
+                          {ACTION_ICONS[e.action]}
+                        </span>
+                      )}
                       {ACTION_LABELS[e.action] ?? e.action}
                     </span>
                   </td>
