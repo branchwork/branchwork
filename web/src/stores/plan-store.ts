@@ -96,6 +96,25 @@ export interface PlanConfigPatch {
   autoAdvance?: boolean;
   autoMode?: boolean;
   maxFixAttempts?: number;
+  /// Explicit `null` clears the loop's self-pause and re-evaluates from the
+  /// last completed task. Only the loop sets non-null values; the wire
+  /// silently ignores non-null patches here.
+  pausedReason?: string | null;
+}
+
+/// Live status of the auto-mode loop for a single plan, driven by the
+/// `auto_mode_state` / `auto_mode_paused` / `auto_mode_merged` /
+/// `auto_mode_fix_spawned` WS events. The pill in PlanBoard renders from
+/// this map plus the persistent `PlanConfig` (autoMode / pausedReason) so
+/// it survives reconnects: the WS-derived runtime fills in *transient*
+/// info (which task is mid-merge, which fix attempt is in flight); the
+/// config fills in *persistent* info (paused or not, and why).
+export interface AutoModeRuntime {
+  state: "merging" | "awaiting_ci" | "fixing_ci" | "advancing" | "paused";
+  task?: string | null;
+  sha?: string | null;
+  reason?: string | null;
+  attempt?: number;
 }
 
 interface PlanStore {
@@ -103,6 +122,14 @@ interface PlanStore {
   selectedPlan: ParsedPlan | null;
   loading: boolean;
   warnings: PlanWarning[];
+  /// Per-plan PlanConfig. Populated by `fetchPlanConfig` on plan open and
+  /// updated by PUT responses + WS events that carry pause-state changes.
+  /// Read by AutoModeControls (toggles) and AutoModeStatusPill (render).
+  planConfigs: Record<string, PlanConfig>;
+  /// Per-plan transient runtime state for the auto-mode pill. WS-driven;
+  /// not persisted across page reloads. The persistent slice (paused vs
+  /// not) lives in `planConfigs[plan].pausedReason`.
+  autoModeRuntimes: Record<string, AutoModeRuntime | null>;
   fetchPlans: () => Promise<void>;
   selectPlan: (name: string) => Promise<void>;
   clearSelectedPlan: () => void;
@@ -113,6 +140,10 @@ interface PlanStore {
   savePlan: (plan: ParsedPlan) => Promise<void>;
   addWarning: (w: PlanWarning) => void;
   dismissWarning: (name: string) => void;
+  fetchPlanConfig: (planName: string) => Promise<PlanConfig>;
+  setPlanConfig: (planName: string, config: PlanConfig) => void;
+  patchPlanConfig: (planName: string, patch: Partial<PlanConfig>) => void;
+  setAutoModeRuntime: (planName: string, runtime: AutoModeRuntime | null) => void;
 }
 
 export const usePlanStore = create<PlanStore>((set, get) => ({
@@ -120,6 +151,8 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   selectedPlan: null,
   loading: false,
   warnings: [],
+  planConfigs: {},
+  autoModeRuntimes: {},
 
   fetchPlans: async () => {
     set({ loading: true });
@@ -265,6 +298,32 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   dismissWarning: (name: string) => {
     set((s) => ({
       warnings: s.warnings.filter((w) => w.name !== name),
+    }));
+  },
+
+  fetchPlanConfig: async (planName: string) => {
+    const cfg = await fetchJson<PlanConfig>(`/api/plans/${planName}/config`);
+    set((s) => ({ planConfigs: { ...s.planConfigs, [planName]: cfg } }));
+    return cfg;
+  },
+
+  setPlanConfig: (planName: string, config: PlanConfig) => {
+    set((s) => ({ planConfigs: { ...s.planConfigs, [planName]: config } }));
+  },
+
+  patchPlanConfig: (planName: string, patch: Partial<PlanConfig>) => {
+    set((s) => {
+      const prev = s.planConfigs[planName];
+      if (!prev) return s;
+      return {
+        planConfigs: { ...s.planConfigs, [planName]: { ...prev, ...patch } },
+      };
+    });
+  },
+
+  setAutoModeRuntime: (planName, runtime) => {
+    set((s) => ({
+      autoModeRuntimes: { ...s.autoModeRuntimes, [planName]: runtime },
     }));
   },
 }));

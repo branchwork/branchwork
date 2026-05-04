@@ -492,6 +492,25 @@ pub struct PlanConfigBody {
     auto_advance: Option<bool>,
     auto_mode: Option<bool>,
     max_fix_attempts: Option<u32>,
+    /// Three-state field: `Absent` (None), `ExplicitNull` (Some(None) — the
+    /// only value we honour: clear the pause + re-evaluate), or
+    /// `ExplicitValue` (Some(Some(_)) — ignored, paused reasons are only
+    /// set by the loop). The `deserialize_some` shim distinguishes
+    /// `Absent` from `ExplicitNull`, which a plain `Option<String>` can't.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    paused_reason: Option<Option<String>>,
+}
+
+/// Serde shim to distinguish absent fields from explicit null. With field
+/// type `Option<Option<T>>` and `#[serde(default, deserialize_with =
+/// "deserialize_some")]`, a missing field is `None` (default), an
+/// explicit `null` is `Some(None)`, and a value is `Some(Some(v))`.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
@@ -643,6 +662,67 @@ pub async fn put_plan_config(
         state.cancel_plan(&name);
         for (agent_id, org_id) in &fix_agents_to_kill {
             let _ = crate::agents::spawn_ops::kill_agent_dispatch(&state, org_id, agent_id).await;
+        }
+    }
+
+    // Explicit `pausedReason: null` is the Resume button: clear the loop's
+    // self-pause, audit, broadcast `auto_mode_resumed` so the dashboard pill
+    // disappears, then re-evaluate auto-advance from the most recently
+    // completed task. Anything other than explicit-null is ignored — the
+    // loop is the only writer of paused reasons.
+    if matches!(body.paused_reason, Some(None)) {
+        crate::db::auto_mode_resume(&state.db, &name);
+
+        let last_completed: Option<String> = {
+            let db = state.db.lock().unwrap();
+            db.query_row(
+                "SELECT task_number FROM task_status \
+                 WHERE plan_name = ?1 AND status IN ('completed', 'skipped') \
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![name],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        };
+
+        {
+            let db = state.db.lock().unwrap();
+            crate::audit::log(
+                &db,
+                auth.org_id(),
+                auth.0.as_ref().map(|u| u.id.as_str()),
+                auth.0.as_ref().map(|u| u.email.as_str()),
+                crate::audit::actions::AUTO_MODE_RESUMED,
+                crate::audit::resources::PLAN,
+                Some(&name),
+                Some(
+                    &serde_json::json!({
+                        "last_completed_task": last_completed,
+                    })
+                    .to_string(),
+                ),
+            );
+        }
+
+        crate::ws::broadcast_event(
+            &state.broadcast_tx,
+            "auto_mode_resumed",
+            serde_json::json!({
+                "plan": name,
+                "last_completed_task": last_completed,
+            }),
+        );
+
+        if let Some(task) = last_completed {
+            let registry = state.registry.clone();
+            let plans_dir = state.plans_dir.clone();
+            let plan_name = name.clone();
+            let effort = *state.effort.lock().unwrap();
+            let port = state.config_port();
+            tokio::spawn(async move {
+                crate::agents::try_auto_advance(registry, plans_dir, plan_name, task, effort, port)
+                    .await;
+            });
         }
     }
 

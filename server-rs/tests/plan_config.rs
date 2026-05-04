@@ -110,6 +110,67 @@ fn put_auto_advance_via_config_matches_dedicated_endpoint() {
 }
 
 #[test]
+fn put_explicit_null_paused_reason_resumes_loop() {
+    let d = TestDashboard::new();
+    d.create_plan("cfg-resume", &minimal_plan("cfg-resume", &d.project));
+
+    // Opt-in + simulate the loop self-pausing (the loop helpers wire later in
+    // the plan but the column is the source of truth either way).
+    let (s, _) = d.put("/api/plans/cfg-resume/config", json!({"autoMode": true}));
+    assert_eq!(s, 200);
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE plan_auto_mode \
+         SET paused_reason = ?1, paused_at = datetime('now') \
+         WHERE plan_name = ?2",
+        params!["merge_conflict", "cfg-resume"],
+    )
+    .unwrap();
+    drop(conn);
+
+    // PUT with explicit null clears the pause and the response reflects it.
+    let (s, body) = d.put(
+        "/api/plans/cfg-resume/config",
+        json!({"pausedReason": null}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert!(body["pausedReason"].is_null(), "got: {body}");
+    // autoMode is left intact — only the pause flag is cleared.
+    assert_eq!(body["autoMode"], true);
+}
+
+#[test]
+fn put_paused_reason_with_non_null_value_is_ignored() {
+    let d = TestDashboard::new();
+    d.create_plan("cfg-pr-ignore", &minimal_plan("cfg-pr-ignore", &d.project));
+
+    let (s, _) = d.put("/api/plans/cfg-pr-ignore/config", json!({"autoMode": true}));
+    assert_eq!(s, 200);
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE plan_auto_mode \
+         SET paused_reason = ?1, paused_at = datetime('now') \
+         WHERE plan_name = ?2",
+        params!["merge_conflict", "cfg-pr-ignore"],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Sending a non-null value is silently ignored — the loop is the only
+    // writer of paused reasons.
+    let (s, body) = d.put(
+        "/api/plans/cfg-pr-ignore/config",
+        json!({"pausedReason": "user_set_reason"}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["pausedReason"], "merge_conflict", "got: {body}");
+}
+
+#[test]
 fn get_surfaces_paused_reason_when_set() {
     let d = TestDashboard::new();
     d.create_plan("cfg-paused", &minimal_plan("cfg-paused", &d.project));

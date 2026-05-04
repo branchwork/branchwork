@@ -174,6 +174,7 @@ export function PlanBoard() {
             </span>
           )}
           <BudgetBadge plan={plan} />
+          <AutoModeStatusPill planName={plan.name} />
         </div>
         <div className="flex items-center gap-3 mt-2">
           <div className="text-sm text-gray-400 max-w-3xl flex-1">
@@ -737,7 +738,9 @@ const AUTO_ADVANCE_TOOLTIP =
 /// Edits to the number input are committed on blur or Enter, not per
 /// keystroke — avoids a PUT per character and lets the user type "10".
 function AutoModeControls({ planName }: { planName: string }) {
-  const [config, setConfig] = useState<PlanConfig | null>(null);
+  const config = usePlanStore((s) => s.planConfigs[planName] ?? null);
+  const fetchPlanConfig = usePlanStore((s) => s.fetchPlanConfig);
+  const setPlanConfig = usePlanStore((s) => s.setPlanConfig);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draftMaxFix, setDraftMaxFix] = useState<string>("");
@@ -745,10 +748,9 @@ function AutoModeControls({ planName }: { planName: string }) {
   useEffect(() => {
     let alive = true;
     setError(null);
-    fetchJson<PlanConfig>(`/api/plans/${planName}/config`)
+    fetchPlanConfig(planName)
       .then((c) => {
         if (!alive) return;
-        setConfig(c);
         setDraftMaxFix(String(c.maxFixAttempts));
       })
       .catch((e) => {
@@ -758,14 +760,14 @@ function AutoModeControls({ planName }: { planName: string }) {
     return () => {
       alive = false;
     };
-  }, [planName]);
+  }, [planName, fetchPlanConfig]);
 
   async function update(patch: PlanConfigPatch) {
     setBusy(true);
     setError(null);
     try {
       const cfg = await putJson<PlanConfig>(`/api/plans/${planName}/config`, patch);
-      setConfig(cfg);
+      setPlanConfig(planName, cfg);
       setDraftMaxFix(String(cfg.maxFixAttempts));
     } catch (e) {
       setError(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -845,6 +847,140 @@ function AutoModeControls({ planName }: { planName: string }) {
       )}
     </div>
   );
+}
+
+/// Live status pill for the auto-mode loop. Renders alongside the plan
+/// title and reflects the current loop phase via the `auto_mode_state` /
+/// `auto_mode_paused` / `auto_mode_merged` / `auto_mode_fix_spawned` WS
+/// events. Hidden when auto-mode is off (no row, or `autoMode = false`)
+/// AND no transient runtime state is in flight. Paused states render a
+/// Resume button that PUTs `pausedReason: null` to the config endpoint.
+export function AutoModeStatusPill({ planName }: { planName: string }) {
+  const config = usePlanStore((s) => s.planConfigs[planName] ?? null);
+  const runtime = usePlanStore((s) => s.autoModeRuntimes[planName] ?? null);
+  const setPlanConfig = usePlanStore((s) => s.setPlanConfig);
+  const [resuming, setResuming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Pause is the persistent slice (lives in PlanConfig); transient labels
+  // are the WS-driven slice (runtime). Persistent wins so a fresh page
+  // load with `pausedReason` set still renders the paused pill.
+  const isPaused = !!config?.pausedReason || runtime?.state === "paused";
+
+  // Hide when auto-mode is off AND not paused AND no runtime in flight.
+  // The "off but paused" combination can happen if the user toggles
+  // auto-mode off while paused — we still show the paused pill so they
+  // can resume; the toggle UX handles the actual disable.
+  if (!config?.autoMode && !isPaused && !runtime) return null;
+  if (!config) return null;
+
+  if (isPaused) {
+    const reason = config.pausedReason ?? runtime?.reason ?? "unknown";
+    const label = humanPauseReason(reason);
+    async function resume() {
+      setResuming(true);
+      setError(null);
+      try {
+        const cfg = await putJson<PlanConfig>(`/api/plans/${planName}/config`, {
+          pausedReason: null,
+        });
+        setPlanConfig(planName, cfg);
+      } catch (e) {
+        setError(`Resume failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setResuming(false);
+      }
+    }
+    return (
+      <span className="flex-shrink-0 inline-flex items-center gap-1.5 text-xs">
+        <span
+          className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-l border border-red-700/60 bg-red-900/30 text-red-300"
+          title={`Auto-mode paused: ${reason}`}
+        >
+          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+          auto: paused — {label}
+        </span>
+        <button
+          type="button"
+          onClick={resume}
+          disabled={resuming}
+          className="px-2 py-0.5 -ml-1.5 rounded-r border border-l-0 border-red-700/60 bg-red-900/40 text-red-200 hover:bg-red-800/50 hover:text-red-100 disabled:opacity-50 transition"
+          title="Clear the pause and re-evaluate from the last completed task"
+        >
+          {resuming ? "Resuming..." : "Resume"}
+        </button>
+        {error && (
+          <span className="text-red-400" role="alert">
+            {error}
+          </span>
+        )}
+      </span>
+    );
+  }
+
+  if (runtime?.state === "merging") {
+    const taskLabel = runtime.task ? ` task ${runtime.task}` : "";
+    return (
+      <span
+        className="flex-shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 text-xs rounded border border-amber-700/50 bg-amber-900/30 text-amber-200"
+        title="Auto-mode is merging the task branch into the canonical default"
+      >
+        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+        auto: merging{taskLabel}
+      </span>
+    );
+  }
+
+  if (runtime?.state === "awaiting_ci") {
+    return (
+      <span
+        className="flex-shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 text-xs rounded border border-indigo-700/50 bg-indigo-900/30 text-indigo-200"
+        title="Auto-mode is waiting on CI for the merged commit"
+      >
+        <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
+        auto: waiting on CI
+      </span>
+    );
+  }
+
+  if (runtime?.state === "fixing_ci") {
+    const cap = config.maxFixAttempts;
+    const attempt = runtime.attempt ?? 1;
+    return (
+      <span
+        className="flex-shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 text-xs rounded border border-orange-700/50 bg-orange-900/30 text-orange-200"
+        title="A fix agent is running to address a CI failure"
+      >
+        <span className="w-1.5 h-1.5 rounded-full bg-orange-400 animate-pulse" />
+        auto: fixing CI (attempt {attempt}/{cap})
+      </span>
+    );
+  }
+
+  // No runtime + auto-mode on + not paused → idle. Render a quiet badge so
+  // the user knows the loop is armed (not running) without being noisy.
+  return (
+    <span
+      className="flex-shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 text-xs rounded border border-emerald-700/40 bg-emerald-900/20 text-emerald-300"
+      title="Auto-mode is enabled and idle"
+    >
+      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+      auto: idle
+    </span>
+  );
+}
+
+/// Map raw `paused_reason` strings to short human-readable labels for the
+/// pill copy. Unknown values fall through verbatim so future loop changes
+/// don't render a stale label.
+function humanPauseReason(reason: string): string {
+  if (reason === "merge_conflict") return "merge conflict";
+  if (reason === "fix_cap_reached") return "fix cap reached";
+  if (reason === "ci_stalled") return "CI stalled";
+  if (reason.startsWith("merge_failed")) return "merge failed";
+  if (reason.startsWith("fix_merge_failed")) return "fix merge failed";
+  if (reason.startsWith("fix_spawn_failed")) return "fix spawn failed";
+  return reason;
 }
 
 interface SwitchProps {

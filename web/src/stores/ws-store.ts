@@ -199,23 +199,88 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
       agentStore.fetchAgents();
       break;
     }
+    case "auto_mode_state": {
+      // Live pill feed: every transition from the auto-mode state machine
+      // (merging → awaiting_ci → advancing|paused) carries a `state` label
+      // here. The pill reads this map; transient labels overwrite each
+      // other. Advancing is treated as idle and clears the runtime so the
+      // pill disappears between tasks.
+      const d = msg.data as {
+        plan: string;
+        task?: string | null;
+        state: string;
+        sha?: string | null;
+        reason?: string | null;
+      };
+      if (d.state === "advancing") {
+        planStore.setAutoModeRuntime(d.plan, null);
+      } else if (
+        d.state === "merging" ||
+        d.state === "awaiting_ci" ||
+        d.state === "fixing_ci" ||
+        d.state === "paused"
+      ) {
+        planStore.setAutoModeRuntime(d.plan, {
+          state: d.state,
+          task: d.task ?? null,
+          sha: d.sha ?? null,
+          reason: d.reason ?? null,
+        });
+      }
+      break;
+    }
+    case "auto_mode_fix_spawned": {
+      // A fix agent was spawned for a Red CI outcome. The state-machine
+      // doesn't broadcast a `fixing_ci` auto_mode_state event today, so we
+      // synthesise one here using the attempt count from the payload + the
+      // cap from the per-plan PlanConfig (read at render time in the pill).
+      const d = msg.data as {
+        plan: string;
+        task: string;
+        fix_task: string;
+        fix_agent_id: string;
+        attempt: number;
+        ci_run_id?: string | null;
+      };
+      planStore.setAutoModeRuntime(d.plan, {
+        state: "fixing_ci",
+        task: d.task,
+        attempt: d.attempt,
+      });
+      break;
+    }
     case "auto_mode_paused": {
-      // The auto-mode loop paused itself for a plan. Phase 4 will read
-      // `pausedReason` from /api/plans/:name/config to render a banner; for
-      // now we surface the pause via a desktop notification so a watcher
-      // doesn't miss it.
+      // The auto-mode loop paused itself for a plan. The pill reads
+      // `pausedReason` from per-plan PlanConfig (persistent across reloads),
+      // so we patch the local config here from the event payload to avoid a
+      // separate refetch — the server already wrote the column.
       const d = msg.data as {
         plan: string;
         task?: string | null;
         reason: string;
         target?: string | null;
       };
+      planStore.patchPlanConfig(d.plan, { pausedReason: d.reason });
+      planStore.setAutoModeRuntime(d.plan, {
+        state: "paused",
+        task: d.task ?? null,
+        reason: d.reason,
+      });
       const taskLabel = d.task ? lookupTaskTitle(d.plan, d.task) : "plan";
       notify(
         `Auto-mode paused: ${d.plan}`,
         `${taskLabel} — ${d.reason}`,
         `auto-mode-paused-${d.plan}`,
       );
+      break;
+    }
+    case "auto_mode_resumed": {
+      // User clicked Resume; the server cleared `paused_reason` and re-
+      // evaluated auto-advance. Update local config + clear runtime so the
+      // pill disappears immediately.
+      const d = msg.data as { plan: string };
+      planStore.patchPlanConfig(d.plan, { pausedReason: null });
+      planStore.setAutoModeRuntime(d.plan, null);
       break;
     }
     case "task_checked": {

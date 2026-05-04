@@ -21,6 +21,12 @@ pub mod actions {
     pub const CONFIG_BUDGET_CHANGE: &str = "config.budget_change";
     pub const CONFIG_AUTO_ADVANCE: &str = "config.auto_advance";
     pub const CONFIG_AUTO_MODE: &str = "config.auto_mode";
+    /// User clicked Resume on the auto-mode pill: clear `paused_reason` and
+    /// re-evaluate auto-advance from the most recently completed task. Audit
+    /// payload carries `last_completed_task` so the trail captures which task
+    /// the resume re-anchored on (helpful when the loop subsequently spawns
+    /// a fresh agent).
+    pub const AUTO_MODE_RESUMED: &str = "auto_mode.resumed";
     pub const CONFIG_PROJECT_CHANGE: &str = "config.project_change";
     pub const CONFIG_KILL_SWITCH: &str = "config.kill_switch";
     pub const ORG_MEMBER_ADD: &str = "org.member_add";
