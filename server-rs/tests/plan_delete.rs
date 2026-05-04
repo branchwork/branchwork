@@ -195,8 +195,14 @@ fn delete_soft_archives_yaml_and_cascades_db_rows() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["hard"], false);
     let archive_path = body["archivePath"].as_str().expect("archivePath set");
-    assert!(
-        archive_path.contains("/archive/"),
+    // Path components, not substring search — Windows uses `\archive\`.
+    let archive_pathbuf = std::path::Path::new(archive_path);
+    assert_eq!(
+        archive_pathbuf
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str()),
+        Some("archive"),
         "archive_path must live under archive/: {archive_path}"
     );
     assert!(
