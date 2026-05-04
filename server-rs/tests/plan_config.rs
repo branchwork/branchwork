@@ -171,6 +171,105 @@ fn put_paused_reason_with_non_null_value_is_ignored() {
 }
 
 #[test]
+fn parallel_defaults_to_false_in_get_response() {
+    // Acceptance: default is false for plans with no auto-mode/auto-advance
+    // rows yet AND for plans where rows exist but the column was never set.
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-par-default",
+        &minimal_plan("cfg-par-default", &d.project),
+    );
+
+    let (s, body) = d.get("/api/plans/cfg-par-default/config");
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], false, "default-off without rows: {body}");
+
+    // Toggle some other field so the rows exist with their default parallel=0.
+    let (s, body) = d.put(
+        "/api/plans/cfg-par-default/config",
+        json!({"autoMode": true, "autoAdvance": true}),
+    );
+    assert_eq!(s, 200);
+    assert_eq!(body["parallel"], false, "row exists, parallel=0: {body}");
+}
+
+#[test]
+fn put_parallel_round_trips_via_unified_config() {
+    let d = TestDashboard::new();
+    d.create_plan("cfg-par-rt", &minimal_plan("cfg-par-rt", &d.project));
+
+    // PUT parallel=true, observe it in the response and on a fresh GET.
+    let (s, body) = d.put("/api/plans/cfg-par-rt/config", json!({"parallel": true}));
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], true);
+
+    let (s, body) = d.get("/api/plans/cfg-par-rt/config");
+    assert_eq!(s, 200);
+    assert_eq!(body["parallel"], true);
+
+    // Both tables carry the value (kept in lockstep so each spawn helper
+    // sees the same answer).
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let am: i64 = conn
+        .query_row(
+            "SELECT parallel FROM plan_auto_mode WHERE plan_name = ?1",
+            params!["cfg-par-rt"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(am, 1, "plan_auto_mode.parallel must be set");
+    let aa: i64 = conn
+        .query_row(
+            "SELECT parallel FROM plan_auto_advance WHERE plan_name = ?1",
+            params!["cfg-par-rt"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(aa, 1, "plan_auto_advance.parallel must be set");
+    drop(conn);
+
+    // PUT parallel=false flips both tables back.
+    let (s, body) = d.put("/api/plans/cfg-par-rt/config", json!({"parallel": false}));
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], false);
+}
+
+#[test]
+fn put_partial_preserves_parallel() {
+    // PUT-ing other fields without `parallel` must not flip `parallel`
+    // back to its default.
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-par-partial",
+        &minimal_plan("cfg-par-partial", &d.project),
+    );
+
+    let (s, _) = d.put(
+        "/api/plans/cfg-par-partial/config",
+        json!({"parallel": true}),
+    );
+    assert_eq!(s, 200);
+
+    // PUT autoMode without parallel — parallel must remain true.
+    let (s, body) = d.put(
+        "/api/plans/cfg-par-partial/config",
+        json!({"autoMode": true}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], true, "parallel clobbered: {body}");
+
+    // PUT maxFixAttempts without parallel — parallel must remain true.
+    let (s, body) = d.put(
+        "/api/plans/cfg-par-partial/config",
+        json!({"maxFixAttempts": 7}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], true, "parallel clobbered: {body}");
+    assert_eq!(body["maxFixAttempts"], 7);
+}
+
+#[test]
 fn get_surfaces_paused_reason_when_set() {
     let d = TestDashboard::new();
     d.create_plan("cfg-paused", &minimal_plan("cfg-paused", &d.project));

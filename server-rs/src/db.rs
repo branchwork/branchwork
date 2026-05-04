@@ -84,6 +84,75 @@ pub fn auto_mode_resume(db: &Db, plan_name: &str) {
     .ok();
 }
 
+/// Snapshot of `plan_auto_mode` for `plan_name`. All fields fall back to
+/// schema defaults when no row exists (matches `auto_mode_enabled` /
+/// `plan_max_fix_attempts` semantics).
+#[allow(dead_code)] // wired in by 3.5.3 worktrees gate + later loop callers
+#[derive(Debug, Clone)]
+pub struct AutoModeConfig {
+    pub enabled: bool,
+    pub max_fix_attempts: u32,
+    pub paused_reason: Option<String>,
+    pub parallel: bool,
+}
+
+/// Read the full `plan_auto_mode` row for `plan_name`. Defaults to
+/// `enabled=false`, `max_fix_attempts=3`, `paused_reason=None`,
+/// `parallel=false` when no row exists.
+#[allow(dead_code)] // wired in by 3.5.3 worktrees gate + later loop callers
+pub fn auto_mode_config(db: &Db, plan_name: &str) -> AutoModeConfig {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT enabled, max_fix_attempts, paused_reason, parallel \
+         FROM plan_auto_mode WHERE plan_name = ?1",
+        params![plan_name],
+        |row| {
+            Ok(AutoModeConfig {
+                enabled: row.get::<_, i64>(0)? != 0,
+                max_fix_attempts: row.get::<_, i64>(1)? as u32,
+                paused_reason: row.get::<_, Option<String>>(2)?,
+                parallel: row.get::<_, i64>(3)? != 0,
+            })
+        },
+    )
+    .unwrap_or(AutoModeConfig {
+        enabled: false,
+        max_fix_attempts: 3,
+        paused_reason: None,
+        parallel: false,
+    })
+}
+
+/// Snapshot of `plan_auto_advance` for `plan_name`. All fields fall back
+/// to schema defaults when no row exists.
+#[allow(dead_code)] // wired in by 3.5.3 worktrees gate + later loop callers
+#[derive(Debug, Clone)]
+pub struct AutoAdvanceConfig {
+    pub enabled: bool,
+    pub parallel: bool,
+}
+
+/// Read the full `plan_auto_advance` row for `plan_name`. Defaults to
+/// `enabled=false`, `parallel=false` when no row exists.
+#[allow(dead_code)] // wired in by 3.5.3 worktrees gate + later loop callers
+pub fn auto_advance_config(db: &Db, plan_name: &str) -> AutoAdvanceConfig {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT enabled, parallel FROM plan_auto_advance WHERE plan_name = ?1",
+        params![plan_name],
+        |row| {
+            Ok(AutoAdvanceConfig {
+                enabled: row.get::<_, i64>(0)? != 0,
+                parallel: row.get::<_, i64>(1)? != 0,
+            })
+        },
+    )
+    .unwrap_or(AutoAdvanceConfig {
+        enabled: false,
+        parallel: false,
+    })
+}
+
 /// Per-plan retry cap for fix agents. Mirrors the schema default (3) so
 /// plans without a `plan_auto_mode` row return the same value the loop
 /// would see if one had been UPSERTed with defaults. The auto-mode loop
@@ -269,17 +338,21 @@ fn migrate(conn: &Connection) {
         CREATE TABLE IF NOT EXISTS plan_auto_advance (
             plan_name  TEXT PRIMARY KEY,
             enabled    INTEGER NOT NULL DEFAULT 0,
+            parallel   INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         -- Auto-mode: opt-in flag plus self-pause state. `enabled` is the
         -- user's toggle; `paused_reason` is set by the loop when it self-
         -- pauses (merge conflict, fix-cap reached, etc.). The actionable
-        -- check is `enabled = 1 AND paused_reason IS NULL`.
+        -- check is `enabled = 1 AND paused_reason IS NULL`. `parallel`
+        -- is the per-plan opt-in for fan-out spawning; gated to false
+        -- until worktree-per-agent isolation ships (Phase 3.5.3).
         CREATE TABLE IF NOT EXISTS plan_auto_mode (
             plan_name        TEXT PRIMARY KEY,
             enabled          INTEGER NOT NULL DEFAULT 0,
             max_fix_attempts INTEGER NOT NULL DEFAULT 3,
+            parallel         INTEGER NOT NULL DEFAULT 0,
             paused_reason    TEXT,
             paused_at        TEXT
         );
@@ -576,6 +649,21 @@ fn migrate(conn: &Connection) {
     // Only source='manual' is sticky against re-inference.
     conn.execute_batch("ALTER TABLE task_status ADD COLUMN source TEXT DEFAULT NULL;")
         .ok();
+
+    // Per-plan opt-in for parallel spawn. Default 0 (off) — until
+    // worktree-per-agent isolation ships, the spawn loop unconditionally
+    // breaks after the first claim (Phase 3.5.1). 3.5.3 will reject toggle
+    // attempts to true at the API layer until worktrees land. Stored on
+    // both tables so each mode (auto-advance / auto-mode) carries its own
+    // knob; the unified config endpoint keeps them in lockstep.
+    conn.execute_batch(
+        "ALTER TABLE plan_auto_mode ADD COLUMN parallel INTEGER NOT NULL DEFAULT 0;",
+    )
+    .ok();
+    conn.execute_batch(
+        "ALTER TABLE plan_auto_advance ADD COLUMN parallel INTEGER NOT NULL DEFAULT 0;",
+    )
+    .ok();
 
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
@@ -1383,6 +1471,94 @@ mod tests {
             )
             .unwrap();
         assert_eq!(max, 3);
+    }
+
+    #[test]
+    fn parallel_default_is_false_for_new_and_missing_rows() {
+        let (db, _dir) = test_db();
+        // No row at all: helpers fall back to schema defaults.
+        let am = auto_mode_config(&db, "missing");
+        assert!(!am.parallel, "missing plan_auto_mode row defaults to false");
+        let aa = auto_advance_config(&db, "missing");
+        assert!(
+            !aa.parallel,
+            "missing plan_auto_advance row defaults to false"
+        );
+
+        // Row exists, parallel column omitted from INSERT: NOT NULL DEFAULT 0
+        // takes hold for both fresh and migrated rows.
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+            params!["p1"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+            params!["p1"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let am = auto_mode_config(&db, "p1");
+        assert!(am.enabled);
+        assert!(!am.parallel, "fresh row defaults parallel to false");
+        let aa = auto_advance_config(&db, "p1");
+        assert!(aa.enabled);
+        assert!(!aa.parallel, "fresh row defaults parallel to false");
+    }
+
+    #[test]
+    fn parallel_round_trips_through_config_helpers() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO plan_auto_mode (plan_name, enabled, parallel) VALUES (?1, 1, 1)",
+            params!["p1"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plan_auto_advance (plan_name, enabled, parallel) VALUES (?1, 1, 1)",
+            params!["p1"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let am = auto_mode_config(&db, "p1");
+        assert!(am.parallel);
+        let aa = auto_advance_config(&db, "p1");
+        assert!(aa.parallel);
+    }
+
+    #[test]
+    fn parallel_migration_is_idempotent_and_preserves_existing_rows() {
+        // Acceptance: re-running `init` on a DB that already carries the
+        // parallel column must not error out, drop rows, or reset the
+        // value. The ALTER TABLE is wrapped in `.ok()` so the second run
+        // becomes a no-op.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let db = init(&path);
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled, parallel) VALUES (?1, 1, 1)",
+                params!["plan-a"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_advance (plan_name, enabled, parallel) VALUES (?1, 1, 1)",
+                params!["plan-a"],
+            )
+            .unwrap();
+        }
+
+        let db2 = init(&path);
+        let am = auto_mode_config(&db2, "plan-a");
+        assert!(am.parallel, "user-set parallel survives re-init");
+        let aa = auto_advance_config(&db2, "plan-a");
+        assert!(aa.parallel, "user-set parallel survives re-init");
     }
 
     #[test]

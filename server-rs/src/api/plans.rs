@@ -484,6 +484,11 @@ struct PlanConfig {
     auto_mode: bool,
     max_fix_attempts: u32,
     paused_reason: Option<String>,
+    /// Per-plan opt-in for fan-out spawn (3.5.2). Stored on both
+    /// `plan_auto_mode` and `plan_auto_advance` and kept in lockstep by
+    /// the unified PUT. Toggling to true is rejected at the API layer
+    /// until worktrees ship (3.5.3).
+    parallel: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -492,6 +497,7 @@ pub struct PlanConfigBody {
     auto_advance: Option<bool>,
     auto_mode: Option<bool>,
     max_fix_attempts: Option<u32>,
+    parallel: Option<bool>,
     /// Three-state field: `Absent` (None), `ExplicitNull` (Some(None) — the
     /// only value we honour: clear the pause + re-evaluate), or
     /// `ExplicitValue` (Some(Some(_)) — ignored, paused reasons are only
@@ -514,18 +520,17 @@ where
 }
 
 fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
-    let auto_advance = db
+    let (auto_advance, advance_parallel) = db
         .query_row(
-            "SELECT enabled FROM plan_auto_advance WHERE plan_name = ?1",
+            "SELECT enabled, parallel FROM plan_auto_advance WHERE plan_name = ?1",
             params![name],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
         )
-        .map(|v| v != 0)
-        .unwrap_or(false);
+        .unwrap_or((false, false));
 
-    let (auto_mode, max_fix_attempts, paused_reason) = db
+    let (auto_mode, max_fix_attempts, paused_reason, mode_parallel) = db
         .query_row(
-            "SELECT enabled, max_fix_attempts, paused_reason \
+            "SELECT enabled, max_fix_attempts, paused_reason, parallel \
              FROM plan_auto_mode WHERE plan_name = ?1",
             params![name],
             |row| {
@@ -533,16 +538,22 @@ fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
                     row.get::<_, i64>(0)? != 0,
                     row.get::<_, i64>(1)? as u32,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
                 ))
             },
         )
-        .unwrap_or((false, 3, None));
+        .unwrap_or((false, 3, None, false));
 
+    // The unified config keeps both tables' `parallel` flags in lockstep,
+    // but in case they ever diverge (manual SQL, partial migration), OR
+    // them so a single "yes" wins. 3.5.3 will reject toggle attempts to
+    // true at the API layer until worktrees ship.
     PlanConfig {
         auto_advance,
         auto_mode,
         max_fix_attempts,
         paused_reason,
+        parallel: mode_parallel || advance_parallel,
     }
 }
 
@@ -591,7 +602,7 @@ pub async fn put_plan_config(
         }
 
         let mut to_kill: Vec<(String, String)> = Vec::new();
-        if body.auto_mode.is_some() || body.max_fix_attempts.is_some() {
+        if body.auto_mode.is_some() || body.max_fix_attempts.is_some() || body.parallel.is_some() {
             // UPSERT each provided field independently so partial updates
             // don't clobber the other column. COALESCE keeps the existing
             // value when the caller omits it.
@@ -631,6 +642,27 @@ pub async fn put_plan_config(
                 )
                 .ok();
             }
+            // `parallel` is mirrored across both tables so each mode's
+            // spawn helper sees the same answer. Two UPSERTs because the
+            // tables are separate; "one statement per field" still holds
+            // per (table, field) pair.
+            if let Some(parallel) = body.parallel {
+                db.execute(
+                    "INSERT INTO plan_auto_mode (plan_name, parallel) \
+                     VALUES (?1, ?2) \
+                     ON CONFLICT(plan_name) DO UPDATE SET parallel = excluded.parallel",
+                    params![name, parallel as i64],
+                )
+                .ok();
+                db.execute(
+                    "INSERT INTO plan_auto_advance (plan_name, parallel, updated_at) \
+                     VALUES (?1, ?2, datetime('now')) \
+                     ON CONFLICT(plan_name) \
+                     DO UPDATE SET parallel = excluded.parallel, updated_at = excluded.updated_at",
+                    params![name, parallel as i64],
+                )
+                .ok();
+            }
 
             let mut audit_payload = serde_json::Map::new();
             if let Some(enabled) = body.auto_mode {
@@ -638,6 +670,9 @@ pub async fn put_plan_config(
             }
             if let Some(max) = body.max_fix_attempts {
                 audit_payload.insert("maxFixAttempts".to_string(), serde_json::json!(max));
+            }
+            if let Some(parallel) = body.parallel {
+                audit_payload.insert("parallel".to_string(), serde_json::json!(parallel));
             }
             crate::audit::log(
                 &db,
