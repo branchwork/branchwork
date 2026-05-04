@@ -1166,57 +1166,18 @@ pub async fn try_auto_advance(
         .collect();
 
     if !intra_ready.is_empty() {
-        // Spawn loop — mirrors the next-phase loop below. Task 3.2 will
-        // extract both into a `spawn_ready_tasks` helper.
-        let mut spawned: Vec<String> = Vec::with_capacity(intra_ready.len());
-        for task in &intra_ready {
-            if !claim_task(&registry.db, &plan_name, &task.number) {
-                continue;
-            }
-
-            broadcast_event(
-                &registry.broadcast_tx,
-                "task_status_changed",
-                serde_json::json!({
-                    "plan_name": plan_name,
-                    "task_number": task.number,
-                    "status": "in_progress",
-                }),
-            );
-
-            let cross_ctx = build_cross_plan_context(&registry.db, &plans_dir, &plan, &task.number);
-            let mcp_available = registry.drivers.injects_mcp(None, port);
-            let prompt = build_task_prompt(
-                &plan,
-                current_phase,
-                task,
-                false,
-                port,
-                cross_ctx.as_deref(),
-                mcp_available,
-            );
-            let branch_name = format!("branchwork/{}/{}", plan_name, task.number);
-
-            pty_agent::start_pty_agent(
-                &registry,
-                pty_agent::StartPtyOpts {
-                    prompt,
-                    cwd: &work_dir,
-                    plan_name: Some(&plan_name),
-                    task_id: Some(&task.number),
-                    effort,
-                    branch: Some(&branch_name),
-                    is_continue: false,
-                    max_budget_usd,
-                    driver: None,
-                    user_id: None,
-                    org_id: None,
-                },
-            )
-            .await;
-
-            spawned.push(task.number.clone());
-        }
+        let spawned = spawn_ready_tasks(
+            &registry,
+            &plans_dir,
+            &plan,
+            current_phase,
+            &intra_ready,
+            effort,
+            port,
+            max_budget_usd,
+            &work_dir,
+        )
+        .await;
 
         // `task_advanced` only fires if we actually spawned at least one
         // task. If every `intra_ready` candidate lost the `claim_task`
@@ -1291,55 +1252,18 @@ pub async fn try_auto_advance(
         next_phase.number
     );
 
-    for task in ready_tasks {
-        // Race guard: only spawn if we successfully claim the task.
-        if !claim_task(&registry.db, &plan_name, &task.number) {
-            continue;
-        }
-
-        broadcast_event(
-            &registry.broadcast_tx,
-            "task_status_changed",
-            serde_json::json!({
-                "plan_name": plan_name,
-                "task_number": task.number,
-                "status": "in_progress",
-            }),
-        );
-
-        let cross_ctx = build_cross_plan_context(&registry.db, &plans_dir, &plan, &task.number);
-        // Auto-advance spawns use the default driver; check whether it
-        // auto-registers MCP so the prompt picks MCP tool vs curl.
-        let mcp_available = registry.drivers.injects_mcp(None, port);
-        let prompt = build_task_prompt(
-            &plan,
-            next_phase,
-            task,
-            false,
-            port,
-            cross_ctx.as_deref(),
-            mcp_available,
-        );
-        let branch_name = format!("branchwork/{}/{}", plan_name, task.number);
-
-        pty_agent::start_pty_agent(
-            &registry,
-            pty_agent::StartPtyOpts {
-                prompt,
-                cwd: &work_dir,
-                plan_name: Some(&plan_name),
-                task_id: Some(&task.number),
-                effort,
-                branch: Some(&branch_name),
-                is_continue: false,
-                max_budget_usd,
-                driver: None,
-                user_id: None,
-                org_id: None,
-            },
-        )
-        .await;
-    }
+    spawn_ready_tasks(
+        &registry,
+        &plans_dir,
+        &plan,
+        next_phase,
+        &ready_tasks,
+        effort,
+        port,
+        max_budget_usd,
+        &work_dir,
+    )
+    .await;
 
     broadcast_event(
         &registry.broadcast_tx,
@@ -1371,6 +1295,78 @@ pub async fn try_auto_advance(
         );
         crate::notifications::notify(webhook_snapshot, msg);
     }
+}
+
+/// Spawn auto-advance agents for `tasks`, a pre-filtered list of ready
+/// candidates from `phase`. For each task we race-guard via
+/// `claim_task`, broadcast `task_status_changed`, build the prompt with
+/// cross-plan context, and call `start_pty_agent`. Returns the task
+/// numbers we actually claimed and spawned — callers use this to gate
+/// any aggregate follow-up broadcast (`task_advanced` for intra-phase
+/// advance stays quiet when every candidate lost its claim race).
+async fn spawn_ready_tasks(
+    registry: &AgentRegistry,
+    plans_dir: &Path,
+    plan: &ParsedPlan,
+    phase: &PlanPhase,
+    tasks: &[&PlanTask],
+    effort: Effort,
+    port: u16,
+    max_budget_usd: Option<f64>,
+    work_dir: &Path,
+) -> Vec<String> {
+    let mut spawned: Vec<String> = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        if !claim_task(&registry.db, &plan.name, &task.number) {
+            continue;
+        }
+
+        broadcast_event(
+            &registry.broadcast_tx,
+            "task_status_changed",
+            serde_json::json!({
+                "plan_name": plan.name,
+                "task_number": task.number,
+                "status": "in_progress",
+            }),
+        );
+
+        let cross_ctx = build_cross_plan_context(&registry.db, plans_dir, plan, &task.number);
+        // Auto-advance spawns use the default driver; check whether it
+        // auto-registers MCP so the prompt picks MCP tool vs curl.
+        let mcp_available = registry.drivers.injects_mcp(None, port);
+        let prompt = build_task_prompt(
+            plan,
+            phase,
+            task,
+            false,
+            port,
+            cross_ctx.as_deref(),
+            mcp_available,
+        );
+        let branch_name = format!("branchwork/{}/{}", plan.name, task.number);
+
+        pty_agent::start_pty_agent(
+            registry,
+            pty_agent::StartPtyOpts {
+                prompt,
+                cwd: work_dir,
+                plan_name: Some(&plan.name),
+                task_id: Some(&task.number),
+                effort,
+                branch: Some(&branch_name),
+                is_continue: false,
+                max_budget_usd,
+                driver: None,
+                user_id: None,
+                org_id: None,
+            },
+        )
+        .await;
+
+        spawned.push(task.number.clone());
+    }
+    spawned
 }
 
 #[cfg(test)]
