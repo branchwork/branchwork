@@ -181,6 +181,22 @@ pub trait AgentDriver: Send + Sync {
         None
     }
 
+    /// Returns the Stop-hook JSON fragment this driver wants written
+    /// into a per-session settings file, or `None` if the driver has
+    /// no portable stop-hook surface (server falls back to the idle
+    /// timer for those — see Phase 4).
+    ///
+    /// `session_id` is the same id passed to `spawn_args` for resume.
+    /// `hook_url` is the absolute URL the hook should POST to (e.g.
+    /// `http://localhost:3100/hooks`). The driver returns the JSON
+    /// the CLI's settings schema expects; the caller wraps it into
+    /// the full settings file shape if any other top-level keys are
+    /// needed.
+    #[allow(dead_code)] // consumed by Phase 1.2+ (Claude impl + per-session settings writer)
+    fn stop_hook_config(&self, _session_id: &str, _hook_url: &str) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Check whether the CLI is installed and authenticated. Default
     /// implementation just confirms the binary is on PATH and reports
     /// [`AuthStatus::Unknown`] otherwise — drivers that know how to read
@@ -955,6 +971,16 @@ Tokens: 200 sent, 75 received. Cost: $0.0150 message, $0.0250 session.
         assert!(AiderDriver::new().mcp_config_json(3100).is_none());
         assert!(CodexDriver::new().mcp_config_json(3100).is_none());
         assert!(GeminiDriver::new().mcp_config_json(3100).is_none());
+    }
+
+    #[test]
+    fn non_claude_drivers_have_no_stop_hook_config() {
+        // Default trait impl returns None — Phase 1.1 ships the surface
+        // with no driver overrides; only Claude will plug in (Phase 1.2).
+        let url = "http://localhost:3100/hooks";
+        assert!(AiderDriver::new().stop_hook_config("sess", url).is_none());
+        assert!(CodexDriver::new().stop_hook_config("sess", url).is_none());
+        assert!(GeminiDriver::new().stop_hook_config("sess", url).is_none());
     }
 
     #[test]
