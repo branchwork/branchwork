@@ -21,6 +21,7 @@ server restarts.
 - [Cost tracking & budgets](#cost-tracking--budgets)
 - [CI integration](#ci-integration)
 - [Auto-mode](#auto-mode) — auto-advance, auto-merge, the status pill, and the disabled Parallel toggle
+- [Unattended auto-mode](#unattended-auto-mode) — Stop-hook → tree-clean gate → merge → CI → next-task pipeline
 - [Notifications](#notifications)
 - [Settings](#settings) — effort level, `--claude-dir`, port, webhook URL
 - [Audit log](#audit-log)
@@ -569,6 +570,177 @@ agent on its own checkout) to avoid interleaved diffs on a shared
 working tree. Until that lands, the parallel toggle on the plan
 board is disabled and any API attempt to set `parallel=true` is
 rejected with `412 worktrees_required`.
+
+---
+
+## Unattended auto-mode
+
+[Auto-mode](#auto-mode) above describes the toggle and the pill;
+this section describes what actually happens between
+"agent finishes its turn" and "next task spawns" once the toggle is
+on. The end-to-end loop runs without a human at the keyboard — no
+Finish click, no Merge click, no Start click on the next task — for
+any plan whose driver supports a Stop hook (today: `claude`).
+
+### End-to-end flow
+
+When a Claude agent under auto-mode finishes its turn:
+
+1. **Agent finishes its turn.** The model emits its final message
+   and would otherwise sit at the prompt waiting for input.
+2. **Stop hook fires.** A per-session settings file written at
+   spawn time (`~/.claude/sessions/<agent-id>.settings.json`,
+   passed via `claude --settings`) tells Claude Code to POST every
+   `Stop` event to `http://localhost:<port>/hooks`. The receiver
+   is `server-rs/src/hooks.rs::receive_hook`.
+3. **Tree-clean gate.** Branchwork runs `git status --porcelain`
+   in the agent's working directory. Tracked-modified, deleted, or
+   unmerged paths trip the gate; untracked files (the agent's
+   scratchpad) are tolerated. A dirty tree pauses the plan with
+   reason `agent_left_uncommitted_work` (see
+   [Pause on uncommitted work](#pause-on-uncommitted-work)) and
+   leaves the agent at the prompt for human review. A clean (or
+   unknown) tree falls through to step 4.
+4. **`graceful_exit`.** Branchwork sends the driver's polite exit
+   sequence (`/exit\r` for Claude) to the PTY. The agent flushes
+   and the PTY closes — the same path a human Finish click takes,
+   but with the audit row written as
+   `agent.auto_finish` + `{"trigger": "stop_hook"}` instead of
+   `agent.finish`.
+5. **`on_agent_exit`.** The merge-on-completion hook in
+   `server-rs/src/agents/pty_agent.rs` notifies the auto-mode
+   loop that the task is ready for merge.
+6. **Auto-mode merges.** The loop checks out the source branch
+   (usually `main`/`master`), runs `git merge --no-ff
+   <task-branch>`, and broadcasts `auto_mode_merged`. The empty-
+   branch merge guard (HTTP 409) and conflict detection (pause
+   with `merge_conflict`) are the same as for a manual Merge
+   click.
+7. **CI gate.** When the project has GitHub Actions and a working
+   `gh` CLI, the source branch is pushed and the loop polls
+   `gh run list` for up to 30 minutes. On failure, a Fix CI agent
+   is spawned automatically (up to `max_fix_attempts`); on
+   exhaustion, the loop pauses with `ci_failed`. CI tooling is
+   best-effort — projects without `gh`/workflows fall through and
+   the loop advances.
+8. **`try_auto_advance`.** With the merge committed (and CI green
+   if applicable), the loop scans the plan for the next ready task.
+   It scans the **current phase first**, broadcasting
+   `task_advanced` if a sibling task is now ready in the same phase.
+   When the current phase is fully done, it falls through to the
+   next-phase scan and broadcasts `phase_advanced`. Either path
+   spawns one new agent and the cycle restarts at step 1.
+
+The audit log records every system-driven Finish as
+`agent.auto_finish` with a trigger badge (`stop_hook` or
+`idle_timeout`) so a post-mortem can tell unattended runs apart
+from the manual `agent.finish` rows.
+
+### Enabling unattended auto-mode
+
+Flip the **Auto-mode** toggle on the plan header. That single
+switch enables the full end-to-end loop for any task whose driver
+returns a non-`None` `stop_hook_config` — today only `claude`. The
+setting is per-plan and persists in the database, so you can leave
+it on for plans you trust to run unattended and off for plans where
+you want to review each task before it merges.
+
+There is no global "default to auto-mode" knob. Opting in is an
+explicit per-plan decision that survives server restarts and
+shows in `plan_updated` WS events.
+
+For non-Claude drivers, see
+[Drivers without a Stop hook](#drivers-without-a-stop-hook) below —
+unattended operation needs an extra opt-in.
+
+### Failure modes
+
+#### Pause on uncommitted work
+
+If the Stop hook fires while the agent's working tree has tracked
+changes, Branchwork pauses the plan instead of merging an
+incomplete branch:
+
+- The auto-mode pill flips to **paused — agent left uncommitted
+  work** (red) with a **Resume** button.
+- A red banner above the phase board lists the dirty paths and
+  exposes an **Inspect agent** button that opens the agent's
+  terminal panel. The task agent is still `running` (the dirty-
+  tree branch never calls `graceful_exit`), so you can pick up
+  exactly where the agent left off.
+
+To resolve:
+
+1. Click **Inspect agent** to open the agent terminal.
+2. Either **commit** the work (drive the agent to commit, or
+   `git add` + `git commit` from your own shell against the
+   agent's working directory) **or discard** it (`git restore .`,
+   or delete the offending files). Untracked scratchpad files
+   never trip the gate, so you don't need to clean those up.
+3. Click **Resume** on the auto-mode pill. Branchwork clears
+   `pausedReason`, re-evaluates from the last completed task, and
+   the loop picks up at step 4 of the [end-to-end flow](#end-to-end-flow).
+
+If you'd rather take the task over by hand: kill the agent, finish
+the changes manually, and click the regular **Merge** button.
+Auto-mode stays paused until you click Resume — it won't grab the
+next task while you're driving.
+
+#### Drivers without a Stop hook
+
+Only the `claude` driver returns a non-`None` `stop_hook_config`
+today. `aider`, `codex`, and `gemini` have no settings-driven Stop
+hook, so the PTY never closes on its own and step 2 of the flow
+above never fires.
+
+| Driver | `stop_hook_config` | Auto-finish path |
+|---|---|---|
+| `claude` | `Some(...)` | Stop hook (deterministic) |
+| `aider`  | `None`      | Idle timer (opt in) |
+| `codex`  | `None`      | Idle timer (opt in) |
+| `gemini` | `None`      | Idle timer (opt in) |
+
+Two ways to run those drivers unattended:
+
+- **Idle-timer fallback (opt in).** Set
+  `BRANCHWORK_AUTO_FINISH_IDLE=1` on the server before launch (and
+  optionally `BRANCHWORK_AUTO_FINISH_IDLE_SECS=<seconds>`, default
+  `300`). A background poller scans every running auto-mode agent
+  whose driver returned `None` from `stop_hook_config` and treats
+  any agent idle past the threshold as done — same tree-clean
+  gate, same `graceful_exit`, same merge / CI / advance loop. The
+  audit trigger reads `idle_timeout` instead of `stop_hook`. Both
+  variables are documented in
+  [reference/configuration.md](reference/configuration.md#auto-mode-idle-finish).
+- **Stay manual.** Leave the env var unset and click **Finish**
+  yourself when the driver finishes its turn. Auto-mode still
+  merges, watches CI, and advances after that — only the Finish
+  click is manual.
+
+The fallback is **off by default** because a driver with no
+activity telemetry can fire prematurely. Driver-specific Stop-hook
+support is the long-term fix; per-driver follow-up backlog plans
+live at `~/.claude/plans/backlog/auto-mode-stop-hook-<driver>.yaml`.
+See
+[reference/drivers.md](reference/drivers.md#stop-hooks-and-unattended-auto-mode)
+for the trait-level contract.
+
+### Manual escape hatch
+
+Clicking **Finish** in the agent panel under auto-mode works
+**exactly the same as before**. The Stop-hook path and the manual
+Finish click both call into `AgentRegistry::graceful_exit`; the
+only observable difference is the audit-log action constant
+(`agent.auto_finish` with a `trigger` field, vs. plain
+`agent.finish`). If you'd rather drive a task by hand while
+auto-mode stays armed for the next one, Finish it yourself — the
+loop picks up from step 5 onward and merges, watches CI, and
+advances as usual.
+
+The same applies to **Kill**: a SIGKILL'd agent leaves the plan
+in whatever state the half-merged tree implies (auto-mode will
+typically pause on the next scan), and **Resume** is the way back
+in once you've cleaned things up by hand.
 
 ---
 

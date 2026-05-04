@@ -1,6 +1,6 @@
 # ADR 0003 — Unattended auto-mode end-to-end
 
-- **Status:** Proposed (2026-05-04)
+- **Status:** Accepted (2026-05-04)
 - **Authors:** cpo
 - **Decision driver(s):** auto-mode that still requires a human Finish click; intra-phase task chains stalling after the first task completes
 
