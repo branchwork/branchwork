@@ -58,6 +58,7 @@ pub trait AgentDriver: Send + Sync {
     fn graceful_exit_sequence(&self) -> Option<&[u8]>;        // default: Some(b"/exit\r")
     fn capabilities(&self) -> DriverCapabilities;             // default: all-true
     fn mcp_config_json(&self, port: u16) -> Option<String>;   // default: None
+    fn stop_hook_config(&self, session_id: &str, hook_url: &str) -> Option<serde_json::Value>; // default: None
     fn auth_status(&self) -> AuthStatus;                      // default: NotInstalled / Unknown
 }
 ```
@@ -82,6 +83,7 @@ out the moment a generic method or `Self: Sized` bound is added.
 | `graceful_exit_sequence` | [`agents/mod.rs::graceful_exit`](../../server-rs/src/agents/mod.rs) on Finish | `Some(b"/exit\r")` | Most CLIs accept `/exit`. Override with a different sequence (e.g. `b"\x04"` for Ctrl-D), or return `None` to force the dashboard to fall through to Kill. |
 | `capabilities` | UI gating, `GET /api/drivers` | all true, not interactive | Override the bools your CLI can't deliver. See [`DriverCapabilities`](#drivercapabilities). |
 | `mcp_config_json` | [`pty_agent.rs::start_pty_agent`](../../server-rs/src/agents/pty_agent.rs) (file is written next to the agent's socket and passed via `SpawnOpts.mcp_config_path`) | `None` | Return the contents of an `.mcp.json` file that registers the Branchwork MCP server with this CLI. Only `claude` ships one today. |
+| `stop_hook_config` | [`pty_agent.rs::start_pty_agent`](../../server-rs/src/agents/pty_agent.rs) (written to a per-session settings file and passed via `SpawnOpts.settings_path`) | `None` | Return the JSON to splice into the per-session settings file so the CLI fires a Stop hook back at the server when the model finishes its turn. Drivers that return `None` fall back to the idle-timer poller. See [Stop hooks and unattended auto-mode](#stop-hooks-and-unattended-auto-mode). |
 | `auth_status` | `GET /api/drivers`, dashboard Drivers panel | `NotInstalled` if binary absent, else `Unknown` | Override when you can read the CLI's credentials yourself (env var, dotfile). Returning `Unknown` is fine — the UI treats it as "probably works" and doesn't block Start/Continue. |
 
 ### `SpawnOpts`
@@ -493,6 +495,64 @@ DriverCapabilities {
   prompt template.
 - Two equivalent env-var spellings (`GEMINI_API_KEY` / `GOOGLE_API_KEY`)
   — Gemini CLI accepts both, and so does the auth probe.
+
+---
+
+## Stop hooks and unattended auto-mode
+
+Auto-mode (the per-plan toggle that auto-merges completed tasks and
+spawns the next ready one) needs a way to detect that an agent is
+*done thinking* — not just that the PTY is still open. The trait
+exposes one optional method that drives this:
+
+```rust
+fn stop_hook_config(
+    &self,
+    session_id: &str,
+    hook_url: &str,
+) -> Option<serde_json::Value>;   // default: None
+```
+
+The server calls it once at spawn time and, if the result is
+`Some(value)`, splices `value` into a per-session settings file the
+CLI is asked to load. The expected wire-side outcome is the CLI
+posting a Stop event back to `hook_url` (`http://localhost:<port>/hooks`)
+when the model finishes its turn. The server's hook handler then runs
+`graceful_exit` on the agent — gated on a clean working tree, so a
+dirty tree pauses the plan instead of overwriting unauthored work.
+End-to-end latency is "as soon as the model emits its final message".
+
+Drivers that return `None` (the default) **still auto-finish under
+auto-mode**, just via the periodic idle poller: any `running` agent
+whose `last_activity_at` is older than the configured threshold gets
+the same `graceful_exit` + audit + broadcast treatment, with
+`trigger:"idle_timeout"` instead of `trigger:"stop_hook"`. The
+fallback is **off by default** — set
+[`BRANCHWORK_AUTO_FINISH_IDLE=1`](configuration.md#auto-mode-idle-finish)
+to enable it (per-plan auto-mode must also be on for the agent's
+plan). The threshold is
+[`BRANCHWORK_AUTO_FINISH_IDLE_SECS`](configuration.md#auto-mode-idle-finish)
+(default `300` s). A driver with `Some(...)` is excluded from the
+idle-poller sweep so the same agent can't be auto-finished twice.
+
+| Driver | `stop_hook_config` | Auto-finish path |
+|---|---|---|
+| `claude` | `Some(...)` | Stop hook (deterministic, no env-var required) |
+| `aider`  | `None`      | Idle timer (only when `BRANCHWORK_AUTO_FINISH_IDLE=1`) |
+| `codex`  | `None`      | Idle timer (only when `BRANCHWORK_AUTO_FINISH_IDLE=1`) |
+| `gemini` | `None`      | Idle timer (only when `BRANCHWORK_AUTO_FINISH_IDLE=1`) |
+
+Claude is the only `Some(...)` impl today because Claude Code is the
+only shipped CLI with a settings-driven Stop hook. The other three
+inherit the trait default; per-driver follow-ups for promoting them
+off the idle fallback live in
+`~/.claude/plans/backlog/auto-mode-stop-hook-<driver>.yaml`.
+
+See [ADR 0003 — unattended auto-mode](../adrs/0003-unattended-auto-mode.md)
+for the full design rationale: per-session settings file path, hook
+URL contract, dedupe of stop-hook vs idle-timer, dirty-tree pause
+semantics, and the explicit scope decision to keep this feature
+standalone-only (the SaaS path is a separate backlog plan).
 
 ---
 
