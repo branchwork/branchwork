@@ -120,7 +120,9 @@ function scheduleReconnect(get: () => WsStore) {
 
 let planRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-function handleWsMessage(msg: { type: string; data: unknown }) {
+// Exported for unit testing. The function is otherwise reached only via
+// the `ws.onmessage` handler installed in `connect()`.
+export function handleWsMessage(msg: { type: string; data: unknown }) {
   const planStore = usePlanStore.getState();
   const agentStore = useAgentStore.getState();
 
@@ -281,6 +283,17 @@ function handleWsMessage(msg: { type: string; data: unknown }) {
       const d = msg.data as { plan: string };
       planStore.patchPlanConfig(d.plan, { pausedReason: null });
       planStore.setAutoModeRuntime(d.plan, null);
+      break;
+    }
+    case "task_advanced": {
+      // Intra-phase advance: a task finished and one or more sibling tasks
+      // in the same phase are being spawned. Refresh agents so the new rows
+      // appear immediately. The accompanying `task_status_changed` events
+      // already drive task-pill state, so no plan refetch is needed here.
+      // No pill update — the existing phase_advanced + auto_mode_state
+      // events drive the auto-mode pill. task_advanced is purely a refresh
+      // trigger today (UI pill enrichment lands in 6.1).
+      agentStore.fetchAgents();
       break;
     }
     case "task_checked": {
