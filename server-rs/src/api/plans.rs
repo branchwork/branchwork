@@ -2973,7 +2973,13 @@ mod check_prompt_tests {
         }
     }
 
+    // TODO(unify-check-prompts/1.3): rewrite/retire these two tests.
+    // T1.1 stripped the git-log/branch verification block from
+    // build_check_prompt. The plan defers the test rewrite to 1.3
+    // (see plans/unify-check-prompts.yaml). #[ignore] keeps the bodies
+    // intact for 1.3 to delete or rewrite while CI stays green here.
     #[test]
+    #[ignore = "asserts deleted git-log behaviour; rewritten in unify-check-prompts/1.3"]
     fn includes_git_log_verification_with_branch_and_files() {
         let plan = sample_plan();
         let phase = plan_parser::PlanPhase {
@@ -3019,6 +3025,7 @@ mod check_prompt_tests {
     }
 
     #[test]
+    #[ignore = "asserts deleted git-log behaviour; rewritten in unify-check-prompts/1.3"]
     fn falls_back_to_plain_git_log_when_no_files() {
         let plan = sample_plan();
         let phase = plan_parser::PlanPhase {
