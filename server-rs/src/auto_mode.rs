@@ -4264,6 +4264,151 @@ mod tests {
         assert!(state.auto_finish_dedupe.lock().unwrap().contains("a-1"));
     }
 
+    /// Brief acceptance for T4.3: pin the idle-poller fallback path against
+    /// the values the env-var contract uses (`BRANCHWORK_AUTO_FINISH_IDLE_SECS=1`,
+    /// agent idle for 10 s) and assert it produces the *same* audit +
+    /// broadcast shape as the Stop-hook path in
+    /// [`crate::hooks::handle_stop_hook`], differing only in the `trigger`
+    /// discriminator (`idle_timeout` vs. `stop_hook`).
+    ///
+    /// This is the load-bearing contract-parity test: dashboards consume
+    /// `auto_finish_triggered` and `AGENT_AUTO_FINISH` regardless of which
+    /// path fired, so the field set must match. The test passes
+    /// `threshold_secs = 1` directly to [`run_idle_pass`] (the
+    /// "inject-a-clock" surface the brief allows) instead of mutating the
+    /// process-wide env var, keeping it safe under parallel `cargo test`.
+    #[tokio::test]
+    async fn idle_poll_at_one_second_threshold_matches_stop_hook_audit_and_broadcast_contract() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        // Non-Claude driver (Aider falls back to the default trait impl,
+        // which returns `None` from `stop_hook_config`), idle for 10 s.
+        seed_running_agent_idle(&db, "a-1", &cwd, "p", "1.1", "aider", 10);
+        enable_auto_mode(&db, "p");
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        // One pass with threshold = 1 s. Mirrors the env-var contract
+        // `BRANCHWORK_AUTO_FINISH_IDLE_SECS=1` without mutating the env.
+        run_idle_pass(&state, 1).await;
+        // Give the spawned graceful_exit task a tick (no-op without a live
+        // PTY, but we want to confirm the spawn itself doesn't panic).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // ── graceful_exit called exactly once ────────────────────────────
+        // Counter-proxy: AGENT_AUTO_FINISH is written inside the same
+        // gated block that spawns graceful_exit (see `run_idle_pass`), so
+        // the audit count == graceful_exit call count. Same proxy the
+        // Stop-hook test uses (`hooks::tests::auto_finish_audit_count`).
+        let auto_finish_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM audit_logs WHERE resource_id = 'a-1' AND action = ?1",
+                params![audit::actions::AGENT_AUTO_FINISH],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            auto_finish_count, 1,
+            "graceful_exit must fire exactly once for the idle agent"
+        );
+
+        // ── Audit row contract parity with Stop-hook path ────────────────
+        // Stop-hook writes (action=AGENT_AUTO_FINISH, resource_type=AGENT,
+        // resource_id=agent_id, diff={"trigger":"stop_hook"}). Idle path
+        // must mirror that shape; only the `trigger` value flips.
+        let (resource_type, diff): (String, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT resource_type, diff FROM audit_logs \
+                 WHERE resource_id = 'a-1' AND action = ?1",
+                params![audit::actions::AGENT_AUTO_FINISH],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            resource_type,
+            audit::resources::AGENT,
+            "AGENT_AUTO_FINISH must be logged against the AGENT resource (Stop-hook parity)"
+        );
+        let diff = diff.expect("AGENT_AUTO_FINISH must carry a diff");
+        let diff_value: serde_json::Value =
+            serde_json::from_str(&diff).expect("diff must be valid JSON");
+        assert_eq!(
+            diff_value,
+            serde_json::json!({ "trigger": "idle_timeout" }),
+            "diff must be exactly {{trigger:idle_timeout}} — matches Stop-hook \
+             shape with only the discriminator differing"
+        );
+
+        // ── Broadcast contract parity with Stop-hook path ────────────────
+        // Stop-hook emits `auto_finish_triggered` with
+        // `{agent_id, plan, task, trigger:"stop_hook"}`. Idle path must
+        // emit the same field set with `trigger:"idle_timeout"`.
+        let evs = drain_events(&mut rx);
+        let triggered: Vec<&serde_json::Value> = evs
+            .iter()
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("auto_finish_triggered"))
+            .collect();
+        assert_eq!(
+            triggered.len(),
+            1,
+            "expected exactly one auto_finish_triggered broadcast, got {}",
+            triggered.len()
+        );
+        let data = triggered[0]
+            .get("data")
+            .and_then(|d| d.as_object())
+            .expect("broadcast data must be an object");
+        // Field set parity: same keys as the Stop-hook broadcast.
+        let mut keys: Vec<&str> = data.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["agent_id", "plan", "task", "trigger"],
+            "broadcast data field set must match the Stop-hook contract"
+        );
+        assert_eq!(data.get("agent_id").and_then(|v| v.as_str()), Some("a-1"));
+        assert_eq!(data.get("plan").and_then(|v| v.as_str()), Some("p"));
+        assert_eq!(data.get("task").and_then(|v| v.as_str()), Some("1.1"));
+        assert_eq!(
+            data.get("trigger").and_then(|v| v.as_str()),
+            Some("idle_timeout"),
+            "trigger discriminator differs from Stop-hook (which emits 'stop_hook')"
+        );
+
+        // ── Clean-path side effects (Stop-hook parity) ───────────────────
+        // Plan stays unpaused; no AUTO_MODE_PAUSED row was written.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "clean-tree idle path must not pause the plan"
+        );
+        let plan_actions = audit_actions_for(&db, "p");
+        assert!(
+            !plan_actions.iter().any(|a| a == actions::AUTO_MODE_PAUSED),
+            "AUTO_MODE_PAUSED must not fire on the clean idle path"
+        );
+        assert!(
+            !evs.iter()
+                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("auto_mode_paused")),
+            "auto_mode_paused must not be broadcast on the clean idle path"
+        );
+
+        // Dedupe set retains the agent so a second pass would no-op
+        // (matches Stop-hook's dedupe behaviour for repeat hits).
+        assert!(
+            state.auto_finish_dedupe.lock().unwrap().contains("a-1"),
+            "agent_id should be retained in auto_finish_dedupe (Stop-hook parity)"
+        );
+    }
+
     /// `IdleFinishConfig::from_values` parsing: covers the matrix the
     /// previous per-iteration env reads handled. Pure helper, no env
     /// mutation — safe under parallel cargo test.
