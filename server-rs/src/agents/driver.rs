@@ -310,6 +310,35 @@ impl AgentDriver for ClaudeDriver {
         Some(cfg.to_string())
     }
 
+    fn stop_hook_config(&self, session_id: &str, hook_url: &str) -> Option<serde_json::Value> {
+        // Claude Code's settings.json hook schema:
+        //   { "hooks": { "Stop": [ { "matcher": "...", "hooks": [...] } ] } }
+        // Stop has no matcher concept (unlike PreToolUse), so the field is
+        // empty. The session_id is hard-coded into the curl payload at
+        // write-time so `hooks::receive_hook` can route to the right agent;
+        // `--max-time 5` caps the POST so a stuck server can't hang the
+        // agent's own exit.
+        let body = format!(r#"{{"session_id":"{session_id}","hook_event_name":"Stop"}}"#);
+        let command = format!(
+            "curl -sS --max-time 5 -X POST {hook_url} -H 'Content-Type: application/json' -d '{body}'"
+        );
+        Some(serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": command,
+                            }
+                        ]
+                    }
+                ]
+            }
+        }))
+    }
+
     fn parse_cost(&self, output: &str) -> Option<f64> {
         let clean = strip_ansi(output);
         let re = Regex::new(r"(?i)total\s+cost[:\s]*\$(\d+\.?\d*)").ok()?;
@@ -975,12 +1004,47 @@ Tokens: 200 sent, 75 received. Cost: $0.0150 message, $0.0250 session.
 
     #[test]
     fn non_claude_drivers_have_no_stop_hook_config() {
-        // Default trait impl returns None — Phase 1.1 ships the surface
-        // with no driver overrides; only Claude will plug in (Phase 1.2).
+        // Default trait impl returns None — Phase 1.1 shipped the surface
+        // with no driver overrides; only Claude plugs in (Phase 1.2).
         let url = "http://localhost:3100/hooks";
         assert!(AiderDriver::new().stop_hook_config("sess", url).is_none());
         assert!(CodexDriver::new().stop_hook_config("sess", url).is_none());
         assert!(GeminiDriver::new().stop_hook_config("sess", url).is_none());
+    }
+
+    #[test]
+    fn claude_stop_hook_config_has_expected_shape() {
+        let driver = ClaudeDriver::new();
+        let session_id = "sess-abc";
+        let hook_url = "http://localhost:3100/hooks";
+        let cfg = driver.stop_hook_config(session_id, hook_url).unwrap();
+
+        let stop_arr = cfg["hooks"]["Stop"]
+            .as_array()
+            .expect("hooks.Stop is an array");
+        assert!(!stop_arr.is_empty(), "hooks.Stop is non-empty");
+
+        let entry = &stop_arr[0];
+        assert_eq!(entry["matcher"], "");
+        let inner = entry["hooks"]
+            .as_array()
+            .expect("Stop[0].hooks is an array");
+        assert!(!inner.is_empty(), "Stop[0].hooks is non-empty");
+        assert_eq!(inner[0]["type"], "command");
+
+        let cmd = inner[0]["command"].as_str().expect("command is a string");
+        assert!(
+            cmd.contains(session_id),
+            "command should contain session_id: {cmd}",
+        );
+        assert!(
+            cmd.contains(hook_url),
+            "command should contain hook_url: {cmd}",
+        );
+        assert!(
+            cmd.contains("--max-time 5"),
+            "command should cap with --max-time 5: {cmd}",
+        );
     }
 
     #[test]
