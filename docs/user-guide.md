@@ -332,9 +332,27 @@ string). They never commit. Three entry points:
   (`✓` / `◐` / `✗`) sits inside the button and persists to
   `plan_verdicts` in the DB so it survives reload.
 
-Verdicts also gate the **Merge** banner: a check agent that says
-`incomplete — agent did not commit its work` flips the task back to
-`in_progress` even if the working tree looked dirty.
+All three per-task entry points (**Check**, **Check Phase**,
+**Check All**) build the prompt the same way — one builder, one
+shape, one source of truth — so picking one over another never
+flips a task's verdict for reasons unrelated to its state. The
+verdict is purely a function of the working-tree file content at
+`project_dir`: `completed` iff the changes described in the
+acceptance criteria are visible in the tree at check time. Git
+history (whether the per-task ref still resolves, what's in `git
+log`, whether the merge has happened) is not consulted by the
+prompt. The "did the agent actually commit anything?" signal lives
+server-side at the merge gate (the empty-branch guard described in
+[Merging](#merging) above) and in the auto-mode
+[pause-on-uncommitted-work path](#pause-on-uncommitted-work), not
+inside the LLM prompt. See
+[ADR 0004](adrs/0004-unify-check-prompts.md) for the rationale.
+
+The verdict's `status` writes back to `task_status` —
+`completed` flips the task into the done-section gate,
+`in_progress` keeps it active, `pending` parks it. The **Merge**
+banner is gated by [`produces_commit`](#produces_commit) plus the
+server-side empty-branch guard, not by the verdict reason string.
 
 ### check-agents query
 

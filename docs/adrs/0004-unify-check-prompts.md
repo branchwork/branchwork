@@ -1,6 +1,6 @@
 # ADR 0004 — Unify single-task and multi-task check prompts
 
-- **Status:** Proposed (2026-05-04)
+- **Status:** Accepted (2026-05-04)
 - **Authors:** cpo
 - **Decision driver(s):** "Check phase" / "Check all" reporting `pending` for tasks that the single-task "Check" button reports `completed`; LLM-side branch-existence detection encoding a contract that doesn't match the real branch lifecycle
 
