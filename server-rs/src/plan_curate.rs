@@ -18,9 +18,10 @@
 //! — adding a new `plan_name`-keyed table only requires updating that
 //! constant (and the cascade itself), not this module.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 use crate::api::plans::PLAN_CASCADE_TABLES;
@@ -57,7 +58,7 @@ impl SnapshotKind {
     }
 }
 
-/// Errors returned by [`snapshot_plan`].
+/// Errors returned by [`snapshot_plan`] and [`replay_cascade`].
 #[derive(Debug)]
 pub enum SnapshotError {
     /// `plan_parser::find_plan_file` returned `None` for the slug.
@@ -66,8 +67,12 @@ pub enum SnapshotError {
     Io(std::io::Error),
     /// SQLite reported an error while reading or writing.
     Db(rusqlite::Error),
-    /// `cascade_json` could not be serialized.
+    /// `cascade_json` could not be serialized or parsed.
     Json(serde_json::Error),
+    /// `cascade_json` parsed but didn't match the snapshot schema —
+    /// e.g. the root wasn't a JSON object. Surfaces as 500 from the
+    /// restore handler so a corrupt snapshot row is loud, not silent.
+    MalformedCascade(&'static str),
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -77,6 +82,7 @@ impl std::fmt::Display for SnapshotError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Db(e) => write!(f, "db: {e}"),
             Self::Json(e) => write!(f, "json: {e}"),
+            Self::MalformedCascade(msg) => write!(f, "malformed cascade_json: {msg}"),
         }
     }
 }
@@ -234,6 +240,131 @@ fn value_to_json(v: rusqlite::types::Value) -> serde_json::Value {
         // length tag so the row round-trips and a 0.4 restore can flag
         // it explicitly rather than silently corrupting bytes.
         Value::Blob(b) => serde_json::Value::String(format!("__blob_{}_bytes__", b.len())),
+    }
+}
+
+/// Per-table replay counts returned by [`replay_cascade`]. `inserted` is
+/// the number of rows the snapshot put back; `skipped` is the number
+/// dropped because of an `INSERT OR IGNORE` collision (UNIQUE / PK
+/// match against rows that already existed in the table). After a
+/// vanilla `delete`-kind restore on a clean DB `skipped` is always 0;
+/// it grows only when a concurrent writer or stale orphan rows shadow
+/// the snapshot.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct ReplayCounts {
+    pub inserted: i64,
+    pub skipped: i64,
+}
+
+/// Columns we drop from the snapshot row before `INSERT OR IGNORE`.
+/// `id` is the auto-increment surrogate on `ci_runs` and
+/// `task_learnings`; preserving the original value would risk
+/// colliding with a row added since the snapshot. Letting SQLite
+/// allocate a fresh id is safe because no other cascade table
+/// references those ids.
+const REPLAY_DROP_COLUMNS: &[&str] = &["id"];
+
+/// Replay the cascade rows captured in a snapshot's `cascade_json` back
+/// into the per-table cascade tables. The transaction MUST be supplied
+/// by the caller so the replay composes with `UPDATE plan_snapshots
+/// SET restored_at = ...` in a single atomic unit — half a restore is
+/// worse than no restore.
+///
+/// Strategy:
+/// - For each table key in [`PLAN_CASCADE_TABLES`] that the JSON
+///   contains, walk every row.
+/// - Build `INSERT OR IGNORE INTO <table> (<cols>) VALUES (...)`,
+///   dropping any column in [`REPLAY_DROP_COLUMNS`] so SQLite assigns
+///   a fresh surrogate id.
+/// - Bind values via [`json_value_to_sql_value`] (NULL / INTEGER /
+///   REAL / TEXT mapping mirrors the inverse of [`value_to_json`]).
+///
+/// Tables that the JSON does not mention are silently skipped — keeps
+/// older snapshots forward-compatible when new cascade tables land.
+/// Tables in the JSON but NOT in [`PLAN_CASCADE_TABLES`] are also
+/// skipped, with a warning log; that case shouldn't happen in
+/// practice (the snapshotter writes through the same constant) but
+/// surfaces a forward-rev mismatch loudly when it does.
+pub fn replay_cascade(
+    tx: &Transaction<'_>,
+    cascade_json: &str,
+) -> Result<HashMap<String, ReplayCounts>, SnapshotError> {
+    let parsed: serde_json::Value = serde_json::from_str(cascade_json)?;
+    let obj = parsed
+        .as_object()
+        .ok_or(SnapshotError::MalformedCascade("root is not a JSON object"))?;
+    let mut counts: HashMap<String, ReplayCounts> = HashMap::new();
+    for table in PLAN_CASCADE_TABLES {
+        let Some(rows) = obj.get(*table).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let mut entry = ReplayCounts::default();
+        for row in rows {
+            let Some(row_obj) = row.as_object() else {
+                continue;
+            };
+            let cols: Vec<&str> = row_obj
+                .keys()
+                .map(|k| k.as_str())
+                .filter(|k| !REPLAY_DROP_COLUMNS.contains(k))
+                .collect();
+            if cols.is_empty() {
+                continue;
+            }
+            let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "INSERT OR IGNORE INTO {table} ({}) VALUES ({})",
+                cols.join(", "),
+                placeholders.join(", "),
+            );
+            let values: Vec<rusqlite::types::Value> = cols
+                .iter()
+                .map(|c| json_value_to_sql_value(&row_obj[*c]))
+                .collect();
+            let n = tx.execute(&sql, params_from_iter(values))?;
+            if n > 0 {
+                entry.inserted += n as i64;
+            } else {
+                entry.skipped += 1;
+            }
+        }
+        counts.insert((*table).to_string(), entry);
+    }
+    // Stragglers: keys in the JSON that no longer correspond to any
+    // table in PLAN_CASCADE_TABLES (table renamed/dropped). Log so a
+    // future audit knows the snapshot couldn't be fully replayed.
+    let known: std::collections::HashSet<&&str> = PLAN_CASCADE_TABLES.iter().collect();
+    for key in obj.keys() {
+        if !known.contains(&key.as_str()) {
+            eprintln!(
+                "plan_snapshots replay: snapshot has rows for unknown table '{key}'; skipped"
+            );
+        }
+    }
+    Ok(counts)
+}
+
+fn json_value_to_sql_value(v: &serde_json::Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Integer(if *b { 1 } else { 0 }),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Real(f)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        // Arrays / objects shouldn't appear in cascade row values today
+        // (no column type is JSON), but stringify defensively so a
+        // future schema change doesn't silently corrupt the value.
+        v @ (serde_json::Value::Array(_) | serde_json::Value::Object(_)) => {
+            Value::Text(v.to_string())
+        }
     }
 }
 

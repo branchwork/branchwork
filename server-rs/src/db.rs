@@ -698,6 +698,14 @@ fn migrate(conn: &Connection) {
     )
     .ok();
 
+    // `restored_at` flips a snapshot row from "available for Undo" to
+    // "already restored". Set by `POST /api/snapshots/:id/restore`
+    // (plan-deletion 0.4); a NULL value means the snapshot is still
+    // recoverable. Kept on the row (rather than deleting it) so the
+    // audit trail can prove "this delete was undone at T".
+    conn.execute_batch("ALTER TABLE plan_snapshots ADD COLUMN restored_at TEXT;")
+        .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 

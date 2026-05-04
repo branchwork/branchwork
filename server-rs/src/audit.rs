@@ -50,6 +50,12 @@ pub mod actions {
     /// `{file_path, archive_path, snapshot_id, hard, cascaded_rows}`;
     /// `archive_path` and `snapshot_id` are null on hard delete.
     pub const PLAN_DELETE: &str = "plan.delete";
+    /// `POST /api/snapshots/:id/restore` replayed a `plan_snapshots` row
+    /// (kind=delete|merge|rename|archive|rewrite_context) back into the
+    /// active plans dir + cascade tables. Diff carries
+    /// `{snapshot_id, plan_name, kind, replayed_rows}`. Resource is the
+    /// restored plan name.
+    pub const PLAN_RESTORE: &str = "plan.restore";
     pub const AUTH_SIGNUP: &str = "auth.signup";
     pub const AUTH_LOGIN: &str = "auth.login";
     pub const SSO_LOGIN: &str = "sso.login";

@@ -263,6 +263,10 @@ async fn run_server(cli: Cli) {
                 .delete(api::plans::delete_plan),
         )
         .route(
+            "/api/snapshots/{id}/restore",
+            post(api::plans::restore_snapshot),
+        )
+        .route(
             "/api/plans/{name}/project",
             axum::routing::put(api::plans::set_project),
         )

@@ -2552,6 +2552,293 @@ pub async fn delete_plan(
     Json(response).into_response()
 }
 
+// ── POST /api/snapshots/:id/restore ─────────────────────────────────────────
+
+/// Replay a `plan_snapshots` row back into the live state. The snapshot
+/// is the substrate the Activity-tab Undo affordance reads from; this
+/// handler is the only writer that flips `restored_at` from NULL to a
+/// timestamp, so once a snapshot is consumed it can't be re-applied
+/// (the row stays around for the audit trail until the retention
+/// purger frees it).
+///
+/// Status code contract:
+/// - 200: file restored, cascade replayed, snapshot marked.
+/// - 404: snapshot id is unknown (purger already freed it, or the user
+///   typed the wrong number).
+/// - 410: snapshot exists but `restored_at` is non-NULL — already
+///   undone. Includes the prior `restored_at` so the UI can render
+///   "this was restored at T".
+/// - 409: a plan with `plan_name` exists in the active list (some
+///   other plan reused the slug after the original delete). Body
+///   carries `current` with a one-line summary so the user can rename
+///   the colliding plan first.
+/// - 500: snapshot row is corrupt, or the cascade replay / file write
+///   failed mid-flight.
+pub async fn restore_snapshot(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    // 1. Load the snapshot row. We need the plan name + body + cascade
+    //    + archive path; restored_at is the gate for already-undone.
+    #[derive(Debug)]
+    struct SnapshotRow {
+        plan_name: String,
+        kind: String,
+        archive_path: Option<String>,
+        yaml_body: String,
+        cascade_json: String,
+        restored_at: Option<String>,
+    }
+    let row = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT plan_name, kind, archive_path, yaml_body, cascade_json, restored_at \
+             FROM plan_snapshots WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(SnapshotRow {
+                    plan_name: r.get(0)?,
+                    kind: r.get(1)?,
+                    archive_path: r.get(2)?,
+                    yaml_body: r.get(3)?,
+                    cascade_json: r.get(4)?,
+                    restored_at: r.get(5)?,
+                })
+            },
+        )
+        .ok()
+    };
+    let Some(row) = row else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "snapshot_not_found"})),
+        )
+            .into_response();
+    };
+
+    // 2. Already restored? 410 Gone — the row is intentionally retained
+    //    (audit substrate) but cannot be replayed twice.
+    if let Some(ref ts) = row.restored_at {
+        return (
+            StatusCode::GONE,
+            Json(serde_json::json!({
+                "error": "snapshot_already_restored",
+                "restored_at": ts,
+            })),
+        )
+            .into_response();
+    }
+
+    // 3. Slug-collision check. If a plan with `plan_name` already exists
+    //    in the active list, refuse with 409 + a one-line summary so the
+    //    user can rename the colliding plan first.
+    if let Some(existing_path) = plan_parser::find_plan_file(&state.plans_dir, &row.plan_name) {
+        let summary = match plan_parser::parse_plan_file(&existing_path) {
+            Ok(p) => format!("title: {}", p.title),
+            Err(_) => format!("file: {}", existing_path.display()),
+        };
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "slug_collision",
+                "current": summary,
+            })),
+        )
+            .into_response();
+    }
+
+    // 4. Replay the cascade + mark the snapshot in a single DB tx.
+    //    `UPDATE ... WHERE restored_at IS NULL` is the critical-section
+    //    guard: a concurrent restore that read NULL in step 1 will see
+    //    rows_affected == 0 here and roll back.
+    let replay = {
+        let mut db = state.db.lock().unwrap();
+        let tx = match db.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("failed to open transaction: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        let claim = tx.execute(
+            "UPDATE plan_snapshots SET restored_at = datetime('now') \
+             WHERE id = ?1 AND restored_at IS NULL",
+            params![id],
+        );
+        match claim {
+            Ok(0) => {
+                let _ = tx.rollback();
+                let restored_at: Option<String> = state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT restored_at FROM plan_snapshots WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(None);
+                return (
+                    StatusCode::GONE,
+                    Json(serde_json::json!({
+                        "error": "snapshot_already_restored",
+                        "restored_at": restored_at,
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("failed to claim snapshot: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+
+        let counts = match crate::plan_curate::replay_cascade(&tx, &row.cascade_json) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.rollback();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("cascade replay failed: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(e) = tx.commit() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("restore commit failed: {e}"),
+                })),
+            )
+                .into_response();
+        }
+        counts
+    };
+
+    // 5. Restore the YAML on disk via tempfile + atomic rename. Final
+    //    name is always `<plan_name>.yaml` per the brief — even if the
+    //    snapshot was taken from a `.yml` or `.md` source. The slug
+    //    gate in step 3 means no other file with this stem exists, so
+    //    rename can never overwrite a foreign plan.
+    let mut warning: Option<String> = None;
+    let yaml_path = state.plans_dir.join(format!("{}.yaml", row.plan_name));
+    if let Err(e) = std::fs::create_dir_all(&state.plans_dir) {
+        warning = Some(format!(
+            "DB cascade succeeded; plans_dir create failed: {e}"
+        ));
+    } else if let Err(e) = atomic_write(&yaml_path, &row.yaml_body) {
+        warning = Some(format!("DB cascade succeeded; YAML write failed: {e}"));
+    }
+
+    // 6. Best-effort: drop the archive copy. Restoration came from the
+    //    snapshot blob, so the on-disk archive is now a stale duplicate
+    //    that would clutter the archive directory and confuse 0.5's
+    //    retention purger.
+    if let Some(ref archive) = row.archive_path {
+        let archive_path = std::path::Path::new(archive);
+        if archive_path.exists()
+            && let Err(e) = std::fs::remove_file(archive_path)
+        {
+            warning = Some(match warning {
+                Some(prev) => format!("{prev}; archive cleanup failed: {e}"),
+                None => format!("archive cleanup failed: {e}"),
+            });
+        }
+    }
+
+    // 7. Audit log + WS broadcast.
+    let restored_at_now: String = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT restored_at FROM plan_snapshots WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string())
+    };
+    {
+        let db = state.db.lock().unwrap();
+        let diff = serde_json::json!({
+            "snapshot_id": id,
+            "plan_name": row.plan_name,
+            "kind": row.kind,
+            "replayed_rows": replay,
+        });
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::PLAN_RESTORE,
+            crate::audit::resources::PLAN,
+            Some(&row.plan_name),
+            Some(&diff.to_string()),
+        );
+    }
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "plan_restored",
+        serde_json::json!({
+            "plan": row.plan_name,
+            "snapshot_id": id,
+        }),
+    );
+
+    let mut response = serde_json::json!({
+        "ok": true,
+        "plan": row.plan_name,
+        "snapshotId": id,
+        "restoredAt": restored_at_now,
+        "replayedRows": replay,
+    });
+    if let Some(w) = warning {
+        response["warning"] = serde_json::Value::String(w);
+    }
+    Json(response).into_response()
+}
+
+/// Write `body` to `path` atomically: write to a sibling tempfile in
+/// the same directory, then rename. POSIX rename is atomic; Windows
+/// rename-over-existing fails but our caller (`restore_snapshot`)
+/// already gated on the slug not existing in the active list, so the
+/// target is always absent. Kept a runtime helper rather than a
+/// `tempfile`-crate dep because the only consumer is this handler and
+/// the file body is a few KB at most.
+fn atomic_write(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("plan.yaml");
+    // Random-ish suffix to avoid colliding with a parallel restore; the
+    // process id + a UUID prefix is more than enough entropy.
+    let tmp_name = format!(".{stem}.tmp.{}.{}", std::process::id(), Uuid::new_v4());
+    let tmp_path = parent.join(tmp_name);
+    std::fs::write(&tmp_path, body)?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        // Best-effort cleanup — if rename failed we don't want a stray
+        // dotfile next to the plans dir on the next restore attempt.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 // ── POST /api/plans/:name/convert ──────────────────────────────────────────
 
 pub async fn convert_plan(
