@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -2226,6 +2226,254 @@ pub async fn update_plan(
     }
 
     Json(serde_json::json!({"ok": true, "name": name})).into_response()
+}
+
+// ── DELETE /api/plans/:name ─────────────────────────────────────────────────
+
+#[derive(Deserialize, Default, Debug)]
+pub struct DeletePlanQuery {
+    /// Bypass archive + snapshot and hard-delete the YAML + cascade. The
+    /// dashboard never sets this; it's for fixture cleanup / runaway
+    /// scratch plans.
+    #[serde(default)]
+    pub hard: bool,
+    /// Run every gate (404 / running-agents / auto-mode) without
+    /// touching the file or the DB. Returns the same body shape with
+    /// `dryRun: true` so the UI can preview the cascade. URL spelling is
+    /// snake_case (`?dry_run=true`); response body keeps camelCase for
+    /// fetch-layer consistency.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Tables keyed by `plan_name` that the DELETE handler cascades.
+/// Audited out of the schema in `db.rs::migrate` (see plan-deletion 0.0).
+/// `agents` is intentionally absent — completed/killed rows have audit
+/// value, so the row is preserved with its dangling `plan_name`.
+const PLAN_CASCADE_TABLES: &[&str] = &[
+    "task_status",
+    "ci_runs",
+    "plan_auto_mode",
+    "plan_auto_advance",
+    "task_fix_attempts",
+    "plan_project",
+    "plan_verdicts",
+    "plan_budget",
+    "task_learnings",
+    "plan_org",
+];
+
+pub async fn delete_plan(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(name): Path<String>,
+    Query(q): Query<DeletePlanQuery>,
+) -> impl IntoResponse {
+    // 1. Resolve the plan file.
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "plan_not_found"})),
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Safety gate: any starting/running agent for this plan blocks
+    //    delete. The user must kill or wait first.
+    let running_agents: Vec<String> = {
+        let db = state.db.lock().unwrap();
+        db.prepare(
+            "SELECT id FROM agents \
+             WHERE plan_name = ?1 \
+               AND status IN ('starting', 'running')",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![name], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default()
+    };
+    if !running_agents.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "plan_has_running_agents",
+                "agents": running_agents,
+            })),
+        )
+            .into_response();
+    }
+
+    // 3. Safety gate: open fix attempt = auto-mode is mid-flight.
+    let open_fix_attempts: i64 = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT COUNT(*) FROM task_fix_attempts \
+             WHERE plan_name = ?1 AND outcome IS NULL",
+            params![name],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    };
+    if open_fix_attempts > 0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "auto_mode_in_flight"})),
+        )
+            .into_response();
+    }
+
+    // dry_run: gates passed, but skip the destructive work. Body shape
+    // mirrors the real-delete body so the UI can preview.
+    if q.dry_run {
+        return Json(serde_json::json!({
+            "ok": true,
+            "dryRun": true,
+            "name": name,
+            "filePath": plan_path.to_str(),
+            "hard": q.hard,
+            "cascadeTables": PLAN_CASCADE_TABLES,
+        }))
+        .into_response();
+    }
+
+    // 4. Snapshot prior state. The `plan_curate::snapshot_plan` helper
+    //    that produces a `plan_snapshots` row lands in 0.3; until then
+    //    soft delete only writes the archive YAML and the snapshot id is
+    //    null. The audit + WS event already carry a `snapshot_id` field
+    //    so 0.3 can wire it without a schema change here.
+    let snapshot_id: Option<i64> = None;
+
+    // 5. Build the archive path (soft delete only). Created lazily right
+    //    before the rename so a hard delete never touches the FS.
+    let archive_path: Option<std::path::PathBuf> = if q.hard {
+        None
+    } else {
+        let archive_dir = state.plans_dir.join("archive");
+        if let Err(e) = std::fs::create_dir_all(&archive_dir) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to create archive dir: {e}"),
+                })),
+            )
+                .into_response();
+        }
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let ext = plan_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("yaml");
+        Some(archive_dir.join(format!("{name}.{ts}.{ext}")))
+    };
+
+    // 6. Cascade DB rows in a single transaction so a partial failure
+    //    leaves the plan intact.
+    let mut cascaded_rows: HashMap<String, i64> = HashMap::new();
+    {
+        let mut db = state.db.lock().unwrap();
+        let tx = match db.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("failed to open transaction: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        for table in PLAN_CASCADE_TABLES {
+            let sql = format!("DELETE FROM {table} WHERE plan_name = ?1");
+            let n = match tx.execute(&sql, params![name]) {
+                Ok(n) => n as i64,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!("cascade failed on {table}: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            cascaded_rows.insert((*table).to_string(), n);
+        }
+        if let Err(e) = tx.commit() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("cascade commit failed: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // 7. Move (soft) or remove (hard) the YAML. Failures here are
+    //    warnings — the DB cascade is the authoritative source of truth.
+    let mut warning: Option<String> = None;
+    if q.hard {
+        if let Err(e) = std::fs::remove_file(&plan_path) {
+            warning = Some(format!("DB cascade succeeded; file remove failed: {e}"));
+        }
+    } else if let Some(ref archive) = archive_path
+        && let Err(e) = std::fs::rename(&plan_path, archive)
+    {
+        warning = Some(format!("DB cascade succeeded; archive move failed: {e}"));
+    }
+
+    // 8. Audit log.
+    {
+        let db = state.db.lock().unwrap();
+        let diff = serde_json::json!({
+            "file_path": plan_path.to_str(),
+            "archive_path": archive_path.as_ref().and_then(|p| p.to_str()),
+            "snapshot_id": snapshot_id,
+            "hard": q.hard,
+            "cascaded_rows": cascaded_rows,
+        });
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::PLAN_DELETE,
+            crate::audit::resources::PLAN,
+            Some(&name),
+            Some(&diff.to_string()),
+        );
+    }
+
+    // 9. WS broadcast. The file watcher will also fire a remove event,
+    //    but the explicit broadcast carries `snapshot_id` + `hard` for
+    //    the Undo affordance and is faster than the watcher's debounce.
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "plan_deleted",
+        serde_json::json!({
+            "plan": name,
+            "snapshot_id": snapshot_id,
+            "hard": q.hard,
+        }),
+    );
+
+    let mut response = serde_json::json!({
+        "ok": true,
+        "name": name,
+        "snapshotId": snapshot_id,
+        "archivePath": archive_path.as_ref().and_then(|p| p.to_str()),
+        "hard": q.hard,
+        "cascadedRows": cascaded_rows,
+    });
+    if let Some(w) = warning {
+        response["warning"] = serde_json::Value::String(w);
+    }
+    Json(response).into_response()
 }
 
 // ── POST /api/plans/:name/convert ──────────────────────────────────────────

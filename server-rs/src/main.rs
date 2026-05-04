@@ -257,7 +257,9 @@ async fn run_server(cli: Cli) {
         .route("/api/plans", get(api::plans::list_plans))
         .route(
             "/api/plans/{name}",
-            get(api::plans::get_plan).put(api::plans::update_plan),
+            get(api::plans::get_plan)
+                .put(api::plans::update_plan)
+                .delete(api::plans::delete_plan),
         )
         .route(
             "/api/plans/{name}/project",

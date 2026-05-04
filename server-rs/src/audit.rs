@@ -45,6 +45,11 @@ pub mod actions {
     pub const ORG_MEMBER_ROLE_CHANGE: &str = "org.member_role_change";
     pub const PLAN_CREATE: &str = "plan.create";
     pub const PLAN_UPDATE: &str = "plan.update";
+    /// `DELETE /api/plans/:name` removed (or archived) a plan and cascaded
+    /// every `plan_name`-keyed row out of the DB. Diff carries
+    /// `{file_path, archive_path, snapshot_id, hard, cascaded_rows}`;
+    /// `archive_path` and `snapshot_id` are null on hard delete.
+    pub const PLAN_DELETE: &str = "plan.delete";
     pub const AUTH_SIGNUP: &str = "auth.signup";
     pub const AUTH_LOGIN: &str = "auth.login";
     pub const SSO_LOGIN: &str = "sso.login";
