@@ -551,6 +551,24 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(supervisor::pidfile_path(&socket_path));
 
+    // Clean up the per-session settings file written by `start_pty_agent`.
+    // Best-effort, mirrors the silence of the socket/pidfile lines above:
+    // drivers without a Stop hook never wrote one, so the deleter treats
+    // NotFound as Ok.
+    let session_id_for_cleanup: Option<String> = {
+        let db = registry.db.lock().unwrap();
+        db.query_row(
+            "SELECT session_id FROM agents WHERE id = ?1",
+            params![agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+    if let Some(session_id) = session_id_for_cleanup.as_deref() {
+        let _ = session_settings::delete_for_agent(session_id);
+    }
+
     // Only broadcast when we actually flipped the row. Otherwise kill_agent
     // already emitted an `agent_stopped:killed` event and a duplicate here
     // would confuse the dashboard.
@@ -984,6 +1002,92 @@ mod tests {
         assert_eq!(
             branch_has_no_commits_ahead_of_trunk(dir.path(), "anything"),
             None
+        );
+    }
+
+    /// Scope-restored override of `$HOME` so that `dirs::home_dir()` calls
+    /// inside `on_agent_exit` resolve to a tempdir for the test's duration.
+    /// Other tests in this crate either don't read `$HOME` or fail open if
+    /// the resolved path doesn't contain the file they expect, so the
+    /// process-global write is acceptable here.
+    struct HomeOverride {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeOverride {
+        fn set(new_home: &Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            // SAFETY: edition 2024 marks `set_var` unsafe because of
+            // concurrent-reader hazards. See struct doc-comment for why
+            // the residual race is tolerable here.
+            unsafe {
+                std::env::set_var("HOME", new_home);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            // SAFETY: see `HomeOverride::set`.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    /// Settings-cleanup path: the supervisor wrote a per-session
+    /// `~/.claude/sessions/<session_id>.settings.json` at spawn time, and
+    /// `on_agent_exit` must remove it so a future spawn with the same
+    /// session_id doesn't re-use stale config. Mirrors the side-effect
+    /// assertion pattern from `on_agent_exit_marks_supervisor_unreachable_when_pidfile_present`.
+    #[tokio::test]
+    async fn on_agent_exit_removes_per_session_settings_file() {
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (registry, _rx) = test_registry(db.clone(), sockets_dir.clone());
+
+        let agent_id = "settings-cleanup-agent";
+        let session_id = "sess-cleanup-7f4a2c";
+        let socket = sockets_dir.join(format!("{agent_id}.sock"));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, session_id, cwd, status, mode, pid, supervisor_socket) \
+                 VALUES (?1, ?2, '/tmp', 'running', 'pty', 1, ?3)",
+                params![agent_id, session_id, socket.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        }
+
+        // Override `$HOME` so `dirs::home_dir()` inside `on_agent_exit`'s
+        // cleanup resolves to a tempdir we own.
+        let home = TempDir::new().unwrap();
+        let _home_guard = HomeOverride::set(home.path());
+
+        // Plant the settings file at the path the deleter will compute.
+        let settings_path = home
+            .path()
+            .join(".claude")
+            .join("sessions")
+            .join(format!("{session_id}.settings.json"));
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(&settings_path, b"{\"hooks\":{}}").unwrap();
+        assert!(
+            settings_path.exists(),
+            "test setup: settings file should exist before on_agent_exit"
+        );
+
+        on_agent_exit(&registry, agent_id).await;
+
+        assert!(
+            !settings_path.exists(),
+            "on_agent_exit should remove the per-session settings file at {}",
+            settings_path.display()
         );
     }
 

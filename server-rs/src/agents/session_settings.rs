@@ -42,10 +42,7 @@ pub(crate) fn write_for_agent_with_home(
         return Ok(None);
     };
 
-    let path = home
-        .join(".claude")
-        .join("sessions")
-        .join(format!("{session_id}.settings.json"));
+    let path = path_for(home, session_id);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -54,6 +51,38 @@ pub(crate) fn write_for_agent_with_home(
     let pretty = serde_json::to_string_pretty(&body).map_err(io::Error::other)?;
     fs::write(&path, pretty)?;
     Ok(Some(path))
+}
+
+/// Best-effort cleanup of the per-session settings file written by
+/// [`write_for_agent`]. Called from [`crate::agents::pty_agent::on_agent_exit`].
+///
+/// Returns `Ok(())` when the file did not exist — drivers that returned
+/// `None` from `stop_hook_config` never wrote one, so a "missing file" is
+/// the normal path on cleanup, not an error.
+#[allow(dead_code)] // wired into on_agent_exit by Phase 1.5
+pub fn delete_for_agent(session_id: &str) -> io::Result<()> {
+    let home = dirs::home_dir().unwrap_or_default();
+    delete_for_agent_with_home(&home, session_id)
+}
+
+/// Test-friendly variant of [`delete_for_agent`]: takes `home` explicitly
+/// so unit tests can point at a tempdir without mutating `$HOME`.
+#[allow(dead_code)] // exercised by the Phase 1.5 unit tests
+pub(crate) fn delete_for_agent_with_home(home: &Path, session_id: &str) -> io::Result<()> {
+    let path = path_for(home, session_id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Resolve the per-session settings path under `home`. Shared between
+/// the writer and the deleter so they cannot drift.
+fn path_for(home: &Path, session_id: &str) -> PathBuf {
+    home.join(".claude")
+        .join("sessions")
+        .join(format!("{session_id}.settings.json"))
 }
 
 /// Small builder so future top-level settings keys (permissions, env, …)
@@ -139,5 +168,37 @@ mod tests {
         .expect("write succeeds even without precreated parent dir");
         assert!(path.exists());
         assert!(home.path().join(".claude/sessions").is_dir());
+    }
+
+    /// Round-trip: a file written by `write_for_agent_with_home` must be
+    /// removed by `delete_for_agent_with_home`. Catches drift between the
+    /// writer's path resolution and the deleter's.
+    #[test]
+    fn delete_removes_file_written_by_writer() {
+        let home = TempDir::new().unwrap();
+        let driver = ClaudeDriver::new();
+        let path = write_for_agent_with_home(
+            home.path(),
+            "sess-roundtrip",
+            &driver,
+            "http://localhost:3100/hooks",
+        )
+        .unwrap()
+        .expect("Claude driver writes a settings file");
+        assert!(path.exists());
+
+        delete_for_agent_with_home(home.path(), "sess-roundtrip").unwrap();
+        assert!(!path.exists(), "settings file should be removed");
+    }
+
+    /// NotFound is the normal path on cleanup (drivers without a stop-hook
+    /// never wrote a file). The deleter must return `Ok(())`, not surface an
+    /// error that the caller would log spuriously.
+    #[test]
+    fn delete_succeeds_when_file_missing() {
+        let home = TempDir::new().unwrap();
+        // No write — file does not exist.
+        delete_for_agent_with_home(home.path(), "sess-never-existed")
+            .expect("missing file should be a no-op, not an error");
     }
 }
