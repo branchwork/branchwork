@@ -71,6 +71,27 @@ Lifecycle-related detection (uncommitted work, branch existence, "did the agent 
   Future readers tempted to reintroduce the prompt-side check should reach for these instead — they fire at the canonical observation point and don't depend on branch lifetime.
 - The prompt no longer asks the LLM to "verify the work is committed". Verification reduces to *"the working tree at `project_dir` contains the changes described in the acceptance criteria"*. That's the right contract for `check_*` — the merge-time guard already enforces commit existence at the integration point.
 
+### Grep sweep (Phase 3.2)
+
+Three greps were run after the refactor + docs landed, looking for stragglers that could re-introduce divergence:
+
+- `grep -rnE "task_branch|git log \{task" server-rs/src` — **non-zero hits, but none in check-prompt code.** All ~50 matches are legitimate uses outside the verifier path:
+  - merge primitives (`git_helpers.rs`, `agents/git_ops.rs`, `bin/branchwork_runner.rs`)
+  - SaaS wire protocol (`saas/runner_protocol.rs::WireMessage::MergeBranch`)
+  - merge dispatcher (`api/agents.rs` request/response types)
+  - CI state (`ci.rs::TaskBranchState`)
+  - the unattended-contract block in **agent** prompts (`agents/prompt.rs::unattended_contract_block` — interpolated into the *task agent's* working prompt at spawn time, not the check agent's verification prompt)
+  - test helpers (`auto_mode.rs::git_create_task_branch`)
+  
+  Crucially, `server-rs/src/api/plans.rs` and `server-rs/src/agents/check_agent.rs` have **zero hits** for `task_branch`. The divergence-reintroduction risk this grep was meant to catch (a future contributor pasting `task_branch` interpolation back into a check prompt) is fully mitigated. The brief's literal "zero hits" expectation was scoped to check-prompt code; documenting here so future readers don't re-chase the non-check matches.
+- `grep -rn "verify.*committed" server-rs/src` — **zero hits.** Cleaner than the brief expected: the `pty_agent.rs:613` diagnostic uses *"left no commits"* wording, not *"verify… committed"*, so the regex doesn't match. The diagnostic itself still exists (see Negative / preserved gaps above).
+- `grep -rn "build_check_prompt" server-rs/src` — **exactly one definition + two callers**, as required:
+  - definition: `server-rs/src/api/plans.rs:2848`
+  - caller 1 (`check_task`): `server-rs/src/api/plans.rs:1645`
+  - caller 2 (`check_all`'s per-task loop): `server-rs/src/api/plans.rs:2800`
+  
+  Additional matches inside the `check_prompt_tests` module (the byte-identity tripwire and the prompt-shape regression test) are test code, not new callers.
+
 ### Migration
 
 - No DB schema change.
