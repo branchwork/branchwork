@@ -18,6 +18,11 @@ export interface CiStatus {
   runUrl?: string | null;
   commitSha?: string | null;
   updatedAt: string;
+  /// Set when the surfaced row belongs to a fix attempt (`<task>-fix-<N>`)
+  /// rather than the canonical task itself. Lets the badge tooltip make
+  /// "this task is green via fix attempt N" explicit instead of silently
+  /// claiming the original task passed.
+  viaFixAttempt?: number | null;
 }
 
 export interface PlanTask {

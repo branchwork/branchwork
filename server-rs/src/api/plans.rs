@@ -262,8 +262,16 @@ pub async fn get_plan(
 
     plan.total_cost_usd = Some(plan_total);
 
-    // Latest CI run per task for this plan.
-    let ci_map = crate::ci::latest_per_task(&db, &name);
+    // Latest CI run per task for this plan. The lookup rolls up
+    // `<task>-fix-<N>` rows onto the canonical task so a green fix attempt
+    // surfaces on the original task's badge — see `ci::latest_per_task`.
+    let task_numbers: Vec<&str> = plan
+        .phases
+        .iter()
+        .flat_map(|p| p.tasks.iter())
+        .map(|t| t.number.as_str())
+        .collect();
+    let ci_map = crate::ci::latest_per_task(&db, &name, &task_numbers);
     for phase in &mut plan.phases {
         for task in &mut phase.tasks {
             if let Some(c) = task_costs.get(&task.number) {

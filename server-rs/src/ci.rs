@@ -651,44 +651,92 @@ pub struct CiStatus {
     pub run_url: Option<String>,
     pub commit_sha: Option<String>,
     pub updated_at: String,
+    /// Set when the picked CI row's `task_number` is `<task>-fix-<N>` rather
+    /// than the canonical task number — i.e. a fix-attempt's CI is what's
+    /// surfaced on the original task's badge. UI may render
+    /// "green via fix attempt N". `None` for a row that belongs to the
+    /// canonical task itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_fix_attempt: Option<u32>,
 }
 
-/// Latest CI run per task number for the given plan.
+/// Latest CI run per task for the given plan, rolling up `<task>-fix-<N>`
+/// attempts onto the canonical task. Caller passes the canonical task
+/// numbers from the parsed plan; we don't infer them from the DB because
+/// the canonical set lives in `plan.yaml`, not in `ci_runs`.
+///
+/// For each requested `task_number`, picks the latest non-dismissed row
+/// whose `task_number` is either `?` exactly or `?-fix-*`. The explicit
+/// `-fix-` infix in the GLOB means task `1.3` does not collide with
+/// `1.30-fix-1` (different canonical task).
 pub fn latest_per_task(
     conn: &rusqlite::Connection,
     plan_name: &str,
+    task_numbers: &[&str],
 ) -> std::collections::HashMap<String, CiStatus> {
-    // Pick row with max(id) per (plan_name, task_number), ignoring rows
-    // the user dismissed via the UI (see `api::ci::dismiss_run`). A task
-    // with only dismissed runs shows no badge rather than a stale red one.
+    // Per-task lookup. Cheap on SQLite (in-process, prepared once,
+    // O(log N) on the (plan_name, task_number) index) and the alternative
+    // — passing the canonical set into a single SQL — would mean either
+    // a giant IN-list or a temp table per call.
     let mut stmt = match conn.prepare(
-        "SELECT c.task_number, c.id, c.status, c.conclusion, c.run_url, c.commit_sha, c.updated_at \
+        "SELECT c.id, c.task_number, c.status, c.conclusion, c.run_url, c.commit_sha, c.updated_at \
          FROM ci_runs c \
-         INNER JOIN (SELECT task_number, MAX(id) AS max_id FROM ci_runs \
-                     WHERE plan_name = ?1 AND dismissed_at IS NULL \
-                     GROUP BY task_number) m \
-           ON c.id = m.max_id \
-         WHERE c.plan_name = ?1 AND c.dismissed_at IS NULL",
+         WHERE c.plan_name = ?1 \
+           AND (c.task_number = ?2 OR c.task_number GLOB ?2 || '-fix-*') \
+           AND c.dismissed_at IS NULL \
+         ORDER BY c.id DESC \
+         LIMIT 1",
     ) {
         Ok(s) => s,
         Err(_) => return Default::default(),
     };
-    let rows = stmt
-        .query_map(params![plan_name], |r| {
+
+    let mut out: std::collections::HashMap<String, CiStatus> =
+        std::collections::HashMap::with_capacity(task_numbers.len());
+    for &task_number in task_numbers {
+        let row = stmt.query_row(params![plan_name, task_number], |r| {
             Ok((
-                r.get::<_, String>(0)?,
-                CiStatus {
-                    id: r.get(1)?,
-                    status: r.get(2)?,
-                    conclusion: r.get(3)?,
-                    run_url: r.get(4)?,
-                    commit_sha: r.get(5)?,
-                    updated_at: r.get(6)?,
-                },
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
             ))
-        })
-        .ok();
-    rows.map(|it| it.flatten().collect()).unwrap_or_default()
+        });
+        if let Ok((id, picked, status, conclusion, run_url, commit_sha, updated_at)) = row {
+            let via_fix_attempt = if picked == task_number {
+                None
+            } else {
+                parse_fix_attempt_suffix(&picked, task_number)
+            };
+            out.insert(
+                task_number.to_string(),
+                CiStatus {
+                    id,
+                    status,
+                    conclusion,
+                    run_url,
+                    commit_sha,
+                    updated_at,
+                    via_fix_attempt,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Parse `<canonical>-fix-<N>` and return `N`. Returns `None` for unexpected
+/// shapes (e.g. non-numeric suffix) — defensive against future task-number
+/// schemes; the caller treats `None` as "row belongs to canonical task" and
+/// would have already returned by then, so we only land here on real fix
+/// matches.
+fn parse_fix_attempt_suffix(picked: &str, canonical: &str) -> Option<u32> {
+    let prefix = format!("{canonical}-fix-");
+    let rest = picked.strip_prefix(&prefix)?;
+    rest.parse::<u32>().ok()
 }
 
 #[cfg(test)]
@@ -750,8 +798,7 @@ mod tests {
         assert!(has_github_actions(dir.path()));
     }
 
-    #[test]
-    fn latest_per_task_returns_most_recent_row() {
+    fn ci_runs_schema() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE ci_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -760,6 +807,12 @@ mod tests {
               dismissed_at TEXT);",
         )
         .unwrap();
+        conn
+    }
+
+    #[test]
+    fn latest_per_task_returns_most_recent_row() {
+        let conn = ci_runs_schema();
         conn.execute(
             "INSERT INTO ci_runs (plan_name, task_number, status) VALUES ('p','1.1','pending')",
             [],
@@ -772,13 +825,133 @@ mod tests {
         )
         .unwrap();
 
-        let got = latest_per_task(&conn, "p");
+        let got = latest_per_task(&conn, "p", &["1.1", "1.2"]);
         assert_eq!(got.len(), 2);
         assert_eq!(got.get("1.1").unwrap().status, "success");
         assert_eq!(
             got.get("1.1").unwrap().run_url.as_deref(),
             Some("https://x")
         );
+        assert_eq!(got.get("1.1").unwrap().via_fix_attempt, None);
         assert_eq!(got.get("1.2").unwrap().status, "failure");
+    }
+
+    #[test]
+    fn latest_per_task_rolls_up_fix_attempt_onto_canonical_task() {
+        // Original CI failed on task 1.3, then a fix-1 attempt landed green.
+        // The badge for canonical task 1.3 should surface the fix-1 row.
+        let conn = ci_runs_schema();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status, conclusion, commit_sha) \
+             VALUES ('p','1.3','failure','failure','sha-orig')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status, conclusion, commit_sha) \
+             VALUES ('p','1.3-fix-1','success','success','sha-fix1')",
+            [],
+        )
+        .unwrap();
+
+        let got = latest_per_task(&conn, "p", &["1.3"]);
+        let ci = got.get("1.3").expect("rollup must populate canonical task");
+        assert_eq!(ci.status, "success");
+        assert_eq!(ci.conclusion.as_deref(), Some("success"));
+        assert_eq!(ci.commit_sha.as_deref(), Some("sha-fix1"));
+        assert_eq!(ci.via_fix_attempt, Some(1));
+    }
+
+    #[test]
+    fn latest_per_task_does_not_collide_across_similarly_numbered_tasks() {
+        // Task 1.3 has a failing run. Separately, task 1.30 has a green
+        // fix-1 attempt — its row's task_number is `1.30-fix-1`, which
+        // must NOT match `1.3-fix-*` (the explicit `-fix-` infix in the
+        // GLOB pattern is what enforces this). Projecting task 1.3 must
+        // keep returning the failure, not leak in the unrelated 1.30
+        // success.
+        let conn = ci_runs_schema();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status, conclusion, commit_sha) \
+             VALUES ('p','1.3','failure','failure','sha-orig')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status, conclusion, commit_sha) \
+             VALUES ('p','1.30-fix-1','success','success','sha-30fix1')",
+            [],
+        )
+        .unwrap();
+
+        let got = latest_per_task(&conn, "p", &["1.3"]);
+        let ci = got.get("1.3").expect("task 1.3 must keep its own row");
+        assert_eq!(ci.status, "failure");
+        assert_eq!(ci.commit_sha.as_deref(), Some("sha-orig"));
+        assert_eq!(ci.via_fix_attempt, None);
+    }
+
+    #[test]
+    fn latest_per_task_picks_highest_fix_attempt() {
+        // Three rows: original failure, fix-1 failure, fix-2 success.
+        // The id-DESC + LIMIT 1 picks the latest by insertion order, which
+        // (with AUTOINCREMENT) is the fix-2 row. via_fix_attempt = 2.
+        let conn = ci_runs_schema();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status) VALUES ('p','1.3','failure')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status) VALUES ('p','1.3-fix-1','failure')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status) VALUES ('p','1.3-fix-2','success')",
+            [],
+        )
+        .unwrap();
+
+        let got = latest_per_task(&conn, "p", &["1.3"]);
+        let ci = got.get("1.3").unwrap();
+        assert_eq!(ci.status, "success");
+        assert_eq!(ci.via_fix_attempt, Some(2));
+    }
+
+    #[test]
+    fn latest_per_task_skips_dismissed_fix_rows() {
+        // A green fix-1 run that's been dismissed must not surface on the
+        // canonical task — the lookup falls back to the next non-dismissed
+        // row, which here is the original failure.
+        let conn = ci_runs_schema();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status) VALUES ('p','1.3','failure')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, status, dismissed_at) \
+             VALUES ('p','1.3-fix-1','success', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let got = latest_per_task(&conn, "p", &["1.3"]);
+        let ci = got.get("1.3").unwrap();
+        assert_eq!(ci.status, "failure");
+        assert_eq!(ci.via_fix_attempt, None);
+    }
+
+    #[test]
+    fn parse_fix_attempt_suffix_handles_well_formed_and_malformed() {
+        assert_eq!(parse_fix_attempt_suffix("1.3-fix-1", "1.3"), Some(1));
+        assert_eq!(parse_fix_attempt_suffix("1.3-fix-42", "1.3"), Some(42));
+        // Wrong canonical: rejected.
+        assert_eq!(parse_fix_attempt_suffix("1.30-fix-1", "1.3"), None);
+        // Non-numeric suffix: defensive None.
+        assert_eq!(parse_fix_attempt_suffix("1.3-fix-x", "1.3"), None);
+        // No suffix: defensive None.
+        assert_eq!(parse_fix_attempt_suffix("1.3", "1.3"), None);
     }
 }
