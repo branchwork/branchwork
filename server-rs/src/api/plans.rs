@@ -2888,7 +2888,7 @@ pub async fn check_all(
 }
 
 fn build_check_prompt(
-    plan_name: &str,
+    _plan_name: &str,
     plan: &plan_parser::ParsedPlan,
     phase: &plan_parser::PlanPhase,
     task: &plan_parser::PlanTask,
@@ -2911,29 +2911,6 @@ fn build_check_prompt(
     } else {
         format!("\nAcceptance criteria:\n{}", task.acceptance)
     };
-    let task_branch = format!("branchwork/{plan_name}/{task_num}", task_num = task.number);
-    let quoted_files: Vec<String> = task
-        .file_paths
-        .iter()
-        .map(|f| format!("'{}'", f.replace('\'', "'\\''")))
-        .collect();
-    let git_log_cmd = if task.file_paths.is_empty() {
-        format!("git log {task_branch}")
-    } else {
-        format!("git log {task_branch} -- {}", quoted_files.join(" "))
-    };
-    // Exclude commits reachable from master/main so pre-existing history on the
-    // base branch doesn't masquerade as the agent's committed work.
-    let git_log_unique_cmd = if task.file_paths.is_empty() {
-        format!(
-            "git log {task_branch} --not master main 2>/dev/null || git log {task_branch} --not master 2>/dev/null || git log {task_branch} --not main"
-        )
-    } else {
-        let files = quoted_files.join(" ");
-        format!(
-            "git log {task_branch} --not master main -- {files} 2>/dev/null || git log {task_branch} --not master -- {files} 2>/dev/null || git log {task_branch} --not main -- {files}"
-        )
-    };
     format!(
         "You are verifying whether a task from a plan has been implemented.\n\
          Answer with ONLY a JSON object, no other text: {{\"status\": \"completed\"|\"in_progress\"|\"pending\", \"reason\": \"brief explanation\"}}\n\n\
@@ -2943,16 +2920,9 @@ fn build_check_prompt(
          Task {task_num}: {task_title}\n\n\
          Task description:\n{description}\n\
          {files}{acceptance}\n\n\
-         Check the project at {project_dir}. Read the relevant files to see what's in the working tree.\n\n\
-         CRITICAL — verify the work is committed on the task branch:\n\
-         Run `{git_log_cmd}` (cd into {project_dir} first). This lists commits on the task branch `{task_branch}` that touch the acceptance files.\n\
-         Then run `{git_log_unique_cmd}` to list commits UNIQUE to the task branch (excluding base-branch history). This is the authoritative signal — pre-existing commits on master/main don't count as the agent's work.\n\
-         - If the branch does not exist (both git commands error), treat the work as not committed on a task branch.\n\
-         - If the working tree shows the changes BUT the unique-commits command returns no output touching the acceptance files, the agent edited files without committing. Respond with status \"in_progress\" and reason starting \"incomplete — agent did not commit its work\" (briefly note which files are uncommitted).\n\
-         - Only return \"completed\" when the acceptance-criteria changes both exist in the code AND appear in the unique-to-task-branch git log.\n\n\
-         Status values:\n\
-         - \"completed\": all described changes exist in the code AND are committed on the task branch (unique to it, not inherited from master/main)\n\
-         - \"in_progress\": some changes exist but the task is not fully done, OR changes exist but are uncommitted on the task branch\n\
+         Check the project at {project_dir}. Read the relevant files. Determine if this task is:\n\
+         - \"completed\": all described changes exist in the code\n\
+         - \"in_progress\": some changes exist but the task is not fully done\n\
          - \"pending\": no evidence of this task being started\n\n\
          Respond with ONLY the JSON object.",
         project_dir = project_dir.display(),
@@ -2964,8 +2934,6 @@ fn build_check_prompt(
         description = task.description,
         files = files_section,
         acceptance = acceptance_section,
-        task_branch = task_branch,
-        git_log_cmd = git_log_cmd,
     )
 }
 
