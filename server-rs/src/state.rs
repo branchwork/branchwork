@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -31,6 +31,21 @@ pub struct AppState {
     /// next get) when the user toggles off — a cancelled token cannot be
     /// reused, so the loop always reads a live one.
     pub cancellation_tokens: Arc<StdMutex<HashMap<String, CancellationToken>>>,
+    /// Set of agent IDs that have already triggered an auto-finish
+    /// graceful-exit on the Stop-hook path. Claude Code fires `Stop`
+    /// once when we send `/exit` and again when the session actually
+    /// ends; without dedupe the second hook would also pass the
+    /// `status == 'running'` gate (the row only flips to `completed`
+    /// inside `on_agent_exit`, which runs after the PTY actually
+    /// closes) and we would re-fire `graceful_exit`, log a duplicate
+    /// `agent.auto_finish` audit row, and broadcast a redundant
+    /// `auto_finish_triggered` event. Insertion is the gate: the first
+    /// Stop wins, every later Stop with the same `agent_id` is a
+    /// no-op. Agent IDs are UUIDs allocated per spawn, so legitimate
+    /// re-Stops after a respawn use a fresh key — the set grows once
+    /// per agent for the process lifetime, which is bounded by total
+    /// agent count.
+    pub auto_finish_dedupe: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl AppState {
@@ -50,6 +65,7 @@ impl AppState {
             runners: crate::saas::runner_ws::new_runner_registry(),
             settings_path: config.settings_path.clone(),
             cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 

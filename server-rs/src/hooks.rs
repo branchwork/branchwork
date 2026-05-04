@@ -133,6 +133,15 @@ async fn handle_stop_hook(state: &AppState, session_id: &str) {
     // Tree-clean check is the same one task-completion uses. Dirty pauses
     // the loop with a reason the dashboard can render; Clean / Unknown
     // proceed (Unknown is permissive on purpose — see the helper docs).
+    //
+    // The dirty-tree branch self-debounces against repeat Stops because
+    // `auto_mode_pause` flips `paused_reason`, which makes the next
+    // `auto_mode_enabled` lookup return false above. Only the
+    // clean / unknown branch needs the dedupe set: it leaves the DB
+    // state untouched (auto-mode stays enabled, agent status stays
+    // running until `on_agent_exit` runs after the PTY closes), so the
+    // second Stop would otherwise re-fire `graceful_exit` + log a
+    // duplicate audit row + broadcast a redundant event.
     match crate::agents::check_tree_clean_for_completion(&state.db, &state.plans_dir, &plan_name) {
         crate::agents::TreeState::Dirty { files } => {
             let trimmed: Vec<&String> = files.iter().take(5).collect();
@@ -158,6 +167,20 @@ async fn handle_stop_hook(state: &AppState, session_id: &str) {
             return;
         }
         crate::agents::TreeState::Clean | crate::agents::TreeState::Unknown => {}
+    }
+
+    // Dedupe: the first Stop wins. `HashSet::insert` returns true on the
+    // first insert and false on subsequent ones — flip it into a "first
+    // call" gate. See the field doc on `AppState::auto_finish_dedupe`
+    // for why this is necessary.
+    let first_call = state
+        .auto_finish_dedupe
+        .lock()
+        .unwrap()
+        .insert(agent_id.clone());
+    if !first_call {
+        eprintln!("[hooks] dedupe: ignoring duplicate Stop for agent {agent_id}");
+        return;
     }
 
     // Spawn graceful_exit so we don't block the HTTP response on the PTY
@@ -205,7 +228,7 @@ mod tests {
 
     use super::*;
 
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
@@ -246,6 +269,7 @@ mod tests {
             runners: new_runner_registry(),
             settings_path: PathBuf::from("/tmp/branchwork-test-hooks-settings.json"),
             cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(HashSet::new())),
         };
         (state, rx)
     }
@@ -357,6 +381,32 @@ mod tests {
         out
     }
 
+    /// How many `agent.auto_finish` audit rows are recorded for `agent_id`.
+    /// Used by the dedupe tests as the side-channel proxy for "how many
+    /// times did `graceful_exit` fire?". The handler unconditionally
+    /// writes an `AGENT_AUTO_FINISH` audit row in the same gated block
+    /// that spawns `graceful_exit`, so the audit count and the
+    /// graceful-exit count are 1-to-1.
+    fn auto_finish_audit_count(db: &Db, agent_id: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM audit_logs WHERE resource_id = ?1 AND action = ?2",
+            params![agent_id, crate::audit::actions::AGENT_AUTO_FINISH],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    /// How many `auto_finish_triggered` broadcasts have been emitted on
+    /// `rx` so far. Counterpart to [`auto_finish_audit_count`] for the
+    /// in-process WS broadcast side of the same gate.
+    fn auto_finish_broadcast_count(rx: &mut broadcast::Receiver<String>) -> usize {
+        drain_event_types(rx)
+            .iter()
+            .filter(|t| t.as_str() == "auto_finish_triggered")
+            .count()
+    }
+
     #[tokio::test]
     async fn unknown_session_is_a_silent_no_op() {
         let (db, dir) = fresh_db();
@@ -382,8 +432,15 @@ mod tests {
         assert_eq!(total, 0);
     }
 
+    /// Brief acceptance #3: `stop_on_non_running_agent_is_noop`.
+    /// Agent row is `completed` when the Stop arrives — the Stop event
+    /// itself still records in `hook_events` (handled unconditionally
+    /// by the `receive_hook` wrapper, not exercised here), but the
+    /// auto-mode side of `handle_stop_hook` early-returns at the
+    /// `status != "running"` guard. No audit row, no broadcast, no
+    /// graceful_exit attempt.
     #[tokio::test]
-    async fn non_running_agent_is_a_silent_no_op() {
+    async fn stop_on_non_running_agent_is_noop() {
         let (db, dir) = fresh_db();
         let cwd = dir.path().join("project");
         git_init_with_clean_tree(&cwd);
@@ -418,8 +475,17 @@ mod tests {
         assert!(audit_actions_for(&db, "p").is_empty());
     }
 
+    /// Brief acceptance #4: `stop_on_agent_with_auto_mode_off_is_telemetry_only`.
+    /// Plan has no `plan_auto_mode` row (auto-mode never opted in), so
+    /// `handle_stop_hook` exits at the `auto_mode_enabled` gate. The
+    /// outer `receive_hook` wrapper still inserts the `hook_events`
+    /// telemetry row unconditionally — that path is exercised by the
+    /// integration shape (we drive the helper directly here, but the
+    /// wrapper's `db.execute("INSERT INTO hook_events ...")` runs
+    /// before `handle_stop_hook` and is independent of the auto-mode
+    /// branch).
     #[tokio::test]
-    async fn auto_mode_off_is_a_silent_no_op() {
+    async fn stop_on_agent_with_auto_mode_off_is_telemetry_only() {
         let (db, dir) = fresh_db();
         let cwd = dir.path().join("project");
         git_init_with_clean_tree(&cwd);
@@ -443,8 +509,14 @@ mod tests {
         assert!(audit_actions_for(&db, "a-1").is_empty());
     }
 
+    /// Brief acceptance #2: `stop_with_dirty_tree_pauses_plan`. Tracked
+    /// file with uncommitted changes ⇒ `paused_reason =
+    /// "agent_left_uncommitted_work"`, no graceful-exit fired (no
+    /// `AGENT_AUTO_FINISH` audit row, no `auto_finish_triggered`
+    /// broadcast). The `auto_mode_paused` broadcast and audit row land
+    /// instead, with a trimmed `files` list for the dashboard.
     #[tokio::test]
-    async fn dirty_tree_pauses_with_uncommitted_work_reason() {
+    async fn stop_with_dirty_tree_pauses_plan() {
         let (db, dir) = fresh_db();
         let cwd = dir.path().join("project");
         git_init_with_clean_tree(&cwd);
@@ -510,8 +582,17 @@ mod tests {
         );
     }
 
+    /// Brief acceptance #1:
+    /// `stop_on_running_auto_mode_agent_with_clean_tree_triggers_graceful_exit`.
+    /// Fires two Stops for the same session and asserts exactly-once
+    /// `graceful_exit` semantics (`AGENT_AUTO_FINISH` count == 1,
+    /// `auto_finish_triggered` broadcast count == 1). The second
+    /// Stop is gated by `auto_finish_dedupe` because the agent's
+    /// status is still `running` (the row only flips to `completed`
+    /// inside `on_agent_exit`, which runs after the PTY actually
+    /// closes — we don't drive a real PTY here).
     #[tokio::test]
-    async fn clean_tree_audits_auto_finish_and_broadcasts() {
+    async fn stop_on_running_auto_mode_agent_with_clean_tree_triggers_graceful_exit() {
         let (db, dir) = fresh_db();
         let cwd = dir.path().join("project");
         git_init_with_clean_tree(&cwd);
@@ -524,6 +605,11 @@ mod tests {
         map_plan_to_project(&db, "p", &cwd.to_string_lossy());
 
         let (state, mut rx) = test_app_state(db.clone(), plans_dir);
+
+        // Two Stops for the same session in quick succession. The agent
+        // row stays `running` for both — graceful_exit must only fire
+        // for the first.
+        handle_stop_hook(&state, "s-1").await;
         handle_stop_hook(&state, "s-1").await;
         // Give the spawned graceful_exit task a tick to run (it will no-op
         // because no live PTY is attached, but we want to make sure the
@@ -533,13 +619,29 @@ mod tests {
         // Plan stays unpaused on the clean path.
         assert!(paused_reason(&db, "p").is_none());
 
-        // auto_finish_triggered broadcast carries the expected fields.
+        // Counter assertion #1: the audit log proxy. AGENT_AUTO_FINISH is
+        // written inside the same gated block that spawns graceful_exit,
+        // so audit count == graceful_exit call count.
+        assert_eq!(
+            auto_finish_audit_count(&db, "a-1"),
+            1,
+            "graceful_exit must fire exactly once across two Stop hooks"
+        );
+
+        // auto_finish_triggered broadcast carries the expected fields,
+        // and only one was emitted.
         let evs = drain_events(&mut rx);
-        let triggered = evs
+        let triggered: Vec<&serde_json::Value> = evs
             .iter()
-            .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("auto_finish_triggered"))
-            .expect("expected auto_finish_triggered broadcast");
-        let data = triggered.get("data").unwrap();
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("auto_finish_triggered"))
+            .collect();
+        assert_eq!(
+            triggered.len(),
+            1,
+            "expected exactly one auto_finish_triggered broadcast, got {}",
+            triggered.len()
+        );
+        let data = triggered[0].get("data").unwrap();
         assert_eq!(data.get("agent_id").and_then(|v| v.as_str()), Some("a-1"));
         assert_eq!(data.get("plan").and_then(|v| v.as_str()), Some("p"));
         assert_eq!(data.get("task").and_then(|v| v.as_str()), Some("1.1"));
@@ -548,16 +650,7 @@ mod tests {
             Some("stop_hook")
         );
 
-        // Audit row landed for AGENT_AUTO_FINISH on the agent resource,
-        // with the trigger discriminator in the diff.
-        let actions = audit_actions_for(&db, "a-1");
-        assert!(
-            actions
-                .iter()
-                .any(|a| a == crate::audit::actions::AGENT_AUTO_FINISH),
-            "expected {} in {actions:?}",
-            crate::audit::actions::AGENT_AUTO_FINISH
-        );
+        // Audit row carries the trigger discriminator in the diff.
         let diff = audit_diff_for(&db, "a-1", crate::audit::actions::AGENT_AUTO_FINISH)
             .expect("AGENT_AUTO_FINISH should have a diff");
         assert!(
@@ -572,6 +665,52 @@ mod tests {
                 .iter()
                 .any(|a| a == crate::auto_mode::actions::AUTO_MODE_PAUSED),
             "AUTO_MODE_PAUSED must not fire on the clean path"
+        );
+
+        // Dedupe set has the agent recorded so a third Stop would also
+        // be debounced.
+        assert!(
+            state.auto_finish_dedupe.lock().unwrap().contains("a-1"),
+            "agent_id should be retained in auto_finish_dedupe"
+        );
+    }
+
+    /// Brief acceptance #5: `two_stops_in_quick_succession_call_graceful_exit_once`.
+    /// Same end behaviour as the test above, but factored into its own
+    /// function with a name that grep-matches the acceptance criteria
+    /// readout. Asserts only the counters (audit row count and
+    /// broadcast count), keeping the body minimal.
+    #[tokio::test]
+    async fn two_stops_in_quick_succession_call_graceful_exit_once() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_with_clean_tree(&cwd);
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_running_agent(&db, "a-1", "s-1", &cwd, "p", "1.1");
+        enable_auto_mode(&db, "p");
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), plans_dir);
+
+        // Fire twice; the second call must be a dedupe no-op because the
+        // first call hasn't yet flipped `agents.status` away from
+        // `running` (that flip happens inside `on_agent_exit`, after the
+        // PTY closes).
+        handle_stop_hook(&state, "s-1").await;
+        handle_stop_hook(&state, "s-1").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            auto_finish_audit_count(&db, "a-1"),
+            1,
+            "AGENT_AUTO_FINISH must be written exactly once"
+        );
+        assert_eq!(
+            auto_finish_broadcast_count(&mut rx),
+            1,
+            "auto_finish_triggered must be broadcast exactly once"
         );
     }
 }

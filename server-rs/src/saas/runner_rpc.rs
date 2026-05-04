@@ -505,6 +505,7 @@ mod tests {
             runners: runners.clone(),
             settings_path: PathBuf::from("/tmp/branchwork-test-settings.json"),
             cancellation_tokens: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
         let app = axum::Router::new()
             .route(
