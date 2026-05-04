@@ -1052,15 +1052,49 @@ fn remaining_budget(db: &Db, plan_name: &str) -> Result<Option<f64>, (f64, f64)>
 
 /// Atomically claim a task for spawning: flip its row to `in_progress` only if
 /// it's currently `pending` or `failed`. Returns true if we won the claim.
+/// Atomically claim a task slot for the given `(plan, task)` and gate the
+/// claim on the plan being idle (no other task agent is `starting` /
+/// `running`).
+///
+/// **Why the idle gate:** without it, two concurrent `try_auto_advance`
+/// calls — one per CI-passed completion when several phase-N tasks
+/// finish close together — each pick a *different* ready task in phase
+/// N+1 and each win their own claim race, spawning two agents
+/// simultaneously. The intra-call `break` in `spawn_ready_tasks` only
+/// gates within one advance call; this `NOT EXISTS` predicate gates
+/// across them.
+///
+/// Check agents (`mode = 'stream-json'`) are excluded — they're
+/// read-only verification runs that don't touch the worktree, so they
+/// shouldn't block auto-advance. Fix agents (`mode = 'pty'`,
+/// `task_id` matches `<task>-fix-<n>`) **are** counted, which gives us
+/// the desired "no new task spawns while a fix is in flight" behaviour
+/// for free — they appear in `agents` with the same `plan_name` and a
+/// `running`-class status.
+///
+/// The check and the claim live in one SQL statement so SQLite's
+/// per-write serialisation gives us race-freedom without a tokio mutex.
 fn claim_task(db: &Db, plan_name: &str, task_number: &str) -> bool {
     let conn = db.lock().unwrap();
     let updated = conn
         .execute(
             "INSERT INTO task_status (plan_name, task_number, status, updated_at)
-             VALUES (?1, ?2, 'in_progress', datetime('now'))
+             SELECT ?1, ?2, 'in_progress', datetime('now')
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM agents
+                 WHERE plan_name = ?1
+                   AND status IN ('starting', 'running')
+                   AND mode != 'stream-json'
+             )
              ON CONFLICT(plan_name, task_number)
              DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at
-             WHERE task_status.status IN ('pending', 'failed')",
+             WHERE task_status.status IN ('pending', 'failed')
+               AND NOT EXISTS (
+                   SELECT 1 FROM agents
+                   WHERE plan_name = ?1
+                     AND status IN ('starting', 'running')
+                     AND mode != 'stream-json'
+               )",
             rusqlite::params![plan_name, task_number],
         )
         .unwrap_or(0);
@@ -1451,6 +1485,87 @@ mod tests {
         // Failed tasks can be re-spawned.
         assert!(claim_task(&db, "p1", "1.1"));
         assert!(!claim_task(&db, "p1", "1.1"));
+    }
+
+    /// Regression: two CI-passed completions arriving close together in
+    /// the auto-mode loop both reach `try_auto_advance` after their
+    /// respective tasks completed. Without this gate, each call picks a
+    /// *different* ready task in the next phase and both spawn — two
+    /// concurrent agents on a single working tree. The DB-side
+    /// `NOT EXISTS` predicate makes the second call lose the claim
+    /// attempt without needing a tokio mutex around the whole advance.
+    fn insert_running_agent(db: &Db, id: &str, plan_name: &str, task_id: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, mode, plan_name, task_id)
+             VALUES (?1, '/tmp/proj', 'running', 'pty', ?2, ?3)",
+            params![id, plan_name, task_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn claim_task_defers_when_sibling_agent_is_running_for_same_plan() {
+        let (db, _dir) = fresh_db();
+        insert_running_agent(&db, "agent-A", "p1", "1.1");
+
+        // Sibling task in the same plan must NOT claim while agent-A
+        // runs — the per-plan idle gate is what keeps auto-advance
+        // strictly sequential across concurrent advance triggers.
+        assert!(!claim_task(&db, "p1", "1.2"));
+
+        // Different plan is unaffected — the gate is per-plan.
+        assert!(claim_task(&db, "p2", "1.1"));
+
+        // Once agent-A is no longer 'running'/'starting', sibling
+        // claims succeed.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET status = 'completed' WHERE id = 'agent-A'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(claim_task(&db, "p1", "1.2"));
+    }
+
+    #[test]
+    fn claim_task_ignores_check_agents_in_idle_gate() {
+        let (db, _dir) = fresh_db();
+        // Check agents (mode='stream-json') are read-only verification
+        // runs that don't touch the worktree, so they shouldn't gate
+        // auto-advance — assert the predicate's `mode != 'stream-json'`
+        // exclusion holds.
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, mode, plan_name, task_id)
+             VALUES ('check-1', '/tmp/proj', 'running', 'stream-json', 'p1', '1.1')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(claim_task(&db, "p1", "1.2"));
+    }
+
+    #[test]
+    fn claim_task_defers_for_starting_agents_too_not_just_running() {
+        let (db, _dir) = fresh_db();
+        // The window between agent-row insert and the spawn-side
+        // status flip to 'running' is short but real; the gate must
+        // see 'starting' as in-flight too, otherwise two advances can
+        // both squeeze through during that window.
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, mode, plan_name, task_id)
+             VALUES ('agent-A', '/tmp/proj', 'starting', 'pty', 'p1', '1.1')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(!claim_task(&db, "p1", "1.2"));
     }
 
     fn write_yaml_plan(dir: &std::path::Path, name: &str, project: &str, body: &str) {
