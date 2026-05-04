@@ -1297,13 +1297,25 @@ pub async fn try_auto_advance(
     }
 }
 
-/// Spawn auto-advance agents for `tasks`, a pre-filtered list of ready
-/// candidates from `phase`. For each task we race-guard via
-/// `claim_task`, broadcast `task_status_changed`, build the prompt with
-/// cross-plan context, and call `start_pty_agent`. Returns the task
-/// numbers we actually claimed and spawned — callers use this to gate
-/// any aggregate follow-up broadcast (`task_advanced` for intra-phase
-/// advance stays quiet when every candidate lost its claim race).
+/// Spawn at most one auto-advance agent from `tasks`, a pre-filtered
+/// list of ready candidates from `phase`. We iterate in order and break
+/// after the first successful `claim_task` + `start_pty_agent` — this
+/// is the unconditional sequential gate (Task 3.5.1): one agent per
+/// `try_auto_advance` call, always. The next ready task in the chain
+/// spawns when the current task's completion fires another
+/// `try_auto_advance` (via `on_task_agent_completed` for auto-mode
+/// plans / `task_status_changed` for auto-advance plans).
+///
+/// Returns the task numbers we actually claimed and spawned (length 0
+/// or 1) — callers use this to gate any aggregate follow-up broadcast
+/// (`task_advanced` for intra-phase advance stays quiet when every
+/// candidate lost its claim race).
+///
+/// The `parallel: bool` per-task column (Phase 3.5.2) is what flips
+/// this from sequential to fan-out, but only when both the column AND
+/// the worktree cross-check (3.5.3) say yes. Today neither holds, so
+/// this loop break is the load-bearing safety against parallel agents
+/// stomping on a single working tree.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_ready_tasks(
     registry: &AgentRegistry,
@@ -1316,7 +1328,7 @@ async fn spawn_ready_tasks(
     max_budget_usd: Option<f64>,
     work_dir: &Path,
 ) -> Vec<String> {
-    let mut spawned: Vec<String> = Vec::with_capacity(tasks.len());
+    let mut spawned: Vec<String> = Vec::with_capacity(1);
     for task in tasks {
         if !claim_task(&registry.db, &plan.name, &task.number) {
             continue;
@@ -1366,6 +1378,9 @@ async fn spawn_ready_tasks(
         .await;
 
         spawned.push(task.number.clone());
+        // Sequential gate: one agent per `try_auto_advance` call.
+        // See doc comment above for the full rationale.
+        break;
     }
     spawned
 }
@@ -2416,6 +2431,99 @@ mod tests {
         assert!(
             has_task_advanced(&events, plan),
             "task_advanced expected with auto_advance-only opt-in: {events:?}",
+        );
+    }
+
+    /// Task 3.5.1 — sequential gate: when several siblings become
+    /// ready at the same tick (fan-out), `spawn_ready_tasks` must
+    /// break after the first successful claim. The remaining ready
+    /// tasks spawn on subsequent `try_auto_advance` ticks driven by
+    /// the first task's completion. This is the load-bearing safety
+    /// today (no `parallel:` column or worktree cross-check yet) so
+    /// pin it explicitly: one agent per call, regardless of how many
+    /// candidates the eligibility filter produced.
+    #[tokio::test]
+    async fn fan_out_only_spawns_one_task_per_tick() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "fan-out";
+        // Three siblings (b, c, d) all depend on a — completing a
+        // makes all three ready at the same tick.
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"a\"\n\
+             \x20       title: A\n\
+             \x20     - number: \"b\"\n\
+             \x20       title: B\n\
+             \x20       dependencies: [\"a\"]\n\
+             \x20     - number: \"c\"\n\
+             \x20       title: C\n\
+             \x20       dependencies: [\"a\"]\n\
+             \x20     - number: \"d\"\n\
+             \x20       title: D\n\
+             \x20       dependencies: [\"a\"]\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        set_task_status(&db, plan, "a", "completed");
+
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "a".to_string(),
+            Effort::Medium,
+            registry.port,
+        )
+        .await;
+
+        // Exactly one of {b, c, d} spawned — the order is the YAML
+        // declaration order so `b` is the deterministic pick, but we
+        // assert on the count and the membership to keep the test
+        // robust against future ordering tweaks in the eligibility
+        // filter.
+        let actual = agent_task_ids(&db, plan);
+        assert_eq!(
+            actual.len(),
+            1,
+            "exactly one task must spawn per tick (fan-out gate), got {actual:?}",
+        );
+        assert!(
+            actual.iter().all(|t| ["b", "c", "d"].contains(&t.as_str())),
+            "spawned task must be one of the ready siblings, got {actual:?}",
+        );
+
+        let events = drain_events(&mut rx);
+        assert!(
+            has_task_advanced(&events, plan),
+            "task_advanced must fire for the one spawned task: {events:?}",
+        );
+        // `to_tasks` payload is a 1-element array — never multiple
+        // siblings at once. Match exactly one of the singleton-array
+        // shapes; reject any 2+ element variant.
+        let task_advanced = events
+            .iter()
+            .find(|e| e.contains("\"type\":\"task_advanced\""))
+            .expect("task_advanced event present");
+        let one_of_singletons = ["[\"b\"]", "[\"c\"]", "[\"d\"]"]
+            .iter()
+            .any(|s| task_advanced.contains(s));
+        assert!(
+            one_of_singletons,
+            "to_tasks must be a 1-element array, event was: {task_advanced}",
         );
     }
 }
