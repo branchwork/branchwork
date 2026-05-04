@@ -1866,9 +1866,11 @@ mod tests {
 
         // ci::trigger_after_merge is spawned by the merge inner; for a
         // canonical-default merge it pushes + writes a pending ci_runs
-        // row. Poll for the row with a short deadline — the spawn races
-        // the assertion otherwise.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // row. Poll for the row with a generous deadline — the spawn
+        // races the assertion otherwise, and the chain of shell-outs
+        // (has_remote, default_branch, push) is slow on Windows CI
+        // (every `git` invocation pays MSYS startup cost).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut ci_run_count: i64 = 0;
         while std::time::Instant::now() < deadline {
             ci_run_count = {
