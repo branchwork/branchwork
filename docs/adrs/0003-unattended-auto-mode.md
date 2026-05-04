@@ -221,7 +221,7 @@ The hook URL contract pinned in Decision §1 (`http://localhost:<port>/hooks` wi
 - Auto-commit of the agent's uncommitted work before auto-finish — pause-and-notify is the chosen UX.
 - Time-bounded execution caps (separate concern from "did the agent finish its turn").
 - Distinguishing Claude paused-on-prompt from Claude finished-cleanly — Stop fires on both; the tree-committable gate is the discriminator.
-- Aider/Codex/Gemini Stop-hook investigation beyond the trait-stub work in Phase 5.
+- Aider/Codex/Gemini Stop-hook investigation beyond the trait-stub work in Phase 5. Filed as backlog plans at `~/.claude/plans/backlog/auto-mode-stop-hook-{aider,codex,gemini}.yaml` — each will reach a real `stop_hook_config` impl or an explicit "no portable hook — idle timer is canonical" decision before being closed.
 - SaaS reachability for the hook URL (runner ↔ server back-channel). Tracked under the `saas-compat-*` backlog plans; see Consequences §*Scope: standalone only*.
 
 ## References
@@ -239,3 +239,4 @@ The hook URL contract pinned in Decision §1 (`http://localhost:<port>/hooks` wi
 - Hook URL contract sources: `AgentRegistry.port` field (`server-rs/src/agents/mod.rs:245`), threaded into drivers at `pty_agent.rs:116` (`driver.mcp_config_json(registry.port)`), and reused by the Claude driver to build `http://127.0.0.1:<port>/mcp` at `server-rs/src/agents/driver.rs:280` — same `<port>` the Stop hook URL targets.
 - SaaS-compat audit (the back-channel work that would carry the hook URL through the runner): `docs/architecture/saas-compat-audit.md`; backlog plans at `~/.claude/plans/backlog/saas-compat-*.yaml`.
 - Implementation plan tracking this ADR: `~/.claude/plans/unattended-auto-mode.yaml` (this plan).
+- Per-driver Stop-hook follow-up backlog plans (filed by task 5.1): `~/.claude/plans/backlog/auto-mode-stop-hook-aider.yaml`, `~/.claude/plans/backlog/auto-mode-stop-hook-codex.yaml`, `~/.claude/plans/backlog/auto-mode-stop-hook-gemini.yaml`.
