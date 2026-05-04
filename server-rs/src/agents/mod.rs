@@ -1304,6 +1304,7 @@ pub async fn try_auto_advance(
 /// numbers we actually claimed and spawned — callers use this to gate
 /// any aggregate follow-up broadcast (`task_advanced` for intra-phase
 /// advance stays quiet when every candidate lost its claim race).
+#[allow(clippy::too_many_arguments)]
 async fn spawn_ready_tasks(
     registry: &AgentRegistry,
     plans_dir: &Path,
