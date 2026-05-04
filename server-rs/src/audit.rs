@@ -14,6 +14,11 @@ pub mod actions {
     pub const AGENT_START: &str = "agent.start";
     pub const AGENT_KILL: &str = "agent.kill";
     pub const AGENT_FINISH: &str = "agent.finish";
+    /// Auto-mode automatically sent the agent's graceful-exit
+    /// sequence after detecting the agent had finished its turn
+    /// (Stop hook) or had been idle past the timeout. Diff carries
+    /// `{trigger: "stop_hook" | "idle_timeout"}`.
+    pub const AGENT_AUTO_FINISH: &str = "agent.auto_finish";
     pub const TASK_STATUS_CHANGE: &str = "task.status_change";
     pub const BRANCH_MERGE: &str = "branch.merge";
     pub const BRANCH_DISCARD: &str = "branch.discard";
@@ -488,6 +493,71 @@ mod tests {
         let filtered = list(&conn, "org-1", 50, 0, Some(actions::AGENT_START), None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].resource_id.as_deref(), Some("agent-abc"));
+    }
+
+    #[test]
+    fn log_and_list_agent_auto_finish() {
+        let conn = test_conn();
+        // Stop-hook trigger (Claude returned a Stop event to the local hook URL).
+        log(
+            &conn,
+            "org-1",
+            None,
+            None,
+            actions::AGENT_AUTO_FINISH,
+            resources::AGENT,
+            Some("agent-stop"),
+            Some(r#"{"trigger":"stop_hook"}"#),
+        );
+        // Idle-timeout trigger (BRANCHWORK_IDLE_AUTO_FINISH fallback fired).
+        log(
+            &conn,
+            "org-1",
+            None,
+            None,
+            actions::AGENT_AUTO_FINISH,
+            resources::AGENT,
+            Some("agent-idle"),
+            Some(r#"{"trigger":"idle_timeout"}"#),
+        );
+        // Non-auto-finish row that must NOT appear under the action filter.
+        log(
+            &conn,
+            "org-1",
+            Some("user-1"),
+            Some("alice@example.com"),
+            actions::AGENT_FINISH,
+            resources::AGENT,
+            Some("agent-manual"),
+            None,
+        );
+
+        let filtered = list(
+            &conn,
+            "org-1",
+            50,
+            0,
+            Some(actions::AGENT_AUTO_FINISH),
+            None,
+        );
+        assert_eq!(filtered.len(), 2);
+        // Newest first — idle_timeout was inserted last.
+        assert_eq!(filtered[0].resource_id.as_deref(), Some("agent-idle"));
+        assert_eq!(
+            filtered[0].diff.as_deref(),
+            Some(r#"{"trigger":"idle_timeout"}"#)
+        );
+        assert_eq!(filtered[1].resource_id.as_deref(), Some("agent-stop"));
+        assert_eq!(
+            filtered[1].diff.as_deref(),
+            Some(r#"{"trigger":"stop_hook"}"#)
+        );
+        // Manual-finish row stays out of the filtered slice.
+        assert!(
+            filtered
+                .iter()
+                .all(|e| e.resource_id.as_deref() != Some("agent-manual"))
+        );
     }
 
     #[test]
