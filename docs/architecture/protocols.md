@@ -9,9 +9,11 @@ Branchwork speaks three protocols beyond plain HTTP:
    hosted server and remote runners, with a SQLite-backed outbox providing
    at-least-once delivery for state-changing events.
 3. **Dashboard WebSocket** — server → browser fan-out (the `agent_*`,
-   `task_status_changed`, `plan_updated`, `plan_checked` events). This page
-   covers the first two; the dashboard event vocabulary is documented inline
-   in [server.md](server.md) and [user-guide.md](../user-guide.md).
+   `task_status_changed`, `plan_updated`, `plan_checked`, auto-mode events).
+   The envelope shape and the auto-mode event family are catalogued in §3
+   below; the broader event vocabulary is not yet centralised here — call
+   sites of [`ws::broadcast_event`](../../server-rs/src/ws.rs) are
+   authoritative.
 
 For the binary split that uses these protocols see
 [overview.md](overview.md). For the daemon endpoint see
@@ -427,7 +429,102 @@ for both. The runner mirror is in `branchwork_runner.rs` around the
 
 ---
 
-## 3. Versioning policy
+## 3. Dashboard WebSocket
+
+**Source:** `server-rs/src/ws.rs`.
+
+**Transport:** a single WebSocket per dashboard tab, mounted at
+`GET /ws`. Connections are read-only from the browser's side — the
+server ignores any inbound frames except WS-level pings — and consume
+a `tokio::sync::broadcast` channel of capacity 256 created once at
+boot. Per-client backpressure is best-effort: a slow consumer that
+falls behind by more than 256 frames is **lagged** by the broadcast
+channel and the next read returns `RecvError::Lagged(skipped)`; the
+handler logs the gap and keeps streaming. There is no replay.
+
+### Envelope
+
+Every frame the server emits is JSON in the canonical
+[`broadcast_event`](../../server-rs/src/ws.rs) shape:
+
+```json
+{
+  "type": "<event-name>",
+  "data": { ... },
+  "timestamp": "2026-05-04T12:34:56.789Z"
+}
+```
+
+- `type` is the discriminator the SPA dispatches on
+  (`web/src/stores/ws-store.ts::handleWsMessage` is one big
+  `switch (msg.type)`).
+- `data` is the per-event payload.
+- `timestamp` is RFC-3339 UTC, set at broadcast time. It is not
+  used for ordering — the broadcast channel preserves emission order
+  for a given subscriber — only for display.
+
+A separate `{"type": "connected", "timestamp": "..."}` greeting is
+sent once on upgrade with no `data` field; the SPA treats it as a
+no-op.
+
+### Auto-mode events
+
+The auto-mode loop and the Stop-hook handler emit a small family of
+events for the dashboard's auto-mode pill, audit log, and (Phase 6.1)
+in-flight notifications. The unattended-auto-mode plan adds
+`auto_finish_triggered`; the rest are listed for context.
+
+| `type`                  | Source                                          | `data` shape (notable fields) |
+|---|---|---|
+| `auto_mode_paused`      | `auto_mode.rs::run_merge_step`, `hooks.rs::handle_stop_hook` | `{ plan, task?, reason, target? }` (merge path) or `{ plan, task?, reason, files }` (Stop-hook dirty-tree path). `reason` is one of `agent_left_uncommitted_work`, `merge_conflict`, `merge_failed: <msg>`, …; `files` carries up to 5 dirty paths. |
+| `auto_mode_merged`      | `auto_mode.rs::run_merge_step`                  | `{ plan, task, sha, target }` — emitted after a successful merge before the CI gate. |
+| `auto_mode_resumed`     | `api/plans.rs::auto_mode_resume`                | `{ plan, last_completed_task }` — user clicked Resume; `pausedReason` cleared server-side. |
+| `auto_finish_triggered` | `hooks.rs::handle_stop_hook` (this plan, T2.5)  | `{ agent_id, plan, task, trigger }` — see below. |
+| `task_advanced`         | `agents/mod.rs::try_auto_advance` (intra-phase) | `{ plan, from_task, to_tasks: [<num>, …] }` — at least one ready sibling task was claimed and spawned in the same phase. |
+| `phase_advanced`        | `agents/mod.rs::try_auto_advance` (next-phase)  | `{ plan_name, from_phase, to_phase }` — note the field is `plan_name`, not `plan`, preserved verbatim from existing dashboards. |
+
+#### `auto_finish_triggered`
+
+Emitted exactly once per agent the moment the unattended Stop-hook
+handler decides to finalize that agent (clean tree, auto-mode on,
+agent still `running`). The handler also writes an `agent.auto_finish`
+audit row with the same `trigger` value in its diff and spawns
+`AgentRegistry::graceful_exit`; the `agent_stopped` broadcast still
+follows once the PTY actually closes.
+
+```json
+{
+  "type": "auto_finish_triggered",
+  "data": {
+    "agent_id": "<uuid>",
+    "plan": "<plan-name>",
+    "task": "<task-number>",
+    "trigger": "stop_hook"
+  },
+  "timestamp": "2026-05-04T12:34:56.789Z"
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `agent_id` | string (UUID) | The agent that just signalled it was done. Matches `agents.id`. |
+| `plan` | string | Plan name (file stem). Matches the `plan` field used by `auto_mode_*` and `task_advanced`, **not** the `plan_name` field used by `phase_advanced`. |
+| `task` | string | Task number as it appears in the plan, e.g. `"2.5"`. |
+| `trigger` | enum string | `"stop_hook"` today; the field is reserved so an idle-poller fallback (gated on `BRANCHWORK_IDLE_AUTO_FINISH=1`, see [ADR 0003](../adrs/0003-unattended-auto-mode.md)) can emit `"idle_timeout"` without a wire change. |
+
+The handler dedupes per-agent (`AppState::auto_finish_dedupe`), so
+duplicate Stop deliveries collapse to one broadcast. The dirty-tree
+branch never emits this event — it emits `auto_mode_paused` instead
+and leaves the agent running so the user can intervene.
+
+Phase 6.1 is the consumer plan: the SPA will fold this into the
+auto-mode pill and the audit-log "Auto-finished agent" row
+(`web/src/components/AuditLog.tsx::ACTION_LABELS`). Until then the
+event ships and is silently ignored by the SPA's default switch arm.
+
+---
+
+## 4. Versioning policy
 
 The protocols are pre-1.0 and not yet under a formal compatibility contract,
 but the wire format already gives us enough room to evolve safely if we
