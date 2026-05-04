@@ -155,9 +155,34 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   autoModeRuntimes: {},
 
   fetchPlans: async () => {
-    set({ loading: true });
-    const plans = await fetchJson<PlanSummary[]>("/api/plans");
-    set({ plans, loading: false });
+    // Only flicker the global loading flag on the first load — refetches
+    // (ws-driven, visibility-change, etc.) update silently to avoid
+    // unmounting the active view while the network round-trip is in flight.
+    const wasInitial = get().plans.length === 0;
+    if (wasInitial) set({ loading: true });
+    try {
+      const plans = await fetchJson<PlanSummary[]>("/api/plans");
+      // Defensive: a refetch that returns an empty list while we already
+      // have populated state is almost always transient (server momentarily
+      // can't enumerate, auth blip, race with file watcher, etc.). Keep the
+      // last-known-good list and let the next event-driven refetch reconcile.
+      // The narrow legitimate case ("user deleted every plan") loses one
+      // refresh cycle, which is fine — they'll see the empty state on the
+      // next event or page reload.
+      if (plans.length === 0 && !wasInitial) {
+        console.warn(
+          "[plan-store] /api/plans returned empty during refetch; keeping current list",
+        );
+        set({ loading: false });
+        return;
+      }
+      set({ plans, loading: false });
+    } catch (e) {
+      // Surface the failure but ensure loading is reset, otherwise the
+      // dashboard would render the spinner indefinitely.
+      set({ loading: false });
+      throw e;
+    }
   },
 
   selectPlan: async (name: string) => {
