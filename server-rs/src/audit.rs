@@ -515,7 +515,7 @@ mod tests {
             Some("agent-stop"),
             Some(r#"{"trigger":"stop_hook"}"#),
         );
-        // Idle-timeout trigger (BRANCHWORK_IDLE_AUTO_FINISH fallback fired).
+        // Idle-timeout trigger (BRANCHWORK_AUTO_FINISH_IDLE fallback fired).
         log(
             &conn,
             "org-1",

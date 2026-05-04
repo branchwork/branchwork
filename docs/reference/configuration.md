@@ -87,6 +87,39 @@ systemd unit `Environment=`, Docker `-e`, Helm `env:`); see
 | `BRANCHWORK_RUNNER_TOKEN` | `branchwork-runner` | _(required)_ | [`bin/branchwork_runner.rs:53`](../../server-rs/src/bin/branchwork_runner.rs) | Runner API token issued by `POST /api/orgs/:slug/runner-tokens`. Sent as a query-string parameter on the WebSocket upgrade. |
 | `BRANCHWORK_RUNNER_ID` | `branchwork-runner` | auto-generated `runner-<uuid>` and persisted in `seq_tracker` | [`bin/branchwork_runner.rs:61`](../../server-rs/src/bin/branchwork_runner.rs) | Stable identifier the dashboard uses to address the runner. Override only when forking or merging identities. |
 
+### Auto-mode (idle finish)
+
+The unattended auto-mode loop relies on the driver's `Stop`-hook surface
+to know when an agent has gone idle (Claude wires this through a
+per-session `settings.json` written at spawn). Drivers that don't expose
+a `Stop` hook (Aider, Codex, Gemini today; any future driver whose
+[`Driver::stop_hook_config`](../../server-rs/src/agents/driver.rs)
+returns `None`) fall back to a server-side **idle poller** — a 60 s
+tokio tick that fires the same auto-finish path with a
+`trigger: "idle_timeout"` discriminator on the audit row and broadcast.
+
+The fallback is **off by default**. ADR 0003
+([docs/adrs/0003-unattended-auto-mode.md](../adrs/0003-unattended-auto-mode.md))
+treats it as a stopgap that only opt-in operators see; driver-specific
+instrumentation is the long-term fix. Both variables are read **once**
+at server start ([`main.rs::run_server`](../../server-rs/src/main.rs)
+calls [`auto_mode::IdleFinishConfig::from_env`](../../server-rs/src/auto_mode.rs))
+and cached for the process lifetime — changing them after startup has
+no effect until the server is restarted.
+
+| Variable | Binary | Default | Source | Description |
+|---|---|---|---|---|
+| `BRANCHWORK_AUTO_FINISH_IDLE` | `branchwork-server` | unset (poller disabled) | [`auto_mode.rs::IdleFinishConfig::from_env`](../../server-rs/src/auto_mode.rs) | Set to the literal string `"1"` to enable the idle-poller fallback. Any other value (`"true"`, `"yes"`, `"on"`, empty, leading/trailing whitespace, …) leaves it disabled. When unset/disabled, no background tokio task is spawned at all — the poller is fully inert. |
+| `BRANCHWORK_AUTO_FINISH_IDLE_SECS` | `branchwork-server` | `300` (five minutes) | [`auto_mode.rs::IdleFinishConfig::from_env`](../../server-rs/src/auto_mode.rs) | Idle threshold in seconds. An agent is considered idle when `now() - agents.last_activity_at` exceeds this value. Parsed as a positive `i64`; non-numeric, zero, or negative values silently fall back to the default. Has no effect unless `BRANCHWORK_AUTO_FINISH_IDLE=1`. |
+
+The auto-finish path itself (graceful exit + `agent.auto_finish` audit
+row + `auto_finish_triggered` broadcast) is identical between the
+`Stop`-hook and idle-poller triggers; only the `trigger` field on the
+audit diff and broadcast payload differs (`"stop_hook"` vs
+`"idle_timeout"`). Dedupe across the two paths is shared via
+`AppState.auto_finish_dedupe`, so a single agent never auto-finishes
+twice.
+
 ### SMTP (budget-alert email)
 
 These are read **only** when a SaaS dashboard sends a budget-alert

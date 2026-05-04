@@ -200,8 +200,11 @@ async fn run_server(cli: Cli) {
 
     // Start the auto-mode idle poller (drivers without a Stop hook fall
     // back to a 60 s tick + idle threshold). Off by default; set
-    // `BRANCHWORK_AUTO_FINISH_IDLE=1` to enable.
-    auto_mode::spawn_idle_poller(state.clone());
+    // `BRANCHWORK_AUTO_FINISH_IDLE=1` to enable. Env vars are read once
+    // here and cached for the process lifetime — reducing accidental
+    // drift between poller iterations. Documented in
+    // `docs/reference/configuration.md` under "Auto-mode (idle finish)".
+    auto_mode::spawn_idle_poller(state.clone(), auto_mode::IdleFinishConfig::from_env());
 
     // Start file watcher
     let _watcher =

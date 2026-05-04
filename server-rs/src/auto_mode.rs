@@ -1309,13 +1309,70 @@ async fn try_spawn_fix_agent_with_cap(
 // Off by default — set `BRANCHWORK_AUTO_FINISH_IDLE=1` on the server to
 // enable. ADR 0003 §"Failure modes" treats the timer as a stopgap that only
 // opt-in users see; driver-specific instrumentation is the long-term fix.
+//
+// The two env vars are read **once** at server start via
+// [`IdleFinishConfig::from_env`] and cached for the process lifetime —
+// reducing accidental drift between iterations. See
+// [`docs/reference/configuration.md`](../../../docs/reference/configuration.md)
+// for the user-facing description of both vars.
 
 const IDLE_POLL_INTERVAL_SECS: u64 = 60;
 const IDLE_THRESHOLD_DEFAULT_SECS: i64 = 300;
 
-/// Spawn the idle-poller background task. Runs forever; cancellation is
-/// process-exit only. Call once from `main::run_server`.
-pub fn spawn_idle_poller(state: AppState) {
+/// Cached env-var configuration for the idle-poller fallback. Built once
+/// at server start via [`Self::from_env`] and handed to
+/// [`spawn_idle_poller`].
+#[derive(Clone, Copy, Debug)]
+pub struct IdleFinishConfig {
+    /// `BRANCHWORK_AUTO_FINISH_IDLE == "1"`. When false the poller is
+    /// fully inert — no tokio task is spawned at all.
+    pub enabled: bool,
+    /// `BRANCHWORK_AUTO_FINISH_IDLE_SECS`, or
+    /// [`IDLE_THRESHOLD_DEFAULT_SECS`] if unset / invalid.
+    pub threshold_secs: i64,
+}
+
+impl IdleFinishConfig {
+    /// Read both env vars from the process environment. Mirrors the gate
+    /// logic the previous per-iteration read used: `enabled = (var ==
+    /// "1")`, `threshold = parse u positive integer or default`.
+    pub fn from_env() -> Self {
+        Self::from_values(
+            std::env::var("BRANCHWORK_AUTO_FINISH_IDLE").ok().as_deref(),
+            std::env::var("BRANCHWORK_AUTO_FINISH_IDLE_SECS")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// Pure parse helper — split out from [`Self::from_env`] so unit
+    /// tests can exercise the parsing rules without mutating the
+    /// process-wide env.
+    pub fn from_values(enabled_raw: Option<&str>, secs_raw: Option<&str>) -> Self {
+        let enabled = matches!(enabled_raw, Some("1"));
+        let threshold_secs = secs_raw
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(IDLE_THRESHOLD_DEFAULT_SECS);
+        Self {
+            enabled,
+            threshold_secs,
+        }
+    }
+}
+
+/// Spawn the idle-poller background task using cached config. When
+/// `cfg.enabled` is false this is a no-op — no tokio task is spawned, so
+/// the default-off server pays nothing. Runs forever otherwise;
+/// cancellation is process-exit only. Call once from `main::run_server`.
+pub fn spawn_idle_poller(state: AppState, cfg: IdleFinishConfig) {
+    if !cfg.enabled {
+        return;
+    }
+    println!(
+        "[Branchwork] Auto-finish idle poller enabled (threshold {}s)",
+        cfg.threshold_secs
+    );
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(IDLE_POLL_INTERVAL_SECS));
         // The first .tick() fires immediately; consume it so the first
@@ -1324,15 +1381,7 @@ pub fn spawn_idle_poller(state: AppState) {
         interval.tick().await;
         loop {
             interval.tick().await;
-            if std::env::var("BRANCHWORK_AUTO_FINISH_IDLE").as_deref() != Ok("1") {
-                continue;
-            }
-            let threshold_secs = std::env::var("BRANCHWORK_AUTO_FINISH_IDLE_SECS")
-                .ok()
-                .and_then(|v| v.parse::<i64>().ok())
-                .filter(|n| *n > 0)
-                .unwrap_or(IDLE_THRESHOLD_DEFAULT_SECS);
-            run_idle_pass(&state, threshold_secs).await;
+            run_idle_pass(&state, cfg.threshold_secs).await;
         }
     });
 }
@@ -4213,5 +4262,38 @@ mod tests {
             "AGENT_AUTO_FINISH must be written exactly once across two passes"
         );
         assert!(state.auto_finish_dedupe.lock().unwrap().contains("a-1"));
+    }
+
+    /// `IdleFinishConfig::from_values` parsing: covers the matrix the
+    /// previous per-iteration env reads handled. Pure helper, no env
+    /// mutation — safe under parallel cargo test.
+    #[test]
+    fn idle_finish_config_from_values() {
+        // Both unset → disabled, default threshold.
+        let cfg = IdleFinishConfig::from_values(None, None);
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.threshold_secs, IDLE_THRESHOLD_DEFAULT_SECS);
+
+        // Enabled flag must be the literal string "1" — anything else
+        // (incl. "true", "yes", "on", whitespace, empty) leaves the
+        // poller disabled. Matches the original gate semantics.
+        for raw in ["", "0", "true", "TRUE", "yes", "on", " 1", "1 "] {
+            let cfg = IdleFinishConfig::from_values(Some(raw), None);
+            assert!(!cfg.enabled, "enabled must be false for {raw:?}, got true");
+        }
+        let cfg = IdleFinishConfig::from_values(Some("1"), None);
+        assert!(cfg.enabled);
+
+        // Threshold parsing: positive int wins, anything else (zero,
+        // negative, non-numeric, empty) falls back to the default.
+        let cfg = IdleFinishConfig::from_values(Some("1"), Some("120"));
+        assert_eq!(cfg.threshold_secs, 120);
+        for raw in ["0", "-5", "abc", "", "1.5"] {
+            let cfg = IdleFinishConfig::from_values(Some("1"), Some(raw));
+            assert_eq!(
+                cfg.threshold_secs, IDLE_THRESHOLD_DEFAULT_SECS,
+                "threshold must default for {raw:?}"
+            );
+        }
     }
 }

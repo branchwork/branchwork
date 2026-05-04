@@ -169,7 +169,7 @@ trait Driver {
 }
 ```
 
-returns `Some(...)` for Claude and `None` for Aider/Codex/Gemini. When `None` is returned, branchwork falls back to a tokio idle-poller (`now() - last_activity_at > IDLE_THRESHOLD`) that triggers the same auto-finish path. The fallback is gated behind an env var (`BRANCHWORK_IDLE_AUTO_FINISH=1`) and disabled by default — driver-specific instrumentation is the right long-term fix; the timer is a stopgap that only opt-in users see.
+returns `Some(...)` for Claude and `None` for Aider/Codex/Gemini. When `None` is returned, branchwork falls back to a tokio idle-poller (`now() - last_activity_at > IDLE_THRESHOLD`) that triggers the same auto-finish path. The fallback is gated behind an env var (`BRANCHWORK_AUTO_FINISH_IDLE=1`, threshold `BRANCHWORK_AUTO_FINISH_IDLE_SECS` defaulting to 300s) and disabled by default — driver-specific instrumentation is the right long-term fix; the timer is a stopgap that only opt-in users see. Both vars are documented in [docs/reference/configuration.md](../reference/configuration.md#auto-mode-idle-finish).
 
 ### 5. UX surfacing
 

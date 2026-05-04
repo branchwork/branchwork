@@ -510,7 +510,7 @@ follows once the PTY actually closes.
 | `agent_id` | string (UUID) | The agent that just signalled it was done. Matches `agents.id`. |
 | `plan` | string | Plan name (file stem). Matches the `plan` field used by `auto_mode_*` and `task_advanced`, **not** the `plan_name` field used by `phase_advanced`. |
 | `task` | string | Task number as it appears in the plan, e.g. `"2.5"`. |
-| `trigger` | enum string | `"stop_hook"` today; the field is reserved so an idle-poller fallback (gated on `BRANCHWORK_IDLE_AUTO_FINISH=1`, see [ADR 0003](../adrs/0003-unattended-auto-mode.md)) can emit `"idle_timeout"` without a wire change. |
+| `trigger` | enum string | `"stop_hook"` for the Claude `Stop`-hook path or `"idle_timeout"` for the idle-poller fallback (gated on `BRANCHWORK_AUTO_FINISH_IDLE=1`; see [reference/configuration.md](../reference/configuration.md#auto-mode-idle-finish) and [ADR 0003](../adrs/0003-unattended-auto-mode.md)). |
 
 The handler dedupes per-agent (`AppState::auto_finish_dedupe`), so
 duplicate Stop deliveries collapse to one broadcast. The dirty-tree
