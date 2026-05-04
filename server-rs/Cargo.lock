@@ -258,6 +258,7 @@ dependencies = [
  "tokio-util",
  "tower-http",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -29,10 +29,13 @@ pub type AgentId = String;
 /// Cross-platform "is this PID still alive" check.
 ///
 /// On Unix we use `kill(pid, 0)` — it sends no signal but succeeds if the
-/// kernel would let us signal the process. On Windows we don't yet have a
-/// cheap PID-liveness primitive wired up, so we conservatively return
-/// `false` and let the caller treat the row as stale (cleanup_and_reattach
-/// will mark the agent `detached` and the operator can restart it).
+/// kernel would let us signal the process. On Windows we open a handle with
+/// `PROCESS_QUERY_LIMITED_INFORMATION` (the cheapest access right that lets
+/// us probe existence) and call `GetExitCodeProcess`; if the kernel reports
+/// `STILL_ACTIVE` the process is running. Both calls share the small
+/// PID-reuse hazard inherent to PID-based liveness checks across all OSes
+/// — for our supervisor lifecycle we accept it. Anything outside the
+/// `1..=u32::MAX` window short-circuits to `false`.
 pub fn process_alive(pid: i64) -> bool {
     #[cfg(unix)]
     {
@@ -40,8 +43,23 @@ pub fn process_alive(pid: i64) -> bool {
     }
     #[cfg(windows)]
     {
-        let _ = pid;
-        false
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid <= 0 || pid > u32::MAX as i64 {
+            return false;
+        }
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+            if h.is_null() {
+                return false;
+            }
+            let mut exit_code: u32 = 0;
+            let got = GetExitCodeProcess(h, &mut exit_code);
+            CloseHandle(h);
+            got != 0 && exit_code == STILL_ACTIVE as u32
+        }
     }
 }
 
@@ -1429,6 +1447,30 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("t.db");
         (crate::db::init(&path), dir)
+    }
+
+    #[test]
+    fn process_alive_reports_current_pid_alive() {
+        // The test process itself is unambiguously alive on every supported
+        // OS. This is the load-bearing positive case for the Windows
+        // OpenProcess + GetExitCodeProcess wiring (the Unix kill(0) path is
+        // exercised by the same assertion).
+        let me = std::process::id() as i64;
+        assert!(process_alive(me), "current process should be alive");
+    }
+
+    #[test]
+    fn process_alive_reports_sentinel_pid_dead() {
+        // i32::MAX is above any plausible OS pid_max, so OpenProcess
+        // (Windows) and kill(0) (Unix) both fail. Mirrors the high-PID
+        // sentinel that cleanup_and_reattach uses to prove rows are
+        // orphaned. (We deliberately don't assert PID 0 / negative PIDs
+        // here — POSIX kill(2) treats them as process-group sentinels and
+        // succeeds, so the result legitimately diverges from Windows.)
+        assert!(
+            !process_alive(i32::MAX as i64),
+            "i32::MAX must report as dead"
+        );
     }
 
     #[test]

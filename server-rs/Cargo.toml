@@ -39,6 +39,9 @@ quick-xml = "0.37"
 flate2 = "1"
 sha2 = "0.10"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [[bin]]
 name = "branchwork-runner"
 path = "src/bin/branchwork_runner.rs"

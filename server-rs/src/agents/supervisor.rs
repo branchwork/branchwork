@@ -499,9 +499,7 @@ async fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(windows))]
     use interprocess::local_socket::ConnectOptions;
-    #[cfg(not(windows))]
     use std::time::Duration;
 
     /// Shell command that works on the current platform. Tests run through
@@ -589,19 +587,110 @@ mod tests {
             .expect("connect local socket")
     }
 
-    #[cfg(not(windows))]
     fn temp_socket(name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(name);
         (dir, path)
     }
 
+    /// Cross-platform IPC end-to-end roundtrip: bind a listener via
+    /// [`socket_name`], connect from a client task, exchange a `Ping`/`Pong`
+    /// frame, and shut down. This is the load-bearing test that proves the
+    /// `interprocess` abstraction (Unix domain socket on Linux/macOS,
+    /// `\\.\pipe\<stem>` named pipe on Windows) actually works on every
+    /// supported platform — the PTY-driven tests below are gated off on
+    /// Windows because of an unrelated ConPTY/`cmd.exe` interaction, so this
+    /// is the only e2e coverage we have for the supervisor's IPC layer
+    /// there. Keep it always-on; do not add a `cfg` gate.
+    #[tokio::test]
+    async fn local_socket_listener_round_trips_ping_pong_cross_platform() {
+        let (_dir, socket) = temp_socket("oai-rt.sock");
+
+        // Server side: bind a listener and accept exactly one client.
+        let server_socket = socket.clone();
+        let server_task = tokio::spawn(async move {
+            let name = socket_name(&server_socket).expect("server: socket name");
+            let listener: LocalListener = ListenerOptions::new()
+                .name(name)
+                .try_overwrite(true)
+                .create_tokio()
+                .expect("server: listener");
+
+            let stream = listener.accept().await.expect("server: accept");
+            let (mut read_half, write_half) = stream.split();
+            let msg = session_protocol::read_frame(&mut read_half)
+                .await
+                .expect("server: read ping");
+            assert!(
+                matches!(msg, Message::Ping),
+                "server: expected Ping, got {msg:?}"
+            );
+            let mut write_half = write_half;
+            session_protocol::write_frame(&mut write_half, &Message::Pong)
+                .await
+                .expect("server: write pong");
+            // Hold the write half open until the client has had a chance to
+            // pull the framed bytes off the wire — dropping immediately can
+            // race the named-pipe peer on Windows.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(write_half);
+        });
+
+        // Wait for the listener to actually be bound. Probing via connect is
+        // the only file-system-agnostic signal: Unix would let us `exists()`
+        // the socket file, but Windows named pipes aren't filesystem-visible.
+        let mut client = None;
+        for _ in 0..100 {
+            let name = match socket_name(&socket) {
+                Ok(n) => n,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+            };
+            match ConnectOptions::new().name(name).connect_tokio().await {
+                Ok(s) => {
+                    client = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        let client = client.expect("client: connect within deadline");
+
+        let (mut read_half, mut write_half) = client.split();
+        session_protocol::write_frame(&mut write_half, &Message::Ping)
+            .await
+            .expect("client: write ping");
+        let pong = tokio::time::timeout(
+            Duration::from_secs(5),
+            session_protocol::read_frame(&mut read_half),
+        )
+        .await
+        .expect("client: read pong did not arrive within 5s")
+        .expect("client: read frame ok");
+        assert!(
+            matches!(pong, Message::Pong),
+            "client: expected Pong, got {pong:?}"
+        );
+
+        // Server task should observe the Ping and write Pong cleanly.
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server task did not finish within 5s")
+            .expect("server task panicked");
+    }
+
     // TODO(windows): these three PTY end-to-end tests drive `cmd.exe echo`
     // through ConPTY and, in GitHub Actions `windows-latest`, the child's
     // output never reaches our log reader — only the ConPTY init query
-    // (`\x1b[6n`) is observed. The supervisor itself builds + lints clean
-    // on Windows (clippy job passes); this is a test-harness interaction
-    // with ConPTY we'll debug once we have a real Windows dev loop.
+    // (`\x1b[6n`) is observed. cmd.exe also uses `&` (not `;`) as a command
+    // separator, so the chained-shell tests below would need restructuring
+    // before they could run there anyway. We rely on
+    // [`local_socket_listener_round_trips_ping_pong_cross_platform`] above
+    // to exercise the IPC layer (named-pipe binding, accept, framed
+    // protocol round-trip) on Windows; the Unix gate below is removed once
+    // we have a real Windows dev loop to debug ConPTY there.
     #[cfg(not(windows))]
     #[tokio::test]
     async fn daemon_proxies_pty_output_to_client() {

@@ -11,6 +11,15 @@ plan is a YAML file under `~/.claude/plans/`; every task runs on its
 own git branch under a per-agent supervisor daemon that survives
 server restarts.
 
+The server runs on Linux, macOS, and Windows — the supervisor is
+backed by Unix domain sockets on Unix and named pipes
+(`\\.\pipe\<agent-id>`) on Windows, and CI exercises both
+`ubuntu-latest` and `windows-latest` on every push. The on-disk layout
+under `~/.claude/` (plans, sessions, branchwork.db) is identical
+across platforms; see
+[architecture/session-daemon.md](architecture/session-daemon.md#detach-unix-vs-windows)
+for the per-OS detach mechanics and testing posture.
+
 ## Contents
 
 - [Plans](#plans) — YAML schema, creating, editing, migrating from .md, project inference

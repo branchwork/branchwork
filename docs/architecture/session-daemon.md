@@ -117,6 +117,14 @@ association and removed it from the parent's job — `detach_from_parent`
 is a no-op. The pidfile dance still applies (it's portable code), but
 the spawn-time PID and the durable PID are the same value.
 
+PID liveness is checked through the same `agents::process_alive(pid)`
+helper in both `cleanup_and_reattach` and the 30s `main.rs` monitor
+loop. On Unix it's `kill(pid, 0)`; on Windows it opens a handle with
+`PROCESS_QUERY_LIMITED_INFORMATION` and asks `GetExitCodeProcess`
+whether the result is `STILL_ACTIVE` (`windows-sys` provides both
+calls). The two share the same small PID-reuse hazard inherent to any
+PID-based liveness check, which we accept for the supervisor.
+
 ## Local IPC: socket vs. named pipe
 
 The daemon-to-client transport is abstracted through the
@@ -356,6 +364,42 @@ sequenceDiagram
     Server->>Server: on_agent_exit:<br/>pidfile absent ⇒ clean<br/>UPDATE agents SET status='completed'<br/>broadcast agent_stopped
     Server-->>Browser: WS event agent_stopped
 ```
+
+## Testing posture
+
+The daemon is a small enough surface that it has near-complete unit
+coverage in [`supervisor.rs::tests`](../../server-rs/src/agents/supervisor.rs)
+plus the wire protocol in
+[`session_protocol.rs::tests`](../../server-rs/src/agents/session_protocol.rs):
+
+| Test                                                       | Linux / macOS | Windows | What it pins                                                                                                                                                                                                                                                                                                                |
+| ---------------------------------------------------------- | :-----------: | :-----: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `socket_name_roundtrip`                                    |       ✅      |    ✅   | `socket_name(path)` returns a `Name` with `.is_path()` true on both platforms — the basis for every bind/connect call.                                                                                                                                                                                                      |
+| `local_socket_listener_round_trips_ping_pong_cross_platform` |     ✅      |    ✅   | End-to-end IPC: bind a listener, accept a client, exchange a `Ping`/`Pong` frame. This is the **only** end-to-end test that exercises the named-pipe path on Windows; the framed protocol over `\\.\pipe\<stem>` is asserted live, not just the path-derivation helper.                                                       |
+| `daemon_proxies_pty_output_to_client`                      |       ✅      |    ⛔   | Spawns a real PTY, has a client connect, asserts the child's stdout reaches it via broadcast.                                                                                                                                                                                                                                |
+| `daemon_writes_to_log_file`                                |       ✅      |    ⛔   | The on-disk transcript invariant: every PTY chunk is appended to `<socket>.log` regardless of whether anyone is attached.                                                                                                                                                                                                    |
+| `daemon_accepts_reconnect_after_client_drops`              |       ✅      |    ⛔   | Reattach after a client drop continues to surface live PTY output to the new connection.                                                                                                                                                                                                                                     |
+
+**Why the three PTY tests are gated `#[cfg(not(windows))]`.** They drive
+`cmd.exe /c "...; ...; ..."` through ConPTY and on `windows-latest` two
+things go wrong at once: ConPTY emits a cursor-position query
+(`\x1b[6n`) that `cmd.exe` does not respond to (so the child stalls
+before printing), and `cmd.exe` uses `&` rather than `;` as a command
+separator (so the chained shell snippet was syntactically wrong on
+Windows from day one). The right fix is to swap the harness shell to
+PowerShell — which uses `;` natively and handles the ConPTY query —
+once we have a real Windows dev loop to validate the migration. Until
+then the IPC layer is covered by the always-on cross-platform test
+above; the supervisor still builds + lints clean on Windows under the
+CI matrix in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml).
+
+**Process liveness coverage.** `process_alive(pid)` is exercised on
+both platforms by `agents::tests::process_alive_reports_*`, which
+asserts that the current process reads as alive and a high sentinel
+PID reads as dead — the load-bearing positive and negative cases that
+keep `cleanup_and_reattach` from misclassifying live agents on a
+restart and the 30s `main.rs` monitor loop from prematurely flipping
+running agents to `completed`.
 
 ## See also
 
