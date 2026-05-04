@@ -253,13 +253,35 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
     await updateStatus(next);
   }
 
+  // Click anywhere on the card to open the running agent's terminal in
+  // the right rail. Only active when an agent is actually running for this
+  // task — otherwise the card is not clickable. Inner interactive elements
+  // (buttons, inputs, textareas, anchors, EditableText fields) are excluded
+  // via `closest()` so the pre-existing controls keep working without each
+  // having to call `stopPropagation`.
+  const handleCardClick = runningAgent
+    ? (e: React.MouseEvent<HTMLDivElement>) => {
+        const target = e.target as HTMLElement;
+        if (
+          target.closest(
+            'button, input, textarea, select, a, [role="button"], [contenteditable="true"]'
+          )
+        ) {
+          return;
+        }
+        selectAgent(runningAgent.id);
+      }
+    : undefined;
+
   return (
     <div
+      onClick={handleCardClick}
       className={`rounded-md border p-3 transition ${
         status === "completed"
           ? "bg-gray-800/30 border-gray-800/50 opacity-70"
           : "bg-gray-800/50 border-gray-700/50 hover:border-gray-600"
-      }`}
+      } ${runningAgent ? "cursor-pointer hover:bg-gray-800/80" : ""}`}
+      title={runningAgent ? "Click to open agent terminal" : undefined}
     >
       {/* Header */}
       <div className="flex items-start justify-between gap-2">
