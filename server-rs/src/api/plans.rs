@@ -2932,6 +2932,46 @@ mod check_prompt_tests {
         }
     }
 
+    // Mirrors the prompt-construction locals inside `api::plans::check_task`
+    // between fetching `plan`/`phase`/`task` and the call to
+    // `start_check_agent`. After Phase 1.2 that body is a single call to
+    // `build_check_prompt`. Tripwire: if a future change reintroduces inline
+    // prompt mangling in `check_task`, update this helper to match — the
+    // identical-prompt test below will then fail until `check_all_tasks` is
+    // updated too (or the divergence is reverted).
+    fn prompt_for_check_task_path(
+        plan_name: &str,
+        plan: &plan_parser::ParsedPlan,
+        phase: &plan_parser::PlanPhase,
+        task: &plan_parser::PlanTask,
+        project_dir: &std::path::Path,
+    ) -> String {
+        build_check_prompt(plan_name, plan, phase, task, project_dir)
+    }
+
+    #[test]
+    fn check_task_and_check_all_build_identical_prompts() {
+        let plan = sample_plan();
+        let phase = plan_parser::PlanPhase {
+            number: 1,
+            title: "P".into(),
+            description: String::new(),
+            tasks: vec![sample_task("1.1", vec!["a.rs".into()])],
+        };
+        let task = phase.tasks[0].clone();
+        let project_dir = std::path::Path::new("/tmp/proj");
+
+        let from_check_task = prompt_for_check_task_path("p", &plan, &phase, &task, project_dir);
+        // `check_all_tasks` calls `build_check_prompt` directly inside its
+        // loop body, so the unified builder's output IS the check-all path.
+        let from_check_all = build_check_prompt("p", &plan, &phase, &task, project_dir);
+
+        assert_eq!(
+            from_check_task, from_check_all,
+            "check_task and check_all_tasks must produce byte-identical prompts"
+        );
+    }
+
     #[test]
     fn excludes_branch_verification_after_unification() {
         let plan = sample_plan();
