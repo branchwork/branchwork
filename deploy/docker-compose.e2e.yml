@@ -1,8 +1,16 @@
 # E2E test environment for Branchwork.
 # Used by the e2e test suite and CI — not for production.
 #
+# Standalone (server-only):
 #   docker compose -f deploy/docker-compose.e2e.yml up -d
 #   docker compose -f deploy/docker-compose.e2e.yml down -v
+#
+# SaaS (server + runner):
+#   BRANCHWORK_RUNNER_TOKEN=<token> docker compose -f deploy/docker-compose.e2e.yml \
+#     --profile saas up -d
+# The token must be provisioned out-of-band — see tests/e2e/run.sh, which signs
+# up a user via /api/auth/signup and POSTs to /api/runners/tokens before
+# bringing the runner up.
 
 name: branchwork-e2e
 
@@ -24,5 +32,24 @@ services:
       retries: 10
       start_period: 10s
 
+  branchwork-runner:
+    profiles: ["saas"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["tini", "--"]
+    command: ["branchwork-runner", "--cwd", "/home/runneruser"]
+    working_dir: /home/runneruser
+    volumes:
+      - branchwork-e2e-runner:/home/runneruser
+    environment:
+      - HOME=/home/runneruser
+      - BRANCHWORK_SAAS_URL=ws://branchwork:3100
+      - BRANCHWORK_RUNNER_TOKEN=${BRANCHWORK_RUNNER_TOKEN:-}
+    depends_on:
+      branchwork:
+        condition: service_healthy
+
 volumes:
   branchwork-e2e-data:
+  branchwork-e2e-runner:

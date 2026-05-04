@@ -5,8 +5,17 @@
 # Usage:
 #   tests/e2e/run.sh [--keep]
 #
+# Env:
+#   E2E_MODE   standalone (default) — server only.
+#              saas               — server + branchwork-runner. The driver
+#                                   signs up a user and mints a runner token
+#                                   via the API, then brings up the runner
+#                                   service with the token injected.
+#   E2E_PORT   host port for the server (default 3199).
+#
 # Flags:
-#   --keep   Skip teardown after tests (useful for debugging)
+#   --keep   Skip teardown after tests (useful for debugging — leaves both
+#            containers running so you can poke at them).
 
 set -euo pipefail
 
@@ -16,9 +25,11 @@ COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose.e2e.yml"
 
 export E2E_PORT="${E2E_PORT:-3199}"
 export BASE_URL="http://localhost:${E2E_PORT}"
+export E2E_MODE="${E2E_MODE:-standalone}"
 
 KEEP=false
 HEALTH_TIMEOUT=30
+RUNNER_ONLINE_TIMEOUT=15
 
 for arg in "$@"; do
   case "$arg" in
@@ -26,6 +37,11 @@ for arg in "$@"; do
     *) echo "Unknown flag: $arg"; exit 1 ;;
   esac
 done
+
+case "$E2E_MODE" in
+  standalone|saas) ;;
+  *) echo "Unknown E2E_MODE: $E2E_MODE (expected standalone or saas)"; exit 1 ;;
+esac
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -49,12 +65,18 @@ FAILED_NAMES=()
 
 teardown() {
   if [ "$KEEP" = true ]; then
-    warn "Skipping teardown (--keep). Container still running at $BASE_URL"
-    warn "Clean up manually: docker compose -f $COMPOSE_FILE down -v"
+    warn "Skipping teardown (--keep). Containers still running."
+    warn "  Server:   $BASE_URL"
+    if [ "$E2E_MODE" = "saas" ]; then
+      warn "  Runner:   docker compose -f $COMPOSE_FILE logs branchwork-runner"
+    fi
+    warn "Clean up manually: docker compose -f $COMPOSE_FILE --profile saas down -v"
     return
   fi
   info "Tearing down containers..."
-  docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null || true
+  # Always pass --profile saas on teardown so the runner is removed even when
+  # we ran in standalone mode (cheap; no-op if it never came up).
+  docker compose -f "$COMPOSE_FILE" --profile saas down -v 2>/dev/null || true
 }
 
 trap teardown EXIT
@@ -62,7 +84,7 @@ trap teardown EXIT
 # ── Idempotency: tear down any leftover container ───────────────────
 
 info "Cleaning up any previous e2e environment..."
-docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null || true
+docker compose -f "$COMPOSE_FILE" --profile saas down -v 2>/dev/null || true
 
 # ── Build ───────────────────────────────────────────────────────────
 
@@ -70,11 +92,11 @@ info "Building Docker image..."
 docker compose -f "$COMPOSE_FILE" build
 info "Build complete."
 
-# ── Start ───────────────────────────────────────────────────────────
+# ── Start server ────────────────────────────────────────────────────
 
-info "Starting container (port $E2E_PORT)..."
-docker compose -f "$COMPOSE_FILE" up -d
-info "Container started."
+info "Starting branchwork (port $E2E_PORT, mode=$E2E_MODE)..."
+docker compose -f "$COMPOSE_FILE" up -d branchwork
+info "Server container started."
 
 # ── Health check ────────────────────────────────────────────────────
 
@@ -94,6 +116,79 @@ if [ "$elapsed" -ge "$HEALTH_TIMEOUT" ]; then
   info "Container logs:"
   docker compose -f "$COMPOSE_FILE" logs --tail=50
   exit 1
+fi
+
+# ── Provision runner (saas mode only) ───────────────────────────────
+
+if [ "$E2E_MODE" = "saas" ]; then
+  if ! command -v jq >/dev/null 2>&1; then
+    fail "saas mode requires jq on PATH (apt-get install jq / brew install jq)"
+    exit 1
+  fi
+
+  COOKIE_JAR="$(mktemp)"
+  E2E_USER_EMAIL="e2e-$(date +%s)-$$@example.test"
+  E2E_USER_PASSWORD="e2e-password-1234"
+
+  info "Signing up e2e user $E2E_USER_EMAIL..."
+  signup_status=$(curl -sS -o /tmp/e2e-signup.json -w "%{http_code}" \
+    -c "$COOKIE_JAR" \
+    -H "Content-Type: application/json" \
+    -X POST "$BASE_URL/api/auth/signup" \
+    -d "{\"email\":\"$E2E_USER_EMAIL\",\"password\":\"$E2E_USER_PASSWORD\"}")
+  if [ "$signup_status" != "201" ]; then
+    fail "Signup returned $signup_status (expected 201)"
+    cat /tmp/e2e-signup.json
+    exit 1
+  fi
+
+  info "Minting runner token via /api/runners/tokens..."
+  token_status=$(curl -sS -o /tmp/e2e-token.json -w "%{http_code}" \
+    -b "$COOKIE_JAR" \
+    -H "Content-Type: application/json" \
+    -X POST "$BASE_URL/api/runners/tokens" \
+    -d '{"runner_name":"e2e-runner"}')
+  if [ "$token_status" != "201" ]; then
+    fail "Token creation returned $token_status (expected 201)"
+    cat /tmp/e2e-token.json
+    exit 1
+  fi
+
+  RUNNER_TOKEN=$(jq -r .token < /tmp/e2e-token.json)
+  if [ -z "$RUNNER_TOKEN" ] || [ "$RUNNER_TOKEN" = "null" ]; then
+    fail "Could not extract token from /api/runners/tokens response"
+    cat /tmp/e2e-token.json
+    exit 1
+  fi
+  export BRANCHWORK_RUNNER_TOKEN="$RUNNER_TOKEN"
+
+  info "Starting branchwork-runner..."
+  docker compose -f "$COMPOSE_FILE" --profile saas up -d branchwork-runner
+  info "Runner container started."
+
+  info "Waiting for runner to report online (timeout: ${RUNNER_ONLINE_TIMEOUT}s)..."
+  online=false
+  elapsed=0
+  while [ "$elapsed" -lt "$RUNNER_ONLINE_TIMEOUT" ]; do
+    body=$(curl -sf -b "$COOKIE_JAR" "$BASE_URL/api/runners" 2>/dev/null || echo '{}')
+    status=$(printf '%s' "$body" | jq -r '.runners[0].status // empty' 2>/dev/null || true)
+    if [ "$status" = "online" ]; then
+      online=true
+      info "Runner is online after ${elapsed}s."
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  if [ "$online" = false ]; then
+    fail "Runner did not report online within ${RUNNER_ONLINE_TIMEOUT}s"
+    info "GET /api/runners response:"
+    curl -sf -b "$COOKIE_JAR" "$BASE_URL/api/runners" || true
+    info "Runner container logs:"
+    docker compose -f "$COMPOSE_FILE" logs --tail=80 branchwork-runner || true
+    exit 1
+  fi
 fi
 
 # ── Run test scripts ────────────────────────────────────────────────

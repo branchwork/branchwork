@@ -35,8 +35,9 @@ RUN cargo build --release 2>/dev/null || true
 COPY server-rs/ ./
 COPY --from=web /src/web/dist /src/web/dist
 
-# Touch main.rs to force rebuild of our crate (not deps)
-RUN touch src/main.rs && cargo build --release --bin branchwork-server
+# Touch our crate sources to force a rebuild (not deps), then build both bins
+RUN touch src/main.rs src/bin/branchwork_runner.rs src/bin/session_daemon.rs && \
+    cargo build --release --bin branchwork-server --bin branchwork-runner
 
 # ── Stage 3: Minimal runtime image ──────────────────────────────────
 FROM alpine:3.21 AS runtime
@@ -45,9 +46,13 @@ RUN apk add --no-cache git ca-certificates tini && \
     adduser -u 1000 -G branchwork -D branchwork
 
 COPY --from=server /src/server-rs/target/release/branchwork-server /usr/local/bin/
+COPY --from=server /src/server-rs/target/release/branchwork-runner /usr/local/bin/
 
-# Data directory: plans, DB, sockets
-RUN mkdir -p /data && chown branchwork:branchwork /data
+# Data dir for the server (plans, DB, sockets) and home dir for the runner
+# (outbox DB, session sockets). Both owned by `branchwork` so a volume
+# mount on either path inherits the right uid/gid.
+RUN mkdir -p /data /home/runneruser && \
+    chown branchwork:branchwork /data /home/runneruser
 VOLUME ["/data"]
 
 USER branchwork
