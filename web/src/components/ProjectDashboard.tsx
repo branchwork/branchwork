@@ -3,22 +3,8 @@ import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { BulkDeleteModal } from "./BulkDeleteModal.js";
-
-function formatDate(iso: string): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
-  const diffDays = Math.floor(diffMs / 86400000);
-  if (diffDays === 0) return "today";
-  if (diffDays === 1) return "yesterday";
-  if (diffDays < 30) return `${diffDays}d ago`;
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-}
-
-function isPlanDone(p: PlanSummary): boolean {
-  return p.taskCount > 0 && p.doneCount >= p.taskCount;
-}
+import { formatRelative } from "../lib/time.js";
+import { isPlanDone } from "../lib/predicates.js";
 
 /// Auto-namer shape used by the Claude Code CLI: three lowercase
 /// hyphen-separated tokens with the middle token ending in `-ing`
@@ -470,7 +456,7 @@ function ProjectCard({
             }
             valueClass={stats.totalCost > 0 ? "text-amber-400" : undefined}
           />
-          <Stat label="Updated" value={formatDate(stats.lastActivity) || "-"} />
+          <Stat label="Updated" value={formatRelative(stats.lastActivity) || "-"} />
         </div>
 
         {/* Aggregate progress */}
@@ -610,7 +596,7 @@ function PlanRow({
         <div className="text-[10px] font-mono text-gray-600 truncate flex items-center gap-2">
           <span className="truncate">{plan.name}</span>
           <span className="flex-shrink-0 text-gray-700">
-            {formatDate(plan.modifiedAt)}
+            {formatRelative(plan.modifiedAt)}
           </span>
           {plan.totalCostUsd != null && plan.totalCostUsd > 0 && (
             <span className="flex-shrink-0 text-amber-500/80">

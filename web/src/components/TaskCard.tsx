@@ -9,6 +9,8 @@ import {
   type AuthStatus,
 } from "../stores/settings-store.js";
 import { EditableText } from "./EditableText.js";
+import { formatRelative } from "../lib/time.js";
+import { errorMessage } from "../lib/error.js";
 
 interface Props {
   task: PlanTask;
@@ -54,21 +56,6 @@ function authStatusLabel(auth: AuthStatus | undefined): string {
     default:
       return "ready";
   }
-}
-
-function timeAgo(iso?: string): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
-  const mins = Math.floor(diffMs / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  if (days < 30) return `${days}d ago`;
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
 export function TaskCard({ task, planName, phaseNumber }: Props) {
@@ -139,8 +126,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       await savePlan(updated);
       await fetchPlans();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Save failed: ${msg}`);
+      setError(`Save failed: ${errorMessage(e)}`);
     }
   }
 
@@ -177,8 +163,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       selectAgent(res.agentId);
       await updateStatus("in_progress");
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Start failed: ${msg}`);
+      setError(`Start failed: ${errorMessage(e)}`);
       console.error("Failed to start task:", e);
     } finally {
       setStarting(false);
@@ -200,8 +185,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       setTimeout(() => selectPlan(planName), 10000);
       setTimeout(() => selectPlan(planName), 30000);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Check failed: ${msg}`);
+      setError(`Check failed: ${errorMessage(e)}`);
       console.error("Failed to check task:", e);
     } finally {
       setChecking(false);
@@ -225,8 +209,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       setAgentId(res.agentId);
       selectAgent(res.agentId);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Fix CI failed: ${msg}`);
+      setError(`Fix CI failed: ${errorMessage(e)}`);
       console.error("Failed to start Fix CI agent:", e);
     } finally {
       setFixingCi(false);
@@ -240,8 +223,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       });
       await selectPlan(planName);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Status update failed: ${msg}`);
+      setError(`Status update failed: ${errorMessage(e)}`);
       console.error("Failed to update status:", e);
     }
     setShowMenu(false);
@@ -336,8 +318,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                         );
                         await selectPlan(planName);
                       } catch (e) {
-                        const msg = e instanceof Error ? e.message : String(e);
-                        setError(`Reset failed: ${msg}`);
+                        setError(`Reset failed: ${errorMessage(e)}`);
                       }
                     }}
                     className="w-full text-left px-3 py-1 text-xs hover:bg-red-950/40 text-red-400/80 hover:text-red-300 flex items-center gap-2"
@@ -352,7 +333,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
             {/* Updated at */}
             {task.statusUpdatedAt && (
               <span className="text-[9px] text-gray-600" title={task.statusUpdatedAt}>
-                {timeAgo(task.statusUpdatedAt)}
+                {formatRelative(task.statusUpdatedAt)}
               </span>
             )}
             {/* Cost — hidden for drivers that don't report spend */}
@@ -439,9 +420,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                           await deleteJson(`/api/ci/${ciRunId}`);
                           await selectPlan(planName);
                         } catch (err) {
-                          const msg =
-                            err instanceof Error ? err.message : String(err);
-                          setError(`Dismiss CI failed: ${msg}`);
+                          setError(`Dismiss CI failed: ${errorMessage(err)}`);
                         }
                       }}
                       className="ml-0.5 text-[10px] text-gray-500 hover:text-gray-300 hover:bg-gray-800/60 px-1 rounded transition"

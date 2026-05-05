@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { HttpError } from "../api.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
+import { errorMessage } from "../lib/error.js";
 
 interface BulkDeleteModalProps {
   planNames: string[];
@@ -201,8 +202,7 @@ export function BulkDeleteModal({
           // Anything else — surface the message and halt. The parent's
           // selection still has this plan + the rest, so the user can
           // retry once the underlying issue is resolved.
-          const msg = e instanceof Error ? e.message : String(e);
-          setError(`Delete failed on "${name}": ${msg}`);
+          setError(`Delete failed on "${name}": ${errorMessage(e)}`);
           return;
         }
         deletedNames.push(name);

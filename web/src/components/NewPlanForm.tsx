@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { HttpError, fetchJson, postJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
+import { formatRelative } from "../lib/time.js";
+import { httpErrorBody } from "../lib/error.js";
 
 interface Folder {
   name: string;
@@ -26,20 +28,6 @@ type RunnerStatus =
 
 interface Props {
   onClose: () => void;
-}
-
-// Mirror of AuditLog formatTimestamp: SQLite's `datetime('now')` emits a
-// naive ISO string, so append `Z` if it isn't already UTC-marked.
-function formatRelative(iso: string): string {
-  const d = new Date(iso + (iso.endsWith("Z") ? "" : "Z"));
-  const diffMs = Date.now() - d.getTime();
-  const diffMin = Math.floor(diffMs / 60000);
-  if (diffMin < 1) return "just now";
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffH = Math.floor(diffMin / 60);
-  if (diffH < 24) return `${diffH}h ago`;
-  const diffD = Math.floor(diffH / 24);
-  return `${diffD}d ago`;
 }
 
 export function NewPlanForm({ onClose }: Props) {
@@ -302,7 +290,7 @@ async function applyRunnerErrorIfAny(
   setRunnerStatus: (s: RunnerStatus) => void
 ): Promise<boolean> {
   if (!(e instanceof HttpError)) return false;
-  const errorKey = (e.body as { error?: string } | undefined)?.error;
+  const errorKey = httpErrorBody<{ error?: string }>(e)?.error;
   if (e.status === 503 && errorKey === "no_runner_connected") {
     setRunnerStatus({ kind: "no_runner" });
     return true;

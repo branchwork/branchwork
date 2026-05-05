@@ -3,22 +3,9 @@ import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
 import { postJson } from "../api.js";
-
-function formatDate(iso: string): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
-  const diffDays = Math.floor(diffMs / 86400000);
-  if (diffDays === 0) return "today";
-  if (diffDays === 1) return "yesterday";
-  if (diffDays < 30) return `${diffDays}d ago`;
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-}
-
-function isPlanDone(p: PlanSummary): boolean {
-  return p.taskCount > 0 && p.doneCount >= p.taskCount;
-}
+import { formatRelative } from "../lib/time.js";
+import { errorMessage } from "../lib/error.js";
+import { isPlanDone } from "../lib/predicates.js";
 
 interface Props {
   view: "plans" | "agents" | "new-plan" | "audit" | "archive" | "admin";
@@ -54,8 +41,7 @@ export function Sidebar({ view, onViewChange }: Props) {
       await fetchPlans();
       if (selectedPlan) await selectPlan(selectedPlan.name);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setActionError(`Convert failed: ${msg}`);
+      setActionError(`Convert failed: ${errorMessage(e)}`);
       console.error("Convert all failed:", e);
     } finally {
       setConvertingAll(false);
@@ -120,7 +106,7 @@ export function Sidebar({ view, onViewChange }: Props) {
               </>
             )}
             {p.taskCount === 0 && <span>{p.phaseCount} phases</span>}
-            <span className="text-gray-700 ml-auto">{formatDate(p.modifiedAt)}</span>
+            <span className="text-gray-700 ml-auto">{formatRelative(p.modifiedAt)}</span>
           </div>
         </button>
       </li>

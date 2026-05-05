@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { fetchJson, postJson, deleteJson, HttpError } from "../api.js";
+import { httpErrorBody } from "../lib/error.js";
 
 export interface Agent {
   id: string;
@@ -123,7 +124,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
       return result;
     } catch (e) {
       if (e instanceof HttpError) {
-        const body = e.body as { error?: string } | undefined;
+        const body = httpErrorBody<{ error?: string }>(e);
         return { error: body?.error ?? `${e.status} ${e.statusText}` };
       }
       return { error: String(e) };

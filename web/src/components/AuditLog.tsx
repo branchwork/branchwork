@@ -3,6 +3,8 @@ import { fetchJson, HttpError } from "../api.js";
 import { useAuthStore } from "../stores/auth-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useWsStore } from "../stores/ws-store.js";
+import { formatTimestamp } from "../lib/time.js";
+import { errorMessage } from "../lib/error.js";
 
 interface AuditEntry {
   id: number;
@@ -115,25 +117,6 @@ const ACTION_ICONS: Record<string, string> = {
   "auto_mode.ci_failed": "✗", // BALLOT X
   "auto_mode.resumed": "▸", // BLACK RIGHT-POINTING SMALL TRIANGLE
 };
-
-function formatTimestamp(iso: string): string {
-  const d = new Date(iso + (iso.endsWith("Z") ? "" : "Z"));
-  const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
-  const diffMin = Math.floor(diffMs / 60000);
-  if (diffMin < 1) return "just now";
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffH = Math.floor(diffMin / 60);
-  if (diffH < 24) return `${diffH}h ago`;
-  const diffD = Math.floor(diffH / 24);
-  if (diffD < 7) return `${diffD}d ago`;
-  return d.toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
 
 function parseDiff(diff: string | null): Record<string, unknown> | null {
   if (!diff) return null;
@@ -461,7 +444,7 @@ export function AuditLog() {
         } else {
           setUndoErrors((e) => ({
             ...e,
-            [entryId]: err instanceof Error ? err.message : String(err),
+            [entryId]: errorMessage(err),
           }));
         }
         pushToast({
@@ -499,7 +482,7 @@ export function AuditLog() {
         setTotal(data.total);
         setOffset(newOffset);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(errorMessage(e));
       } finally {
         setLoading(false);
       }
@@ -552,7 +535,7 @@ export function AuditLog() {
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setExporting(false);
     }

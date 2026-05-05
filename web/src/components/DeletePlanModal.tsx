@@ -5,6 +5,7 @@ import {
   type DeletePlanPreview,
 } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
+import { errorMessage } from "../lib/error.js";
 
 interface DeletePlanModalProps {
   planName: string;
@@ -257,8 +258,7 @@ export function DeletePlanModal({
         onClose();
         return;
       } else {
-        const msg = e instanceof Error ? e.message : String(e);
-        setError(`Delete failed: ${msg}`);
+        setError(`Delete failed: ${errorMessage(e)}`);
       }
     } finally {
       setBusy(false);

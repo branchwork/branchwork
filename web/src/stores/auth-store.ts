@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { HttpError, fetchJson, postJson } from "../api.js";
+import { errorMessage } from "../lib/error.js";
 
 export interface AuthUser {
   id: string;
@@ -26,14 +27,6 @@ interface AuthStore {
   login: (email: string, password: string) => Promise<void>;
   signup: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
-}
-
-function errorMessage(e: unknown): string {
-  if (e instanceof HttpError) {
-    const body = e.body as { error?: string } | undefined;
-    return body?.error ?? `${e.status} ${e.statusText}`;
-  }
-  return e instanceof Error ? e.message : String(e);
 }
 
 export const useAuthStore = create<AuthStore>((set) => ({

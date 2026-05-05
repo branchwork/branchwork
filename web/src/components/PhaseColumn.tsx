@@ -3,6 +3,7 @@ import { postJson } from "../api.js";
 import { usePlanStore, type PlanPhase } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { TaskCard } from "./TaskCard.js";
+import { errorMessage } from "../lib/error.js";
 
 interface Props {
   phase: PlanPhase;
@@ -73,8 +74,7 @@ export function PhaseColumn({ phase, planName, statusFilter }: Props) {
         setStartError("No tasks were started");
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setStartError(`Start phase failed: ${msg}`);
+      setStartError(`Start phase failed: ${errorMessage(e)}`);
     } finally {
       setStarting(false);
     }

@@ -12,6 +12,7 @@ import { fetchJson, postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
 import { DeletePlanModal } from "./DeletePlanModal.js";
+import { errorMessage } from "../lib/error.js";
 
 export function PlanBoard() {
   const plan = usePlanStore((s) => s.selectedPlan);
@@ -63,7 +64,7 @@ export function PlanBoard() {
       await postJson(`/api/plans/${plan.name}/reset-status`, {});
       await selectPlan(plan.name);
     } catch (e) {
-      setError(`Reset failed: ${e instanceof Error ? e.message : String(e)}`);
+      setError(`Reset failed: ${errorMessage(e)}`);
     } finally {
       setResetting(false);
     }
@@ -81,7 +82,7 @@ export function PlanBoard() {
     try {
       await postJson(`/api/plans/${plan.name}/check-all`, {});
     } catch (e) {
-      setError(`Check all failed: ${e instanceof Error ? e.message : String(e)}`);
+      setError(`Check all failed: ${errorMessage(e)}`);
     } finally {
       setCheckingAll(false);
     }
@@ -98,7 +99,7 @@ export function PlanBoard() {
       );
       selectAgent(res.agentId);
     } catch (e) {
-      setError(`Check Plan failed: ${e instanceof Error ? e.message : String(e)}`);
+      setError(`Check Plan failed: ${errorMessage(e)}`);
     } finally {
       setCheckingPlan(false);
     }
@@ -111,8 +112,7 @@ export function PlanBoard() {
       await savePlan(updated);
       await fetchPlans();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Save failed: ${msg}`);
+      setError(`Save failed: ${errorMessage(e)}`);
     }
   }
 
@@ -124,8 +124,7 @@ export function PlanBoard() {
       await fetchPlans();
       await selectPlan(plan!.name);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(`Convert failed: ${msg}`);
+      setError(`Convert failed: ${errorMessage(e)}`);
       console.error("Convert failed:", e);
     } finally {
       setConverting(false);
@@ -602,7 +601,7 @@ function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonP
         new Set(data.branches.filter((b) => !b.hasUniqueCommits).map((b) => b.name)),
       );
     } catch (e) {
-      onError(`Load branches failed: ${e instanceof Error ? e.message : String(e)}`);
+      onError(`Load branches failed: ${errorMessage(e)}`);
       setOpen(false);
     } finally {
       setLoading(false);
@@ -629,7 +628,7 @@ function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonP
       setForce(false);
       onDone();
     } catch (e) {
-      onError(`Purge failed: ${e instanceof Error ? e.message : String(e)}`);
+      onError(`Purge failed: ${errorMessage(e)}`);
     } finally {
       setBusy(false);
     }
@@ -785,7 +784,7 @@ function AutoModeControls({ planName }: { planName: string }) {
       })
       .catch((e) => {
         if (!alive) return;
-        setError(`Load config failed: ${e instanceof Error ? e.message : String(e)}`);
+        setError(`Load config failed: ${errorMessage(e)}`);
       });
     return () => {
       alive = false;
@@ -800,7 +799,7 @@ function AutoModeControls({ planName }: { planName: string }) {
       setPlanConfig(planName, cfg);
       setDraftMaxFix(String(cfg.maxFixAttempts));
     } catch (e) {
-      setError(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
+      setError(`Save failed: ${errorMessage(e)}`);
     } finally {
       setBusy(false);
     }
@@ -984,7 +983,7 @@ export function AutoModeStatusPill({ planName }: { planName: string }) {
         });
         setPlanConfig(planName, cfg);
       } catch (e) {
-        setError(`Resume failed: ${e instanceof Error ? e.message : String(e)}`);
+        setError(`Resume failed: ${errorMessage(e)}`);
       } finally {
         setResuming(false);
       }

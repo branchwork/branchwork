@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchJson, HttpError } from "../api.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useWsStore } from "../stores/ws-store.js";
+import { formatTimestamp } from "../lib/time.js";
+import { errorMessage } from "../lib/error.js";
 
 /// One row from `GET /api/snapshots`. Mirrors the Rust
 /// `SnapshotListEntry` (camelCased on the wire).
@@ -76,25 +78,6 @@ function formatCountdown(iso: string): { label: string; tone: string } {
   return { label: `expires in ${minutes}m`, tone: "text-red-400" };
 }
 
-function formatTimestamp(iso: string): string {
-  const d = new Date(iso + (iso.endsWith("Z") ? "" : "Z"));
-  const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
-  const diffMin = Math.floor(diffMs / 60000);
-  if (diffMin < 1) return "just now";
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffH = Math.floor(diffMin / 60);
-  if (diffH < 24) return `${diffH}h ago`;
-  const diffD = Math.floor(diffH / 24);
-  if (diffD < 7) return `${diffD}d ago`;
-  return d.toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
 export function ArchivePanel() {
   const connected = useWsStore((s) => s.connected);
   const pushToast = usePlanStore((s) => s.pushToast);
@@ -121,7 +104,7 @@ export function ArchivePanel() {
       const data = await fetchJson<SnapshotListResponse>("/api/snapshots");
       setEntries(data.snapshots);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setLoading(false);
     }
@@ -191,7 +174,7 @@ export function ArchivePanel() {
           ttlMs: 5_000,
         });
       } catch (err) {
-        let message = err instanceof Error ? err.message : String(err);
+        let message = errorMessage(err);
         if (err instanceof HttpError) {
           if (err.status === 410) {
             message = "snapshot already restored";
@@ -255,7 +238,7 @@ export function ArchivePanel() {
           });
         }
       } catch (err) {
-        let message = err instanceof Error ? err.message : String(err);
+        let message = errorMessage(err);
         if (err instanceof HttpError) {
           if (err.status === 404) {
             message = "already purged";
