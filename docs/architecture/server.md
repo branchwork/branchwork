@@ -88,12 +88,36 @@ into the modules below.
 
 | Module                             | Owns                                                                                                |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `api/plans.rs`                     | `/api/plans*` — list/get/create/update plans, set project/budget/auto-advance, task status, learnings, auto-status, reset, stale-branch sweep, plan and task `Check`, `start-task`, `start-phase-tasks`. The biggest file in the tree. |
+| `api/plans.rs`                     | `/api/plans*` — list/get/create/update plans, set project/budget/auto-advance, task status, learnings, auto-status, reset, stale-branch sweep, plan and task `Check`, `start-task`, `start-phase-tasks`. The biggest file in the tree. `POST /api/plans` resolves the project folder either locally or via a `CreateFolder` round-trip to the org's runner — see [Filesystem dispatch in SaaS mode](#filesystem-dispatch-in-saas-mode) below. |
 | `api/agents.rs`                    | `/api/agents*` — list, output, diff, merge, discard, kill, finish, drivers, events. Includes the empty-branch merge guard. |
 | `api/ci.rs`                        | `/api/actions/fix-ci`, `/api/ci/{id}*` — Fix-CI agent spawn, CI run dismiss, failure-log fetch.    |
-| `api/settings.rs`                  | `/api/settings`, `/api/folders` — global server settings and project-folder browser.                 |
+| `api/settings.rs`                  | `/api/settings`, `/api/folders` — global server settings and project-folder browser. `GET /api/folders` is the canonical example of the runner-dispatch pattern: it lists `~` on the SaaS host or on the runner host depending on [`org_has_runner`](#filesystem-dispatch-in-saas-mode). |
 | `api/billing.rs`                   | `/api/orgs/{slug}/{usage,budget,kill-switch,user-quotas}` — SaaS-only billing surface.               |
 | `api/mod.rs`                       | Pure module declarations.                                                                            |
+
+#### Filesystem dispatch in SaaS mode
+
+`/api/folders` and `POST /api/plans` both need to read or create
+directories. In a self-hosted deployment the dashboard *is* on the
+machine that owns those directories and a plain `std::fs` call is
+correct. In SaaS the dashboard is on Branchwork-hosted infrastructure
+and the customer's source tree lives on a runner — so each handler
+checks
+[`saas::dispatch::org_has_runner(&db, org_id)`](../../server-rs/src/saas/dispatch.rs)
+and either takes the local path or sends a `ListFolders` /
+`CreateFolder` frame over the runner WebSocket and awaits the
+correlated reply with an 8 s budget. The handler returns
+`503 no_runner_connected` when the org has registered a runner but
+none is currently online, `504 runner_unavailable` on RPC timeout, and
+the same JSON shape on success regardless of which branch ran.
+
+The wire-level mechanics (envelope format, `req_id` correlation, why
+these frames are best-effort rather than outbox-backed) live in
+[protocols.md — Request/response frames](protocols.md#requestresponse-frames).
+Branch / merge / push / `gh` operations follow the same pattern; see
+[runner.md — Folder operations](runner.md#folder-operations) and
+[Branch, merge, and CI handlers](runner.md#branch-merge-and-ci-handlers)
+for the runner-side handlers.
 
 ### `ws.rs` — dashboard WebSocket fan-out
 

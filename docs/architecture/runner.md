@@ -17,6 +17,36 @@ daemon the runner reuses as its supervisor is documented at
 inline below; the canonical reference is `WireMessage` in
 [`server-rs/src/saas/runner_protocol.rs`](../../server-rs/src/saas/runner_protocol.rs).
 
+## What the runner does
+
+A SaaS runner exposes the customer machine's filesystem, git state,
+and AI CLIs to the hosted dashboard. It owns four kinds of work, each
+triggered by the dashboard sending a `WireMessage` frame on the
+shared WebSocket:
+
+- **Spawning agents** under the same `branchwork-server session`
+  supervisor self-hosted mode uses, then forwarding PTY I/O frames in
+  both directions. See [Spawning agents](#spawning-agents-and-reusing-the-session-daemon).
+- **Folder listing and creation** as synchronous RPCs the SaaS server
+  issues on behalf of `GET /api/folders` and `POST /api/plans` — the
+  runner is the dashboard's window into the project parent directory
+  (`~/projects`, `~/code`, …) on the customer machine. See
+  [Folder operations](#folder-operations).
+- **Branch resolution, merge, push, and `gh` queries** for everything
+  the merge button and CI badge used to do directly on the SaaS
+  filesystem. See
+  [Branch, merge, and CI handlers](#branch-merge-and-ci-handlers).
+- **Auto-mode round-trips** that drive the merge → CI gate → fix loop
+  end-to-end for unattended plans, again via request/response frames
+  correlated by `req_id`.
+
+All four families share the [request/response pattern documented in
+protocols.md](protocols.md#requestresponse-frames): the SaaS server
+mints a `req_id`, parks on a `oneshot`, and times out cleanly if the
+runner never replies. Folder, branch, and `gh` requests are
+classified best-effort — the dashboard's HTTP caller is the retry
+loop, not the runner outbox.
+
 ## Where the runner fits
 
 ```
@@ -274,19 +304,44 @@ issues per-task absolute paths (e.g. for monorepo subpackages) the
 runner spawns the daemon with that exact path and the runner's own
 `--cwd` is irrelevant for that agent.
 
+## Folder operations
+
+The first runner-dispatched filesystem RPCs were `ListFolders` and
+`CreateFolder`. They back the project-folder picker (`GET
+/api/folders`) and the New Plan flow's "create folder if missing"
+checkbox (`POST /api/plans`). Both are synchronous from the
+dashboard's point of view — a live HTTP caller is parked on a
+`oneshot` for ~8 s while the runner does the work — and both are the
+canonical precedent for the [Branch, merge, and CI
+handlers](#branch-merge-and-ci-handlers) below.
+
+| Variant | What the runner does | Reply |
+|---|---|---|
+| `ListFolders { req_id }` | One-level scan of the runner home directory: `read_dir($HOME)`, filter to directories, drop dotfiles, return `name` + absolute `path` per entry. Mirrors `api::settings::list_folders`'s local fallback so the JSON shape is identical in both modes. | `FoldersListed { req_id, entries }` |
+| `CreateFolder { req_id, path, create_if_missing }` | Resolve `path` (`~`-expand against `$HOME`, otherwise treat as absolute). If the directory exists, return `ok: true` with the canonical `resolved_path`. If missing and `create_if_missing` is `false`, return `ok: false, error: "folder_not_found"`. If missing and `create_if_missing` is `true`, `mkdir -p` and return the canonical path. Any other I/O error surfaces as `ok: false` with the OS error string in `error`. | `FolderCreated { req_id, ok, resolved_path?, error? }` |
+
+The runner-side implementation lives in `check_or_create_folder`
+inside [`branchwork_runner.rs`](../../server-rs/src/bin/branchwork_runner.rs);
+the SaaS-side dispatch is the
+[`runner_request`](../../server-rs/src/saas/runner_rpc.rs) helper.
+Both frames are best-effort — see
+[protocols.md — Request/response frames](protocols.md#requestresponse-frames)
+for the rationale (live HTTP caller is the retry loop, outbox replay
+would deliver an answer to a caller that has already given up).
+
 ## Branch, merge, and CI handlers
 
-Beyond spawning agents, the runner is also the host for the side
-effects the SaaS dashboard used to perform directly on its own
-filesystem: resolving the canonical default branch, listing local
-branches, performing the merge, pushing to `origin`, and querying
-`gh` for CI run status and failure logs. Each one is implemented as
-an additional arm in the runner's `handle_server_message` match
-(`branchwork_runner.rs`); they all reply with a best-effort envelope
-correlated by `req_id`. The wire protocol for these eight
-request/response pairs is documented in
-[protocols.md](protocols.md#wiremessage-variants); this section covers
-the runner-side handler shape.
+Beyond spawning agents and folder browsing, the runner is also the
+host for the side effects the SaaS dashboard used to perform directly
+on its own filesystem: resolving the canonical default branch,
+listing local branches, performing the merge, pushing to `origin`,
+and querying `gh` for CI run status and failure logs. Each one is
+implemented as an additional arm in the runner's
+`handle_server_message` match (`branchwork_runner.rs`); they all
+reply with a best-effort envelope correlated by `req_id`. The wire
+protocol for these eight request/response pairs is documented in
+[protocols.md](protocols.md#wiremessage-variants); this section
+covers the runner-side handler shape.
 
 | Variant | Shells out to | Validates / trims | Reply |
 |---|---|---|---|

@@ -3,14 +3,26 @@
 # Builds the Docker image, starts the container, runs tests, tears down.
 #
 # Usage:
-#   tests/e2e/run.sh [--keep]
+#   tests/e2e/run.sh [--keep]                 # standalone mode (default)
+#   E2E_MODE=saas tests/e2e/run.sh [--keep]   # SaaS + runner mode
 #
 # Env:
-#   E2E_MODE   standalone (default) — server only.
+#   E2E_MODE   standalone (default) — server only. Folder ops, merges, and
+#                                     CI calls run against the server's
+#                                     local filesystem.
 #              saas               — server + branchwork-runner. The driver
-#                                   signs up a user and mints a runner token
-#                                   via the API, then brings up the runner
-#                                   service with the token injected.
+#                                   signs up a user, mints a runner token
+#                                   via the API, brings up the runner
+#                                   service with the token injected, and
+#                                   waits for the runner to report `online`
+#                                   on `GET /api/runners` before running
+#                                   tests. Test scripts named
+#                                   `test_saas_*.sh` exercise the runner
+#                                   round-trip path
+#                                   (`/api/folders`, `POST /api/plans`,
+#                                   `no_runner_connected` 503s) — see
+#                                   docs/architecture/runner.md for the
+#                                   wire protocol they exercise.
 #   E2E_PORT   host port for the server (default 3199).
 #
 # Flags:
