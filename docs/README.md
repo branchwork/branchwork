@@ -41,6 +41,11 @@ The three-binary split, wire protocols, and storage model.
   schema, org multi-tenancy, outbox tables, idempotent migrations, the
   per-agent sibling files, and a four-way restart matrix covering every
   persisted artifact.
+- [architecture/deploy.md](architecture/deploy.md) — Docker image
+  pipeline (zigbuild stage 2, per-arch parallel build matrix +
+  manifest job in `docker.yml`), the consumer tag contract that lets
+  the Hetzner deploy and `docker pull` resolve a single tag to the
+  right per-arch slice, and the canonical pull-and-run smoke fixtures.
 
 ## Reference
 
