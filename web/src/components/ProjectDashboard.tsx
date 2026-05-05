@@ -202,6 +202,24 @@ export function ProjectDashboard() {
   ).length;
   const totalCost = plans.reduce((s, p) => s + (p.totalCostUsd ?? 0), 0);
 
+  // Selected list ordered by their visible position on the dashboard,
+  // so the modal lists plans in the same order the user sees them.
+  // Walking projectStats (already sorted) lets the bulk modal show
+  // names in dashboard order — important when the 409 banner names
+  // a plan and the user is scanning the list to find it.
+  //
+  // MUST be declared before any early returns below — Rules of Hooks
+  // require all hooks to fire on every render.
+  const orderedSelected: string[] = useMemo(() => {
+    const out: string[] = [];
+    for (const ps of projectStats) {
+      for (const p of ps.plans) {
+        if (selected.has(p.name)) out.push(p.name);
+      }
+    }
+    return out;
+  }, [projectStats, selected]);
+
   if (loading && plans.length === 0) {
     return (
       <div className="flex items-center justify-center h-full text-gray-500">
@@ -223,21 +241,6 @@ export function ProjectDashboard() {
       </div>
     );
   }
-
-  // Selected list ordered by their visible position on the dashboard,
-  // so the modal lists plans in the same order the user sees them.
-  // Walking projectStats (already sorted) lets the bulk modal show
-  // names in dashboard order — important when the 409 banner names
-  // a plan and the user is scanning the list to find it.
-  const orderedSelected: string[] = useMemo(() => {
-    const out: string[] = [];
-    for (const ps of projectStats) {
-      for (const p of ps.plans) {
-        if (selected.has(p.name)) out.push(p.name);
-      }
-    }
-    return out;
-  }, [projectStats, selected]);
 
   return (
     <div className="p-6 pb-20">
