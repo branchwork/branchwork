@@ -105,6 +105,66 @@ The first fixture is the canonical one for CI; the second is the
 external-side check used during a deploy verification (e.g. the
 runbook in saas plan task 6.10).
 
+## Production reverse proxy (Caddy)
+
+The Hetzner box hosts several Cloudflare-fronted sites
+(`varpulis-cep.com`, `openraroc.com`, `reglyze.com`,
+`branchwork.dev`). They share a single Caddy instance — the
+`demo-caddy` container in the `demo` Docker Compose project at
+`/home/cpo/varpulis-demo/repo/deploy/demo/`. Each new site is added
+as a block in that project's `Caddyfile`; restarting the `demo-caddy`
+container re-establishes the bind mount so caddy picks up the new
+content.
+
+DNS for `branchwork.dev` is at Cloudflare with proxy enabled
+(orange cloud), so HTTP-01 to Let's Encrypt cannot work — the edge
+terminates TLS. Two viable patterns for origin TLS:
+
+- **Cloudflare Origin Certificate** (path used by `varpulis-cep` and
+  `openraroc`): minted via the Cloudflare dashboard, installed at
+  `/etc/caddy/certs/<name>-origin{,-key}.pem`, served via
+  `tls /etc/caddy/certs/<name>-origin.pem
+  /etc/caddy/certs/<name>-origin-key.pem`. Requires the Cloudflare
+  zone in **Full (Strict)** mode.
+- **`tls internal`** (path used by `reglyze` and `branchwork.dev`):
+  Caddy serves a self-signed cert from its internal CA. The
+  Cloudflare zone TLS mode must be **Full** (not Strict) for the
+  edge to accept it. No cert minting or sudo write to
+  `/etc/caddy/certs/` needed.
+
+The current `branchwork.dev` site block (matches the reglyze
+pattern):
+
+```caddyfile
+branchwork.dev, www.branchwork.dev {
+    tls internal
+
+    @www host www.branchwork.dev
+    redir @www https://branchwork.dev{uri} permanent
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    reverse_proxy 172.17.0.1:3100
+}
+```
+
+`172.17.0.1` is the Docker bridge gateway — the address `demo-caddy`
+uses to reach the host's loopback, where the `branchwork-server`
+compose stack (introduced in task 6.7) binds port 3100.
+
+Operational gotcha — the `Caddyfile` is mounted into `demo-caddy`
+as a single-file bind. Editing it via atomic-rewrite (the default
+for most editors) strands the bind on the original inode; the
+container keeps reading the old content until you restart it.
+Either edit in-place (`cat > Caddyfile`) **and** then run
+`docker restart demo-caddy`, or just restart unconditionally after
+any edit.
+
 ## See also
 
 - [`build-perf-2026-05-05-baseline.md`](../build-perf-2026-05-05-baseline.md)
