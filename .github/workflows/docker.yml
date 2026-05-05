@@ -1,9 +1,15 @@
 name: Docker
 
 on:
+  # Trunk publishes are gated on a green CI run so a broken push to master
+  # never produces a deployable :edge image. Tag pushes and manual dispatches
+  # bypass the gate — releases are explicit human action.
+  workflow_run:
+    workflows: [CI] # name from ci.yml
+    types: [completed]
+    branches: [master]
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -16,6 +22,11 @@ env:
 
 jobs:
   build-and-push:
+    # Only publish if either we weren't triggered by workflow_run (tag push or
+    # manual dispatch), or the CI run that triggered us was green.
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +54,9 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=sha,prefix=,format=short
 
       - name: Build and push
         uses: docker/build-push-action@v6
