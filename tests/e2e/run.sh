@@ -21,7 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose.e2e.yml"
+export COMPOSE_FILE="$REPO_ROOT/deploy/docker-compose.e2e.yml"
 
 export E2E_PORT="${E2E_PORT:-3199}"
 export BASE_URL="http://localhost:${E2E_PORT}"
@@ -126,7 +126,7 @@ if [ "$E2E_MODE" = "saas" ]; then
     exit 1
   fi
 
-  COOKIE_JAR="$(mktemp)"
+  export COOKIE_JAR="$(mktemp)"
   E2E_USER_EMAIL="e2e-$(date +%s)-$$@example.test"
   E2E_USER_PASSWORD="e2e-password-1234"
 
