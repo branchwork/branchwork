@@ -286,3 +286,233 @@ move:
 The zigbuild lift did **not** absorb most of the available gain —
 it left ~10 minutes of cold and the entire warm regression on the
 table, both of which a per-arch matrix recovers.
+
+## Phase 2 results
+
+Re-measurement after T2.1 (`docker.yml` split into a 2-entry build
+matrix on `amd64`/`arm64` with `push-by-digest=true`, plus a
+`manifest` job that fans the per-arch digests back into the
+human-readable tags via `docker buildx imagetools create`).
+Per-arch GHA cache scopes (`amd64` / `arm64`) replace the previous
+single `zigbuild-deps` scope, so the two arches no longer invalidate
+each other.
+
+The Dockerfile is unchanged from Phase 1 — stage 2 still does a
+single dual-target `cargo zigbuild --target x86_64-unknown-linux-musl
+--target aarch64-unknown-linux-musl` invocation. Both matrix arches
+therefore execute the full dual-target Rust compile; only stage 3
+(`COPY --from=server /out/${TARGETARCH}/...`) is per-arch. Splitting
+stage 2 by `$TARGETARCH` was deferred — see "Why the cold gap
+remains" below.
+
+| Run | ID | Trigger | SHA | Note |
+|---|---|---|---|---|
+| Cold | [25383180962](https://github.com/branchwork/branchwork/actions/runs/25383180962) | `workflow_run` (after CI green) | 310afbe | First run on master with both arches' GHA cache scopes empty |
+| Warm | [25384334395](https://github.com/branchwork/branchwork/actions/runs/25384334395) | `workflow_dispatch` | 310afbe | Same SHA, full per-arch GHA cache from cold run |
+
+A second `workflow_run` on the same SHA fired concurrently with the
+cold above (run [25383536100](https://github.com/branchwork/branchwork/actions/runs/25383536100),
+created 7 minutes after cold, finished 6 minutes after cold). It
+contended with the cold run for cache writes — relevant context for
+the amd64-vs-arm64 wall-clock asymmetry below; see "Variance from
+cache contention".
+
+### Total wall clock
+
+The metric of record is run-level `createdAt → updatedAt`, which
+spans the parallel build matrix and the sequential manifest job.
+
+|        | Cold (Phase 2) | vs 0.1 baseline | Warm (Phase 2) | vs 0.1 baseline |
+|--------|---------------:|----------------:|---------------:|----------------:|
+| Run (`createdAt → updatedAt`)         | **20m 28s** (1228s) | **25.2%** (4.0× speedup) | **1m 44s** (104s) | 186% (1.9× slower) |
+| `build (arm64)` job (started → completed) | 13m 14s (794s)      | —                       | 30s               | — |
+| `build (amd64)` job (started → completed) | 19m 32s (1172s)     | —                       | 22s               | — |
+| `manifest` job (started → completed)      | 36s                 | —                       | 57s               | — |
+
+**Cold acceptance — PASS** (≤30% of the 0.1 baseline 4869s, i.e.
+≤1460s). Cold landed at 25.2% of baseline, comfortably under the
+target. Compared to Phase 1 cold (950s, 19.5%), Phase 2 cold
+regressed by 278s / 29% — see "Why the cold gap remains".
+
+**Warm acceptance — FAIL** (≤40% of the 0.1 baseline 56s, i.e.
+≤22s). Warm landed at 186% of baseline (104s), a 4.6× miss against
+the target and a 41% regression vs Phase 1 warm (74s). The miss is
+structural — see "Why warm got slower again".
+
+### Per-job breakdown
+
+The build matrix runs `amd64` and `arm64` in parallel, each emitting
+a tagless image keyed by digest. The `manifest` job downloads both
+digests via `actions/download-artifact@v4` and runs `docker buildx
+imagetools create` to attach the human-readable tags pointing at
+both per-arch images.
+
+#### Cold
+
+| Job             | Build and push | Set up Docker Buildx | Misc | Total |
+|-----------------|---------------:|---------------------:|-----:|------:|
+| build (arm64)   | 12m 44s (764s) | 17s                  | 13s  | 13m 14s |
+| build (amd64)   | 19m 10s (1150s)| 6s                   | 16s  | 19m 32s |
+| manifest        | —              | 9s                   | 27s* | 36s   |
+
+\* `manifest` misc = Set up job 4s + Download digests <1s + Login 1s + Extract metadata 1s + **Create manifest 17s** + post-steps 4s.
+
+#### Warm
+
+| Job             | Build and push | Set up Docker Buildx | Misc | Total |
+|-----------------|---------------:|---------------------:|-----:|------:|
+| build (amd64)   | 5s             | 7s                   | 10s  | 22s   |
+| build (arm64)   | 10s            | 6s                   | 14s  | 30s   |
+| manifest        | —              | 7s                   | 50s* | 57s   |
+
+\* `manifest` misc = Set up job 2s + Download digests <1s + Login 1s + Extract metadata 1s + **Create manifest 43s** + post-steps 3s.
+
+The manifest job is wholly sequential against the build matrix
+(`needs: build`). Even on a perfect cache hit, it adds ~30-60s of
+fixed overhead on top of `max(amd64-job, arm64-job)`, dominated by
+the `docker buildx imagetools create` call attaching tags to the
+per-arch digests in GHCR.
+
+### Build-and-push internals (cold) — longest substeps
+
+Aggregating both matrix jobs' BuildKit DAG nodes (each job's stage 2
+runs the full dual-target zigbuild, so identical step labels appear
+in both jobs).
+
+| #  | Job   | Step                                                                | Duration |
+|----|-------|---------------------------------------------------------------------|---------:|
+| 30 | amd64 | `[server  9/13]` `cargo zigbuild --release` (deps prebuild, dual-target) | **7m 49s** (469.4s) |
+| 40 | amd64 | `exporting to GitHub Actions Cache`                                 | **5m 55s** (354.5s) |
+| 30 | arm64 | `[server  9/13]` `cargo zigbuild --release` (deps prebuild, dual-target) | 5m 49s (348.5s) |
+| 33 | amd64 | `[server 12/13]` `cargo zigbuild --bin … --release` (dual-target)   | 3m 45s (224.7s) |
+| 33 | arm64 | `[server 12/13]` `cargo zigbuild --bin … --release` (dual-target)   | 2m 49s (168.8s) |
+| 40 | arm64 | `exporting to GitHub Actions Cache`                                 | 2m 33s (152.7s) |
+| 25 | amd64 | `[server  4/13]` `cargo install cargo-zigbuild`                     | 1m 13s (73.1s) |
+| 23 | arm64 | `[server  4/13]` `cargo install cargo-zigbuild`                     | 1m 02s (61.7s) |
+
+The Phase 1 longest substep was a single `[amd64 server 9/13]
+cargo zigbuild` deps prebuild at 433.7s. Phase 2 cold contains *two*
+of those steps — one per matrix job — at 348.5s and 469.4s. The
+zigbuild + install + rust-target overhead is paid twice instead of
+once, and that duplication is the main reason cold regressed against
+Phase 1.
+
+#### Why the cold gap remains
+
+The Phase 1 prediction was `cold ≈ max(amd64-native, arm64-native)
+≈ 6-7m per arch`. Realised cold is 13-20m per arch. The factor-2
+gap traces to the Dockerfile still cross-compiling **both** targets
+in stage 2, even when the parent matrix job only needs one:
+
+```dockerfile
+# stage 2 RUN (deploy/Dockerfile:51-54 + 63-69), executed in BOTH
+# matrix jobs:
+RUN cargo zigbuild \
+      --target x86_64-unknown-linux-musl \
+      --target aarch64-unknown-linux-musl \
+      --release …
+```
+
+Buildx does not prune unreferenced stage 2 outputs based on the
+single `COPY --from=server /out/${TARGETARCH}/…` in stage 3. The
+arm64 matrix job builds both binaries, then copies only the arm64
+slice into runtime; amd64 does the same in mirror. Each parallel
+job thus carries the full dual-target compile cost, and the
+parallelism only saves the stage-3 layer + per-arch GHA cache
+export (which is now non-trivially smaller per scope).
+
+To realise the predicted ~7m cold, stage 2 would need to be
+split — e.g. take a `TARGET_TRIPLE` `ARG` from `$TARGETARCH` and
+invoke `cargo zigbuild --target $TARGET_TRIPLE` once. That work is
+out of scope for this plan; tracked as a follow-up.
+
+#### Variance from cache contention
+
+A second cold run on the same SHA ([25383536100](https://github.com/branchwork/branchwork/actions/runs/25383536100))
+fired 7 minutes after our canonical cold and ran in parallel until
+shortly after our warm dispatch. Both cold runs wrote to the same
+per-arch cache scopes simultaneously. In our canonical cold:
+
+- arm64 finished its `Build and push` at 14:54:02Z, before the
+  second cold's amd64 had even started exporting cache. arm64 was
+  uncontested.
+- amd64 finished its `Build and push` at 15:00:25Z, with 354.5s of
+  that being `exporting to GitHub Actions Cache` — overlapping
+  exactly the window during which the second cold's amd64 was
+  reading the scope.
+
+The second cold's per-arch wall clock was actually closer to
+symmetric: arm64 14m 41s, amd64 16m 25s. Our cold's amd64 (19m 32s)
+appears anomalously slow as a result of the export contention.
+Treat the cold number as an upper bound; a clean re-run with no
+parallel cold should land closer to 16-17m, still above the Phase 1
+combined 16m but with the asymmetry reduced.
+
+### Why warm got slower again
+
+Phase 1 warm = 74s; Phase 2 warm = 104s. The 30s regression splits
+across two structural costs:
+
+- **Manifest job overhead (~57s)**: Phase 1 had a single build job
+  whose `Post Build and push` step exported the cached image
+  directly to GHCR with all tags attached in one shot. Phase 2 has
+  to re-attach tags via a separate manifest job — `docker buildx
+  imagetools create` against the per-arch digests took 43s on warm
+  (it round-trips through GHCR to read each digest's manifest, then
+  writes a new manifest list per tag). Add Buildx setup + login on
+  the new job (~10s) and the manifest contributes ~57s of
+  unavoidable sequential overhead.
+- **Per-job setup duplication (~5-10s)**: each parallel build job
+  pays its own `Set up Docker Buildx` (6-7s) and Buildx daemon
+  cold-start. The matrix amortises compute but multiplies setup.
+  In the warm case the build itself is `5-10s` per arch, so setup
+  + post-steps dominate; the parallel structure then runs at
+  `max(amd64, arm64) ≈ 30s` for the build phase.
+
+Net warm budget on a perfect cache hit:
+`max(amd64-job, arm64-job) + manifest-job ≈ 30s + 57s ≈ 90s`,
+which is consistent with the observed 104s once you allow ~14s of
+runner overhead between job boundaries (queueing, runner
+provisioning).
+
+The ≤22s warm target is unreachable under the current matrix +
+manifest design — the manifest job alone exceeds it. Reaching the
+target would require collapsing back to a single build job (losing
+parallel arch builds) or moving the tag attachment into the build
+jobs themselves (losing the per-arch digest publishing model).
+Neither is in scope for this plan.
+
+### Cache-hit rate
+
+|        | Buildable layers (per arch job) | CACHED | Hit rate |
+|--------|--------------------------------:|-------:|---------:|
+| Cold   | 24                              | 0      | 0%       |
+| Warm   | 24                              | 24     | 100%     |
+
+Same shape as Phase 1: zero hits cold, 100% hits warm. The DAG
+node count per arch job (~38) is below the Phase 1 combined-job DAG
+(47) because each matrix job only materialises one runtime stage
+slice instead of both.
+
+### Final verdict against documented targets
+
+| Metric | Target (vs 0.1 baseline) | Phase 1 | Phase 2 | Verdict |
+|--------|--------------------------|--------:|--------:|---------|
+| Cold   | ≤30% of 4869s = ≤1460s   | 950s (19.5%) | **1228s (25.2%)** | **PASS** |
+| Warm   | ≤40% of 56s   = ≤22s     | 74s (132%)   | **104s (186%)**   | **FAIL** (gap explained) |
+
+Cold passes on absolute targets but regresses against Phase 1, due
+to the Dockerfile dual-target zigbuild being unchanged in T2.1 (the
+matrix split saves stage-3 + cache-export, not stage-2 compute). A
+follow-up that splits stage 2 by `$TARGETARCH` would recover the
+predicted ~7m cold.
+
+Warm fails by 4.6× on the target. The miss is structural to the
+matrix + manifest design: the sequential manifest job adds ~57s of
+fixed overhead that the ≤22s warm target cannot absorb. This is a
+documented trade-off — per-arch digest publishing requires a fan-in
+step — and the absolute warm cost (104s) is still trivial against
+cold's 1228s.
+
+The plan-level wall-clock objective stands: cold went from 81m
+(baseline) to 20.5m (Phase 2), a 60-minute saving per cold run.
