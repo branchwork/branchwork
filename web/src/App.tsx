@@ -14,6 +14,7 @@ import { AuditLog } from "./components/AuditLog.js";
 import { ArchivePanel } from "./components/ArchivePanel.js";
 import { LoginPage } from "./components/LoginPage.js";
 import { AdminPage } from "./components/AdminPage.js";
+import { Toaster } from "./components/Toaster.js";
 
 type View = "plans" | "agents" | "new-plan" | "audit" | "archive" | "admin";
 
@@ -100,6 +101,8 @@ export function App() {
           </div>
         )}
       </main>
+
+      <Toaster />
 
       {/* Connection indicator + logout */}
       <div className="fixed bottom-3 right-3 flex items-center gap-3 text-xs text-gray-500">
