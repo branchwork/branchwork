@@ -165,6 +165,59 @@ Either edit in-place (`cat > Caddyfile`) **and** then run
 `docker restart demo-caddy`, or just restart unconditionally after
 any edit.
 
+## First-run smoke test
+
+After bringing up the prod overlay (task 6.7) and the Caddy site
+block (task 6.6), task 6.8 runs a four-step smoke against the
+public URL to confirm the auth + cookie + dashboard surface is
+live before pointing a real runner at `wss://branchwork.dev`.
+Every assertion is HTTP-only — no browser needed:
+
+```sh
+EMAIL="smoke-$(date +%s)@example.com"
+PASSWORD="smoketest-pw-1234"
+
+# 1. Signup. Asserts 201 and Set-Cookie carries Secure + HttpOnly.
+curl -sS -i -c /tmp/bw-cookies.txt -X POST https://branchwork.dev/api/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}"
+
+# 2. /api/auth/me with the cookie. Asserts 200 + the user row.
+curl -sS -i -b /tmp/bw-cookies.txt https://branchwork.dev/api/auth/me
+
+# 3. Dashboard renders. Asserts 200 text/html and the SPA bundle
+#    referenced in the index also returns 200.
+curl -sS -o /tmp/bw-index.html -w "%{http_code}\n" https://branchwork.dev/
+
+# 4. Issue a runner token. Asserts 201 + JSON containing `token`.
+curl -sS -i -b /tmp/bw-cookies.txt -X POST https://branchwork.dev/api/runners/tokens \
+  -H 'Content-Type: application/json' \
+  -d '{"runner_name":"smoke-test"}'
+```
+
+Expected `Set-Cookie` shape from step 1, with the prod overlay's
+`BRANCHWORK_SECURE_COOKIES=1` (introduced in task 6.4) applied:
+
+```
+branchwork_session=<hex>; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800; Secure
+```
+
+Save the token from step 4 — task 6.9 feeds it to a real runner
+(`branchwork-runner --saas-url wss://branchwork.dev --token …`)
+to prove the dispatch path works end-to-end. The smoke run on
+2026-05-05 stashed it at
+`~/.config/branchwork/saas-runner-token-smoke.txt` (mode 0600,
+out of git); rotate or revoke once the runner smoke is signed
+off.
+
+The first signed-up user lands in `default-org` (membership ORDER
+BY name puts "Default Organization" before the personal
+`<localpart>'s org`). Promotion to `owner` of the personal org is
+not needed for the smoke since `/api/runners/tokens` only requires
+authentication — the token is bound to whichever org the
+middleware resolves, and `default-org` is fine for a first-run
+exercise.
+
 ## See also
 
 - [`build-perf-2026-05-05-baseline.md`](../build-perf-2026-05-05-baseline.md)
