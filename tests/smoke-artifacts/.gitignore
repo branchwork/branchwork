@@ -1,0 +1,10 @@
+# Smoke run artefacts (screenshots, traces, HTML reports) are written here
+# by tests/smoke/run.sh under <run-date>/ subdirectories. They are useful
+# locally for human review but should not be committed — each run is
+# unique and the binaries (PNGs, .zip traces, video) bloat the repo.
+#
+# The directory itself is checked in (with this .gitignore + README) so
+# the smoke runner does not need to mkdir it on first run.
+*
+!.gitignore
+!README.md
