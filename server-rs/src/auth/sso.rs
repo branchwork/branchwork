@@ -871,6 +871,7 @@ fn complete_sso_login(
     email: &str,
     external_id: &str,
     groups: &[String],
+    secure_cookie: bool,
 ) -> Response {
     let result = {
         let conn = state.db.lock().unwrap();
@@ -913,7 +914,7 @@ fn complete_sso_login(
     };
 
     let token = sessions::create(&state.db, &user_id);
-    let cookie = sessions::set_cookie_value(&token);
+    let cookie = sessions::set_cookie_value(&token, secure_cookie);
 
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
@@ -1465,13 +1466,22 @@ pub async fn oidc_callback(
         provider.groups_claim.as_deref().unwrap_or("groups"),
     );
 
-    complete_sso_login(&state, &provider, &email, &claims.sub, &groups)
+    let secure_cookie = sessions::should_secure_cookie(&headers);
+    complete_sso_login(
+        &state,
+        &provider,
+        &email,
+        &claims.sub,
+        &groups,
+        secure_cookie,
+    )
 }
 
 /// `POST /api/auth/sso/:provider_id/saml/acs` — SAML Assertion Consumer Service.
 pub async fn saml_acs(
     State(state): State<AppState>,
     Path(provider_id): Path<String>,
+    headers: HeaderMap,
     Form(form): Form<SamlAcsForm>,
 ) -> Response {
     let provider = {
@@ -1554,7 +1564,8 @@ pub async fn saml_acs(
         .cloned()
         .unwrap_or_default();
 
-    complete_sso_login(&state, &provider, &email, name_id, &groups)
+    let secure_cookie = sessions::should_secure_cookie(&headers);
+    complete_sso_login(&state, &provider, &email, name_id, &groups, secure_cookie)
 }
 
 /// `GET /api/auth/sso/:provider_id/saml/metadata` — SAML SP metadata XML.

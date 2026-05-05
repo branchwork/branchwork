@@ -1,3 +1,4 @@
+use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, Utc};
 use rand::RngCore;
 use rusqlite::{OptionalExtension, params};
@@ -109,16 +110,54 @@ pub fn token_from_cookie_header(header: &str) -> Option<String> {
 
 /// Render the `Set-Cookie` value for a newly issued token. HttpOnly + SameSite=Lax
 /// so the cookie survives a browser refresh but is not exposed to JS and isn't
-/// sent on cross-site POSTs. Not marked Secure — Branchwork is typically run on
-/// `http://localhost` and a Secure cookie would never stick.
-pub fn set_cookie_value(token: &str) -> String {
+/// sent on cross-site POSTs. Pass `secure=true` behind a TLS-terminating proxy
+/// so a downgrade attack can't strip the cookie; default `false` keeps plain
+/// `http://localhost` dev working (a Secure cookie would never stick there).
+/// See [`should_secure_cookie`] for the env-var + `X-Forwarded-Proto` decision.
+pub fn set_cookie_value(token: &str, secure: bool) -> String {
     let max_age = SESSION_TTL.num_seconds();
-    format!("{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}")
+    let mut s = format!("{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
+    if secure {
+        s.push_str("; Secure");
+    }
+    s
 }
 
-/// Render a `Set-Cookie` value that clears the cookie — for logout.
-pub fn clear_cookie_value() -> String {
-    format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+/// Render a `Set-Cookie` value that clears the cookie — for logout. The
+/// `Secure` attribute must mirror the issuing call so the browser actually
+/// matches and replaces the existing cookie under TLS.
+pub fn clear_cookie_value(secure: bool) -> String {
+    let mut s = format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    if secure {
+        s.push_str("; Secure");
+    }
+    s
+}
+
+/// Decide whether new session cookies should carry the `Secure` attribute.
+///
+/// True if the operator opted in via `BRANCHWORK_SECURE_COOKIES=1` (the
+/// canonical prod-compose flag, see `docs/reference/configuration.md`) **or**
+/// the front proxy reports the request reached us over TLS via
+/// `X-Forwarded-Proto: https`. Default false so plain `http://localhost`
+/// dev is unchanged — a `Secure` cookie would never stick on plain HTTP.
+pub fn should_secure_cookie(headers: &HeaderMap) -> bool {
+    let env_raw = std::env::var("BRANCHWORK_SECURE_COOKIES").ok();
+    let header_value = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok());
+    secure_signal_from_parts(env_raw.as_deref(), header_value)
+}
+
+/// Pure decision helper split out from [`should_secure_cookie`] so unit
+/// tests can exercise the rules without mutating the process-wide env.
+/// Env wins as soon as it equals literal `"1"`; otherwise we accept any
+/// case-insensitive `https` from the proxy header.
+pub fn secure_signal_from_parts(env_raw: Option<&str>, header_xfp: Option<&str>) -> bool {
+    if matches!(env_raw, Some("1")) {
+        return true;
+    }
+    matches!(header_xfp, Some(v) if v.eq_ignore_ascii_case("https"))
 }
 
 #[cfg(test)]
@@ -190,5 +229,68 @@ mod tests {
         let t = token_from_cookie_header(&format!("other=x; {COOKIE_NAME}=abc123; extra=y"));
         assert_eq!(t.as_deref(), Some("abc123"));
         assert!(token_from_cookie_header("other=x").is_none());
+    }
+
+    #[test]
+    fn set_cookie_value_appends_secure_iff_flag_is_set() {
+        let on = set_cookie_value("abc", true);
+        assert!(
+            on.ends_with("; Secure"),
+            "secure=true should append `; Secure`, got: {on}"
+        );
+        // Other invariants the wire contract relies on are unaffected.
+        assert!(on.contains("HttpOnly"));
+        assert!(on.contains("SameSite=Lax"));
+
+        let off = set_cookie_value("abc", false);
+        assert!(
+            !off.contains("Secure"),
+            "secure=false must omit `Secure` so localhost dev keeps the cookie, got: {off}"
+        );
+    }
+
+    #[test]
+    fn clear_cookie_value_appends_secure_iff_flag_is_set() {
+        // Logout must mirror login's attribute set or the browser will refuse
+        // to overwrite the existing cookie under TLS.
+        let on = clear_cookie_value(true);
+        assert!(on.ends_with("; Secure"), "got: {on}");
+        assert!(on.contains("Max-Age=0"));
+
+        let off = clear_cookie_value(false);
+        assert!(!off.contains("Secure"), "got: {off}");
+    }
+
+    #[test]
+    fn secure_signal_env_set_to_one_wins() {
+        assert!(secure_signal_from_parts(Some("1"), None));
+        assert!(secure_signal_from_parts(Some("1"), Some("http")));
+    }
+
+    #[test]
+    fn secure_signal_env_other_values_are_ignored() {
+        // Only the literal "1" enables — match the BRANCHWORK_AUTO_FINISH_IDLE
+        // contract so operators have one mental model for boolean env flags.
+        assert!(!secure_signal_from_parts(Some(""), None));
+        assert!(!secure_signal_from_parts(Some("true"), None));
+        assert!(!secure_signal_from_parts(Some("0"), None));
+    }
+
+    #[test]
+    fn secure_signal_xforwarded_proto_https_enables() {
+        assert!(secure_signal_from_parts(None, Some("https")));
+        assert!(secure_signal_from_parts(None, Some("HTTPS")));
+        assert!(!secure_signal_from_parts(None, Some("http")));
+        assert!(!secure_signal_from_parts(None, None));
+    }
+
+    #[test]
+    fn should_secure_cookie_reads_xforwarded_proto_header() {
+        // Only the header path is safe to assert here — `BRANCHWORK_SECURE_COOKIES`
+        // could be set in the test process env and bias the result. The env path
+        // is exhaustively covered by `secure_signal_env_*` against the pure helper.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(should_secure_cookie(&h));
     }
 }

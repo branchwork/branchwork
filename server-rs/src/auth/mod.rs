@@ -117,7 +117,11 @@ fn set_cookie(cookie: String) -> HeaderMap {
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 /// POST /api/auth/signup
-pub async fn signup(State(state): State<AppState>, Json(creds): Json<Credentials>) -> Response {
+pub async fn signup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(creds): Json<Credentials>,
+) -> Response {
     let email = creds.email.trim().to_lowercase();
     if email.is_empty() || !email.contains('@') {
         return err(StatusCode::BAD_REQUEST, "invalid_email");
@@ -182,10 +186,11 @@ pub async fn signup(State(state): State<AppState>, Json(creds): Json<Credentials
     }
 
     let token = sessions::create(&state.db, &id);
-    let headers = set_cookie(sessions::set_cookie_value(&token));
+    let secure = sessions::should_secure_cookie(&headers);
+    let resp_headers = set_cookie(sessions::set_cookie_value(&token, secure));
     (
         StatusCode::CREATED,
-        headers,
+        resp_headers,
         Json(UserDto {
             id,
             email,
@@ -196,7 +201,11 @@ pub async fn signup(State(state): State<AppState>, Json(creds): Json<Credentials
 }
 
 /// POST /api/auth/login
-pub async fn login(State(state): State<AppState>, Json(creds): Json<Credentials>) -> Response {
+pub async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(creds): Json<Credentials>,
+) -> Response {
     let email = creds.email.trim().to_lowercase();
 
     let row: Option<(String, String)> = {
@@ -242,10 +251,11 @@ pub async fn login(State(state): State<AppState>, Json(creds): Json<Credentials>
     };
 
     let token = sessions::create(&state.db, &id);
-    let headers = set_cookie(sessions::set_cookie_value(&token));
+    let secure = sessions::should_secure_cookie(&headers);
+    let resp_headers = set_cookie(sessions::set_cookie_value(&token, secure));
     (
         StatusCode::OK,
-        headers,
+        resp_headers,
         Json(UserDto {
             id,
             email,
@@ -262,7 +272,8 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
     {
         sessions::delete(&state.db, &token);
     }
-    let h = set_cookie(sessions::clear_cookie_value());
+    let secure = sessions::should_secure_cookie(&headers);
+    let h = set_cookie(sessions::clear_cookie_value(secure));
     (StatusCode::OK, h, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
