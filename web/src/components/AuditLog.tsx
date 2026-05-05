@@ -1,10 +1,20 @@
 import { useCallback, useEffect, useState } from "react";
+import * as v from "valibot";
 import { fetchJson, HttpError } from "../api.js";
 import { useAuthStore } from "../stores/auth-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useWsStore } from "../stores/ws-store.js";
 import { formatTimestamp } from "../lib/time.js";
 import { errorMessage } from "../lib/error.js";
+import { parseWsMessage } from "../schemas/ws-events.js";
+
+/// Audit-row diff bodies are server-generated JSON whose shape varies
+/// per action. Schema coverage for every action's diff is a v2 concern
+/// (audit §12 — `Agent` / `PlanConfig` / `AuditEntry` redeclarations).
+/// At this layer we only assert the wire is a JSON object so the
+/// renderer's `parsed.<key>` lookups don't blow up on a primitive or
+/// array.
+const DiffObjectSchema = v.record(v.string(), v.unknown());
 
 interface AuditEntry {
   id: number;
@@ -120,11 +130,14 @@ const ACTION_ICONS: Record<string, string> = {
 
 function parseDiff(diff: string | null): Record<string, unknown> | null {
   if (!diff) return null;
+  let value: unknown;
   try {
-    return JSON.parse(diff);
+    value = JSON.parse(diff);
   } catch {
     return null;
   }
+  const result = v.safeParse(DiffObjectSchema, value);
+  return result.success ? result.output : null;
 }
 
 function autoFinishTriggerLabel(diff: string | null): string {
@@ -501,14 +514,10 @@ export function AuditLog() {
     if (!socket) return;
 
     const handler = (ev: MessageEvent) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === "audit_log") {
-          // Refresh the current page to show the new entry
-          fetchLogs(offset);
-        }
-      } catch {
-        // ignore
+      const parsed = parseWsMessage(ev.data);
+      if (parsed.ok && parsed.value.type === "audit_log") {
+        // Refresh the current page to show the new entry
+        fetchLogs(offset);
       }
     };
     socket.addEventListener("message", handler);

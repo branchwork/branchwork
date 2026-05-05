@@ -6,6 +6,10 @@ import "@xterm/xterm/css/xterm.css";
 import { useAgentStore, type AgentOutputLine, type AgentDiff } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
+import {
+  parseStreamJsonLine,
+  parseVerdictJson,
+} from "../schemas/stream-json.js";
 
 type Tab = "output" | "diff";
 
@@ -283,16 +287,13 @@ function StreamJsonView({ agentId, isActive }: { agentId: string; isActive: bool
   // Extract verdict
   const verdict = useMemo(() => {
     for (let i = output.length - 1; i >= 0; i--) {
-      try {
-        const d = JSON.parse(output[i].content);
-        if (d.type === "result" && d.result) {
-          const m = d.result.match(/\{\s*"status"\s*:\s*"[^"]+"/);
-          if (m) {
-            const v = JSON.parse(m[0] + (m[0].endsWith("}") ? "" : "}"));
-            if (v.status) return v as { status: string; reason: string };
-          }
-        }
-      } catch { /* skip */ }
+      const env = parseStreamJsonLine(output[i].content);
+      if (env.type !== "result" || !env.result) continue;
+      const m = env.result.match(/\{\s*"status"\s*:\s*"[^"]+"/);
+      if (!m) continue;
+      const closed = m[0].endsWith("}") ? m[0] : `${m[0]}}`;
+      const parsed = parseVerdictJson(closed);
+      if (parsed) return parsed;
     }
     return null;
   }, [output]);
@@ -304,48 +305,65 @@ function StreamJsonView({ agentId, isActive }: { agentId: string; isActive: bool
   };
 
   function renderLine(line: AgentOutputLine) {
-    try {
-      const d = JSON.parse(line.content);
-      if (d.type === "assistant" && d.message?.content) {
-        const texts = d.message.content
-          .filter((b: { type: string }) => b.type === "text")
-          .map((b: { text: string }) => b.text)
-          .filter(Boolean);
-        const toolUses = d.message.content
-          .filter((b: { type: string }) => b.type === "tool_use")
-          .map((b: { name: string }) => b.name);
-        return (
-          <div key={line.id}>
-            {toolUses.length > 0 && (
-              <div className="text-[11px] text-blue-400/70 py-0.5">
-                {toolUses.map((t: string) => `[${t}]`).join(" ")}
-              </div>
-            )}
-            {texts.length > 0 && (
-              <div className="text-xs text-gray-200 py-1 whitespace-pre-wrap">
-                {texts.join("\n")}
-              </div>
-            )}
-          </div>
-        );
+    const env = parseStreamJsonLine(line.content);
+    if (env.type === "assistant") {
+      const texts: string[] = [];
+      const toolUses: string[] = [];
+      for (const block of env.message.content) {
+        // The content union has a `{ type: string }` catch-all branch
+        // for unknown Claude block types (`thinking`, `image`, …); the
+        // `in` checks narrow `block` to the specific branches that
+        // actually carry `text` / `name`.
+        if (block.type === "text" && "text" in block) {
+          if (block.text) texts.push(block.text);
+        } else if (block.type === "tool_use" && "name" in block) {
+          toolUses.push(block.name);
+        }
       }
-      if (d.type === "result") {
-        const dur = d.duration_ms ? `${(d.duration_ms / 1000).toFixed(1)}s` : "";
-        const cost = typeof d.total_cost_usd === "number" ? `$${d.total_cost_usd.toFixed(4)}` : null;
-        return (
-          <div key={line.id} className="text-[10px] text-gray-600 py-1 border-t border-gray-800 mt-1">
-            Finished in {dur} ({d.num_turns ?? 0} turns)
-            {cost && <span className="text-amber-500/80 ml-2">{cost}</span>}
-          </div>
-        );
-      }
-      // Skip noise
-      if (["system", "rate_limit_event", "user"].includes(d.type)) return null;
-    } catch { /* skip */ }
-    if (line.message_type === "stderr") {
-      const text = line.content.trim();
+      return (
+        <div key={line.id}>
+          {toolUses.length > 0 && (
+            <div className="text-[11px] text-blue-400/70 py-0.5">
+              {toolUses.map((t) => `[${t}]`).join(" ")}
+            </div>
+          )}
+          {texts.length > 0 && (
+            <div className="text-xs text-gray-200 py-1 whitespace-pre-wrap">
+              {texts.join("\n")}
+            </div>
+          )}
+        </div>
+      );
+    }
+    if (env.type === "result") {
+      const dur = env.duration_ms
+        ? `${(env.duration_ms / 1000).toFixed(1)}s`
+        : "";
+      const cost =
+        typeof env.total_cost_usd === "number"
+          ? `$${env.total_cost_usd.toFixed(4)}`
+          : null;
+      return (
+        <div
+          key={line.id}
+          className="text-[10px] text-gray-600 py-1 border-t border-gray-800 mt-1"
+        >
+          Finished in {dur} ({env.num_turns ?? 0} turns)
+          {cost && <span className="text-amber-500/80 ml-2">{cost}</span>}
+        </div>
+      );
+    }
+    // `raw` covers non-JSON lines and unknown envelope shapes. We keep the
+    // historical behaviour: a stderr `raw` line surfaces in red, anything
+    // else (including known-but-skipped envelopes like `system`) drops.
+    if (env.type === "raw" && line.message_type === "stderr") {
+      const text = env.raw.trim();
       if (text.startsWith("Warning:")) return null;
-      return <div key={line.id} className="text-[10px] text-red-400 py-0.5">{text}</div>;
+      return (
+        <div key={line.id} className="text-[10px] text-red-400 py-0.5">
+          {text}
+        </div>
+      );
     }
     return null;
   }

@@ -157,4 +157,66 @@ describe("ws-store handleWsMessage", () => {
       expect(usePlanStore.getState().selectedPlan).toEqual(other);
     },
   );
+
+  it(
+    "drops a malformed task_status_changed: warns, does not throw, " +
+      "does not partially apply",
+    () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const patchTaskStatus = vi.fn();
+      // Replace the action with a spy so we can assert the malformed
+      // payload never reached the store.
+      usePlanStore.setState({ patchTaskStatus });
+
+      // `plan_name` must be a string — sending a number is the canonical
+      // shape mismatch the schema needs to reject.
+      expect(() =>
+        handleWsMessage({
+          type: "task_status_changed",
+          data: { plan_name: 123, task_number: "1.1", status: "completed" },
+        }),
+      ).not.toThrow();
+
+      expect(patchTaskStatus).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledTimes(1);
+      const args = warn.mock.calls[0];
+      expect(String(args[0])).toMatch(/dropped malformed/);
+
+      warn.mockRestore();
+    },
+  );
+
+  it(
+    "drops a JSON string that fails the discriminator: warns and ignores",
+    () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchAgents = vi.fn().mockResolvedValue(undefined);
+      useAgentStore.setState({ fetchAgents });
+
+      // Unknown event types fall outside the discriminated union and the
+      // listener silently drops them. The on-the-wire shape is a string
+      // (this is what `ws.onmessage` hands to `handleWsMessage`), so we
+      // exercise the JSON-string branch here too.
+      expect(() =>
+        handleWsMessage(
+          JSON.stringify({ type: "completely_unknown_event", data: {} }),
+        ),
+      ).not.toThrow();
+
+      expect(fetchAgents).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalled();
+
+      warn.mockRestore();
+    },
+  );
+
+  it("drops non-JSON garbage from ws.onmessage without throwing", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(() => handleWsMessage("<<not even json>>")).not.toThrow();
+    expect(warn).toHaveBeenCalled();
+    expect(String(warn.mock.calls[0][0])).toMatch(/malformed/);
+
+    warn.mockRestore();
+  });
 });

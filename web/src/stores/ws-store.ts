@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { usePlanStore } from "./plan-store.js";
 import { useAgentStore } from "./agent-store.js";
+import { parseWsMessage, type WsMessage } from "../schemas/ws-events.js";
 
 const MAX_RECONNECT_DELAY = 30_000;
 const INITIAL_RECONNECT_DELAY = 2_000;
@@ -88,12 +89,7 @@ export const useWsStore = create<WsStore>((set, get) => ({
     };
 
     ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        handleWsMessage(msg);
-      } catch {
-        // ignore non-JSON
-      }
+      handleWsMessage(ev.data);
     };
 
     set({ socket: ws });
@@ -120,17 +116,28 @@ function scheduleReconnect(get: () => WsStore) {
 
 let planRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-// Exported for unit testing. The function is otherwise reached only via
-// the `ws.onmessage` handler installed in `connect()`.
-export function handleWsMessage(msg: { type: string; data: unknown }) {
+// Exported for unit testing. Accepts either a raw JSON string (from
+// `ws.onmessage`) or an already-decoded message object (handy for tests).
+// Validation runs through `parseWsMessage`; malformed payloads are
+// logged once and dropped — they never reach the store.
+export function handleWsMessage(input: unknown) {
+  const parsed = parseWsMessage(input);
+  if (!parsed.ok) {
+    console.warn("[ws] dropped malformed message:", parsed.error);
+    return;
+  }
+  dispatch(parsed.value);
+}
+
+function dispatch(msg: WsMessage) {
   const planStore = usePlanStore.getState();
   const agentStore = useAgentStore.getState();
 
   switch (msg.type) {
     case "plan_updated": {
-      const d = msg.data as { action: string; plan?: unknown };
-      if (d.plan) {
-        planStore.updatePlan(d.plan as Parameters<typeof planStore.updatePlan>[0]);
+      const { plan } = msg.data;
+      if (plan) {
+        planStore.updatePlan(plan as Parameters<typeof planStore.updatePlan>[0]);
       }
       // Debounce plan list refresh to avoid flickering
       if (planRefreshTimer) clearTimeout(planRefreshTimer);
@@ -148,11 +155,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       // Soft delete carries `snapshot_id`; we surface it as an Undo
       // action so the renderer can POST /api/snapshots/{id}/restore.
       // Hard delete (`hard: true`) has no snapshot_id and no Undo.
-      const d = msg.data as {
-        plan: string;
-        snapshot_id?: string | null;
-        hard?: boolean;
-      };
+      const d = msg.data;
       planStore.removePlan(d.plan);
       const snapshotId = d.snapshot_id ?? undefined;
       planStore.pushToast({
@@ -170,7 +173,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       break;
     }
     case "agent_output": {
-      const d = msg.data as { agent_id: string; message_type: string; content: unknown };
+      const d = msg.data;
       agentStore.appendOutput(d.agent_id, {
         id: Date.now(),
         agent_id: d.agent_id,
@@ -181,7 +184,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       break;
     }
     case "agent_stopped": {
-      const d = msg.data as { id: string; status: string };
+      const d = msg.data;
       const agent = agentStore.agents.find((a) => a.id === d.id);
       const taskLabel = agent
         ? lookupTaskTitle(agent.plan_name, agent.task_id)
@@ -206,12 +209,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       // already triggers fetchAgents; this case adds the user-facing
       // notification with the plan/task context that's only visible at the
       // auto-mode layer.
-      const d = msg.data as {
-        plan: string;
-        task: string;
-        sha?: string | null;
-        target?: string | null;
-      };
+      const d = msg.data;
       const taskLabel = lookupTaskTitle(d.plan, d.task);
       const targetSuffix = d.target ? ` → ${d.target}` : "";
       notify(
@@ -234,12 +232,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       // `auto_mode_state` event (state=merging) so the user sees the
       // loop start work without a visible gap. Overwritten by the
       // following `auto_mode_state` broadcast.
-      const d = msg.data as {
-        agent_id: string;
-        plan: string;
-        task: string;
-        trigger: string;
-      };
+      const d = msg.data;
       planStore.setAutoModeRuntime(d.plan, {
         state: "auto_finishing",
         task: d.task,
@@ -255,13 +248,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       // here. The pill reads this map; transient labels overwrite each
       // other. Advancing is treated as idle and clears the runtime so the
       // pill disappears between tasks.
-      const d = msg.data as {
-        plan: string;
-        task?: string | null;
-        state: string;
-        sha?: string | null;
-        reason?: string | null;
-      };
+      const d = msg.data;
       if (d.state === "advancing") {
         planStore.setAutoModeRuntime(d.plan, null);
       } else if (
@@ -284,14 +271,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       // doesn't broadcast a `fixing_ci` auto_mode_state event today, so we
       // synthesise one here using the attempt count from the payload + the
       // cap from the per-plan PlanConfig (read at render time in the pill).
-      const d = msg.data as {
-        plan: string;
-        task: string;
-        fix_task: string;
-        fix_agent_id: string;
-        attempt: number;
-        ci_run_id?: string | null;
-      };
+      const d = msg.data;
       planStore.setAutoModeRuntime(d.plan, {
         state: "fixing_ci",
         task: d.task,
@@ -304,12 +284,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       // `pausedReason` from per-plan PlanConfig (persistent across reloads),
       // so we patch the local config here from the event payload to avoid a
       // separate refetch — the server already wrote the column.
-      const d = msg.data as {
-        plan: string;
-        task?: string | null;
-        reason: string;
-        target?: string | null;
-      };
+      const d = msg.data;
       planStore.patchPlanConfig(d.plan, { pausedReason: d.reason });
       planStore.setAutoModeRuntime(d.plan, {
         state: "paused",
@@ -328,7 +303,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       // User clicked Resume; the server cleared `paused_reason` and re-
       // evaluated auto-advance. Update local config + clear runtime so the
       // pill disappears immediately.
-      const d = msg.data as { plan: string };
+      const d = msg.data;
       planStore.patchPlanConfig(d.plan, { pausedReason: null });
       planStore.setAutoModeRuntime(d.plan, null);
       break;
@@ -345,17 +320,12 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       break;
     }
     case "task_checked": {
-      const d2 = msg.data as { plan_name: string; task_number: string; status: string };
-      planStore.patchTaskStatus(d2.plan_name, d2.task_number, d2.status);
+      const d = msg.data;
+      planStore.patchTaskStatus(d.plan_name, d.task_number, d.status);
       break;
     }
     case "plan_checked": {
-      const d = msg.data as {
-        plan_name: string;
-        verdict: string;
-        reason?: string;
-        agent_id?: string;
-      };
+      const d = msg.data;
       planStore.patchPlanVerdict(d.plan_name, {
         verdict: d.verdict,
         reason: d.reason ?? null,
@@ -370,15 +340,15 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       break;
     }
     case "task_status_changed": {
-      const d2 = msg.data as { plan_name: string; task_number: string; status: string };
-      if (d2.status === "completed" || d2.status === "failed") {
+      const d = msg.data;
+      if (d.status === "completed" || d.status === "failed") {
         notify(
-          `${lookupTaskTitle(d2.plan_name, d2.task_number)} — ${d2.status}`,
-          d2.plan_name,
-          `task-${d2.plan_name}-${d2.task_number}`
+          `${lookupTaskTitle(d.plan_name, d.task_number)} — ${d.status}`,
+          d.plan_name,
+          `task-${d.plan_name}-${d.task_number}`
         );
       }
-      planStore.patchTaskStatus(d2.plan_name, d2.task_number, d2.status);
+      planStore.patchTaskStatus(d.plan_name, d.task_number, d.status);
       // Debounced authoritative refetch — guarantees convergence to server
       // truth (doneCount, statuses for non-selected plans, MCP/agent-driven
       // transitions) even when the signed-delta in patchTaskStatus can't see
@@ -392,15 +362,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       break;
     }
     case "ci_status_changed": {
-      const d = msg.data as {
-        id: number;
-        plan_name: string;
-        task_number: string;
-        status: string;
-        conclusion?: string | null;
-        run_url?: string | null;
-        commit_sha?: string | null;
-      };
+      const d = msg.data;
       planStore.patchTaskCi(d.plan_name, d.task_number, {
         id: d.id,
         status: d.status as
@@ -420,7 +382,7 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       break;
     }
     case "plan_warning": {
-      const d = msg.data as { name: string; file: string; error: string };
+      const d = msg.data;
       notify(`Plan error: ${d.name}`, d.error, `plan-warning-${d.name}`);
       planStore.addWarning({
         name: d.name,
@@ -430,8 +392,20 @@ export function handleWsMessage(msg: { type: string; data: unknown }) {
       });
       break;
     }
+    // Events the validator accepts but the dashboard does not act on
+    // yet — Phase 2 of dashboard-ui-overhaul wires the handlers (audit
+    // §4). Listing them keeps `noFallthroughCasesInSwitch` happy while
+    // making the gap explicit instead of letting them land in a TODO.
     case "hook_event":
-      // Could display in an activity feed
+    case "audit_log":
+    case "phase_advanced":
+    case "task_cost_reported":
+    case "plan_reset":
+    case "ci_run_dismissed":
+    case "agent_branch_cleared":
+    case "runner_connected":
+    case "runner_disconnected":
+    case "runner_drivers":
       break;
   }
 }
