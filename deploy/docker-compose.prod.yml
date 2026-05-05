@@ -1,0 +1,19 @@
+# Production overlay used on Hetzner behind Caddy.
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+services:
+  branchwork:
+    image: ghcr.io/branchwork/branchwork:${BRANCHWORK_VERSION:-edge}
+    pull_policy: always
+    ports: !override
+      # Bind to the host's docker0 bridge IP, not 127.0.0.1: the demo-caddy
+      # container that fronts branchwork.dev sits on a different bridge
+      # network and reaches the host via 172.17.0.1, not the host loopback.
+      # 172.17.0.1 keeps 3100 off the public IP while letting Caddy proxy in.
+      - "172.17.0.1:3100:3100"
+    volumes: !override
+      - /opt/branchwork/data:/data
+    environment:
+      - BRANCHWORK_SECURE_COOKIES=1
+      - BRANCHWORK_PUBLIC_URL=https://branchwork.dev
+      - BRANCHWORK_DATA_DIR=/data
+    restart: unless-stopped
