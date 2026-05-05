@@ -5,10 +5,7 @@
 
 services:
   branchwork:
-    image: ghcr.io/branchwork/branchwork:${BRANCHWORK_VERSION:-0.3.0}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    image: ghcr.io/branchwork/branchwork:${BRANCHWORK_VERSION:-edge}
     ports:
       - "${BRANCHWORK_PORT:-3100}:3100"
     volumes:
