@@ -737,10 +737,13 @@ fn merge_to_default_inserts_ci_run() {
     assert_eq!(body["into"], "master");
 
     // `trigger_after_merge` is `tokio::spawn`d after the response, so
-    // poll for the row. 500ms is the brief's soft default; widen the
-    // deadline a bit so a slow CI run does not flake before the
-    // single git push + INSERT lands.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // poll for the row with a generous deadline — the spawn races the
+    // assertion otherwise, and the chain of shell-outs (has_remote,
+    // default_branch, push) is slow on Windows CI (every `git`
+    // invocation pays MSYS startup cost; CI run 25405974340 saw the
+    // merge_guard suite take 105s where green runs take ~14s). Loop
+    // exits as soon as the row appears, so Linux runtime is unchanged.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if ci_run_count(&d, "mp-def") >= 1 {
             break;
