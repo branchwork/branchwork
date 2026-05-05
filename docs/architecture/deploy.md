@@ -218,6 +218,84 @@ authentication — the token is bound to whichever org the
 middleware resolves, and `default-org` is fine for a first-run
 exercise.
 
+## Real-runner smoke test (T6.9)
+
+Task 6.9 takes the token from 6.8 and points an actual
+`branchwork-runner` binary at `wss://branchwork.dev` from a
+machine that is **not** the Hetzner host, then exercises the
+SaaS folder dispatch flow end-to-end. This is the production
+equivalent of the local containerised smoke from T5.7 — same
+four scenarios, but over WSS through Cloudflare instead of an
+in-cluster Docker network.
+
+```sh
+TOKEN=$(grep -E '^TOKEN=' ~/.config/branchwork/saas-runner-token-smoke.txt | cut -d= -f2)
+SERVER_BIN=$(realpath server-rs/target/release/branchwork-server)
+
+# Run from the dev box (anywhere with network egress to branchwork.dev).
+# --cwd is the runner's filesystem root; /api/folders calls
+# `dirs::home_dir()` on the runner-side regardless of --cwd, so any
+# directory works as long as $HOME is sane.
+./server-rs/target/release/branchwork-runner \
+  --saas-url wss://branchwork.dev \
+  --token "$TOKEN" \
+  --cwd "$HOME" \
+  --db-path /tmp/bw-t69-runner.db \
+  --server-bin "$SERVER_BIN" \
+  > /tmp/bw-t69-runner.log 2>&1 &
+
+# (browser session: signup or login at https://branchwork.dev so
+#  the cookie jar at /tmp/bw-cookies.txt has a valid
+#  branchwork_session). Then drive the four scenarios via curl:
+
+# 1. ListFolders dispatches to runner.
+curl -sS -b /tmp/bw-cookies.txt https://branchwork.dev/api/folders | jq '.[0:3]'
+
+# 2. CreateFolder creates dir on runner host only.
+curl -sS -b /tmp/bw-cookies.txt -X POST https://branchwork.dev/api/plans/create \
+  -H 'Content-Type: application/json' \
+  -d '{"description":"smoke","folder":"~/bw-smoke-1","createFolder":true}'
+ls "$HOME/bw-smoke-1"     # exists locally
+# (and on Hetzner: ls /opt/branchwork/data → no bw-smoke-1)
+
+# 3. Kill runner → 503.
+kill <runner-pid>; sleep 2
+curl -sS -i -b /tmp/bw-cookies.txt https://branchwork.dev/api/folders   # → 503 no_runner_connected
+
+# 4. Restart runner → reconnect ≤ 2 s.
+./server-rs/target/release/branchwork-runner --saas-url … &
+sleep 2
+curl -sS -b /tmp/bw-cookies.txt https://branchwork.dev/api/folders      # → 200 again
+```
+
+The 2026-05-05 run produced (logs in `/tmp/bw-t69-logs/`):
+
+| Scenario                   | Result                                      |
+| -------------------------- | ------------------------------------------- |
+| 1. ListFolders             | HTTP 200, 33 entries all under `/home/cpo/` |
+| 2. CreateFolder + agentId  | HTTP 200, `/home/cpo/bw-t69-smoke-…` made   |
+| 3. Kill runner → 503       | `{"error":"no_runner_connected"}`           |
+| 4. Restart → 200           | First 200 at **~1051 ms** after relaunch    |
+
+Two operational notes for future smokes:
+
+1. **Reuse `--db-path`.** The runner persists its `runner_id`
+   in the SQLite outbox at that path. Reusing the file across
+   the kill/restart cycle keeps the same row in the server's
+   `runners` table, so the reconnect is observed as the *same*
+   runner reattaching, not a brand-new one — which matches the
+   production pattern (the operator runs `branchwork-runner`
+   under systemd with a stable data dir).
+2. **Step 2 spawns a real plan agent on the runner.** The
+   `/api/plans/create` handler does CreateFolder *and* then
+   sends a `StartAgent` envelope so the planning agent can run
+   on the runner host. For a folder-only smoke, kill the
+   session daemon by exact PID (the runner logs
+   `[runner] spawned session daemon pid=<N>`) before it spends
+   tokens. **Never** `pgrep -f "branchwork-server"` — that
+   would also match the production supervisor on the same box
+   (see [ADR 0005](../adrs/0005-e2e-tests-must-be-containerized.md)).
+
 ## See also
 
 - [`build-perf-2026-05-05-baseline.md`](../build-perf-2026-05-05-baseline.md)
