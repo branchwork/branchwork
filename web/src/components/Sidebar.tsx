@@ -4,6 +4,7 @@ import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
+import { useUiStore } from "../stores/ui-store.js";
 import { postJson } from "../api.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
@@ -24,6 +25,17 @@ export function Sidebar() {
   const [convertingAll, setConvertingAll] = useState(false);
   const [showDone, setShowDone] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState("");
+
+  const sidebarOpen = useUiStore((s) => s.sidebarOpen);
+  const closeSidebar = useUiStore((s) => s.closeSidebar);
+  const location = useLocation();
+
+  // Auto-close the slide-over on route change so a plan tap doesn't
+  // leave the sidebar covering the page. Desktop ignores this state
+  // (the sidebar is always visible on `≥md` regardless of the flag).
+  useEffect(() => {
+    closeSidebar();
+  }, [location.pathname, closeSidebar]);
 
   const hasMdPlans = plans.some((p) => p.name && !p.name.endsWith(".yaml"));
 
@@ -107,8 +119,26 @@ export function Sidebar() {
   }
 
   return (
-    <aside className="w-64 bg-gray-900 border-r border-gray-800 flex flex-col">
-      {/* Logo — click to return to project dashboard */}
+    <>
+      {/* Mobile backdrop — taps anywhere outside the slide-over close
+          it. Hidden on `≥md` where the sidebar is persistent. */}
+      {sidebarOpen && (
+        <div
+          data-testid="sidebar-backdrop"
+          onClick={closeSidebar}
+          className="md:hidden fixed inset-0 z-30 bg-black/50"
+          aria-hidden="true"
+        />
+      )}
+      <aside
+        data-testid="sidebar"
+        data-open={sidebarOpen}
+        aria-hidden={!sidebarOpen ? true : undefined}
+        className={`w-64 bg-gray-900 border-r border-gray-800 flex flex-col fixed inset-y-0 left-0 z-40 transform transition-transform duration-200 ease-out md:static md:translate-x-0 md:transition-none ${
+          sidebarOpen ? "translate-x-0" : "-translate-x-full"
+        }`}
+      >
+        {/* Logo — click to return to project dashboard */}
       <Link
         to="/"
         className="p-4 border-b border-gray-800 text-left hover:bg-gray-800/30 transition block"
@@ -292,7 +322,8 @@ export function Sidebar() {
           </div>
         ))}
       </div>
-    </aside>
+      </aside>
+    </>
   );
 }
 

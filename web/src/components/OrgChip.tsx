@@ -17,7 +17,16 @@ import { useRunnerStore } from "../stores/runner-store.js";
 /// read `useRunnerStore.mode`, so a SaaS box without a runner still
 /// shows the org chip (the org concept is independent of runner
 /// presence).
-export function OrgChip() {
+///
+/// `placement` controls which side of the trigger the dropdown opens
+/// from. Default is `"above"` (the bottom-right chrome cluster needs
+/// the menu to open upward); the mobile top-bar passes `"below"` so
+/// the menu drops down into the viewport instead of off the top edge.
+export function OrgChip({
+  placement = "above",
+}: {
+  placement?: "above" | "below";
+} = {}) {
   const mode = useRunnerStore((s) => s.mode);
   const runnerLoaded = useRunnerStore((s) => s.loaded);
   const orgsLoaded = useOrgStore((s) => s.loaded);
@@ -115,7 +124,10 @@ export function OrgChip() {
         <div
           role="menu"
           data-testid="org-chip-menu"
-          className="absolute bottom-full mb-2 right-0 min-w-[200px] bg-gray-900 border border-gray-700 rounded shadow-lg py-1 z-50"
+          data-placement={placement}
+          className={`absolute right-0 min-w-[200px] bg-gray-900 border border-gray-700 rounded shadow-lg py-1 z-50 ${
+            placement === "above" ? "bottom-full mb-2" : "top-full mt-2"
+          }`}
         >
           <div className="px-3 py-1 text-[11px] uppercase tracking-wide text-gray-500">
             Switch to

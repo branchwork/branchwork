@@ -8,6 +8,7 @@ import { useRunnerStore } from "./stores/runner-store.js";
 import { useOrgStore } from "./stores/org-store.js";
 import { useAuthStore } from "./stores/auth-store.js";
 import { Sidebar } from "./components/Sidebar.js";
+import { MobileTopBar } from "./components/MobileTopBar.js";
 import { PlanBoard } from "./components/PlanBoard.js";
 import { ProjectDashboard } from "./components/ProjectDashboard.js";
 import { AgentTree } from "./components/AgentTree.js";
@@ -106,12 +107,13 @@ export function App() {
   }
 
   return (
-    <div className="flex h-screen bg-gray-950 text-gray-100">
+    <div className="flex flex-col md:flex-row h-screen bg-gray-950 text-gray-100">
       <ConnectionBanner />
       <RouteSync />
+      <MobileTopBar />
       <Sidebar />
 
-      <main className="flex-1 flex overflow-hidden">
+      <main className="flex-1 flex overflow-hidden min-h-0">
         <div className="flex-1 overflow-auto">
           <Routes>
             <Route path="/" element={<ProjectDashboard />} />
@@ -142,8 +144,11 @@ export function App() {
 
       <Toaster />
 
-      {/* Connection indicator + org chip + logout */}
-      <div className="fixed bottom-3 right-3 flex items-center gap-3 text-xs text-gray-500">
+      {/* Connection indicator + org chip + logout. Hidden on `<md`
+          where the org chip / runner status / connection dot reflow
+          into MobileTopBar. Email + sign-out are intentionally
+          desktop-only for now — mobile sign-out is a follow-up. */}
+      <div className="hidden md:flex fixed bottom-3 right-3 items-center gap-3 text-xs text-gray-500">
         <OrgChip />
         <RunnerStatus />
         <span className="flex items-center gap-2">
