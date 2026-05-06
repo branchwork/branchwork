@@ -248,3 +248,69 @@ describe("fetchJson session-expiry interceptor", () => {
     },
   );
 });
+
+describe("fetchJson X-Org-Id header (task 4.3)", () => {
+  // Map-backed localStorage stand-in. Same shape as the org-store test
+  // file uses — vi.unstubAllGlobals in afterEach restores jsdom's
+  // (broken) default for the rest of the suite.
+  function makeMockStorage(): Storage {
+    const map = new Map<string, string>();
+    return {
+      get length() {
+        return map.size;
+      },
+      clear: () => map.clear(),
+      getItem: (k: string) => (map.has(k) ? (map.get(k) ?? null) : null),
+      setItem: (k: string, v: string) => {
+        map.set(k, String(v));
+      },
+      removeItem: (k: string) => {
+        map.delete(k);
+      },
+      key: (i: number) => Array.from(map.keys())[i] ?? null,
+    };
+  }
+
+  it("does NOT include X-Org-Id when no org pin is set in localStorage", async () => {
+    vi.stubGlobal("localStorage", makeMockStorage());
+    const fetchSpy = vi.fn(
+      async () =>
+        new Response("{}", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await fetchJson("/api/plans");
+
+    const call = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    const init = call[1];
+    const headers = init.headers as Record<string, string>;
+    expect(headers["X-Org-Id"]).toBeUndefined();
+    // Content-Type still rides every request.
+    expect(headers["Content-Type"]).toBe("application/json");
+  });
+
+  it("sends X-Org-Id from localStorage on every request", async () => {
+    const storage = makeMockStorage();
+    storage.setItem("branchwork.activeOrgId", "org-pinned");
+    vi.stubGlobal("localStorage", storage);
+
+    const fetchSpy = vi.fn(
+      async () =>
+        new Response("{}", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await fetchJson("/api/plans");
+
+    const call = fetchSpy.mock.calls[0] as unknown as [string, RequestInit];
+    const init = call[1];
+    const headers = init.headers as Record<string, string>;
+    expect(headers["X-Org-Id"]).toBe("org-pinned");
+  });
+});

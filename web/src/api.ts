@@ -1,7 +1,21 @@
 import { useAuthStore } from "./stores/auth-store.js";
 import { toastError, toastWarn } from "./lib/toast.js";
+import { readActiveOrgFromStorage } from "./stores/org-store.js";
 
 const BASE = "";
+
+/// Build the headers we attach to every dashboard request. Content-Type
+/// is fixed; `X-Org-Id` rides every request when the user has explicitly
+/// switched orgs (org-store persists the pick to localStorage in 4.3),
+/// so the server resolves the right multi-tenancy context. Absent on a
+/// cold visit — server falls back to `first-membership`, mirroring the
+/// pre-4.3 behaviour.
+function defaultHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const activeOrg = readActiveOrgFromStorage();
+  if (activeOrg) headers["X-Org-Id"] = activeOrg;
+  return headers;
+}
 
 export class HttpError extends Error {
   constructor(public status: number, public statusText: string, public body?: unknown) {
@@ -52,10 +66,16 @@ async function readBody(res: Response): Promise<unknown> {
 ///   sentinel — the session is still good).
 /// - Any other non-2xx: reject with `HttpError`.
 export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  // Spread `defaultHeaders()` first so callers can still override
+  // Content-Type explicitly via `init.headers` (mirrors the prior
+  // semantics — init takes precedence). The X-Org-Id header is
+  // intentionally NOT user-overridable from a single call site; it's
+  // global state owned by org-store.
+  const headers = { ...defaultHeaders(), ...(init?.headers ?? {}) };
   const res = await fetch(`${BASE}${path}`, {
     credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
     ...init,
+    headers,
   });
   if (res.ok) {
     return res.json() as Promise<T>;

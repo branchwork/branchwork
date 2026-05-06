@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetAllStores } from "./reset-all.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import {
@@ -9,6 +9,12 @@ import {
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useToastStore } from "../stores/toast-store.js";
 import { subscribeToWsEvents, useWsStore } from "../stores/ws-store.js";
+import {
+  ACTIVE_ORG_STORAGE_KEY,
+  readActiveOrgFromStorage,
+  useOrgStore,
+  writeActiveOrgToStorage,
+} from "../stores/org-store.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -237,4 +243,65 @@ describe("resetAllStores", () => {
       expect(useSettingsStore.getState().planArchiveRetentionDays).toBe(30);
     },
   );
+
+  // Task 4.3 acceptance: resetAllStores must also drop the active-org
+  // pin in localStorage, otherwise user A's org would carry over to
+  // user B as the X-Org-Id header on every request and grant access
+  // to A's data.
+  describe("org-store reset (task 4.3)", () => {
+    function makeMockStorage(): Storage {
+      const map = new Map<string, string>();
+      return {
+        get length() {
+          return map.size;
+        },
+        clear: () => map.clear(),
+        getItem: (k: string) => (map.has(k) ? (map.get(k) ?? null) : null),
+        setItem: (k: string, v: string) => {
+          map.set(k, String(v));
+        },
+        removeItem: (k: string) => {
+          map.delete(k);
+        },
+        key: (i: number) => Array.from(map.keys())[i] ?? null,
+      };
+    }
+
+    beforeEach(() => {
+      vi.stubGlobal("localStorage", makeMockStorage());
+    });
+
+    it("clears org-store memberships AND the localStorage X-Org-Id pin", () => {
+      writeActiveOrgToStorage("org-user-a");
+      useOrgStore.setState({
+        memberships: [
+          {
+            id: "org-user-a",
+            name: "User A's org",
+            slug: "user-a",
+            role: "owner",
+            memberCount: 2,
+          },
+        ],
+        loaded: true,
+        lastFetchedAt: Date.now(),
+      });
+      // Sanity-check the seed.
+      expect(readActiveOrgFromStorage()).toBe("org-user-a");
+      expect(useOrgStore.getState().memberships).toHaveLength(1);
+
+      resetAllStores();
+
+      // Both the in-memory slice and the persisted pin are gone, so
+      // user B's first /api/auth/me request resolves to user B's first
+      // membership (server-side fallback) instead of inheriting user A's
+      // pin.
+      expect(useOrgStore.getState().memberships).toEqual([]);
+      expect(useOrgStore.getState().loaded).toBe(false);
+      expect(readActiveOrgFromStorage()).toBeNull();
+      expect(
+        globalThis.localStorage?.getItem(ACTIVE_ORG_STORAGE_KEY),
+      ).toBeNull();
+    });
+  });
 });

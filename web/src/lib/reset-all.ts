@@ -2,6 +2,7 @@ import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
+import { useOrgStore } from "../stores/org-store.js";
 import { useToastStore } from "../stores/toast-store.js";
 import { useWsStore } from "../stores/ws-store.js";
 
@@ -34,5 +35,12 @@ export function resetAllStores(): void {
   useAgentStore.getState().reset();
   useSettingsStore.getState().reset();
   useRunnerStore.getState().reset();
+  // Drops memberships + clears the localStorage X-Org-Id pin so the
+  // next sign-in starts on the new user's first-membership org. Sits
+  // after runner-store because the org pin influences which org-scoped
+  // requests run during the next bootstrap (deterministic ordering
+  // matters less than presence — but keeping the pin clear before the
+  // next /api/auth/me fires is the load-bearing part).
+  useOrgStore.getState().reset();
   useToastStore.getState().clear();
 }

@@ -261,17 +261,30 @@ pub async fn create_org(
 }
 
 /// `GET /api/orgs` — list orgs the current user belongs to.
+///
+/// Each entry carries a `memberCount` so the dashboard org chip can render
+/// "<name> · 3 members" without an extra round-trip per org. Member count is
+/// computed from `org_members` and excludes nothing (every member counts,
+/// including viewers).
 pub async fn list_orgs(State(state): State<AppState>, user: AuthUser) -> Response {
     let conn = state.db.lock().unwrap();
     let memberships = user_memberships(&conn, &user.id);
     let orgs: Vec<serde_json::Value> = memberships
         .into_iter()
         .map(|m| {
+            let member_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM org_members WHERE org_id = ?1",
+                    params![m.org_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             serde_json::json!({
                 "id": m.org_id,
                 "name": m.org_name,
                 "slug": m.org_slug,
                 "role": m.role,
+                "memberCount": member_count,
             })
         })
         .collect();
