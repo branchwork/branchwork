@@ -284,3 +284,126 @@ describe("LoginPage SSO discovery fallback", () => {
     expect(emailInput.value).toBe("person@personal.com");
   });
 });
+
+describe("LoginPage email/password submit", () => {
+  it("disables submit until both email and password are non-empty", () => {
+    installFetchMock(() => ({ status: 200, body: [] }));
+    render(<LoginPage />);
+    const submit = screen.getByRole("button", {
+      name: /^Sign in$/,
+    }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(screen.getByPlaceholderText("you@example.com"), {
+      target: { value: "user@example.com" },
+    });
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(screen.getByPlaceholderText("********"), {
+      target: { value: "hunter2!" },
+    });
+    expect(submit.disabled).toBe(false);
+  });
+
+  it("login-mode submit calls auth-store.login with (email, password)", async () => {
+    installFetchMock(() => ({ status: 200, body: [] }));
+    const loginSpy = vi.fn().mockResolvedValue(undefined);
+    seedAuthStore({ login: loginSpy });
+    render(<LoginPage />);
+
+    fireEvent.change(screen.getByPlaceholderText("you@example.com"), {
+      target: { value: "user@example.com" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("********"), {
+      target: { value: "hunter2!" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Sign in$/ }));
+    });
+
+    expect(loginSpy).toHaveBeenCalledTimes(1);
+    expect(loginSpy).toHaveBeenCalledWith("user@example.com", "hunter2!");
+  });
+
+  it("signup-mode submit calls auth-store.signup with (email, password)", async () => {
+    installFetchMock(() => ({ status: 200, body: [] }));
+    const signupSpy = vi.fn().mockResolvedValue(undefined);
+    seedAuthStore({ signup: signupSpy });
+    render(<LoginPage />);
+
+    // Toggle into signup mode.
+    fireEvent.click(screen.getByText(/Need an account/i));
+    fireEvent.change(screen.getByPlaceholderText("you@example.com"), {
+      target: { value: "new@example.com" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("********"), {
+      target: { value: "longenough" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Sign up$/ }));
+    });
+
+    expect(signupSpy).toHaveBeenCalledTimes(1);
+    expect(signupSpy).toHaveBeenCalledWith("new@example.com", "longenough");
+  });
+
+  it("does not crash when login throws; the form stays mounted", async () => {
+    installFetchMock(() => ({ status: 200, body: [] }));
+    const loginSpy = vi
+      .fn()
+      .mockRejectedValue(new Error("invalid_credentials"));
+    seedAuthStore({ login: loginSpy });
+    render(<LoginPage />);
+
+    fireEvent.change(screen.getByPlaceholderText("you@example.com"), {
+      target: { value: "user@example.com" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("********"), {
+      target: { value: "hunter2!" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Sign in$/ }));
+    });
+
+    // The store would normally set error here; handler swallows the throw
+    // so the form remains rendered.
+    expect(screen.getByPlaceholderText("you@example.com")).toBeTruthy();
+    expect(screen.getByPlaceholderText("********")).toBeTruthy();
+  });
+});
+
+describe("LoginPage error states", () => {
+  it("renders the humanized message for known store error codes", () => {
+    installFetchMock(() => ({ status: 200, body: [] }));
+    seedAuthStore({ error: "invalid_credentials" });
+    render(<LoginPage />);
+    expect(screen.getByText("Wrong email or password.")).toBeTruthy();
+  });
+
+  it("falls back to a humanized form for unknown error codes", () => {
+    installFetchMock(() => ({ status: 200, body: [] }));
+    seedAuthStore({ error: "some_unknown_code" });
+    render(<LoginPage />);
+    // humanize() replaces underscores with spaces when no explicit copy
+    // is registered.
+    expect(screen.getByText("some unknown code")).toBeTruthy();
+  });
+
+  it("renders the SSO error from ?sso_error=invalid_token on mount", () => {
+    window.history.replaceState({}, "", "/?sso_error=invalid_token");
+    installFetchMock(() => ({ status: 200, body: [] }));
+    render(<LoginPage />);
+    expect(screen.getByText("Identity verification failed.")).toBeTruthy();
+  });
+
+  it("strips ?sso_error from the URL after reading it on mount", () => {
+    window.history.replaceState({}, "", "/?sso_error=idp_error");
+    installFetchMock(() => ({ status: 200, body: [] }));
+    render(<LoginPage />);
+    // The error is shown but the URL is cleaned up so a refresh does
+    // not re-render it.
+    expect(screen.getByText(/identity provider returned an error/i)).toBeTruthy();
+    expect(window.location.search).toBe("");
+  });
+});
