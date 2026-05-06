@@ -12,7 +12,7 @@ import { MobileTopBar } from "./components/MobileTopBar.js";
 import { PlanBoard } from "./components/PlanBoard.js";
 import { ProjectDashboard } from "./components/ProjectDashboard.js";
 import { AgentTree } from "./components/AgentTree.js";
-import { AgentPanel } from "./components/AgentPanel.js";
+import { AgentRail } from "./components/AgentRail.js";
 import { NewPlanForm } from "./components/NewPlanForm.js";
 import { AuditLog } from "./components/AuditLog.js";
 import { ArchivePanel } from "./components/ArchivePanel.js";
@@ -24,7 +24,6 @@ import { ConnectionBanner } from "./components/ConnectionBanner.js";
 import { RunnerStatus } from "./components/RunnerStatus.js";
 import { OrgChip } from "./components/OrgChip.js";
 import { EnsurePlan } from "./components/EnsurePlan.js";
-import { EnsureAgents } from "./components/EnsureAgents.js";
 import { NotFoundPage } from "./components/NotFoundPage.js";
 import { useRouteSelection } from "./hooks/use-route-selection.js";
 
@@ -204,26 +203,6 @@ function RouteSync() {
   }, [routeAgentId, selectedAgentId]);
 
   return null;
-}
-
-/// Right-rail AgentPanel mounts only when an agent id sits in the URL,
-/// either as the deep-link path /agents/:agentId or as the cross-route
-/// `?agent=<id>` overlay. Keeps today's behaviour where the agent
-/// panel can sit beside any main view (notably PlanBoard). The
-/// `<EnsureAgents/>` wrapper handles the data dependency: it ensures
-/// the agent list has been fetched before rendering the panel, and
-/// surfaces a not-found message in the rail when the URL id is
-/// stale.
-function AgentRail() {
-  const { routeAgentId } = useRouteSelection();
-  if (!routeAgentId) return null;
-  return (
-    <div className="w-[600px] border-l border-gray-800 h-full">
-      <EnsureAgents>
-        <AgentPanel />
-      </EnsureAgents>
-    </div>
-  );
 }
 
 /// /new-plan renders the modal and routes back to /plans on close.
