@@ -9,3 +9,7 @@ screenshots/take-screenshots.mjs
 .claude/
 # Drafts + ephemera we don't track
 devto-article.md
+# Playwright e2e runtime / artifacts (web/playwright.config.ts).
+web/.playwright-artifacts/
+web/.playwright-runtime.json
+tests/smoke-artifacts/

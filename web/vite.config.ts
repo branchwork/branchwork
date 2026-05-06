@@ -1,19 +1,23 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+const backendPort = process.env.BRANCHWORK_BACKEND_PORT ?? "3100";
+const backendHttp = `http://localhost:${backendPort}`;
+const backendWs = `ws://localhost:${backendPort}`;
+
 export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://localhost:3100",
-      "/hooks": "http://localhost:3100",
+      "/api": backendHttp,
+      "/hooks": backendHttp,
       "/ws": {
-        target: "ws://localhost:3100",
+        target: backendWs,
         ws: true,
       },
       "/terminal": {
-        target: "ws://localhost:3100",
+        target: backendWs,
         ws: true,
       },
     },

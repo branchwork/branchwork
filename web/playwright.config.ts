@@ -1,31 +1,36 @@
 import { defineConfig, devices } from "@playwright/test";
 
-// Smoke test config for the containerized SaaS stack — drives the new-plan
-// form against a runner round-trip end-to-end. Bootstrapped by
-// tests/smoke/run.sh, which writes BASE_URL / SMOKE_PROJECT / SMOKE_USER_*
-// into the environment before invoking `pnpm --filter @branchwork/web
-// test:smoke`.
+// Playwright config for the README golden-path e2e (task 8.1). The
+// bootstrap helper at e2e/support/test-server.ts owns the rust-server +
+// vite + stub-claude lifecycle: this config just hands Playwright a
+// `webServer` command that runs it.
 //
-// The spec exercises four scenarios from the plan brief:
-//   1. Folder suggestions list runner-side dirs
-//   2. no_runner_connected banner when the runner is stopped
-//   3. createFolder=true round-trip lands on the runner FS
-//   4. runner_unavailable when the runner is killed mid-flight
-//
-// We do not run any vitest tests from here — vitest is configured to read
-// `src/**/*.{test,spec}.{ts,tsx}` only, so this config is a separate axis.
-const baseURL = process.env.BASE_URL ?? "http://localhost:3199";
-const artifactsDir = process.env.SMOKE_ARTIFACTS_DIR ?? "../tests/smoke-artifacts/_default";
+// The smoke spec (e2e/runner-banners.spec.ts) lives in its own config —
+// see `playwright.smoke.config.ts`. It is not run by `pnpm e2e`.
+const VITE_PORT = Number(process.env.BRANCHWORK_E2E_VITE_PORT ?? 5174);
+const baseURL = `http://localhost:${VITE_PORT}`;
 
 export default defineConfig({
   testDir: "./e2e",
-  fullyParallel: false, // The four scenarios share a single runner container.
+  testIgnore: ["**/runner-banners.spec.ts"],
+  fullyParallel: false,
   workers: 1,
   retries: 0,
-  reporter: [["list"], ["html", { outputFolder: `${artifactsDir}/html-report`, open: "never" }]],
-  outputDir: `${artifactsDir}/test-results`,
-  timeout: 60_000,
-  expect: { timeout: 10_000 },
+  reporter: [["list"]],
+  outputDir: "./.playwright-artifacts/test-results",
+  timeout: 180_000,
+  expect: { timeout: 15_000 },
+  webServer: {
+    command: "pnpm exec tsx e2e/support/test-server.ts",
+    url: baseURL,
+    reuseExistingServer: false,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 120_000,
+    env: {
+      BRANCHWORK_E2E_VITE_PORT: String(VITE_PORT),
+    },
+  },
   use: {
     baseURL,
     headless: true,
