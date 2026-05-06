@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { HttpError, fetchJson, postJson } from "../api.js";
 import { errorMessage } from "../lib/error.js";
+import { resetAllStores } from "../lib/reset-all.js";
 
 export interface AuthUser {
   id: string;
@@ -78,5 +79,10 @@ export const useAuthStore = create<AuthStore>((set) => ({
       // the user's intent even if the server is unreachable.
     }
     set({ user: null, error: null });
+    // Drop the previous user's plans/agents/settings/ws-state so they
+    // don't bleed into the next sign-in in the same tab. Audit §2 major:
+    // before this, `useAuthStore.logout()` cleared `user` only, leaving
+    // every other store populated until a refresh.
+    resetAllStores();
   },
 }));

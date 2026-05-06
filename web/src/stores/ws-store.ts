@@ -60,6 +60,15 @@ interface WsStore {
   reconnectAttempt: number;
   connect: () => void;
   disconnect: () => void;
+  /// Disconnect the socket, clear all subscriptions, and reset state.
+  /// Driven by `lib/reset-all.ts::resetAllStores()` on logout so the
+  /// previous user's session can't keep mutating stores via late
+  /// broadcasts. Distinct from `disconnect()` (which leaves
+  /// subscriptions intact for a future reconnect): on a real logout we
+  /// want components that re-mount under user B to re-subscribe with
+  /// fresh closures rather than fire stale handlers from user A's
+  /// component tree.
+  reset: () => void;
 }
 
 type WsEventName = WsMessage["type"];
@@ -173,6 +182,27 @@ export const useWsStore = create<WsStore>((set, get) => ({
       socket.close();
       set({ socket: null, connected: false, reconnectAttempt: 0 });
     }
+  },
+
+  reset: () => {
+    const { socket } = get();
+    if (socket) {
+      // Some browsers throw when close() is called on a socket that's
+      // already mid-close. We don't care about the error here — the
+      // state assignment below makes us forget the handle either way.
+      try {
+        socket.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    // Drop every external subscriber. Components mounted under user A
+    // will unmount when the login screen renders (user becomes null),
+    // which fires their useEffect cleanups; clearing here is belt-and-
+    // braces for any subscriber whose cleanup didn't reach the Set
+    // (e.g. an old test that registered without unmounting).
+    wsSubscriptions.clear();
+    set({ socket: null, connected: false, reconnectAttempt: 0 });
   },
 }));
 

@@ -78,6 +78,11 @@ interface AgentStore {
   /// No-op if no row matches — the next `fetchAgents()` reconciles.
   clearAgentBranch: (match: { agentId?: string; branch?: string }) => void;
   appendOutput: (agentId: string, line: AgentOutputLine) => void;
+  /// Drop every slice back to its initial shape. Driven by
+  /// `lib/reset-all.ts::resetAllStores()` on logout so user A's agent
+  /// rows / output buffers / diffs don't leak into user B's session.
+  /// Also clears the in-flight fetch handle.
+  reset: () => void;
 }
 
 /// Module-level handle to the single in-flight `fetchAgents()` round trip.
@@ -225,4 +230,16 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
         [agentId]: [...(s.agentOutput[agentId] ?? []), line],
       },
     })),
+
+  reset: () => {
+    inFlightAgentsFetch = null;
+    set({
+      agents: [],
+      selectedAgentId: null,
+      agentOutput: {},
+      agentDiffs: {},
+      agentsFetched: false,
+      lastAgentsFetchedAt: null,
+    });
+  },
 }));

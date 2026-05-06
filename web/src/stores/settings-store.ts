@@ -73,6 +73,11 @@ interface SettingsStore {
   setPlanArchiveRetentionDays: (value: number) => Promise<void>;
   driverCapabilities: (name: string | null | undefined) => DriverCapabilities;
   driverAuth: (name: string | null | undefined) => AuthStatus | undefined;
+  /// Drop every slice back to its initial shape. Driven by
+  /// `lib/reset-all.ts::resetAllStores()` on logout so user A's
+  /// effort/webhook/driver settings don't leak into user B's session.
+  /// Also clears both in-flight fetch handles.
+  reset: () => void;
 }
 
 /// Module-level handle to the single in-flight `fetchSettings()` round trip.
@@ -187,5 +192,21 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       (name && drivers.find((d) => d.name === name)) ||
       drivers.find((d) => d.name === defaultDriver);
     return match?.auth_status;
+  },
+
+  reset: () => {
+    inFlightSettingsFetch = null;
+    inFlightDriversFetch = null;
+    set({
+      effort: "high",
+      skipPermissions: true,
+      webhookUrl: null,
+      planArchiveRetentionDays: 30,
+      loaded: false,
+      drivers: [],
+      defaultDriver: "claude",
+      lastSettingsFetchedAt: null,
+      lastDriversFetchedAt: null,
+    });
   },
 }));

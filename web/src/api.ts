@@ -38,8 +38,9 @@ async function readBody(res: Response): Promise<unknown> {
 /// - **401 Unauthorized** (any endpoint): assume the session expired.
 ///   Reset auth state via `useAuthStore.getState().logout()` — which
 ///   also resets every dependent store (cross-task contract: auth
-///   logout is the dashboard's single store-reset point, see task 3.3
-///   of the dashboard-ui-overhaul plan). Push a `kind:"warn"` toast
+///   logout is the dashboard's single store-reset point, see task 3.1
+///   of the dashboard-ui-overhaul plan and `lib/reset-all.ts`). Push a
+///   `kind:"warn"` toast
 ///   ("Session expired — please sign in again") and reject with
 ///   `SessionExpiredError`. Skipped when there is no current user
 ///   (the bootstrap `/api/auth/me` probe must not fire a misleading

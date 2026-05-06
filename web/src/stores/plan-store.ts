@@ -278,6 +278,12 @@ interface PlanStore {
   /// `HttpError` on non-2xx; the dry-run path itself never 409s, so a
   /// 4xx here means the plan is gone (404) or the request was malformed.
   previewDeletePlan: (name: string) => Promise<DeletePlanPreview>;
+  /// Drop every slice back to its initial shape. Driven by
+  /// `lib/reset-all.ts::resetAllStores()` after `auth-store.logout()`
+  /// completes so user A's plans don't bleed into user B's session in
+  /// the same tab. Also clears the in-flight fetch handle so user B's
+  /// bootstrap is not coalesced onto user A's still-pending request.
+  reset: () => void;
 }
 
 /// Module-level handle to the single in-flight `fetchPlans()` round trip.
@@ -626,5 +632,25 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       `/api/plans/${name}?dry_run=true`,
       { method: "DELETE" },
     );
+  },
+
+  reset: () => {
+    // Clear the module-level in-flight handle so a stale user-A fetch
+    // does not coalesce user-B's bootstrap onto a now-401-bound promise.
+    // The `.finally()` guard in `fetchPlans` checks `=== promise` before
+    // nulling, so this assignment is safe even if the prior fetch is
+    // still pending.
+    inFlightPlansFetch = null;
+    set({
+      plans: [],
+      selectedPlan: null,
+      loading: false,
+      plansFetched: false,
+      lastPlansFetchedAt: null,
+      warnings: [],
+      planConfigs: {},
+      autoModeRuntimes: {},
+      toasts: [],
+    });
   },
 }));
