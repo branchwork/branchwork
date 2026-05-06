@@ -1,0 +1,47 @@
+# webMethods Integration Server work directories
+work/
+logs/
+*.log
+
+# IS runtime directories
+WmRoot/
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+*~
+
+# Build artifacts
+*.zip
+*.jar
+!packages/*/code/jars/**/*.jar
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Node modules (if using npm for testing)
+node_modules/
+
+# Python cache (if using Python for testing)
+__pycache__/
+*.pyc
+*.pyo
+
+# Test reports
+test-results/
+coverage/
+*.xml
+*.html

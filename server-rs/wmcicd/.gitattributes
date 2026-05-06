@@ -1,0 +1,32 @@
+# Ensure consistent line endings across platforms
+* text=auto
+
+# webMethods Integration Server package files
+packages/**/*.ndf text eol=lf
+packages/**/*.fdf text eol=lf
+packages/**/*.idf text eol=lf
+packages/**/*.xml text eol=lf
+packages/**/*.xsd text eol=lf
+packages/**/*.wsdl text eol=lf
+
+# Source code files
+*.java text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Binary files
+*.jar binary
+*.zip binary
+*.war binary
+*.ear binary
+*.class binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary

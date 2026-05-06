@@ -1,0 +1,29 @@
+# CODEOWNERS file for webMethods CI/CD repository
+# Define code ownership for automatic review assignment
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything in the repo
+* @integration-team
+
+# Package owners
+/packages/ @integration-team @package-maintainers
+
+# Configuration owners
+/config/ @devops-team @integration-team
+
+# Docker and deployment
+/docker/ @devops-team
+/helm/ @devops-team @kubernetes-team
+
+# CI/CD workflows
+/.github/workflows/ @devops-team
+
+# Testing
+/tests/ @qa-team @integration-team
+
+# Scripts
+/scripts/ @devops-team
+
+# Documentation
+/docs/ @tech-writers @integration-team
+/README.md @tech-writers
