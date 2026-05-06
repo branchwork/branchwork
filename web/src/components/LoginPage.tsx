@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useAuthStore } from "../stores/auth-store.js";
 import type { SsoLoginOption } from "../stores/auth-store.js";
 import { fetchJson } from "../api.js";
+import { Banner } from "./ui/Banner.js";
+import { Button } from "./ui/Button.js";
 
 type Mode = "login" | "signup";
 
@@ -128,18 +130,18 @@ export function LoginPage() {
         />
 
         {displayError && (
-          <div className="mb-3 text-xs text-red-400 bg-red-900/20 border border-red-900/40 rounded px-2 py-1.5">
-            {humanize(displayError)}
-          </div>
+          <Banner className="mb-3">{humanize(displayError)}</Banner>
         )}
 
-        <button
+        <Button
           type="submit"
+          variant="primary"
           disabled={submitting || !email || !password}
-          className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-800 disabled:text-gray-400 text-white text-sm font-medium rounded py-2 transition"
+          loading={submitting}
+          className="w-full font-medium"
         >
-          {submitting ? "\u2026" : submitLabel}
-        </button>
+          {submitLabel}
+        </Button>
 
         {ssoProviders.length > 0 && (
           <div className="mt-4 space-y-2">

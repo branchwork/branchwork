@@ -6,6 +6,7 @@ import { usePlanStore } from "../stores/plan-store.js";
 import { useWsStore } from "../stores/ws-store.js";
 import { formatTimestamp } from "../lib/time.js";
 import { errorMessage } from "../lib/error.js";
+import { toastError } from "../lib/toast.js";
 import { parseWsMessage } from "../schemas/ws-events.js";
 
 /// Audit-row diff bodies are server-generated JSON whose shape varies
@@ -362,7 +363,6 @@ export function AuditLog() {
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const [actionFilter, setActionFilter] = useState("");
   const [resourceFilter, setResourceFilter] = useState("");
@@ -480,7 +480,6 @@ export function AuditLog() {
   const fetchLogs = useCallback(
     async (newOffset = 0) => {
       setLoading(true);
-      setError(null);
       try {
         const params = new URLSearchParams();
         params.set("limit", String(PAGE_SIZE));
@@ -495,7 +494,7 @@ export function AuditLog() {
         setTotal(data.total);
         setOffset(newOffset);
       } catch (e) {
-        setError(errorMessage(e));
+        toastError(e);
       } finally {
         setLoading(false);
       }
@@ -544,7 +543,7 @@ export function AuditLog() {
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setError(errorMessage(e));
+      toastError(e);
     } finally {
       setExporting(false);
     }
@@ -604,19 +603,6 @@ export function AuditLog() {
           </button>
         </div>
       </div>
-
-      {/* Error */}
-      {error && (
-        <div className="px-6 py-2 bg-red-900/20 border-b border-red-800/30 text-xs text-red-400 flex items-center justify-between">
-          <span>{error}</span>
-          <button
-            onClick={() => setError(null)}
-            className="text-red-600 hover:text-red-400"
-          >
-            x
-          </button>
-        </div>
-      )}
 
       {/* Table */}
       <div className="flex-1 overflow-auto">

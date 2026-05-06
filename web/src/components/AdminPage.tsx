@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
+import { Banner } from "./ui/Banner.js";
+import { Button } from "./ui/Button.js";
 
 const EFFORT_LEVELS: { value: EffortLevel; label: string }[] = [
   { value: "low", label: "Low" },
@@ -177,19 +179,21 @@ export function AdminPage() {
             placeholder="https://hooks.slack.com/services/..."
             className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 placeholder:text-gray-600 focus:outline-none focus:border-indigo-600"
           />
-          <button
+          <Button
             onClick={saveWebhook}
             disabled={!dirty || webhookStatus === "saving"}
-            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm rounded transition"
+            loading={webhookStatus === "saving"}
+            variant="primary"
+            size="sm"
           >
-            {webhookStatus === "saving" ? "Saving…" : "Save"}
-          </button>
+            {webhookStatus === "saving" ? "Saving" : "Save"}
+          </Button>
         </div>
         {webhookStatus === "saved" && (
           <p className="text-[11px] text-emerald-400 mt-1.5">Saved.</p>
         )}
         {webhookStatus === "error" && webhookError && (
-          <p className="text-[11px] text-red-400 mt-1.5">{webhookError}</p>
+          <Banner className="mt-1.5">{webhookError}</Banner>
         )}
       </Section>
 
@@ -235,7 +239,7 @@ export function AdminPage() {
           <p className="text-[11px] text-emerald-400 mt-1.5">Saved.</p>
         )}
         {retentionStatus === "error" && retentionError && (
-          <p className="text-[11px] text-red-400 mt-1.5">{retentionError}</p>
+          <Banner className="mt-1.5">{retentionError}</Banner>
         )}
       </Section>
     </div>

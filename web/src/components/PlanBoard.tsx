@@ -12,7 +12,9 @@ import { fetchJson, postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
 import { DeletePlanModal } from "./DeletePlanModal.js";
-import { errorMessage } from "../lib/error.js";
+import { Button } from "./ui/Button.js";
+import { Modal } from "./ui/Modal.js";
+import { toastError } from "../lib/toast.js";
 
 export function PlanBoard() {
   const plan = usePlanStore((s) => s.selectedPlan);
@@ -22,9 +24,10 @@ export function PlanBoard() {
   const [resetting, setResetting] = useState(false);
   const [checkingAll, setCheckingAll] = useState(false);
   const [checkingPlan, setCheckingPlan] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [confirmCheckAll, setConfirmCheckAll] = useState(false);
   const planArchiveRetentionDays = useSettingsStore(
     (s) => s.planArchiveRetentionDays,
   );
@@ -57,14 +60,13 @@ export function PlanBoard() {
 
   async function handleReset() {
     if (!plan) return;
-    if (!confirm(`Reset all task statuses to pending for "${plan.title}"?`)) return;
+    setConfirmReset(false);
     setResetting(true);
-    setError(null);
     try {
       await postJson(`/api/plans/${plan.name}/reset-status`, {});
       await selectPlan(plan.name);
     } catch (e) {
-      setError(`Reset failed: ${errorMessage(e)}`);
+      toastError(e, "Reset failed");
     } finally {
       setResetting(false);
     }
@@ -72,17 +74,12 @@ export function PlanBoard() {
 
   async function handleCheckAll() {
     if (!plan) return;
-    const pendingCount = plan.phases
-      .flatMap((p) => p.tasks)
-      .filter((t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending"))
-      .length;
-    if (!confirm(`Spawn ${pendingCount} check agents for this plan? This will use API credits.`)) return;
+    setConfirmCheckAll(false);
     setCheckingAll(true);
-    setError(null);
     try {
       await postJson(`/api/plans/${plan.name}/check-all`, {});
     } catch (e) {
-      setError(`Check all failed: ${errorMessage(e)}`);
+      toastError(e, "Check all failed");
     } finally {
       setCheckingAll(false);
     }
@@ -91,7 +88,6 @@ export function PlanBoard() {
   async function handleCheckPlan() {
     if (!plan) return;
     setCheckingPlan(true);
-    setError(null);
     try {
       const res = await postJson<{ agentId: string }>(
         `/api/plans/${plan.name}/check`,
@@ -99,7 +95,7 @@ export function PlanBoard() {
       );
       selectAgent(res.agentId);
     } catch (e) {
-      setError(`Check Plan failed: ${errorMessage(e)}`);
+      toastError(e, "Check Plan failed");
     } finally {
       setCheckingPlan(false);
     }
@@ -112,24 +108,27 @@ export function PlanBoard() {
       await savePlan(updated);
       await fetchPlans();
     } catch (e) {
-      setError(`Save failed: ${errorMessage(e)}`);
+      toastError(e, "Save failed");
     }
   }
 
   async function handleConvert() {
     setConverting(true);
-    setError(null);
     try {
       await postJson(`/api/plans/${plan!.name}/convert`, {});
       await fetchPlans();
       await selectPlan(plan!.name);
     } catch (e) {
-      setError(`Convert failed: ${errorMessage(e)}`);
-      console.error("Convert failed:", e);
+      toastError(e, "Convert failed");
     } finally {
       setConverting(false);
     }
   }
+
+  const pendingCheckCount = plan.phases
+    .flatMap((p) => p.tasks)
+    .filter((t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending"))
+    .length;
 
   return (
     <div className="p-6">
@@ -209,7 +208,7 @@ export function PlanBoard() {
             onViewAgent={selectAgent}
           />
           <button
-            onClick={handleCheckAll}
+            onClick={() => setConfirmCheckAll(true)}
             disabled={checkingAll || !plan.project}
             className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-emerald-600 hover:text-emerald-400 disabled:opacity-50 disabled:hover:border-gray-700 disabled:hover:text-gray-400 text-gray-300 rounded transition"
             title="Spawn a check agent for every unfinished task in this plan"
@@ -217,14 +216,14 @@ export function PlanBoard() {
             {checkingAll ? "Spawning..." : "Check All"}
           </button>
           <button
-            onClick={handleReset}
+            onClick={() => setConfirmReset(true)}
             disabled={resetting}
             className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-red-600 hover:text-red-400 disabled:opacity-50 text-gray-300 rounded transition"
             title="Reset all task statuses to pending"
           >
             {resetting ? "Resetting..." : "Reset"}
           </button>
-          <StaleBranchesButton planName={plan.name} onError={setError} onDone={() => selectPlan(plan.name)} />
+          <StaleBranchesButton planName={plan.name} onDone={() => selectPlan(plan.name)} />
         </div>
         <div className="flex items-center justify-between gap-3">
           <AutoModeControls planName={plan.name} />
@@ -244,15 +243,26 @@ export function PlanBoard() {
             onClose={() => setDeleteOpen(false)}
           />
         )}
-        {/* Error toast */}
-        {error && (
-          <div className="mt-2 text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded px-3 py-2 inline-flex items-center gap-2">
-            <span>{error}</span>
-            <button onClick={() => setError(null)} className="text-red-600 hover:text-red-400 ml-2">
-              dismiss
-            </button>
-          </div>
-        )}
+        <ConfirmDialog
+          open={confirmReset}
+          title="Reset task statuses"
+          description={`Reset all task statuses to pending for "${plan.title}"?`}
+          confirmLabel={resetting ? "Resetting..." : "Reset"}
+          confirmVariant="danger"
+          confirmDisabled={resetting}
+          onConfirm={handleReset}
+          onCancel={() => setConfirmReset(false)}
+        />
+        <ConfirmDialog
+          open={confirmCheckAll}
+          title="Check all tasks"
+          description={`Spawn ${pendingCheckCount} check agents for this plan? This will use API credits.`}
+          confirmLabel={checkingAll ? "Spawning..." : `Spawn ${pendingCheckCount}`}
+          confirmVariant="primary"
+          confirmDisabled={checkingAll}
+          onConfirm={handleCheckAll}
+          onCancel={() => setConfirmCheckAll(false)}
+        />
         {/* Overall progress */}
         {total > 0 && (
           <div className="mt-3 h-1.5 bg-gray-800 rounded-full overflow-hidden max-w-md">
@@ -571,7 +581,6 @@ interface StaleBranch {
 
 interface StaleBranchesButtonProps {
   planName: string;
-  onError: (msg: string | null) => void;
   onDone: () => void;
 }
 
@@ -579,7 +588,7 @@ interface StaleBranchesButtonProps {
 /// branches, then pick which to purge. Defaults to selecting only the
 /// branches with no unique commits (the "agent exited without committing"
 /// leftovers). Dangerous branches require a force opt-in.
-function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonProps) {
+function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [branches, setBranches] = useState<StaleBranch[]>([]);
@@ -590,7 +599,6 @@ function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonP
   async function openAndLoad() {
     setOpen(true);
     setLoading(true);
-    onError(null);
     try {
       const data = await fetchJson<{ branches: StaleBranch[] }>(
         `/api/plans/${planName}/branches/stale`,
@@ -601,7 +609,7 @@ function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonP
         new Set(data.branches.filter((b) => !b.hasUniqueCommits).map((b) => b.name)),
       );
     } catch (e) {
-      onError(`Load branches failed: ${errorMessage(e)}`);
+      toastError(e, "Load branches failed");
       setOpen(false);
     } finally {
       setLoading(false);
@@ -610,7 +618,6 @@ function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonP
 
   async function purge() {
     setBusy(true);
-    onError(null);
     try {
       const toPurge = [...selected];
       const { results } = await postJson<{
@@ -618,7 +625,7 @@ function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonP
       }>(`/api/plans/${planName}/branches/stale/purge`, { branches: toPurge, force });
       const failed = results.filter((r) => !r.ok);
       if (failed.length > 0) {
-        onError(
+        toastError(
           `${failed.length} failed: ` +
             failed.map((f) => `${f.branch} (${f.error})`).join(", "),
         );
@@ -628,7 +635,7 @@ function StaleBranchesButton({ planName, onError, onDone }: StaleBranchesButtonP
       setForce(false);
       onDone();
     } catch (e) {
-      onError(`Purge failed: ${errorMessage(e)}`);
+      toastError(e, "Purge failed");
     } finally {
       setBusy(false);
     }
@@ -771,12 +778,10 @@ function AutoModeControls({ planName }: { planName: string }) {
   const fetchPlanConfig = usePlanStore((s) => s.fetchPlanConfig);
   const setPlanConfig = usePlanStore((s) => s.setPlanConfig);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [draftMaxFix, setDraftMaxFix] = useState<string>("");
 
   useEffect(() => {
     let alive = true;
-    setError(null);
     fetchPlanConfig(planName)
       .then((c) => {
         if (!alive) return;
@@ -784,7 +789,7 @@ function AutoModeControls({ planName }: { planName: string }) {
       })
       .catch((e) => {
         if (!alive) return;
-        setError(`Load config failed: ${errorMessage(e)}`);
+        toastError(e, "Load config failed");
       });
     return () => {
       alive = false;
@@ -793,13 +798,12 @@ function AutoModeControls({ planName }: { planName: string }) {
 
   async function update(patch: PlanConfigPatch) {
     setBusy(true);
-    setError(null);
     try {
       const cfg = await putJson<PlanConfig>(`/api/plans/${planName}/config`, patch);
       setPlanConfig(planName, cfg);
       setDraftMaxFix(String(cfg.maxFixAttempts));
     } catch (e) {
-      setError(`Save failed: ${errorMessage(e)}`);
+      toastError(e, "Save failed");
     } finally {
       setBusy(false);
     }
@@ -818,68 +822,59 @@ function AutoModeControls({ planName }: { planName: string }) {
     }
   }
 
-  if (!config && !error) {
+  if (!config) {
     return <div className="mt-3 h-5" aria-hidden />;
   }
 
   return (
     <div className="flex items-center gap-4 mt-3 text-xs">
-      {config && (
-        <>
-          <Switch
-            label="Auto-advance"
-            title={AUTO_ADVANCE_TOOLTIP}
-            checked={config.autoAdvance}
+      <Switch
+        label="Auto-advance"
+        title={AUTO_ADVANCE_TOOLTIP}
+        checked={config.autoAdvance}
+        disabled={busy}
+        onChange={(v) => update({ autoAdvance: v })}
+      />
+      <Switch
+        label="Auto-mode"
+        title={AUTO_MODE_TOOLTIP}
+        checked={config.autoMode}
+        disabled={busy}
+        onChange={(v) => update({ autoMode: v })}
+      />
+      <Switch
+        label="Parallel"
+        title={PARALLEL_DISABLED_TOOLTIP}
+        checked={config.parallel}
+        disabled
+        onChange={() => {}}
+      />
+      {config.autoMode && (
+        <label
+          className="flex items-center gap-1.5 text-gray-400"
+          title="Max fix attempts per task before auto-mode pauses (0 = merge only, never spawn a fix agent)."
+        >
+          <span>Fix attempts</span>
+          <input
+            type="number"
+            min={0}
+            max={10}
+            step={1}
+            value={draftMaxFix}
             disabled={busy}
-            onChange={(v) => update({ autoAdvance: v })}
+            onChange={(e) => setDraftMaxFix(e.target.value)}
+            onBlur={commitMaxFix}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                (e.target as HTMLInputElement).blur();
+              } else if (e.key === "Escape") {
+                setDraftMaxFix(String(config.maxFixAttempts));
+                (e.target as HTMLInputElement).blur();
+              }
+            }}
+            className="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 w-12 text-center text-gray-200 outline-none focus:border-indigo-500 disabled:opacity-50"
           />
-          <Switch
-            label="Auto-mode"
-            title={AUTO_MODE_TOOLTIP}
-            checked={config.autoMode}
-            disabled={busy}
-            onChange={(v) => update({ autoMode: v })}
-          />
-          <Switch
-            label="Parallel"
-            title={PARALLEL_DISABLED_TOOLTIP}
-            checked={config.parallel}
-            disabled
-            onChange={() => {}}
-          />
-          {config.autoMode && (
-            <label
-              className="flex items-center gap-1.5 text-gray-400"
-              title="Max fix attempts per task before auto-mode pauses (0 = merge only, never spawn a fix agent)."
-            >
-              <span>Fix attempts</span>
-              <input
-                type="number"
-                min={0}
-                max={10}
-                step={1}
-                value={draftMaxFix}
-                disabled={busy}
-                onChange={(e) => setDraftMaxFix(e.target.value)}
-                onBlur={commitMaxFix}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    (e.target as HTMLInputElement).blur();
-                  } else if (e.key === "Escape") {
-                    setDraftMaxFix(String(config.maxFixAttempts));
-                    (e.target as HTMLInputElement).blur();
-                  }
-                }}
-                className="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 w-12 text-center text-gray-200 outline-none focus:border-indigo-500 disabled:opacity-50"
-              />
-            </label>
-          )}
-        </>
-      )}
-      {error && (
-        <span className="text-red-400" role="alert">
-          {error}
-        </span>
+        </label>
       )}
     </div>
   );
@@ -957,7 +952,6 @@ export function AutoModeStatusPill({ planName }: { planName: string }) {
   const runtime = usePlanStore((s) => s.autoModeRuntimes[planName] ?? null);
   const setPlanConfig = usePlanStore((s) => s.setPlanConfig);
   const [resuming, setResuming] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   // Pause is the persistent slice (lives in PlanConfig); transient labels
   // are the WS-driven slice (runtime). Persistent wins so a fresh page
@@ -976,14 +970,13 @@ export function AutoModeStatusPill({ planName }: { planName: string }) {
     const label = humanPauseReason(reason);
     async function resume() {
       setResuming(true);
-      setError(null);
       try {
         const cfg = await putJson<PlanConfig>(`/api/plans/${planName}/config`, {
           pausedReason: null,
         });
         setPlanConfig(planName, cfg);
       } catch (e) {
-        setError(`Resume failed: ${errorMessage(e)}`);
+        toastError(e, "Resume failed");
       } finally {
         setResuming(false);
       }
@@ -1006,11 +999,6 @@ export function AutoModeStatusPill({ planName }: { planName: string }) {
         >
           {resuming ? "Resuming..." : "Resume"}
         </button>
-        {error && (
-          <span className="text-red-400" role="alert">
-            {error}
-          </span>
-        )}
       </span>
     );
   }
@@ -1133,5 +1121,49 @@ function Switch({ label, title, checked, disabled, onChange }: SwitchProps) {
         {label}
       </span>
     </button>
+  );
+}
+
+interface ConfirmDialogProps {
+  open: boolean;
+  title: string;
+  description: string;
+  confirmLabel: string;
+  confirmVariant: "primary" | "danger";
+  confirmDisabled: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}
+
+/// Small confirm dialog wrapper around the `Modal` primitive — replaces
+/// the `confirm()` calls flagged in audit §1 (PlanBoard reset / check-all,
+/// PhaseCard check-phase). The Modal handles focus trap, Esc, and return
+/// focus; this wrapper just supplies the standard two-button footer.
+function ConfirmDialog({
+  open,
+  title,
+  description,
+  confirmLabel,
+  confirmVariant,
+  confirmDisabled,
+  onConfirm,
+  onCancel,
+}: ConfirmDialogProps) {
+  return (
+    <Modal open={open} onClose={onCancel} title={title} description={description}>
+      <div className="mt-4 flex justify-end gap-2">
+        <Button variant="ghost" size="sm" onClick={onCancel} disabled={confirmDisabled}>
+          Cancel
+        </Button>
+        <Button
+          variant={confirmVariant}
+          size="sm"
+          onClick={onConfirm}
+          disabled={confirmDisabled}
+        >
+          {confirmLabel}
+        </Button>
+      </div>
+    </Modal>
   );
 }

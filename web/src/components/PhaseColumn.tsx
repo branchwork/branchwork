@@ -3,7 +3,8 @@ import { postJson } from "../api.js";
 import { usePlanStore, type PlanPhase } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { TaskCard } from "./TaskCard.js";
-import { errorMessage } from "../lib/error.js";
+import { Button } from "./ui/Button.js";
+import { toastError, toastWarn } from "../lib/toast.js";
 
 interface Props {
   phase: PlanPhase;
@@ -29,7 +30,6 @@ export function PhaseColumn({ phase, planName, statusFilter }: Props) {
   const [collapsed, setCollapsed] = useState(allDone);
   const [showDoneTasks, setShowDoneTasks] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [startError, setStartError] = useState<string | null>(null);
   const selectedPlan = usePlanStore((s) => s.selectedPlan);
   const selectPlan = usePlanStore((s) => s.selectPlan);
   const effort = useSettingsStore((s) => s.effort);
@@ -63,7 +63,6 @@ export function PhaseColumn({ phase, planName, statusFilter }: Props) {
   async function handleStartPhase() {
     if (readyCount === 0) return;
     setStarting(true);
-    setStartError(null);
     try {
       const res = await postJson<StartPhaseResponse>(
         `/api/plans/${planName}/phases/${phase.number}/start`,
@@ -71,10 +70,10 @@ export function PhaseColumn({ phase, planName, statusFilter }: Props) {
       );
       await selectPlan(planName);
       if (res.started.length === 0) {
-        setStartError("No tasks were started");
+        toastWarn("No tasks were started");
       }
     } catch (e) {
-      setStartError(`Start phase failed: ${errorMessage(e)}`);
+      toastError(e, "Start phase failed");
     } finally {
       setStarting(false);
     }
@@ -120,17 +119,19 @@ export function PhaseColumn({ phase, planName, statusFilter }: Props) {
           </span>
           {/* Start Phase — spawn agents for all ready tasks in parallel */}
           {readyCount > 0 && (
-            <button
+            <Button
+              variant="primary"
+              size="sm"
               onClick={(e) => {
                 e.stopPropagation();
                 handleStartPhase();
               }}
               disabled={starting}
               title={`Spawn ${readyCount} agent${readyCount !== 1 ? "s" : ""} in parallel, each on its own branch`}
-              className="ml-auto px-2 py-0.5 text-[10px] bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded font-medium transition"
+              className="ml-auto py-0.5 text-[10px] font-medium"
             >
               {starting ? "Starting..." : `Start Phase (${readyCount})`}
-            </button>
+            </Button>
           )}
         </div>
         <h3 className="text-sm font-semibold mt-1 truncate" title={phase.title}>
@@ -145,20 +146,6 @@ export function PhaseColumn({ phase, planName, statusFilter }: Props) {
               }`}
               style={{ width: `${pct}%` }}
             />
-          </div>
-        )}
-        {startError && (
-          <div className="mt-2 text-[10px] text-red-400 bg-red-900/20 border border-red-800/30 rounded px-2 py-1 flex items-start justify-between gap-1">
-            <span className="line-clamp-2">{startError}</span>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setStartError(null);
-              }}
-              className="text-red-600 hover:text-red-400 flex-shrink-0"
-            >
-              x
-            </button>
           </div>
         )}
       </div>

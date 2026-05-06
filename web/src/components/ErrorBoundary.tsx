@@ -1,4 +1,5 @@
 import { Component, type ReactNode, type ErrorInfo } from "react";
+import { Button } from "./ui/Button.js";
 
 interface Props {
   children: ReactNode;
@@ -33,15 +34,16 @@ export class ErrorBoundary extends Component<Props, State> {
             <pre className="text-xs text-gray-600 bg-gray-800 p-3 rounded overflow-auto max-h-40 mb-4">
               {this.state.error.stack}
             </pre>
-            <button
+            <Button
+              variant="primary"
+              size="sm"
               onClick={() => {
                 this.setState({ error: null });
                 window.location.reload();
               }}
-              className="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded transition"
             >
               Reload
-            </button>
+            </Button>
           </div>
         </div>
       );

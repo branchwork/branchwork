@@ -4,7 +4,7 @@ import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
 import { postJson } from "../api.js";
 import { formatRelative } from "../lib/time.js";
-import { errorMessage } from "../lib/error.js";
+import { toastError } from "../lib/toast.js";
 import { isPlanDone } from "../lib/predicates.js";
 
 interface Props {
@@ -27,7 +27,6 @@ export function Sidebar({ view, onViewChange }: Props) {
     (a) => a.status === "running" || a.status === "starting"
   ).length;
   const [convertingAll, setConvertingAll] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
   const [showDone, setShowDone] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState("");
 
@@ -35,14 +34,12 @@ export function Sidebar({ view, onViewChange }: Props) {
 
   async function handleConvertAll() {
     setConvertingAll(true);
-    setActionError(null);
     try {
       await postJson("/api/plans/convert-all", {});
       await fetchPlans();
       if (selectedPlan) await selectPlan(selectedPlan.name);
     } catch (e) {
-      setActionError(`Convert failed: ${errorMessage(e)}`);
-      console.error("Convert all failed:", e);
+      toastError(e, "Convert failed");
     } finally {
       setConvertingAll(false);
     }
@@ -201,12 +198,6 @@ export function Sidebar({ view, onViewChange }: Props) {
         >
           + New Plan
         </button>
-        {actionError && (
-          <div className="mt-1 text-[10px] text-red-400 bg-red-900/20 border border-red-800/30 rounded px-2 py-1 flex items-start justify-between gap-1">
-            <span>{actionError}</span>
-            <button onClick={() => setActionError(null)} className="text-red-600 hover:text-red-400 flex-shrink-0">x</button>
-          </div>
-        )}
       </div>
 
       {/* Effort level */}

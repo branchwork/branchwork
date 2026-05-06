@@ -2,6 +2,9 @@ import { useState } from "react";
 import type { PlanPhase } from "../stores/plan-store.js";
 import { postJson } from "../api.js";
 import { TaskCard } from "./TaskCard.js";
+import { Button } from "./ui/Button.js";
+import { Modal } from "./ui/Modal.js";
+import { toastError } from "../lib/toast.js";
 
 interface Props {
   phase: PlanPhase;
@@ -24,24 +27,29 @@ export function PhaseCard({ phase, planName, statusFilter }: Props) {
   // Done phases start collapsed, active phases start expanded
   const [expanded, setExpanded] = useState(!allDone);
   const [checking, setChecking] = useState(false);
+  const [confirmCheck, setConfirmCheck] = useState(false);
 
   const filteredTasks = statusFilter
     ? phase.tasks.filter((t) => (t.status ?? "pending") === statusFilter)
     : phase.tasks;
 
-  async function handleCheckPhase(e: React.MouseEvent) {
+  const eligibleCount = phase.tasks.filter(
+    (t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending")
+  ).length;
+
+  function openConfirm(e: React.MouseEvent) {
     e.stopPropagation();
-    const eligible = phase.tasks.filter(
-      (t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending")
-    ).length;
-    if (eligible === 0) return;
-    if (!confirm(`Spawn ${eligible} check agents for Phase ${phase.number}? This will use API credits.`))
-      return;
+    if (eligibleCount === 0) return;
+    setConfirmCheck(true);
+  }
+
+  async function runCheckPhase() {
+    setConfirmCheck(false);
     setChecking(true);
     try {
       await postJson(`/api/plans/${planName}/check-all`, { phase: phase.number });
     } catch (e) {
-      console.error("Check phase failed:", e);
+      toastError(e, "Check phase failed");
     } finally {
       setChecking(false);
     }
@@ -125,8 +133,8 @@ export function PhaseCard({ phase, planName, statusFilter }: Props) {
             {/* Check phase button (only when there's something to check) */}
             {!allDone && (
               <button
-                onClick={handleCheckPhase}
-                disabled={checking}
+                onClick={openConfirm}
+                disabled={checking || eligibleCount === 0}
                 className="flex-shrink-0 px-2 py-0.5 text-[10px] bg-gray-800 border border-gray-700 hover:border-emerald-600 hover:text-emerald-400 disabled:opacity-50 text-gray-400 rounded transition"
                 title="Spawn a check agent for every unfinished task in this phase"
               >
@@ -161,6 +169,21 @@ export function PhaseCard({ phase, planName, statusFilter }: Props) {
           <p className="text-xs text-gray-600">No matching tasks</p>
         </div>
       )}
+      <Modal
+        open={confirmCheck}
+        onClose={() => setConfirmCheck(false)}
+        title={`Check Phase ${phase.number}`}
+        description={`Spawn ${eligibleCount} check agents for Phase ${phase.number}? This will use API credits.`}
+      >
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="ghost" size="sm" onClick={() => setConfirmCheck(false)}>
+            Cancel
+          </Button>
+          <Button variant="primary" size="sm" onClick={runCheckPhase}>
+            Spawn {eligibleCount}
+          </Button>
+        </div>
+      </Modal>
     </div>
   );
 }

@@ -6,6 +6,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useAgentStore, type AgentOutputLine, type AgentDiff } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
+import { toastError } from "../lib/toast.js";
 import {
   parseStreamJsonLine,
   parseVerdictJson,
@@ -415,7 +416,6 @@ export function DiffView({
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [mergeState, setMergeState] = useState<"idle" | "confirming" | "merging" | "merged" | "error">("idle");
   const [discardState, setDiscardState] = useState<"idle" | "confirming" | "discarding" | "discarded" | "error">("idle");
-  const [actionError, setActionError] = useState<string | null>(null);
   const [mergeTargets, setMergeTargets] = useState<{ default: string | null; available: string[] } | null>(null);
   const [targetsLoading, setTargetsLoading] = useState(true);
   const [targetsError, setTargetsError] = useState(false);
@@ -582,13 +582,12 @@ export function DiffView({
                   <button
                     onClick={async () => {
                       setDiscardState("discarding");
-                      setActionError(null);
                       const result = await discardAgentBranch(agentId);
                       if (result.ok) {
                         setDiscardState("discarded");
                       } else {
                         setDiscardState("error");
-                        setActionError(result.error ?? "Discard failed");
+                        toastError(result.error ?? "Discard failed");
                       }
                     }}
                     className="px-2 py-0.5 text-[11px] bg-red-900/60 text-red-300 hover:bg-red-900 rounded transition"
@@ -622,7 +621,6 @@ export function DiffView({
                   <button
                     onClick={async () => {
                       setMergeState("merging");
-                      setActionError(null);
                       const result = await mergeAgentBranch(
                         agentId,
                         selectedTarget ?? undefined
@@ -631,7 +629,7 @@ export function DiffView({
                         setMergeState("merged");
                       } else {
                         setMergeState("error");
-                        setActionError(result.error ?? "Merge failed");
+                        toastError(result.error ?? "Merge failed");
                       }
                     }}
                     className="px-2 py-0.5 text-[11px] bg-emerald-900/60 text-emerald-300 hover:bg-emerald-900 rounded transition"
@@ -733,11 +731,6 @@ export function DiffView({
             <span className="text-xs text-gray-500">Branch discarded</span>
           )}
         </div>
-
-        {/* Error display */}
-        {actionError && (
-          <div className="mt-1 text-[10px] text-red-400">{actionError}</div>
-        )}
       </div>
     </div>
   );

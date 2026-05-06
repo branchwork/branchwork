@@ -4,6 +4,8 @@ import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { formatRelative } from "../lib/time.js";
 import { httpErrorBody } from "../lib/error.js";
+import { toastError } from "../lib/toast.js";
+import { Button } from "./ui/Button.js";
 
 interface Folder {
   name: string;
@@ -38,7 +40,6 @@ export function NewPlanForm({ onClose }: Props) {
   const [templateId, setTemplateId] = useState<string>("");
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [confirmCreate, setConfirmCreate] = useState<string | null>(null);
   const [runnerStatus, setRunnerStatus] = useState<RunnerStatus | null>(null);
   const selectAgent = useAgentStore((s) => s.selectAgent);
@@ -79,7 +80,6 @@ export function NewPlanForm({ onClose }: Props) {
     : folders;
 
   async function handleSubmit() {
-    setError(null);
     setCreating(true);
     try {
       const res = await postJson<{ agentId: string; folder: string }>(
@@ -110,7 +110,7 @@ export function NewPlanForm({ onClose }: Props) {
           return;
         }
         if (e.status === 400 && body.error === "create_failed") {
-          setError(body.message ?? "Runner failed to create folder.");
+          toastError(body.message ?? "Runner failed to create folder.");
           return;
         }
         if (e.status === 503 && body.error === "no_runner_connected") {
@@ -118,11 +118,11 @@ export function NewPlanForm({ onClose }: Props) {
           return;
         }
         if (e.status === 504 && body.error === "runner_unavailable") {
-          setError("Runner did not respond in time. Try again.");
+          toastError("Runner did not respond in time. Try again.");
           return;
         }
       }
-      setError(String(e));
+      toastError(e);
     } finally {
       setCreating(false);
     }
@@ -165,7 +165,6 @@ export function NewPlanForm({ onClose }: Props) {
             onChange={(e) => {
               setFolder(e.target.value);
               setConfirmCreate(null);
-              setError(null);
             }}
             onFocus={() => setShowSuggestions(true)}
             onBlur={() => setTimeout(() => setShowSuggestions(false), 200)}
@@ -266,21 +265,15 @@ export function NewPlanForm({ onClose }: Props) {
         </p>
       </div>
 
-      {/* Error */}
-      {error && (
-        <div className="mb-4 p-2 bg-red-900/20 border border-red-700/50 rounded text-xs text-red-400">
-          {error}
-        </div>
-      )}
-
       {/* Submit */}
-      <button
+      <Button
         onClick={handleSubmit}
         disabled={creating || !description.trim() || !folder.trim()}
-        className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm rounded transition"
+        loading={creating}
+        variant="primary"
       >
         {creating ? "Starting agent..." : "Create Plan"}
-      </button>
+      </Button>
     </div>
   );
 }

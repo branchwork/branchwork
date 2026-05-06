@@ -9,8 +9,9 @@ import {
   type AuthStatus,
 } from "../stores/settings-store.js";
 import { EditableText } from "./EditableText.js";
+import { Button } from "./ui/Button.js";
 import { formatRelative } from "../lib/time.js";
-import { errorMessage } from "../lib/error.js";
+import { toastError } from "../lib/toast.js";
 
 interface Props {
   task: PlanTask;
@@ -64,7 +65,6 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const [fixingCi, setFixingCi] = useState(false);
   const [agentId, setAgentId] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [merging, setMerging] = useState(false);
   const agents = useAgentStore((s) => s.agents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
@@ -126,7 +126,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       await savePlan(updated);
       await fetchPlans();
     } catch (e) {
-      setError(`Save failed: ${errorMessage(e)}`);
+      toastError(e, "Save failed");
     }
   }
 
@@ -149,7 +149,6 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
 
   async function handleStart(mode: "start" | "continue" = "start") {
     setStarting(true);
-    setError(null);
     try {
       const res = await postJson<{ agentId: string }>("/api/actions/start-task", {
         planName,
@@ -163,8 +162,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       selectAgent(res.agentId);
       await updateStatus("in_progress");
     } catch (e) {
-      setError(`Start failed: ${errorMessage(e)}`);
-      console.error("Failed to start task:", e);
+      toastError(e, "Start failed");
     } finally {
       setStarting(false);
     }
@@ -172,7 +170,6 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
 
   async function handleCheck() {
     setChecking(true);
-    setError(null);
     try {
       const res = await postJson<{ agentId: string }>(
         `/api/plans/${planName}/tasks/${task.number}/check`,
@@ -185,8 +182,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       setTimeout(() => selectPlan(planName), 10000);
       setTimeout(() => selectPlan(planName), 30000);
     } catch (e) {
-      setError(`Check failed: ${errorMessage(e)}`);
-      console.error("Failed to check task:", e);
+      toastError(e, "Check failed");
     } finally {
       setChecking(false);
     }
@@ -195,7 +191,6 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   async function handleFixCi() {
     if (!task.ci || task.ci.status !== "failure") return;
     setFixingCi(true);
-    setError(null);
     try {
       const res = await postJson<{ agentId: string; branch: string }>(
         "/api/actions/fix-ci",
@@ -209,8 +204,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       setAgentId(res.agentId);
       selectAgent(res.agentId);
     } catch (e) {
-      setError(`Fix CI failed: ${errorMessage(e)}`);
-      console.error("Failed to start Fix CI agent:", e);
+      toastError(e, "Fix CI failed");
     } finally {
       setFixingCi(false);
     }
@@ -223,8 +217,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       });
       await selectPlan(planName);
     } catch (e) {
-      setError(`Status update failed: ${errorMessage(e)}`);
-      console.error("Failed to update status:", e);
+      toastError(e, "Status update failed");
     }
     setShowMenu(false);
   }
@@ -318,7 +311,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                         );
                         await selectPlan(planName);
                       } catch (e) {
-                        setError(`Reset failed: ${errorMessage(e)}`);
+                        toastError(e, "Reset failed");
                       }
                     }}
                     className="w-full text-left px-3 py-1 text-xs hover:bg-red-950/40 text-red-400/80 hover:text-red-300 flex items-center gap-2"
@@ -420,7 +413,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                           await deleteJson(`/api/ci/${ciRunId}`);
                           await selectPlan(planName);
                         } catch (err) {
-                          setError(`Dismiss CI failed: ${errorMessage(err)}`);
+                          toastError(err, "Dismiss CI failed");
                         }
                       }}
                       className="ml-0.5 text-[10px] text-gray-500 hover:text-gray-300 hover:bg-gray-800/60 px-1 rounded transition"
@@ -486,7 +479,9 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
 
           {/* Start — for pending tasks */}
           {status === "pending" && !agentId && (
-            <button
+            <Button
+              variant="primary"
+              size="sm"
               onClick={() => handleStart("start")}
               disabled={starting || blocked || !authReady || taskLocked}
               title={
@@ -498,10 +493,10 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                       ? `Blocked by ${unmetDeps.join(", ")}`
                       : undefined
               }
-              className="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
+              className="px-2 py-1"
             >
               {starting ? "..." : "Start"}
-            </button>
+            </Button>
           )}
 
           {/* Continue — for in_progress tasks */}
@@ -594,12 +589,11 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                 <button
                   onClick={async () => {
                     setDiscarding(true);
-                    setError(null);
                     const result = await discardAgentBranch(branchAgent.id);
                     if (result.ok) {
                       await selectPlan(planName);
                     } else {
-                      setError(result.error ?? "Discard failed");
+                      toastError(result.error ?? "Discard failed");
                     }
                     setDiscarding(false);
                     setConfirmDiscard(false);
@@ -631,12 +625,11 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                   <button
                     onClick={async () => {
                       setMerging(true);
-                      setError(null);
                       const result = await mergeAgentBranch(branchAgent.id);
                       if (result.ok) {
                         await selectPlan(planName);
                       } else {
-                        setError(result.error ?? "Merge failed");
+                        toastError(result.error ?? "Merge failed");
                       }
                       setMerging(false);
                     }}
@@ -696,18 +689,6 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         />
       </div>
 
-      {/* Error display */}
-      {error && (
-        <div className="mt-2 text-[11px] text-red-400 bg-red-900/20 border border-red-800/30 rounded px-2 py-1 flex items-start justify-between gap-1">
-          <span className="line-clamp-2">{error}</span>
-          <button
-            onClick={() => setError(null)}
-            className="text-red-600 hover:text-red-400 flex-shrink-0"
-          >
-            x
-          </button>
-        </div>
-      )}
     </div>
   );
 }
