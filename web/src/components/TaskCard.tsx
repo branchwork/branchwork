@@ -442,6 +442,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
             <EditableText
               value={task.title}
               onSave={(v) => saveTaskField({ title: v })}
+              label={`task ${task.number} title`}
               className="text-sm font-medium"
               editClassName="text-sm font-medium"
             />
@@ -697,6 +698,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         <EditableText
           value={task.description}
           onSave={(v) => saveTaskField({ description: v })}
+          label={`task ${task.number} description`}
           multiline
           className="line-clamp-2"
           editClassName="text-[11px]"
@@ -709,6 +711,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
         <EditableText
           value={task.acceptance}
           onSave={(v) => saveTaskField({ acceptance: v })}
+          label={`task ${task.number} acceptance`}
           className="line-clamp-1"
           editClassName="text-[11px]"
           placeholder="Add acceptance criteria..."

@@ -165,6 +165,7 @@ export function PlanBoard() {
             <EditableText
               value={plan.title}
               onSave={(v) => saveField({ title: v })}
+              label="plan title"
               className="text-xl font-bold"
               editClassName="text-xl font-bold"
             />
@@ -193,6 +194,7 @@ export function PlanBoard() {
             <EditableText
               value={plan.context}
               onSave={(v) => saveField({ context: v })}
+              label="plan context"
               multiline
               className="line-clamp-2"
               editClassName="text-sm"
