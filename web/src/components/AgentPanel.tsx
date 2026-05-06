@@ -12,6 +12,8 @@ import {
   parseVerdictJson,
 } from "../schemas/stream-json.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
+import { Dropdown, DropdownItem } from "./ui/Dropdown.js";
+import { Tabs } from "./ui/Tabs.js";
 
 type Tab = "output" | "diff";
 
@@ -108,32 +110,25 @@ export function AgentPanel() {
         </div>
       </div>
 
-      {/* Tab bar */}
-      <div className="flex border-b border-gray-800 flex-shrink-0">
-        <button
-          onClick={() => setActiveTab("output")}
-          className={`px-3 py-1.5 text-xs font-medium transition ${
-            activeTab === "output"
-              ? "text-gray-200 border-b-2 border-indigo-500"
-              : "text-gray-500 hover:text-gray-300"
-          }`}
-        >
-          Output
-        </button>
-        <button
-          onClick={() => setActiveTab("diff")}
-          disabled={!hasBaseCommit}
-          className={`px-3 py-1.5 text-xs font-medium transition ${
-            activeTab === "diff"
-              ? "text-gray-200 border-b-2 border-indigo-500"
-              : hasBaseCommit
-                ? "text-gray-500 hover:text-gray-300"
-                : "text-gray-700 cursor-not-allowed"
-          }`}
-        >
-          Diff
-        </button>
-      </div>
+      {/* Tab bar — keyboard nav lives in the `Tabs` primitive
+          (arrow keys, Home/End). */}
+      <Tabs<Tab>
+        label="Agent panel"
+        value={activeTab}
+        onChange={setActiveTab}
+        className="border-b border-gray-800 flex-shrink-0"
+        tabs={[
+          { value: "output", label: "Output" },
+          {
+            value: "diff",
+            label: "Diff",
+            disabled: !hasBaseCommit,
+            title: hasBaseCommit
+              ? undefined
+              : "Diff unavailable — agent has no base commit yet",
+          },
+        ]}
+      />
 
       {/* Content */}
       {activeTab === "output" ? (
@@ -425,8 +420,6 @@ export function DiffView({
   const [targetsLoading, setTargetsLoading] = useState(true);
   const [targetsError, setTargetsError] = useState(false);
   const [selectedTarget, setSelectedTarget] = useState<string | null>(null);
-  const [dropdownOpen, setDropdownOpen] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
 
   const diffData = agentDiffs[agentId];
 
@@ -457,17 +450,6 @@ export function DiffView({
       cancelled = true;
     };
   }, [agentId, fetchMergeTargets]);
-
-  useEffect(() => {
-    if (!dropdownOpen) return;
-    function onMouseDown(e: MouseEvent) {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setDropdownOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", onMouseDown);
-    return () => document.removeEventListener("mousedown", onMouseDown);
-  }, [dropdownOpen]);
 
   if (!diffData) {
     return (
@@ -651,75 +633,61 @@ export function DiffView({
               ) : mergeState === "merging" ? (
                 <span className="text-[10px] text-gray-500">Merging...</span>
               ) : (
-                <div className="relative" ref={dropdownRef}>
-                  <div className="flex items-center">
-                    <button
-                      onClick={() => {
-                        setDropdownOpen(false);
-                        setMergeState("confirming");
-                      }}
-                      className={`px-3 py-1 text-xs bg-emerald-900/50 text-emerald-400 hover:bg-emerald-900 ${
-                        showChevron ? "rounded-l" : "rounded"
-                      } transition font-medium`}
-                      title={targetsError ? "couldn't load alternates" : undefined}
-                    >
-                      Merge into {resolvedTarget}
-                    </button>
-                    {showChevron && (
-                      <button
-                        onClick={() => setDropdownOpen((o) => !o)}
-                        className="px-2 py-1 text-xs bg-emerald-900/50 text-emerald-400 hover:bg-emerald-900 rounded-r border-l border-emerald-700/40 transition"
-                        title="Choose target branch"
-                        aria-label="Choose target branch"
-                      >
-                        ∇
-                      </button>
-                    )}
-                  </div>
-                  {dropdownOpen && (
-                    <div className="absolute bottom-full right-0 mb-1 bg-gray-900 border border-gray-700 rounded shadow-lg min-w-[180px] py-1 z-20">
-                      {targetsLoading ? (
-                        <div className="px-3 py-1 text-[11px] text-gray-500 flex items-center gap-2">
-                          <span className="inline-block w-3 h-3 border-2 border-gray-600 border-t-gray-300 rounded-full animate-spin" />
-                          Loading…
-                        </div>
-                      ) : (
-                        <>
-                          {mergeTargets?.default && (
-                            <button
-                              onClick={() => {
-                                setSelectedTarget(null);
-                                setDropdownOpen(false);
-                              }}
-                              className={`block w-full text-left px-3 py-1 text-[11px] hover:bg-gray-800 transition ${
-                                selectedTarget === null
-                                  ? "text-emerald-400"
-                                  : "text-gray-300"
-                              }`}
-                            >
-                              {mergeTargets.default}{" "}
-                              <span className="text-gray-600">(default)</span>
-                            </button>
-                          )}
-                          {mergeTargets?.available.map((branch) => (
-                            <button
-                              key={branch}
-                              onClick={() => {
-                                setSelectedTarget(branch);
-                                setDropdownOpen(false);
-                              }}
-                              className={`block w-full text-left px-3 py-1 text-[11px] hover:bg-gray-800 transition ${
-                                selectedTarget === branch
-                                  ? "text-emerald-400"
-                                  : "text-gray-300"
-                              }`}
-                            >
-                              {branch}
-                            </button>
-                          ))}
-                        </>
+                <div className="flex items-center">
+                  <button
+                    onClick={() => setMergeState("confirming")}
+                    className={`px-3 py-1 text-xs bg-emerald-900/50 text-emerald-400 hover:bg-emerald-900 ${
+                      showChevron ? "rounded-l" : "rounded"
+                    } transition font-medium`}
+                    title={targetsError ? "couldn't load alternates" : undefined}
+                  >
+                    Merge into {resolvedTarget}
+                  </button>
+                  {showChevron && (
+                    <Dropdown
+                      label="Choose merge target branch"
+                      align="right"
+                      side="top"
+                      className="min-w-[180px]"
+                      trigger={(props) => (
+                        <button
+                          {...props}
+                          type="button"
+                          aria-label="Choose target branch"
+                          title="Choose target branch"
+                          className="px-2 py-1 text-xs bg-emerald-900/50 text-emerald-400 hover:bg-emerald-900 rounded-r border-l border-emerald-700/40 transition"
+                        >
+                          <span aria-hidden="true">&#8711;</span>
+                        </button>
                       )}
-                    </div>
+                    >
+                      {mergeTargets?.default && (
+                        <DropdownItem
+                          onSelect={() => setSelectedTarget(null)}
+                          className={
+                            selectedTarget === null
+                              ? "text-emerald-400"
+                              : ""
+                          }
+                        >
+                          {mergeTargets.default}{" "}
+                          <span className="text-gray-600">(default)</span>
+                        </DropdownItem>
+                      )}
+                      {mergeTargets?.available.map((branch) => (
+                        <DropdownItem
+                          key={branch}
+                          onSelect={() => setSelectedTarget(branch)}
+                          className={
+                            selectedTarget === branch
+                              ? "text-emerald-400"
+                              : ""
+                          }
+                        >
+                          {branch}
+                        </DropdownItem>
+                      ))}
+                    </Dropdown>
                   )}
                 </div>
               )}

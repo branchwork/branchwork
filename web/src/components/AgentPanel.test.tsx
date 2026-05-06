@@ -84,7 +84,10 @@ describe("AgentPanel DiffView merge dropdown", () => {
     });
 
     fireEvent.click(chevron);
-    const featureItem = await screen.findByRole("button", { name: "feature/x" });
+    // Migrated to the `Dropdown` primitive — items now carry
+    // `role="menuitem"` (audit §8 fix). Older tests queried by
+    // `role="button"`.
+    const featureItem = await screen.findByRole("menuitem", { name: "feature/x" });
     fireEvent.click(featureItem);
 
     // Main merge button now reads "Merge into feature/x".
@@ -117,15 +120,15 @@ describe("AgentPanel DiffView merge dropdown", () => {
     });
     fireEvent.click(chevron);
 
-    // Sanity-check: dropdown is open (feature/x item visible).
-    await screen.findByRole("button", { name: "feature/x" });
+    // Sanity-check: dropdown is open (feature/x menuitem visible).
+    await screen.findByRole("menuitem", { name: "feature/x" });
 
     // Click somewhere outside the dropdown wrapper.
     fireEvent.mouseDown(document.body);
 
     await waitFor(() => {
       expect(
-        screen.queryByRole("button", { name: "feature/x" })
+        screen.queryByRole("menuitem", { name: "feature/x" })
       ).toBeNull();
     });
     expect(mergeAgentBranch).not.toHaveBeenCalled();

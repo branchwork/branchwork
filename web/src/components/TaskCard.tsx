@@ -10,6 +10,7 @@ import {
 } from "../stores/settings-store.js";
 import { EditableText } from "./EditableText.js";
 import { Button } from "./ui/Button.js";
+import { Dropdown, DropdownItem, DropdownSeparator } from "./ui/Dropdown.js";
 import { TouchTarget } from "./ui/TouchTarget.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
@@ -66,7 +67,6 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const [checking, setChecking] = useState(false);
   const [fixingCi, setFixingCi] = useState(false);
   const [agentId, setAgentId] = useState<string | null>(null);
-  const [showMenu, setShowMenu] = useState(false);
   const [merging, setMerging] = useState(false);
   const agents = useAgentStore((s) => s.agents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
@@ -225,7 +225,18 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
     } catch (e) {
       toastError(e, "Status update failed");
     }
-    setShowMenu(false);
+  }
+
+  async function resetStatus() {
+    try {
+      await postJson(
+        `/api/plans/${planName}/tasks/${task.number}/reset-status`,
+        {},
+      );
+      await selectPlan(planName);
+    } catch (e) {
+      toastError(e, "Reset failed");
+    }
   }
 
   async function cycleStatus() {
@@ -272,64 +283,56 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
             <span className="text-[10px] font-mono text-gray-500">
               {task.number}
             </span>
-            {/* Clickable status badge */}
-            <div className="relative">
-              <button
-                onClick={cycleStatus}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setShowMenu(!showMenu);
-                }}
-                className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer hover:opacity-80 flex items-center gap-1 ${cfg.bg}`}
-                title="Click to cycle status, right-click for menu"
-              >
-                <span className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
-                {cfg.label}
-              </button>
-
-              {/* Status dropdown menu */}
-              {showMenu && (
-                <div className="absolute top-6 left-0 z-10 bg-gray-800 border border-gray-700 rounded-md shadow-lg py-1 min-w-[140px]">
-                  {Object.entries(statusConfig)
-                    .filter(([k]) => k !== "checking")
-                    .map(([key, val]) => (
-                    <button
-                      key={key}
-                      onClick={() => updateStatus(key)}
-                      className={`w-full text-left px-3 py-1 text-xs hover:bg-gray-700 flex items-center gap-2 ${
-                        key === status ? "text-white" : "text-gray-400"
-                      }`}
-                    >
-                      <span className={`w-1.5 h-1.5 rounded-full ${val.dot}`} />
-                      {val.label}
-                    </button>
-                  ))}
-                  {/* Reset — clears the task_status row entirely. Useful when
-                      a task has ended up stuck in `checking` or similar from
-                      a dead agent. Backend refuses if an agent is still live. */}
-                  <div className="border-t border-gray-700 my-1" />
-                  <button
-                    onClick={async () => {
-                      setShowMenu(false);
-                      try {
-                        await postJson(
-                          `/api/plans/${planName}/tasks/${task.number}/reset-status`,
-                          {},
-                        );
-                        await selectPlan(planName);
-                      } catch (e) {
-                        toastError(e, "Reset failed");
-                      }
-                    }}
-                    className="w-full text-left px-3 py-1 text-xs hover:bg-red-950/40 text-red-400/80 hover:text-red-300 flex items-center gap-2"
-                    title="Clear status row — useful to unwedge a stuck 'checking' task"
-                  >
-                    <span className="w-1.5 h-1.5 rounded-full bg-red-400/80" />
-                    Reset
-                  </button>
-                </div>
+            {/* Status badge — left-click cycles, kebab opens the menu.
+                Right-click context menu was removed (audit §8: hidden
+                keyboard interaction). */}
+            <button
+              onClick={cycleStatus}
+              className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer hover:opacity-80 flex items-center gap-1 ${cfg.bg}`}
+              title="Click to cycle status"
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
+              {cfg.label}
+            </button>
+            <Dropdown
+              label={`Set status for task ${task.number}`}
+              trigger={(props) => (
+                <button
+                  {...props}
+                  type="button"
+                  aria-label={`Status menu for task ${task.number}`}
+                  title="Open status menu"
+                  className="text-[10px] px-1 py-0.5 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-700/60 transition leading-none"
+                >
+                  <span aria-hidden="true">&#x22EE;</span>
+                </button>
               )}
-            </div>
+            >
+              {Object.entries(statusConfig)
+                .filter(([k]) => k !== "checking")
+                .map(([key, val]) => (
+                  <DropdownItem
+                    key={key}
+                    onSelect={() => updateStatus(key)}
+                    className={key === status ? "text-white" : ""}
+                  >
+                    <span className={`w-1.5 h-1.5 rounded-full ${val.dot}`} />
+                    {val.label}
+                  </DropdownItem>
+                ))}
+              <DropdownSeparator />
+              {/* Reset — clears the task_status row entirely. Useful when
+                  a task has ended up stuck in `checking` or similar from
+                  a dead agent. Backend refuses if an agent is still live. */}
+              <DropdownItem
+                onSelect={resetStatus}
+                variant="danger"
+                title="Clear status row — useful to unwedge a stuck 'checking' task"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-red-400/80" />
+                Reset
+              </DropdownItem>
+            </Dropdown>
             {/* Updated at */}
             {task.statusUpdatedAt && (
               <span className="text-[9px] text-gray-600" title={task.statusUpdatedAt}>
@@ -455,10 +458,19 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
             !agentId &&
             (status === "pending" || status === "in_progress" || status === "failed") && (
               <TouchTarget>
+                {/* Native `<select>` deliberately kept (audit §8 listed
+                    this alongside hand-rolled menus, but a native select
+                    already provides Tab focus, Enter/ArrowDown to open,
+                    arrow-key navigation, Esc to close, and type-ahead
+                    search — it is strictly more accessible than any
+                    custom `<Dropdown/>` we could ship. Adding the
+                    explicit `aria-label` so axe-core has a programmatic
+                    name beyond the `title` tooltip. */}
                 <select
                   value={driver}
                   onChange={(e) => setDriver(e.target.value)}
                   disabled={taskLocked}
+                  aria-label={`Driver for task ${task.number}`}
                   className="text-[10px] bg-gray-800 border border-gray-700 text-gray-300 rounded px-1 py-0.5 focus:outline-none focus:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed"
                   title={
                     taskLocked
