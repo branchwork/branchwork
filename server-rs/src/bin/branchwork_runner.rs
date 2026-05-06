@@ -477,6 +477,7 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
             driver,
             effort,
             max_budget_usd,
+            skip_permissions,
         } => {
             println!(
                 "[runner] start_agent: {} plan={} task={} driver={}",
@@ -498,6 +499,7 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                 prompt,
                 effort.as_deref(),
                 *max_budget_usd,
+                skip_permissions.unwrap_or(false),
             )
             .await
             {
@@ -1380,6 +1382,7 @@ fn extra_env_for_driver(driver: &str) -> &'static [(&'static str, &'static str)]
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_agent(
     state: &RunnerState,
     agent_id: &str,
@@ -1388,6 +1391,7 @@ async fn spawn_agent(
     prompt: &str,
     effort: Option<&str>,
     _max_budget_usd: Option<f64>,
+    skip_permissions: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Build socket path.
     let sockets_dir = state.cwd.join(".branchwork-runner-sessions");
@@ -1432,6 +1436,14 @@ async fn spawn_agent(
     {
         args.push("--effort".to_string());
         args.push(eff.to_string());
+    }
+
+    // Skip-permissions resolution is done server-side (per-runner override
+    // → server default) before the StartAgent envelope is built, so the
+    // runner just relays the resolved boolean into Claude's CLI flag. Other
+    // drivers don't have an equivalent toggle today.
+    if binary == "claude" && skip_permissions {
+        args.push("--dangerously-skip-permissions".to_string());
     }
 
     // Spawn the session daemon.

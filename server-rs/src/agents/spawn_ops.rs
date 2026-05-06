@@ -87,7 +87,6 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
     let cwd_str = cwd.to_string_lossy().to_string();
     let (driver_name_resolved, _driver) = state.registry.drivers.get_or_default(driver_name);
     let driver_name_owned = driver_name_resolved.to_string();
-    let effort_str = effort.to_string();
 
     // `source_branch` is left NULL in SaaS mode. It's informational only —
     // the merge resolver in `api/agents.rs::resolve_merge_target`
@@ -133,6 +132,31 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
         }),
     );
 
+    // Pick the runner up-front so we can apply its per-runner override to
+    // `effort` / `skip_permissions` before building the StartAgent envelope
+    // (the runner does not re-resolve). If no runner can be picked, we keep
+    // the row at `starting`; an outbox replay only kicks in once we know
+    // which runner to enqueue against.
+    let Some(runner_id) = pick_runner_for_org(&state.db, org_id) else {
+        eprintln!(
+            "[spawn_ops] org {org_id} has runner row(s) but selection failed; agent {agent_id} stays in 'starting'"
+        );
+        return agent_id;
+    };
+
+    // Resolve per-runner override → server default for the two fields the
+    // runner config covers today. The raw effort comes from the caller
+    // (already merged with `state.effort`); skip_permissions is read off
+    // the registry default here because the standalone path takes it from
+    // the same source.
+    let server_skip = state
+        .registry
+        .skip_permissions
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let cfg = crate::db::runner_config(&state.db, &runner_id);
+    let (effort_resolved, skip_resolved) =
+        crate::api::runners::resolve_for_dispatch(&cfg, &effort.to_string(), server_skip);
+
     let message = WireMessage::StartAgent {
         agent_id: agent_id.clone(),
         plan_name: plan_name.unwrap_or("").to_string(),
@@ -140,17 +164,11 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
         prompt,
         cwd: cwd_str,
         driver: driver_name_owned,
-        effort: Some(effort_str),
+        effort: Some(effort_resolved),
         max_budget_usd,
+        skip_permissions: Some(skip_resolved),
     };
     let payload = serde_json::to_string(&message).unwrap_or_default();
-
-    let Some(runner_id) = pick_runner_for_org(&state.db, org_id) else {
-        eprintln!(
-            "[spawn_ops] org {org_id} has runner row(s) but selection failed; agent {agent_id} stays in 'starting'"
-        );
-        return agent_id;
-    };
 
     send_reliable_to_runner(state, &runner_id, message, &payload).await;
     agent_id

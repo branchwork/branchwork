@@ -153,6 +153,53 @@ pub fn auto_advance_config(db: &Db, plan_name: &str) -> AutoAdvanceConfig {
     })
 }
 
+/// Per-runner override of server-wide settings. Both fields are
+/// `Option<_>`: `None` means inherit the server-wide default. The dispatch
+/// layer resolves override-or-inherit at StartAgent build time and ships
+/// the resolved values; the runner does not re-resolve.
+#[derive(Debug, Clone, Default)]
+pub struct RunnerConfig {
+    pub effort: Option<String>,
+    pub skip_permissions: Option<bool>,
+}
+
+/// Read the per-runner override row. Returns the all-`None` default when
+/// no row exists — i.e. the runner inherits both server-wide settings.
+#[allow(dead_code)] // wired in by the SaaS dispatch path
+pub fn runner_config(db: &Db, runner_id: &str) -> RunnerConfig {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT effort, skip_permissions FROM runner_config WHERE runner_id = ?1",
+        params![runner_id],
+        |row| {
+            Ok(RunnerConfig {
+                effort: row.get::<_, Option<String>>(0)?,
+                skip_permissions: row.get::<_, Option<i64>>(1)?.map(|v| v != 0),
+            })
+        },
+    )
+    .unwrap_or_default()
+}
+
+/// Persist a per-runner override. Either field set to `None` clears that
+/// override; passing `RunnerConfig::default()` collapses the row to "inherit
+/// everything". UPSERT keyed by `runner_id` so the call is idempotent.
+#[allow(dead_code)] // wired in by api::runners::put_runner_config
+pub fn set_runner_config(db: &Db, runner_id: &str, org_id: &str, cfg: &RunnerConfig) {
+    let conn = db.lock().unwrap();
+    let skip_int: Option<i64> = cfg.skip_permissions.map(|b| if b { 1 } else { 0 });
+    conn.execute(
+        "INSERT INTO runner_config (runner_id, effort, skip_permissions, org_id) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(runner_id) DO UPDATE SET \
+            effort = excluded.effort, \
+            skip_permissions = excluded.skip_permissions, \
+            org_id = excluded.org_id",
+        params![runner_id, cfg.effort, skip_int, org_id],
+    )
+    .ok();
+}
+
 /// Per-plan retry cap for fix agents. Mirrors the schema default (3) so
 /// plans without a `plan_auto_mode` row return the same value the loop
 /// would see if one had been UPSERTed with defaults. The auto-mode loop
@@ -468,6 +515,19 @@ fn migrate(conn: &Connection) {
             FOREIGN KEY (created_by) REFERENCES users(id)
         );
         CREATE INDEX IF NOT EXISTS idx_runner_tokens_org ON runner_tokens(org_id);
+
+        -- Per-runner override of server-wide settings. Both columns are
+        -- nullable: NULL means inherit the server-wide default. The dispatch
+        -- layer resolves override-or-inherit at StartAgent build time and
+        -- ships the resolved values; the runner does not re-resolve.
+        CREATE TABLE IF NOT EXISTS runner_config (
+            runner_id        TEXT PRIMARY KEY,
+            effort           TEXT,
+            skip_permissions INTEGER,
+            org_id           TEXT NOT NULL DEFAULT 'default-org',
+            FOREIGN KEY (runner_id) REFERENCES runners(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_runner_config_org ON runner_config(org_id);
 
         -- ── Per-org usage tracking and budgets ────────────────────────────
         CREATE TABLE IF NOT EXISTS org_budgets (
@@ -1721,5 +1781,117 @@ mod tests {
             )
             .unwrap();
         assert_eq!(max, 5, "user-set max_fix_attempts survives re-init");
+    }
+
+    // ── runner_config ────────────────────────────────────────────────────
+
+    fn seed_runner(db: &Db, runner_id: &str, org_id: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO runners (id, name, org_id, status) VALUES (?1, ?2, ?3, 'online')",
+            params![runner_id, runner_id, org_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn runner_config_defaults_to_inherit_when_no_row() {
+        // No row in `runner_config` => both fields are None, i.e. the
+        // dispatcher will fall through to the server-wide defaults.
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-a", "default-org");
+        let cfg = runner_config(&db, "runner-a");
+        assert!(cfg.effort.is_none());
+        assert!(cfg.skip_permissions.is_none());
+    }
+
+    #[test]
+    fn set_runner_config_round_trips_partial_overrides() {
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-b", "default-org");
+
+        // Set both fields.
+        set_runner_config(
+            &db,
+            "runner-b",
+            "default-org",
+            &RunnerConfig {
+                effort: Some("max".into()),
+                skip_permissions: Some(false),
+            },
+        );
+        let cfg = runner_config(&db, "runner-b");
+        assert_eq!(cfg.effort.as_deref(), Some("max"));
+        assert_eq!(cfg.skip_permissions, Some(false));
+
+        // UPSERT replaces the row, so passing only one override clears the
+        // other (matches the API: callers must read-modify-write).
+        set_runner_config(
+            &db,
+            "runner-b",
+            "default-org",
+            &RunnerConfig {
+                effort: Some("low".into()),
+                skip_permissions: None,
+            },
+        );
+        let cfg = runner_config(&db, "runner-b");
+        assert_eq!(cfg.effort.as_deref(), Some("low"));
+        assert!(cfg.skip_permissions.is_none());
+    }
+
+    #[test]
+    fn runner_config_cleared_to_all_inherit() {
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-c", "default-org");
+        set_runner_config(
+            &db,
+            "runner-c",
+            "default-org",
+            &RunnerConfig {
+                effort: Some("high".into()),
+                skip_permissions: Some(true),
+            },
+        );
+        // Default => both None => effectively cleared.
+        set_runner_config(&db, "runner-c", "default-org", &RunnerConfig::default());
+        let cfg = runner_config(&db, "runner-c");
+        assert!(cfg.effort.is_none());
+        assert!(cfg.skip_permissions.is_none());
+    }
+
+    #[test]
+    fn runner_config_cascades_when_runner_deleted() {
+        // FK ON DELETE CASCADE: removing a runner row scrubs its config row
+        // so an old override doesn't quietly apply if the same id is
+        // re-enrolled later.
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-d", "default-org");
+        set_runner_config(
+            &db,
+            "runner-d",
+            "default-org",
+            &RunnerConfig {
+                effort: Some("max".into()),
+                skip_permissions: Some(true),
+            },
+        );
+
+        let cleared: i64 = {
+            let conn = db.lock().unwrap();
+            // SQLite needs FKs explicitly enabled per-connection. The
+            // production code never deletes runners by hand, but make the
+            // CASCADE behaviour visible here.
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute("DELETE FROM runners WHERE id = ?1", params!["runner-d"])
+                .unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM runner_config WHERE runner_id = ?1",
+                params!["runner-d"],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(cleared, 0, "runner_config row should cascade-delete");
     }
 }

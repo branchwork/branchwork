@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { fetchJson, postJson } from "../api.js";
+import { fetchJson, postJson, putJson } from "../api.js";
 
 /// Deployment mode discriminator returned by `GET /api/runners`. Drives
 /// whether the `RunnerStatus` indicator renders at all (audit §17 / 4.1):
@@ -87,6 +87,30 @@ export interface RunnerDriverInfo {
   status: RunnerDriverState;
 }
 
+/// Per-runner config response (`GET /api/runners/{id}/config`). `effort`
+/// and `skipPermissions` are the *effective* (resolved) values; `override`
+/// captures what was set explicitly so the UI can render "Inherit server
+/// default" vs "Explicit override that happens to equal the default".
+export interface RunnerConfig {
+  runnerId: string;
+  effort: string;
+  skipPermissions: boolean;
+  override: {
+    effort: string | null;
+    skipPermissions: boolean | null;
+  };
+}
+
+/// Body for `PUT /api/runners/{id}/config`. Each field uses
+/// `null | string | boolean | undefined`:
+/// - `undefined` → omit from the body, don't change.
+/// - `null` → clear the override (back to inherit).
+/// - typed value → set the override.
+export interface RunnerConfigPatch {
+  effort?: string | null;
+  skipPermissions?: boolean | null;
+}
+
 interface RunnerStore {
   /// Resolved deployment mode. Starts as `unknown` so the indicator stays
   /// hidden until we know the answer (avoids flashing the amber "register
@@ -141,6 +165,21 @@ interface RunnerStore {
     runner_id: string;
     drivers?: RunnerDriverInfo[];
   }) => void;
+  /// Per-runner config cache, keyed by `runner.id`. Populated lazily by
+  /// `fetchRunnerConfig`; the Settings expander on RunnersPage subscribes
+  /// here so the values survive a row re-render.
+  configByRunnerId: Record<string, RunnerConfig>;
+  /// Fetch (or refresh) `GET /api/runners/{id}/config` and cache the result
+  /// under `configByRunnerId[id]`. The Settings expander calls this on first
+  /// open.
+  fetchRunnerConfig: (runnerId: string) => Promise<RunnerConfig>;
+  /// PUT `/api/runners/{id}/config`. The server returns the same shape as
+  /// GET so we update `configByRunnerId` from the response — no follow-up
+  /// fetch needed.
+  saveRunnerConfig: (
+    runnerId: string,
+    patch: RunnerConfigPatch,
+  ) => Promise<RunnerConfig>;
   /// Drop everything back to its initial shape. Driven by `reset-all.ts` on
   /// logout so user A's runner inventory doesn't bleed into user B's tab.
   reset: () => void;
@@ -160,6 +199,7 @@ const INITIAL_STATE: Pick<
   | "lastRunnersFetchedAt"
   | "driversByRunnerId"
   | "selectedRunnerId"
+  | "configByRunnerId"
 > = {
   mode: "unknown",
   runners: [],
@@ -167,6 +207,7 @@ const INITIAL_STATE: Pick<
   lastRunnersFetchedAt: null,
   driversByRunnerId: {},
   selectedRunnerId: null,
+  configByRunnerId: {},
 };
 
 export const useRunnerStore = create<RunnerStore>((set, get) => ({
@@ -329,6 +370,37 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
       };
       return { runners: next, driversByRunnerId: nextDriversByRunnerId };
     });
+  },
+
+  fetchRunnerConfig: async (runnerId) => {
+    const cfg = await fetchJson<RunnerConfig>(
+      `/api/runners/${encodeURIComponent(runnerId)}/config`,
+    );
+    set((s) => ({
+      configByRunnerId: { ...s.configByRunnerId, [runnerId]: cfg },
+    }));
+    return cfg;
+  },
+
+  saveRunnerConfig: async (runnerId, patch) => {
+    // Forward exactly what the caller passed: `null` clears the override,
+    // `undefined` omits the key (server treats missing as "no change").
+    // Build the body manually so JSON.stringify doesn't drop `null`.
+    const body: Record<string, unknown> = {};
+    if (Object.prototype.hasOwnProperty.call(patch, "effort")) {
+      body.effort = patch.effort ?? null;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "skipPermissions")) {
+      body.skip_permissions = patch.skipPermissions ?? null;
+    }
+    const cfg = await putJson<RunnerConfig>(
+      `/api/runners/${encodeURIComponent(runnerId)}/config`,
+      body,
+    );
+    set((s) => ({
+      configByRunnerId: { ...s.configByRunnerId, [runnerId]: cfg },
+    }));
+    return cfg;
   },
 
   reset: () => {

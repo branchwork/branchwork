@@ -42,6 +42,11 @@ pub mod actions {
     pub const AUTO_MODE_RESUMED: &str = "auto_mode.resumed";
     pub const CONFIG_PROJECT_CHANGE: &str = "config.project_change";
     pub const CONFIG_KILL_SWITCH: &str = "config.kill_switch";
+    /// `PUT /api/runners/{id}/config` set or cleared a per-runner override
+    /// for `effort` / `skip_permissions`. Diff carries
+    /// `{runner_id, effort: Option<String>, skip_permissions: Option<bool>}`,
+    /// where `null` means the override was cleared (back to inherit).
+    pub const CONFIG_RUNNER_OVERRIDE: &str = "config.runner_override";
     pub const ORG_MEMBER_ADD: &str = "org.member_add";
     pub const ORG_MEMBER_REMOVE: &str = "org.member_remove";
     pub const ORG_MEMBER_ROLE_CHANGE: &str = "org.member_role_change";

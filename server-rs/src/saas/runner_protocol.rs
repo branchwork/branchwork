@@ -85,6 +85,12 @@ pub enum WireMessage {
 
     // ── SaaS -> Runner ──────────────────────────────────────────────────
     /// Dashboard user clicked "Start" — spawn an agent.
+    ///
+    /// `effort` and `skip_permissions` ship the per-runner-resolved values:
+    /// the SaaS server has already merged any `runner_config` override over
+    /// the server-wide default, and the runner does not re-resolve. Old
+    /// runner builds without `skip_permissions` deserialise it as `None`
+    /// and fall back to "do not pass `--dangerously-skip-permissions`".
     StartAgent {
         agent_id: String,
         plan_name: String,
@@ -96,6 +102,8 @@ pub enum WireMessage {
         effort: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_budget_usd: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skip_permissions: Option<bool>,
     },
 
     /// Kill a running agent.

@@ -7,10 +7,18 @@ import {
   type RunnerDriverState,
 } from "../stores/runner-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
+import { Banner } from "./ui/Banner.js";
 import { Button } from "./ui/Button.js";
 import { RunnerEnrollModal } from "./RunnerEnrollModal.js";
 import { formatRelative } from "../lib/time.js";
 import { toastWarn } from "../lib/toast.js";
+
+const EFFORT_LEVELS: { value: string; label: string }[] = [
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "max", label: "Max" },
+];
 
 /// Replaces the 1.1 placeholder. Owns the full SaaS runner control
 /// plane:
@@ -182,6 +190,7 @@ function RunnerRow({ runner }: { runner: Runner }) {
   const selectedRunnerId = useRunnerStore((s) => s.selectedRunnerId);
   const setSelectedRunnerId = useRunnerStore((s) => s.setSelectedRunnerId);
   const isSelected = selectedRunnerId === runner.id;
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   return (
     <li className="px-4 py-3" data-testid="runner-row">
@@ -210,6 +219,19 @@ function RunnerRow({ runner }: { runner: Runner }) {
               <div>Enrolled {formatRelative(runner.createdAt)}</div>
             )}
           </div>
+          <button
+            type="button"
+            onClick={() => setSettingsOpen((v) => !v)}
+            aria-expanded={settingsOpen}
+            className={`text-[11px] px-2 py-0.5 rounded border transition ${
+              settingsOpen
+                ? "border-indigo-700/50 bg-indigo-900/30 text-indigo-200"
+                : "border-gray-700 bg-gray-900/40 text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+            }`}
+            data-testid={`runner-settings-toggle-${runner.id}`}
+          >
+            Settings
+          </button>
           <button
             type="button"
             onClick={() => setSelectedRunnerId(runner.id)}
@@ -241,9 +263,199 @@ function RunnerRow({ runner }: { runner: Runner }) {
           </div>
         )}
       </dl>
+      {settingsOpen && <RunnerSettings runnerId={runner.id} />}
     </li>
   );
 }
+
+const INHERIT_VALUE = "__inherit__";
+
+/// Per-runner override for `effort` and `skip_permissions`. Lazy-loads the
+/// effective config on first open and persists changes via PUT
+/// `/api/runners/{id}/config`. Selecting "Inherit server default" sends
+/// `null`, which clears the override server-side.
+function RunnerSettings({ runnerId }: { runnerId: string }) {
+  const config = useRunnerStore((s) => s.configByRunnerId[runnerId]);
+  const fetchRunnerConfig = useRunnerStore((s) => s.fetchRunnerConfig);
+  const saveRunnerConfig = useRunnerStore((s) => s.saveRunnerConfig);
+
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (config) return;
+    setLoading(true);
+    setError(null);
+    fetchRunnerConfig(runnerId)
+      .catch((e: unknown) => setError(String(e)))
+      .finally(() => setLoading(false));
+  }, [runnerId, config, fetchRunnerConfig]);
+
+  async function commit(patch: {
+    effort?: string | null;
+    skipPermissions?: boolean | null;
+  }) {
+    setSaving(true);
+    setError(null);
+    try {
+      await saveRunnerConfig(runnerId, patch);
+      setSavedAt(Date.now());
+      setTimeout(() => setSavedAt(null), 2000);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (loading && !config) {
+    return (
+      <div className="mt-3 text-[11px] text-gray-500">Loading settings…</div>
+    );
+  }
+  if (!config) {
+    return (
+      <Banner className="mt-3" data-testid={`runner-settings-error-${runnerId}`}>
+        {error ?? "Failed to load runner settings"}
+      </Banner>
+    );
+  }
+
+  const effortOverride = config.override.effort;
+  const skipOverride = config.override.skipPermissions;
+  // Server default is the *effective* value when the override is null —
+  // the absence of an override means the resolved value IS the server
+  // default. Cache it so the dropdown can show "Inherit (high)".
+  const inheritedEffort =
+    effortOverride === null ? config.effort : null;
+
+  return (
+    <div
+      className="mt-3 rounded border border-gray-800 bg-gray-950/50 p-3"
+      data-testid={`runner-settings-${runnerId}`}
+    >
+      <h3 className="text-[11px] font-semibold text-gray-300 uppercase tracking-wide mb-2">
+        Per-runner settings
+      </h3>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <SettingRow
+          label="Effort"
+          description="Reasoning level passed to agents on this runner."
+        >
+          <select
+            value={effortOverride ?? INHERIT_VALUE}
+            onChange={(e) => {
+              const v = e.target.value;
+              void commit({ effort: v === INHERIT_VALUE ? null : v });
+            }}
+            disabled={saving}
+            data-testid={`runner-effort-select-${runnerId}`}
+            className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 focus:outline-none focus:border-indigo-600 disabled:opacity-60"
+          >
+            <option value={INHERIT_VALUE}>
+              Inherit server default
+              {inheritedEffort ? ` (${inheritedEffort})` : ""}
+            </option>
+            {EFFORT_LEVELS.map((l) => (
+              <option key={l.value} value={l.value}>
+                {l.label}
+              </option>
+            ))}
+          </select>
+        </SettingRow>
+
+        <SettingRow
+          label="Skip permissions"
+          description={
+            <>
+              Pass <code className="text-gray-400">--dangerously-skip-permissions</code>{" "}
+              for Claude agents on this runner.
+            </>
+          }
+        >
+          <SkipTriState
+            override={skipOverride}
+            effective={config.skipPermissions}
+            disabled={saving}
+            onChange={(next) => void commit({ skipPermissions: next })}
+            testId={`runner-skip-select-${runnerId}`}
+          />
+        </SettingRow>
+      </div>
+
+      <div className="mt-2 flex items-center gap-2 text-[11px]">
+        {saving && <span className="text-gray-500">Saving…</span>}
+        {!saving && savedAt && (
+          <span className="text-emerald-400">Saved.</span>
+        )}
+        {error && <Banner className="grow">{error}</Banner>}
+      </div>
+    </div>
+  );
+}
+
+function SettingRow({
+  label,
+  description,
+  children,
+}: {
+  label: string;
+  description: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <div className="text-xs font-medium text-gray-300">{label}</div>
+      <p className="text-[11px] text-gray-500 mt-0.5 mb-1.5 leading-relaxed">
+        {description}
+      </p>
+      {children}
+    </div>
+  );
+}
+
+function SkipTriState({
+  override,
+  effective,
+  disabled,
+  onChange,
+  testId,
+}: {
+  override: boolean | null;
+  effective: boolean;
+  disabled: boolean;
+  onChange: (next: boolean | null) => void;
+  testId: string;
+}) {
+  const value =
+    override === null ? INHERIT_VALUE : override ? "on" : "off";
+  // When no override is set, the effective value IS the server default,
+  // so showing "(on)/(off)" next to "Inherit" is the closest hint.
+  const inheritedHint = override === null ? (effective ? "on" : "off") : null;
+  return (
+    <select
+      value={value}
+      onChange={(e) => {
+        const v = e.target.value;
+        if (v === INHERIT_VALUE) onChange(null);
+        else onChange(v === "on");
+      }}
+      disabled={disabled}
+      data-testid={testId}
+      className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 focus:outline-none focus:border-indigo-600 disabled:opacity-60"
+    >
+      <option value={INHERIT_VALUE}>
+        Inherit server default{inheritedHint ? ` (${inheritedHint})` : ""}
+      </option>
+      <option value="on">On</option>
+      <option value="off">Off</option>
+    </select>
+  );
+}
+
 
 /// "N drivers · M ready" chip that expands on hover/click into per-driver
 /// auth state. `ready` counts every driver whose state isn't

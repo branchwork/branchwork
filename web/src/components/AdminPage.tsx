@@ -141,6 +141,7 @@ export function AdminPage() {
             </button>
           ))}
         </div>
+        <PerRunnerOverrideNote />
       </Section>
 
       <Section
@@ -165,6 +166,7 @@ export function AdminPage() {
             {skipPermissions ? "On" : "Off"}
           </span>
         </label>
+        <PerRunnerOverrideNote />
       </Section>
 
       <Section
@@ -259,5 +261,23 @@ function Section({ title, description, children }: SectionProps) {
       <p className="text-[11px] text-gray-500 mt-1 mb-3 leading-relaxed">{description}</p>
       {children}
     </div>
+  );
+}
+
+/// Tiny note rendered under server-wide settings that runners can override
+/// (`effort`, `skip_permissions`). Points the operator at the Runners page
+/// where the per-runner expander lives.
+function PerRunnerOverrideNote() {
+  return (
+    <p className="mt-2 text-[11px] text-gray-600">
+      Runners can override this per-runner on the{" "}
+      <a
+        href="/runners"
+        className="underline decoration-dotted hover:text-gray-400"
+      >
+        Runners page
+      </a>
+      .
+    </p>
   );
 }

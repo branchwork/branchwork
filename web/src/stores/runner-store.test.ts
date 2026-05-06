@@ -254,4 +254,77 @@ describe("runner-store", () => {
     // First runner becomes the default selection.
     expect(s.selectedRunnerId).toBe("r1");
   });
+
+  // ── per-runner config (4.7) ───────────────────────────────────────────
+
+  it("fetchRunnerConfig caches the response under configByRunnerId", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            runnerId: "r1",
+            effort: "high",
+            skipPermissions: false,
+            override: { effort: null, skipPermissions: null },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    const cfg = await useRunnerStore.getState().fetchRunnerConfig("r1");
+    expect(cfg.effort).toBe("high");
+    expect(cfg.skipPermissions).toBe(false);
+    expect(useRunnerStore.getState().configByRunnerId.r1).toEqual(cfg);
+  });
+
+  it("saveRunnerConfig forwards null to clear an override", async () => {
+    let captured: unknown = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+        captured = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          JSON.stringify({
+            runnerId: "r1",
+            effort: "high",
+            skipPermissions: false,
+            override: { effort: null, skipPermissions: null },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    await useRunnerStore
+      .getState()
+      .saveRunnerConfig("r1", { effort: null, skipPermissions: null });
+    expect(captured).toEqual({ effort: null, skip_permissions: null });
+  });
+
+  it("saveRunnerConfig only sends fields the caller mentioned", async () => {
+    // Acceptance: PUT body must not include keys the caller didn't pass —
+    // the server treats missing keys as "no change", and we don't want a
+    // partial PUT to clobber the unspecified column.
+    let captured: Record<string, unknown> | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo, init?: RequestInit) => {
+        captured = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          JSON.stringify({
+            runnerId: "r1",
+            effort: "max",
+            skipPermissions: false,
+            override: { effort: "max", skipPermissions: null },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    await useRunnerStore
+      .getState()
+      .saveRunnerConfig("r1", { effort: "max" });
+    expect(captured).toEqual({ effort: "max" });
+    expect(captured).not.toHaveProperty("skip_permissions");
+  });
 });
