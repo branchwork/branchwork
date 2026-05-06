@@ -206,6 +206,13 @@ interface PlanStore {
   plans: PlanSummary[];
   selectedPlan: ParsedPlan | null;
   loading: boolean;
+  /// `false` until the first successful `fetchPlans()` resolves. Distinct
+  /// from `loading` (which toggles per fetch) and from `plans.length === 0`
+  /// (which can mean "fetched, none exist" *or* "never fetched"). Read by
+  /// `<EnsurePlan/>` to decide between rendering a loading state and
+  /// surfacing "plan not found" — without it the wrapper can't tell those
+  /// two states apart on first nav.
+  plansFetched: boolean;
   warnings: PlanWarning[];
   /// Per-plan PlanConfig. Populated by `fetchPlanConfig` on plan open and
   /// updated by PUT responses + WS events that carry pause-state changes.
@@ -262,6 +269,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   plans: [],
   selectedPlan: null,
   loading: false,
+  plansFetched: false,
   warnings: [],
   planConfigs: {},
   autoModeRuntimes: {},
@@ -286,13 +294,16 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
         console.warn(
           "[plan-store] /api/plans returned empty during refetch; keeping current list",
         );
-        set({ loading: false });
+        set({ loading: false, plansFetched: true });
         return;
       }
-      set({ plans, loading: false });
+      set({ plans, loading: false, plansFetched: true });
     } catch (e) {
       // Surface the failure but ensure loading is reset, otherwise the
-      // dashboard would render the spinner indefinitely.
+      // dashboard would render the spinner indefinitely. `plansFetched`
+      // stays false so EnsurePlan can retry on the next mount; in the
+      // worst case the user sees the loading state until the network
+      // recovers, which is preferable to a misleading "plan not found".
       set({ loading: false });
       throw e;
     }

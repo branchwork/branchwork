@@ -45,6 +45,10 @@ interface AgentStore {
   selectedAgentId: string | null;
   agentOutput: Record<string, AgentOutputLine[]>;
   agentDiffs: Record<string, AgentDiff>;
+  /// `false` until the first successful `fetchAgents()` resolves.
+  /// Used by `<EnsureAgents/>` so it can show a loading state on first
+  /// nav and only surface "agent not found" once the list is known.
+  agentsFetched: boolean;
   fetchAgents: () => Promise<void>;
   fetchAgentOutput: (agentId: string) => Promise<void>;
   fetchAgentDiff: (agentId: string) => Promise<void>;
@@ -70,10 +74,11 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
   selectedAgentId: null,
   agentOutput: {},
   agentDiffs: {},
+  agentsFetched: false,
 
   fetchAgents: async () => {
     const agents = await fetchJson<Agent[]>("/api/agents");
-    set({ agents });
+    set({ agents, agentsFetched: true });
   },
 
   fetchAgentOutput: async (agentId: string) => {

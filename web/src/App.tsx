@@ -17,6 +17,9 @@ import { LoginPage } from "./components/LoginPage.js";
 import { AdminPage } from "./components/AdminPage.js";
 import { RunnersPage } from "./components/RunnersPage.js";
 import { Toaster } from "./components/Toaster.js";
+import { EnsurePlan } from "./components/EnsurePlan.js";
+import { EnsureAgents } from "./components/EnsureAgents.js";
+import { NotFoundPage } from "./components/NotFoundPage.js";
 import { useRouteSelection } from "./hooks/use-route-selection.js";
 
 export function App() {
@@ -84,7 +87,14 @@ export function App() {
           <Routes>
             <Route path="/" element={<ProjectDashboard />} />
             <Route path="/plans" element={<ProjectDashboard />} />
-            <Route path="/plans/:planName" element={<PlanBoard />} />
+            <Route
+              path="/plans/:planName"
+              element={
+                <EnsurePlan>
+                  <PlanBoard />
+                </EnsurePlan>
+              }
+            />
             <Route path="/agents" element={<AgentTree />} />
             <Route path="/agents/:agentId" element={<AgentTree />} />
             <Route path="/audit" element={<AuditLog />} />
@@ -94,7 +104,7 @@ export function App() {
             <Route path="/runners" element={<RunnersPage />} />
             <Route path="/new-plan" element={<NewPlanRoute />} />
             <Route path="/login" element={<Navigate to="/" replace />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
+            <Route path="*" element={<NotFoundPage />} />
           </Routes>
         </div>
 
@@ -163,13 +173,19 @@ function RouteSync() {
 /// Right-rail AgentPanel mounts only when an agent id sits in the URL,
 /// either as the deep-link path /agents/:agentId or as the cross-route
 /// `?agent=<id>` overlay. Keeps today's behaviour where the agent
-/// panel can sit beside any main view (notably PlanBoard).
+/// panel can sit beside any main view (notably PlanBoard). The
+/// `<EnsureAgents/>` wrapper handles the data dependency: it ensures
+/// the agent list has been fetched before rendering the panel, and
+/// surfaces a not-found message in the rail when the URL id is
+/// stale.
 function AgentRail() {
   const { routeAgentId } = useRouteSelection();
   if (!routeAgentId) return null;
   return (
     <div className="w-[600px] border-l border-gray-800 h-full">
-      <AgentPanel />
+      <EnsureAgents>
+        <AgentPanel />
+      </EnsureAgents>
     </div>
   );
 }
