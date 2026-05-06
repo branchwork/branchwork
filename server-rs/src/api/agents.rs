@@ -104,7 +104,14 @@ pub async fn list_agents(
         .query_map(params![org_id], |row| {
             Ok(serde_json::json!({
                 "id": row.get::<_, String>(0)?,
-                "session_id": row.get::<_, String>(1)?,
+                // session_id is NULLable in the schema (db.rs:278). Local
+                // PTY agents always carry one, but remote-mode tracking
+                // rows inserted on the SaaS server when the runner picks
+                // up a StartAgent stay NULL until the runner echoes one
+                // back — which today nothing in the wire protocol does.
+                // Decoding as String! made every remote-mode agent
+                // silently dropped by the surrounding query_map().flatten().
+                "session_id": row.get::<_, Option<String>>(1)?,
                 "pid": row.get::<_, Option<i64>>(2)?,
                 "parent_agent_id": row.get::<_, Option<String>>(3)?,
                 "plan_name": row.get::<_, Option<String>>(4)?,
