@@ -56,6 +56,10 @@ RUN cargo zigbuild \
 # Real source + frontend dist
 COPY server-rs/ ./
 COPY --from=web /src/web/dist /src/web/dist
+# Asset embedded by `include_str!` in src/saas/install_runner.rs. The
+# relative path resolves to /src/deploy/install-runner.sh from inside
+# the crate, so it must live alongside the server-rs tree.
+COPY deploy/install-runner.sh /src/deploy/install-runner.sh
 
 # Touch our crate sources to invalidate cargo's bin-level cache (deps
 # stay cached), then build both bins for both targets in a single
