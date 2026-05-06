@@ -4,6 +4,7 @@ import { usePlanStore } from "./stores/plan-store.js";
 import { useAgentStore } from "./stores/agent-store.js";
 import { useWsStore } from "./stores/ws-store.js";
 import { useSettingsStore } from "./stores/settings-store.js";
+import { useRunnerStore } from "./stores/runner-store.js";
 import { useAuthStore } from "./stores/auth-store.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { PlanBoard } from "./components/PlanBoard.js";
@@ -18,6 +19,7 @@ import { AdminPage } from "./components/AdminPage.js";
 import { RunnersPage } from "./components/RunnersPage.js";
 import { Toaster } from "./components/Toaster.js";
 import { ConnectionBanner } from "./components/ConnectionBanner.js";
+import { RunnerStatus } from "./components/RunnerStatus.js";
 import { EnsurePlan } from "./components/EnsurePlan.js";
 import { EnsureAgents } from "./components/EnsureAgents.js";
 import { NotFoundPage } from "./components/NotFoundPage.js";
@@ -31,6 +33,7 @@ export function App() {
 
   const fetchSettings = useSettingsStore((s) => s.fetchSettings);
   const fetchDrivers = useSettingsStore((s) => s.fetchDrivers);
+  const fetchRunners = useRunnerStore((s) => s.fetchRunners);
 
   const user = useAuthStore((s) => s.user);
   const authLoading = useAuthStore((s) => s.loading);
@@ -62,6 +65,7 @@ export function App() {
         fetchAgents(),
         fetchSettings(),
         fetchDrivers(),
+        fetchRunners(),
       ]);
       if (cancelled) return;
       connect();
@@ -136,6 +140,7 @@ export function App() {
 
       {/* Connection indicator + logout */}
       <div className="fixed bottom-3 right-3 flex items-center gap-3 text-xs text-gray-500">
+        <RunnerStatus />
         <span className="flex items-center gap-2">
           <span
             className={`inline-block w-2 h-2 rounded-full ${

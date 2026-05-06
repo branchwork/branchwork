@@ -819,6 +819,12 @@ pub async fn create_runner_token(
 }
 
 /// GET /api/runners — list registered runners.
+///
+/// Response shape (frozen for the dashboard RunnerStatus indicator, audit §17):
+/// `{ runners: [...], mode: "saas" | "standalone" }`. The `mode` field tells
+/// the dashboard whether the deployment expects remote runners at all — in
+/// `standalone` the indicator is hidden, in `saas` it shows online/offline/
+/// missing-runner state. See `deployment_mode` for the resolution rule.
 pub async fn list_runners(State(state): State<AppState>, user: crate::auth::AuthUser) -> Response {
     let runners: Vec<serde_json::Value> = {
         let conn = state.db.lock().unwrap();
@@ -844,7 +850,69 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
         .collect()
     };
 
-    axum::Json(serde_json::json!({ "runners": runners })).into_response()
+    let mode = deployment_mode(&state.db, &user.org_id);
+    axum::Json(serde_json::json!({ "runners": runners, "mode": mode })).into_response()
+}
+
+/// Resolve the dashboard's deployment-mode discriminator for `org_id`.
+///
+/// Returns `"saas"` if either signal is present:
+///   - `BRANCHWORK_PUBLIC_URL` is set (the prod overlay's SaaS hint —
+///     `deploy/docker-compose.prod.yml` sets it on every public deploy).
+///   - The org already has at least one row in `runners` (matches
+///     `crate::saas::dispatch::org_has_runner`, the same signal the
+///     auto-mode and folder-dispatch paths use).
+///
+/// Returns `"standalone"` otherwise. The "SaaS, no runner registered" state
+/// the audit calls out (amber dot + `/runners` link) is reachable when the
+/// env hint is set but no runner has connected yet.
+fn deployment_mode(db: &Db, org_id: &str) -> &'static str {
+    let env_hint = std::env::var("BRANCHWORK_PUBLIC_URL")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    deployment_mode_from_signals(env_hint, crate::saas::dispatch::org_has_runner(db, org_id))
+}
+
+/// Pure split of [`deployment_mode`] so unit tests don't have to mutate
+/// the process env (parallel `cargo test` makes env mutation unsafe).
+/// Mirrors the `IdleFinishConfig::from_values` convention.
+fn deployment_mode_from_signals(env_hint: bool, has_runner: bool) -> &'static str {
+    if env_hint || has_runner {
+        "saas"
+    } else {
+        "standalone"
+    }
+}
+
+#[cfg(test)]
+mod deployment_mode_tests {
+    use super::deployment_mode_from_signals;
+
+    #[test]
+    fn standalone_when_no_signals() {
+        assert_eq!(deployment_mode_from_signals(false, false), "standalone");
+    }
+
+    #[test]
+    fn saas_when_env_hint_only() {
+        // The "SaaS, no runner registered" state from the audit — env hint
+        // alone flips us into SaaS mode so the indicator shows the amber
+        // "register a runner" prompt instead of disappearing.
+        assert_eq!(deployment_mode_from_signals(true, false), "saas");
+    }
+
+    #[test]
+    fn saas_when_runner_only() {
+        // Standalone deploy that opted into a remote runner anyway. Once
+        // any runner row exists for the org, every folder op routes via
+        // the runner (matches `org_has_runner`'s contract).
+        assert_eq!(deployment_mode_from_signals(false, true), "saas");
+    }
+
+    #[test]
+    fn saas_when_both_signals() {
+        assert_eq!(deployment_mode_from_signals(true, true), "saas");
+    }
 }
 
 /// POST /api/runners/{runner_id}/commands — enqueue a command to a runner.

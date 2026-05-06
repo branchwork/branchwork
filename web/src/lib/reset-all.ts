@@ -1,6 +1,7 @@
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
+import { useRunnerStore } from "../stores/runner-store.js";
 import { useToastStore } from "../stores/toast-store.js";
 import { useWsStore } from "../stores/ws-store.js";
 
@@ -32,5 +33,6 @@ export function resetAllStores(): void {
   usePlanStore.getState().reset();
   useAgentStore.getState().reset();
   useSettingsStore.getState().reset();
+  useRunnerStore.getState().reset();
   useToastStore.getState().clear();
 }

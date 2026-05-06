@@ -8,6 +8,7 @@ import {
   useAgentStore,
 } from "./agent-store.js";
 import { useSettingsStore } from "./settings-store.js";
+import { useRunnerStore } from "./runner-store.js";
 import { parseWsMessage, type WsMessage } from "../schemas/ws-events.js";
 
 const MAX_RECONNECT_DELAY = 30_000;
@@ -172,6 +173,10 @@ export const useWsStore = create<WsStore>((set, get) => ({
         useAgentStore.getState().fetchAgents().catch(() => {});
         settingsStore.fetchSettings().catch(() => {});
         settingsStore.fetchDrivers().catch(() => {});
+        // Runner inventory: any `runner_connected/_disconnected` events that
+        // fired during the disconnect were lost, so the cached `online/offline`
+        // status could be wrong. Refetching gives us a clean baseline.
+        useRunnerStore.getState().fetchRunners().catch(() => {});
         // Per-plan auto-mode-config: only refetch the plans we already
         // know about (planConfigs is keyed by plans the user has opened
         // in this session). New plans surface via plan_updated /
@@ -704,12 +709,26 @@ function dispatch(msg: WsMessage) {
       // Keeping the case explicit so the switch still discriminates
       // every WsMessage variant.
       break;
-    case "runner_connected":
-    case "runner_disconnected":
-    case "runner_drivers":
-      // Schemas land in Phase 2; the runner-status UI consumer is
-      // wired in Phase 4 alongside the `/runners` page (audit §17).
+    case "runner_connected": {
+      const d = msg.data;
+      useRunnerStore.getState().applyConnected({
+        runner_id: d.runner_id,
+        runner_name: d.runner_name ?? null,
+      });
       break;
+    }
+    case "runner_disconnected": {
+      const d = msg.data;
+      useRunnerStore.getState().applyDisconnected({ runner_id: d.runner_id });
+      break;
+    }
+    case "runner_drivers": {
+      // Per-runner driver inventory lands in 4.5 — for 4.1 we only refresh
+      // the runner's `lastSeenAt` so the indicator's tooltip stays accurate.
+      const d = msg.data;
+      useRunnerStore.getState().applyDriversTouch({ runner_id: d.runner_id });
+      break;
+    }
   }
 
   // Notify external subscribers AFTER the built-in switch so they see
