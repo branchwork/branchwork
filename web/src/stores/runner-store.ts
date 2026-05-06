@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { fetchJson } from "../api.js";
+import { fetchJson, postJson } from "../api.js";
 
 /// Deployment mode discriminator returned by `GET /api/runners`. Drives
 /// whether the `RunnerStatus` indicator renders at all (audit §17 / 4.1):
@@ -31,6 +31,14 @@ interface RunnersResponse {
   mode?: "standalone" | "saas";
 }
 
+/// Server response for `POST /api/runners/tokens`. The 32-byte hex
+/// token is shown to the operator exactly once — there is no `GET` to
+/// re-read it later (only the SHA-256 hash is persisted server-side).
+export interface RunnerTokenIssued {
+  token: string;
+  runner_name: string;
+}
+
 interface RunnerStore {
   /// Resolved deployment mode. Starts as `unknown` so the indicator stays
   /// hidden until we know the answer (avoids flashing the amber "register
@@ -46,6 +54,12 @@ interface RunnerStore {
   lastRunnersFetchedAt: number | null;
 
   fetchRunners: () => Promise<void>;
+  /// Create a runner enrolment token. The full token is only present
+  /// in this response — the dashboard MUST surface it to the operator
+  /// immediately (the install-command modal in `RunnersPage`) because
+  /// nothing stores it. On success we refetch `/api/runners` so a row
+  /// appears once the runner connects via `branchwork-runner --token`.
+  createRunnerToken: (runnerName: string) => Promise<RunnerTokenIssued>;
   /// Wired from `ws-store.ts` for `runner_connected`. Optimistically inserts
   /// or updates the row so the indicator flips to emerald the moment the
   /// runner registers, without waiting for a refetch.
@@ -105,6 +119,20 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
       if (inFlightRunnersFetch === promise) inFlightRunnersFetch = null;
     });
     return promise;
+  },
+
+  createRunnerToken: async (runnerName) => {
+    const issued = await postJson<RunnerTokenIssued>(
+      "/api/runners/tokens",
+      { runner_name: runnerName },
+    );
+    // Don't await — the modal needs the token NOW; the runner row only
+    // appears once the operator runs `branchwork-runner --token` and the
+    // WS handshake lands. The refetch is a best-effort warmup so a row
+    // shows up faster if the runner is already running. WS
+    // `runner_connected` will reconcile in any case.
+    void get().fetchRunners();
+    return issued;
   },
 
   applyConnected: (payload) => {
@@ -174,6 +202,5 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
   reset: () => {
     inFlightRunnersFetch = null;
     set({ ...INITIAL_STATE });
-    void get; // suppress unused-binding lint without changing the create<...> signature
   },
 }));

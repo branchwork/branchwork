@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useRunnerStore, type Runner } from "./runner-store.js";
 
 afterEach(() => {
   useRunnerStore.getState().reset();
+  vi.unstubAllGlobals();
 });
 
 function seedRunner(overrides: Partial<Runner> = {}): Runner {
@@ -92,6 +93,52 @@ describe("runner-store", () => {
     // Existing row is untouched, no synthetic ghost row added.
     expect(useRunnerStore.getState().runners).toHaveLength(1);
     expect(useRunnerStore.getState().runners[0].status).toBe("online");
+  });
+
+  it("createRunnerToken POSTs runner_name and surfaces the issued token", async () => {
+    // Capture the FIRST POST body — the store also fires a follow-up
+    // GET /api/runners (warmup refetch) which would otherwise clobber
+    // the captured body with the empty body of the GET.
+    let tokenPostBody: unknown = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+        const path = typeof input === "string" ? input : (input as Request).url;
+        if (path.endsWith("/api/runners/tokens")) {
+          tokenPostBody = JSON.parse(String(init?.body ?? "{}"));
+          return new Response(
+            JSON.stringify({ token: "cafef00d", runner_name: "laptop" }),
+            { status: 201, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        // Warmup GET /api/runners — return an empty list so the
+        // refetch lands without erroring.
+        return new Response(
+          JSON.stringify({ runners: [], mode: "saas" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    const issued = await useRunnerStore
+      .getState()
+      .createRunnerToken("laptop");
+    expect(issued).toEqual({ token: "cafef00d", runner_name: "laptop" });
+    expect(tokenPostBody).toEqual({ runner_name: "laptop" });
+  });
+
+  it("createRunnerToken propagates server errors so the modal can render them inline", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ error: "name_taken" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    await expect(
+      useRunnerStore.getState().createRunnerToken("dup"),
+    ).rejects.toThrow();
   });
 
   it("reset returns the store to its initial shape", () => {
