@@ -1,15 +1,160 @@
-import { useState } from "react";
-import type { PlanPhase } from "../stores/plan-store.js";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import type { PlanPhase, PlanTask } from "../stores/plan-store.js";
 import { postJson } from "../api.js";
 import { TaskCard } from "./TaskCard.js";
 import { Button } from "./ui/Button.js";
 import { Modal } from "./ui/Modal.js";
 import { toastError } from "../lib/toast.js";
+import { useScrollParent } from "../hooks/use-scroll-parent.js";
 
 interface Props {
   phase: PlanPhase;
   planName: string;
   statusFilter?: string | null;
+}
+
+// Matches the Tailwind breakpoints used by the task grid below
+// (`md:grid-cols-2 xl:grid-cols-3`).
+function pickColumns(width: number): number {
+  if (width >= 1280) return 3;
+  if (width >= 768) return 2;
+  return 1;
+}
+
+function useResponsiveColumns(): number {
+  const [cols, setCols] = useState<number>(() =>
+    typeof window === "undefined" ? 3 : pickColumns(window.innerWidth),
+  );
+  useEffect(() => {
+    function update() {
+      setCols(pickColumns(window.innerWidth));
+    }
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  return cols;
+}
+
+interface VirtualizedTaskGridProps {
+  tasks: PlanTask[];
+  planName: string;
+  phaseNumber: number;
+}
+
+// Below this count we render the original full grid (cheaper than the
+// virtualiser's overhead for small lists, and avoids a host of edge
+// cases — jsdom layout, focus management, drag-and-drop, etc.). At or
+// above the threshold we switch to row virtualisation; the brief's
+// acceptance test (200 tasks → ~30 in DOM) is comfortably above this.
+export const VIRTUALIZATION_THRESHOLD = 30;
+
+// Row-based virtualisation: tasks are chunked into rows of `cols`
+// (1/2/3 to mirror the Tailwind grid), each row is a virtual item.
+// Dynamic measurement via `virtualizer.measureElement` lets variable
+// TaskCard heights compose without a fixed estimate.
+function VirtualizedTaskGrid({
+  tasks,
+  planName,
+  phaseNumber,
+}: VirtualizedTaskGridProps) {
+  const cols = useResponsiveColumns();
+  const containerRef = useRef<HTMLDivElement>(null);
+  const scrollEl = useScrollParent(containerRef);
+
+  const rows = useMemo(() => {
+    const out: PlanTask[][] = [];
+    for (let i = 0; i < tasks.length; i += cols) {
+      out.push(tasks.slice(i, i + cols));
+    }
+    return out;
+  }, [tasks, cols]);
+
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => scrollEl,
+    estimateSize: () => 140,
+    overscan: 4,
+    gap: 8,
+    // Seed jsdom (and SSR / first paint before layout) with a plausible
+    // viewport so initial render isn't empty.
+    initialRect: { width: 1280, height: 800 },
+  });
+
+  const items = virtualizer.getVirtualItems();
+  const colsClass =
+    cols === 3
+      ? "grid-cols-3"
+      : cols === 2
+        ? "grid-cols-2"
+        : "grid-cols-1";
+
+  return (
+    <div ref={containerRef} className="px-3 pb-3">
+      <div
+        style={{
+          height: `${virtualizer.getTotalSize()}px`,
+          position: "relative",
+          width: "100%",
+        }}
+      >
+        {items.map((virtualRow) => {
+          const row = rows[virtualRow.index];
+          return (
+            <div
+              key={virtualRow.key}
+              data-index={virtualRow.index}
+              ref={virtualizer.measureElement}
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%",
+                transform: `translateY(${virtualRow.start}px)`,
+              }}
+              className={`grid ${colsClass} gap-2`}
+            >
+              {row.map((task) => (
+                <TaskCard
+                  key={task.number}
+                  task={task}
+                  planName={planName}
+                  phaseNumber={phaseNumber}
+                />
+              ))}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function StaticTaskGrid({
+  tasks,
+  planName,
+  phaseNumber,
+}: VirtualizedTaskGridProps) {
+  return (
+    <div className="px-3 pb-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
+      {tasks.map((task) => (
+        <TaskCard
+          key={task.number}
+          task={task}
+          planName={planName}
+          phaseNumber={phaseNumber}
+        />
+      ))}
+    </div>
+  );
+}
+
+function TaskGrid(props: VirtualizedTaskGridProps) {
+  return props.tasks.length >= VIRTUALIZATION_THRESHOLD ? (
+    <VirtualizedTaskGrid {...props} />
+  ) : (
+    <StaticTaskGrid {...props} />
+  );
 }
 
 export function PhaseCard({ phase, planName, statusFilter }: Props) {
@@ -150,18 +295,18 @@ export function PhaseCard({ phase, planName, statusFilter }: Props) {
         </div>
       </div>
 
-      {/* Expanded: show tasks */}
+      {/* Expanded: show tasks. Audit §10 major: plans with 100+ tasks
+          per phase used to render every card; TaskGrid switches to a
+          row virtualiser at VIRTUALIZATION_THRESHOLD so the DOM stays
+          bounded to the visible viewport plus a small overscan. Phases
+          with fewer tasks render the full grid for simpler keyboard
+          navigation and zero virtualiser overhead. */}
       {expanded && filteredTasks.length > 0 && (
-        <div className="px-3 pb-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
-          {filteredTasks.map((task) => (
-            <TaskCard
-              key={task.number}
-              task={task}
-              planName={planName}
-              phaseNumber={phase.number}
-            />
-          ))}
-        </div>
+        <TaskGrid
+          tasks={filteredTasks}
+          planName={planName}
+          phaseNumber={phase.number}
+        />
       )}
 
       {expanded && filteredTasks.length === 0 && phase.tasks.length > 0 && (

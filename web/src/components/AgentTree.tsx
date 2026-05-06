@@ -1,10 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useRouteSelection } from "../hooks/use-route-selection.js";
+import { useScrollParent } from "../hooks/use-scroll-parent.js";
 import { StaleDataChip } from "./StaleDataChip.js";
+
+// See PhaseCard.tsx for the same trade-off rationale: below this count
+// we render the full list (cheaper than a virtualiser for short lists,
+// avoids jsdom layout edge cases); at or above we switch to row
+// virtualisation. The brief's acceptance bar (200+ historical agents)
+// is comfortably above this.
+const VIRTUALIZATION_THRESHOLD = 30;
 
 export function AgentTree() {
   const agents = useAgentStore((s) => s.agents);
@@ -39,11 +48,30 @@ export function AgentTree() {
     return [...names].sort();
   }, [agents]);
 
-  // Build tree: group by parent
-  const filteredIds = new Set(filtered.map((a) => a.id));
-  const roots = filtered.filter((a) => !a.parent_agent_id || !filteredIds.has(a.parent_agent_id));
-  const childrenOf = (parentId: string) =>
-    filtered.filter((a) => a.parent_agent_id === parentId);
+  // Build tree: group by parent, then flatten to a depth-tagged list in
+  // DFS order so the virtualiser can treat it as a 1D row stream while
+  // we keep the visual tree shape via per-row paddingLeft.
+  const flatRows = useMemo(() => {
+    const filteredIds = new Set(filtered.map((a) => a.id));
+    const roots = filtered.filter(
+      (a) => !a.parent_agent_id || !filteredIds.has(a.parent_agent_id),
+    );
+    const byParent = new Map<string, Agent[]>();
+    for (const a of filtered) {
+      if (!a.parent_agent_id) continue;
+      const arr = byParent.get(a.parent_agent_id) ?? [];
+      arr.push(a);
+      byParent.set(a.parent_agent_id, arr);
+    }
+    const out: { agent: Agent; depth: number }[] = [];
+    function walk(a: Agent, depth: number) {
+      out.push({ agent: a, depth });
+      const kids = byParent.get(a.id);
+      if (kids) for (const c of kids) walk(c, depth + 1);
+    }
+    for (const r of roots) walk(r, 0);
+    return out;
+  }, [filtered]);
 
   const statusDot: Record<string, string> = {
     starting: "bg-yellow-500",
@@ -53,15 +81,28 @@ export function AgentTree() {
     killed: "bg-red-400",
   };
 
-  function renderAgent(agent: Agent, depth = 0) {
-    const children = childrenOf(agent.id);
+  // Virtualisation: audit §10 major. Accounts with 200+ historical
+  // agents used to render every row up-front; this bounds the DOM to
+  // the visible viewport plus a small overscan.
+  const listRef = useRef<HTMLDivElement>(null);
+  const scrollEl = useScrollParent(listRef);
+  const virtualizer = useVirtualizer({
+    count: flatRows.length,
+    getScrollElement: () => scrollEl,
+    estimateSize: () => 84,
+    overscan: 5,
+    gap: 4,
+    initialRect: { width: 1280, height: 800 },
+  });
+
+  function renderAgentRow(agent: Agent, depth: number) {
     const isSelected = agent.id === selectedAgentId;
 
     return (
-      <div key={agent.id} style={{ paddingLeft: depth * 20 }}>
+      <div style={{ paddingLeft: depth * 20 }}>
         <Link
           to={`/agents/${agent.id}`}
-          className={`block w-full text-left p-3 rounded-md border transition mb-1 ${
+          className={`block w-full text-left p-3 rounded-md border transition ${
             isSelected
               ? "bg-gray-800 border-indigo-600"
               : "bg-gray-900 border-gray-800 hover:border-gray-700"
@@ -107,8 +148,6 @@ export function AgentTree() {
             </div>
           </div>
         </Link>
-
-        {children.map((child) => renderAgent(child, depth + 1))}
       </div>
     );
   }
@@ -180,8 +219,42 @@ export function AgentTree() {
             Start a task from the Plan Board or wait for hook events
           </p>
         </div>
+      ) : flatRows.length >= VIRTUALIZATION_THRESHOLD ? (
+        <div ref={listRef}>
+          <div
+            style={{
+              height: `${virtualizer.getTotalSize()}px`,
+              position: "relative",
+              width: "100%",
+            }}
+          >
+            {virtualizer.getVirtualItems().map((vRow) => {
+              const row = flatRows[vRow.index];
+              return (
+                <div
+                  key={vRow.key}
+                  data-index={vRow.index}
+                  ref={virtualizer.measureElement}
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    transform: `translateY(${vRow.start}px)`,
+                  }}
+                >
+                  {renderAgentRow(row.agent, row.depth)}
+                </div>
+              );
+            })}
+          </div>
+        </div>
       ) : (
-        <div className="space-y-1">{roots.map((a) => renderAgent(a))}</div>
+        <div className="space-y-1">
+          {flatRows.map(({ agent, depth }) => (
+            <div key={agent.id}>{renderAgentRow(agent, depth)}</div>
+          ))}
+        </div>
       )}
     </div>
   );

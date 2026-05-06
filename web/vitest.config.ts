@@ -13,6 +13,10 @@ export default defineConfig({
         url: "http://localhost/",
       },
     },
+    // Stubs ResizeObserver + getBoundingClientRect so
+    // @tanstack/react-virtual can compute non-empty visible ranges in
+    // jsdom (it otherwise sees 0x0 viewports and renders no items).
+    setupFiles: ["./src/test-helpers/jsdom-layout.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
   },
 });
