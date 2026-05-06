@@ -154,4 +154,57 @@ describe("RunnersPage", () => {
     expect(screen.getByText(/Loading runners/i)).toBeTruthy();
     expect(useToastStore.getState().toasts.length).toBe(0);
   });
+
+  it("renders a driver-inventory chip with N drivers · M ready summary", () => {
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1", name: "laptop", status: "online" })],
+      driversByRunnerId: {
+        r1: [
+          { name: "claude", status: { state: "api_key" } },
+          { name: "aider", status: { state: "not_installed" } },
+          { name: "codex", status: { state: "oauth", account: "alice" } },
+          { name: "gemini", status: { state: "unauthenticated" } },
+        ],
+      },
+    });
+    render(<RunnersPage />);
+    const chip = screen.getByTestId("runner-driver-chip");
+    // 4 drivers / 2 ready (api_key + oauth). Two `not_installed` /
+    // `unauthenticated` count as not-ready.
+    expect(chip.textContent).toMatch(/4 drivers/);
+    expect(chip.textContent).toMatch(/2 ready/);
+  });
+
+  it("driver-inventory popover shows per-driver state when expanded on hover", () => {
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1", name: "laptop", status: "online" })],
+      driversByRunnerId: {
+        r1: [
+          { name: "claude", status: { state: "api_key" } },
+          { name: "aider", status: { state: "not_installed" } },
+        ],
+      },
+    });
+    render(<RunnersPage />);
+    // Chip wrapper is the parent of the trigger button — hover over it.
+    const chip = screen.getByTestId("runner-driver-chip");
+    fireEvent.mouseEnter(chip.querySelector("button")!);
+    const popover = screen.getByTestId("runner-driver-chip-popover");
+    expect(popover.textContent).toMatch(/claude/);
+    expect(popover.textContent).toMatch(/API key/);
+    expect(popover.textContent).toMatch(/aider/);
+    expect(popover.textContent).toMatch(/not installed/);
+  });
+
+  it("Select button calls setSelectedRunnerId with the row's id", () => {
+    const setSelectedRunnerId = vi.fn();
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1", name: "laptop" })],
+      selectedRunnerId: null,
+      setSelectedRunnerId,
+    });
+    render(<RunnersPage />);
+    fireEvent.click(screen.getByTestId("runner-select-r1"));
+    expect(setSelectedRunnerId).toHaveBeenCalledWith("r1");
+  });
 });

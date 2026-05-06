@@ -45,6 +45,26 @@ const DEFAULT_CAPABILITIES: DriverCapabilities = {
   interactive_only: false,
 };
 
+/// Driver-inventory load status. Distinguishes "we never asked" from
+/// "we asked but the runner has not reported yet" so the sidebar can
+/// render the right copy for SaaS deployments where the runner is
+/// missing or freshly enrolled.
+///
+/// - `online`:        live runner pushed an inventory recently.
+/// - `offline`:       runner is registered but disconnected; we are
+///                    serving its last-known DB-persisted state.
+/// - `missing`:       SaaS deployment has no runner row for the org.
+/// - `never_reported`:runner row exists but never sent a hello/auth
+///                    report (newly enrolled, never connected, …).
+/// - `local`:         standalone deployment — server's compiled
+///                    DriverRegistry is authoritative.
+export type DriverRunnerStatus =
+  | "online"
+  | "offline"
+  | "missing"
+  | "never_reported"
+  | "local";
+
 interface SettingsStore {
   effort: EffortLevel;
   skipPermissions: boolean;
@@ -58,6 +78,15 @@ interface SettingsStore {
   loaded: boolean;
   drivers: DriverInfo[];
   defaultDriver: string;
+  /// Runner the current `drivers` array describes. `null` ≡ standalone
+  /// or "we couldn't resolve a runner" — used by the sidebar to render
+  /// the runner label (or hide it). Tracks the value the user passed
+  /// most recently to `fetchDrivers(runnerId)`.
+  driversRunnerId: string | null;
+  /// Server's verdict on the runner that filled `drivers`. The sidebar
+  /// uses this to render an offline/never-reported chip on top of the
+  /// list when the data is stale.
+  driversRunnerStatus: DriverRunnerStatus;
   /// ms-since-epoch when the last `fetchSettings()` resolved. Mirrors the
   /// plan-store / agent-store debounce contract so reconnect-driven
   /// refetches (audit §4: settings + drivers were missed on reconnect)
@@ -66,7 +95,13 @@ interface SettingsStore {
   /// ms-since-epoch when the last `fetchDrivers()` resolved.
   lastDriversFetchedAt: number | null;
   fetchSettings: () => Promise<void>;
-  fetchDrivers: () => Promise<void>;
+  /// Optional `runnerId` selects which runner's inventory to fetch in
+  /// SaaS mode. Standalone deployments ignore the parameter and always
+  /// return the server's local registry. Concurrent calls with the same
+  /// runner id coalesce; calls with a different runner id replace any
+  /// in-flight call so the sidebar reflects the runner the user just
+  /// switched to instead of the stale runner.
+  fetchDrivers: (runnerId?: string | null) => Promise<void>;
   setEffort: (level: EffortLevel) => Promise<void>;
   setSkipPermissions: (value: boolean) => Promise<void>;
   setWebhookUrl: (value: string | null) => Promise<void>;
@@ -85,7 +120,12 @@ interface SettingsStore {
 /// onto one network request. ws-store also reads this to debounce
 /// reconnect refetches.
 let inFlightSettingsFetch: Promise<void> | null = null;
+/// In-flight drivers fetch + the runner it was launched against. We
+/// coalesce calls for the same runner but cancel-replace when the user
+/// switches runners — otherwise the sidebar shows the previous runner's
+/// drivers until the in-flight fetch finishes.
 let inFlightDriversFetch: Promise<void> | null = null;
+let inFlightDriversFetchRunnerId: string | null | undefined = undefined;
 
 export function getInFlightSettingsFetch(): Promise<void> | null {
   return inFlightSettingsFetch;
@@ -103,6 +143,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   loaded: false,
   drivers: [],
   defaultDriver: "claude",
+  driversRunnerId: null,
+  driversRunnerStatus: "local",
   lastSettingsFetchedAt: null,
   lastDriversFetchedAt: null,
 
@@ -131,21 +173,46 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     return promise;
   },
 
-  fetchDrivers: () => {
-    if (inFlightDriversFetch) return inFlightDriversFetch;
+  fetchDrivers: (runnerId) => {
+    const targetRunnerId = runnerId ?? null;
+    // Coalesce only when the in-flight fetch is for the same runner. A
+    // call with a different runner id supersedes the previous fetch so
+    // the sidebar reflects the runner the user just switched to.
+    if (
+      inFlightDriversFetch &&
+      inFlightDriversFetchRunnerId === targetRunnerId
+    ) {
+      return inFlightDriversFetch;
+    }
+    const path = targetRunnerId
+      ? `/api/drivers?runner_id=${encodeURIComponent(targetRunnerId)}`
+      : "/api/drivers";
     const promise = (async () => {
-      const data = await fetchJson<{ drivers: DriverInfo[]; default: string }>(
-        "/api/drivers"
-      );
+      const data = await fetchJson<{
+        drivers: DriverInfo[];
+        default: string;
+        runner_id?: string | null;
+        runner_status?: DriverRunnerStatus;
+      }>(path);
+      // Stale guard: if the user switched runners while this fetch was
+      // in flight, drop the result silently — the newer fetch's set()
+      // will overwrite shortly.
+      if (inFlightDriversFetchRunnerId !== targetRunnerId) return;
       set({
         drivers: data.drivers,
         defaultDriver: data.default,
+        driversRunnerId: data.runner_id ?? targetRunnerId,
+        driversRunnerStatus: data.runner_status ?? "local",
         lastDriversFetchedAt: Date.now(),
       });
     })();
     inFlightDriversFetch = promise;
+    inFlightDriversFetchRunnerId = targetRunnerId;
     promise.finally(() => {
-      if (inFlightDriversFetch === promise) inFlightDriversFetch = null;
+      if (inFlightDriversFetch === promise) {
+        inFlightDriversFetch = null;
+        inFlightDriversFetchRunnerId = undefined;
+      }
     });
     return promise;
   },
@@ -197,6 +264,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   reset: () => {
     inFlightSettingsFetch = null;
     inFlightDriversFetch = null;
+    inFlightDriversFetchRunnerId = undefined;
     set({
       effort: "high",
       skipPermissions: true,
@@ -205,6 +273,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       loaded: false,
       drivers: [],
       defaultDriver: "claude",
+      driversRunnerId: null,
+      driversRunnerStatus: "local",
       lastSettingsFetchedAt: null,
       lastDriversFetchedAt: null,
     });

@@ -31,9 +31,9 @@ use uuid::Uuid;
 use crate::api::agents::MergeOutcome;
 use crate::ci::aggregate;
 use crate::db::Db;
-use crate::saas::runner_protocol::{CiAggregate, CiRunSummary, WireMessage};
+use crate::saas::runner_protocol::{CiAggregate, CiRunSummary, DriverAuthInfo, WireMessage};
 use crate::saas::runner_rpc::{RunnerRpcError, runner_request};
-use crate::saas::runner_ws::RunnerResponse;
+use crate::saas::runner_ws::{RunnerRegistry, RunnerResponse};
 use crate::state::AppState;
 
 /// Returns `true` iff at least one row exists in `runners` for `org_id`,
@@ -304,6 +304,241 @@ pub async fn fetch_failure_log_dispatch(
     }
 }
 
+// ── Driver inventory dispatch ───────────────────────────────────────────────
+
+/// Mode-aware driver inventory listing.
+///
+/// In standalone mode this returns the server's local [`DriverRegistry`] —
+/// matching the legacy `/api/drivers` shape so existing dashboards keep
+/// working. In SaaS mode the dashboard wants the **runner's** driver
+/// install + auth state, because the dashboard host has no agent CLIs and
+/// the SaaS user can't SSH in to fix them.
+///
+/// Returns the same outer JSON shape regardless of mode:
+/// ```json
+/// { "drivers": [{ "name", "binary", "capabilities", "auth_status": {kind, ...} }],
+///   "default": "claude",
+///   "runner_id": "<id>" | null,    // present in SaaS mode
+///   "runner_status": "online"|"offline"|"missing"|"never_reported" }
+/// ```
+///
+/// `runner_id` selects which runner to inspect; `None` falls back to the
+/// most recently-seen runner in the org. Capabilities (cost, verdict, …)
+/// come from the **server's** compiled `DriverRegistry` keyed by name —
+/// the runner does not ship capability metadata, but the static profile
+/// is the same on both sides at a given version. The runner-reported
+/// auth state (NotInstalled / Unauthenticated / Oauth / ApiKey / …) is
+/// merged in at the boundary, with `DriverAuthStatus` (`state` tag)
+/// converted to `AuthStatus` (`kind` tag) so the frontend keeps a single
+/// shape for all paths.
+pub async fn list_drivers_dispatch(
+    state: &AppState,
+    org_id: &str,
+    runner_id: Option<&str>,
+) -> serde_json::Value {
+    if !org_has_runner(&state.db, org_id) {
+        return list_drivers_local(state);
+    }
+
+    let resolved_runner_id = match runner_id {
+        Some(id) if !id.is_empty() => Some(id.to_string()),
+        _ => most_recent_runner_id_for_org(&state.db, org_id),
+    };
+
+    let Some(rid) = resolved_runner_id else {
+        // SaaS-mode org with no runner-id we can resolve — return the
+        // local registry so the dashboard at least shows the driver
+        // names + capabilities, with auth_status absent (treated as
+        // "probably ready" by the frontend).
+        let mut local = list_drivers_local(state);
+        local["runner_id"] = serde_json::Value::Null;
+        local["runner_status"] = serde_json::Value::String("missing".into());
+        return local;
+    };
+
+    // In-memory snapshot first (live runner). Fall back to DB-persisted
+    // last-known state for offline runners. If neither has anything yet,
+    // emit `never_reported` so the UI can prompt the user to wait for
+    // the first DriverAuthReport.
+    let cached = read_cached_drivers(&state.runners, &rid).await;
+    let drivers_opt = match cached {
+        Some(d) => Some((d, "online")),
+        None => read_persisted_drivers(&state.db, &rid)
+            .map(|d| (d, runner_db_status(&state.db, &rid).unwrap_or("offline"))),
+    };
+
+    let (runner_drivers, runner_status) = match drivers_opt {
+        Some(pair) => pair,
+        None => {
+            return serde_json::json!({
+                "drivers": [],
+                "default": crate::agents::driver::DEFAULT_DRIVER,
+                "runner_id": rid,
+                "runner_status": "never_reported",
+            });
+        }
+    };
+
+    let registry = &state.registry.drivers;
+    let entries: Vec<serde_json::Value> = runner_drivers
+        .into_iter()
+        .map(|info| driver_info_to_api_shape(&info, registry))
+        .collect();
+    serde_json::json!({
+        "drivers": entries,
+        "default": crate::agents::driver::DEFAULT_DRIVER,
+        "runner_id": rid,
+        "runner_status": runner_status,
+    })
+}
+
+/// Server-local driver inventory — the standalone path. Mirrors the
+/// historical `/api/drivers` shape so callers that pre-date SaaS routing
+/// keep working unchanged.
+pub fn list_drivers_local(state: &AppState) -> serde_json::Value {
+    let reg = &state.registry.drivers;
+    let entries: Vec<serde_json::Value> = reg
+        .names()
+        .into_iter()
+        .map(|name| {
+            let driver = reg.get(&name);
+            let binary = driver
+                .as_ref()
+                .map(|d| d.binary().to_string())
+                .unwrap_or_default();
+            let caps = driver
+                .as_ref()
+                .map(|d| d.capabilities())
+                .unwrap_or_default();
+            let auth = driver
+                .as_ref()
+                .map(|d| d.auth_status())
+                .unwrap_or(crate::agents::driver::AuthStatus::Unknown);
+            serde_json::json!({
+                "name": name,
+                "binary": binary,
+                "capabilities": caps,
+                "auth_status": auth,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "drivers": entries,
+        "default": crate::agents::driver::DEFAULT_DRIVER,
+    })
+}
+
+/// In-memory cache lookup. Returns `None` when the runner is not
+/// currently connected or when it has not yet sent a hello/auth report.
+async fn read_cached_drivers(
+    registry: &RunnerRegistry,
+    runner_id: &str,
+) -> Option<Vec<DriverAuthInfo>> {
+    registry
+        .lock()
+        .await
+        .get(runner_id)
+        .and_then(|r| r.drivers.clone())
+}
+
+/// DB-persisted last-known driver inventory. Used when the runner is
+/// offline or the WS reader hasn't populated the in-memory cache yet
+/// (e.g. server boot, runner reconnect mid-rollout).
+fn read_persisted_drivers(db: &Db, runner_id: &str) -> Option<Vec<DriverAuthInfo>> {
+    let conn = db.lock().unwrap();
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT drivers_json FROM runners WHERE id = ?1",
+            params![runner_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    json.and_then(|s| serde_json::from_str::<Vec<DriverAuthInfo>>(&s).ok())
+}
+
+/// Read the `runners.status` column for tooltip / chip rendering. Falls
+/// back to `"offline"` on missing rows so callers don't have to encode a
+/// fourth status everywhere.
+fn runner_db_status(db: &Db, runner_id: &str) -> Option<&'static str> {
+    let conn = db.lock().unwrap();
+    let s: Option<String> = conn
+        .query_row(
+            "SELECT status FROM runners WHERE id = ?1",
+            params![runner_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    Some(match s.as_deref() {
+        Some("online") => "online",
+        _ => "offline",
+    })
+}
+
+/// Pick the most-recently-seen runner in the org. Used when the caller
+/// passes `runner_id = None` — mirrors the dispatch convention used by
+/// `runner_request` (default to the freshest live runner).
+fn most_recent_runner_id_for_org(db: &Db, org_id: &str) -> Option<String> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT id FROM runners WHERE org_id = ?1 \
+         ORDER BY (status = 'online') DESC, last_seen_at DESC LIMIT 1",
+        params![org_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Convert a runner-pushed [`DriverAuthInfo`] into the JSON shape the
+/// existing `/api/drivers` endpoint serializes. The runner protocol
+/// uses `DriverAuthStatus` (tag `state`) and an optional `help`; the
+/// server's `AuthStatus` (tag `kind`) requires a non-optional `help`.
+/// Both are bridged here so the frontend keeps a single discriminator.
+/// Capabilities come from the server's compiled registry by name —
+/// runners don't ship capability profiles but they're static per-driver.
+fn driver_info_to_api_shape(
+    info: &DriverAuthInfo,
+    registry: &crate::agents::driver::DriverRegistry,
+) -> serde_json::Value {
+    use crate::saas::runner_protocol::DriverAuthStatus;
+
+    let driver = registry.get(&info.name);
+    let binary = driver
+        .as_ref()
+        .map(|d| d.binary().to_string())
+        .unwrap_or_else(|| info.name.clone());
+    let capabilities = driver
+        .as_ref()
+        .map(|d| d.capabilities())
+        .unwrap_or_default();
+
+    let auth_status = match &info.status {
+        DriverAuthStatus::NotInstalled => serde_json::json!({ "kind": "not_installed" }),
+        DriverAuthStatus::Unauthenticated { help } => serde_json::json!({
+            "kind": "unauthenticated",
+            "help": help.clone().unwrap_or_default(),
+        }),
+        DriverAuthStatus::Oauth { account } => serde_json::json!({
+            "kind": "oauth",
+            "account": account,
+        }),
+        DriverAuthStatus::ApiKey => serde_json::json!({ "kind": "api_key" }),
+        DriverAuthStatus::CloudProvider { provider } => serde_json::json!({
+            "kind": "cloud_provider",
+            "provider": provider,
+        }),
+        DriverAuthStatus::Unknown => serde_json::json!({ "kind": "unknown" }),
+    };
+
+    serde_json::json!({
+        "name": info.name,
+        "binary": binary,
+        "capabilities": capabilities,
+        "auth_status": auth_status,
+    })
+}
+
 /// Resolve the most recent failing CI run id for `plan_name`. Used by the
 /// standalone-mode `fetch_failure_log_dispatch` when the caller passes
 /// `run_id: None`. The runner-side equivalent lives in the runner's
@@ -430,6 +665,7 @@ mod tests {
                 command_tx: cmd_tx,
                 hostname: None,
                 version: None,
+                drivers: None,
                 pending,
             },
         );
@@ -644,5 +880,211 @@ mod tests {
         // the one a fix-on-red loop wants to inspect.
         let resolved = latest_failing_run_id_for_plan(&db, "demo-plan");
         assert_eq!(resolved.as_deref(), Some("100"));
+    }
+
+    // ── list_drivers_dispatch tests ─────────────────────────────────────────
+
+    use crate::saas::runner_protocol::{DriverAuthInfo, DriverAuthStatus};
+
+    /// Schema variant with the 4.5 `drivers_json` column. Most existing
+    /// tests in this module want a leaner schema; spinning up a separate
+    /// helper keeps the legacy fixtures untouched.
+    fn db_with_runners_schema_45() -> Db {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runners ( \
+               id TEXT PRIMARY KEY, \
+               name TEXT, \
+               org_id TEXT, \
+               status TEXT, \
+               hostname TEXT, \
+               version TEXT, \
+               last_seen_at TEXT, \
+               created_at TEXT, \
+               drivers_json TEXT \
+             );",
+        )
+        .unwrap();
+        Arc::new(StdMutex::new(conn))
+    }
+
+    fn seed_runner_45(
+        db: &Db,
+        runner_id: &str,
+        org_id: &str,
+        status: &str,
+        drivers_json: Option<&str>,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO runners (id, name, org_id, status, last_seen_at, drivers_json) \
+             VALUES (?1, 'test', ?2, ?3, datetime('now'), ?4)",
+            params![runner_id, org_id, status, drivers_json],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_returns_local_registry_shape() {
+        // No runner row → standalone branch → server's local DriverRegistry.
+        let db = db_with_runners_schema_45();
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+        let body = list_drivers_dispatch(&state, "org-1", None).await;
+
+        // Local registry always has the 4 default drivers from
+        // `DriverRegistry::with_defaults` at this point; the brief
+        // mandates the standalone path is unchanged.
+        let names: Vec<&str> = body["drivers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"claude"));
+        assert_eq!(body["default"], "claude");
+        // SaaS-only fields must be absent in standalone.
+        assert!(body.get("runner_id").is_none());
+        assert!(body.get("runner_status").is_none());
+    }
+
+    #[tokio::test]
+    async fn saas_returns_runner_cached_drivers_with_kind_tag() {
+        // Online runner with cached drivers → in-memory cache path. The
+        // dispatch must convert `DriverAuthStatus { state }` to
+        // `AuthStatus { kind }` so the frontend keeps a single shape.
+        let db = db_with_runners_schema_45();
+        seed_runner_45(&db, "r1", "org-saas", "online", None);
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        // Inject a cached inventory directly into the in-memory handle —
+        // simulates what `RunnerHello` / `DriverAuthReport` populated.
+        let cached = vec![
+            DriverAuthInfo {
+                name: "claude".into(),
+                status: DriverAuthStatus::Oauth {
+                    account: Some("alice@example.com".into()),
+                },
+            },
+            DriverAuthInfo {
+                name: "aider".into(),
+                status: DriverAuthStatus::NotInstalled,
+            },
+            DriverAuthInfo {
+                name: "codex".into(),
+                status: DriverAuthStatus::Unauthenticated {
+                    help: Some("Run `codex login`".into()),
+                },
+            },
+        ];
+        let (cmd_tx, _rx) = mpsc::unbounded_channel::<String>();
+        state.runners.lock().await.insert(
+            "r1".into(),
+            ConnectedRunner {
+                command_tx: cmd_tx,
+                hostname: None,
+                version: None,
+                drivers: Some(cached),
+                pending: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+
+        let body = list_drivers_dispatch(&state, "org-saas", Some("r1")).await;
+        assert_eq!(body["runner_id"], "r1");
+        assert_eq!(body["runner_status"], "online");
+        let entries = body["drivers"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let by_name: HashMap<&str, &serde_json::Value> = entries
+            .iter()
+            .map(|e| (e["name"].as_str().unwrap(), e))
+            .collect();
+
+        // OAuth: account threads through.
+        assert_eq!(
+            by_name["claude"]["auth_status"]["kind"].as_str(),
+            Some("oauth")
+        );
+        assert_eq!(
+            by_name["claude"]["auth_status"]["account"].as_str(),
+            Some("alice@example.com")
+        );
+        // NotInstalled: bare kind, no extra fields beyond `kind`.
+        assert_eq!(
+            by_name["aider"]["auth_status"]["kind"].as_str(),
+            Some("not_installed")
+        );
+        // Unauthenticated.help is Optional on the wire but always
+        // present (possibly empty string) in the dashboard shape.
+        assert_eq!(
+            by_name["codex"]["auth_status"]["kind"].as_str(),
+            Some("unauthenticated")
+        );
+        assert_eq!(
+            by_name["codex"]["auth_status"]["help"].as_str(),
+            Some("Run `codex login`")
+        );
+        // Capabilities are filled from the server's compiled registry by
+        // name — `claude` reports the default-true profile.
+        assert_eq!(
+            by_name["claude"]["capabilities"]["supports_cost"], true,
+            "capabilities must come from the server registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn saas_falls_back_to_persisted_drivers_when_runner_offline() {
+        // No in-memory entry for the runner (it disconnected) but the DB
+        // still has its last-known inventory → DB fallback path.
+        let db = db_with_runners_schema_45();
+        let drivers_json = serde_json::to_string(&vec![DriverAuthInfo {
+            name: "claude".into(),
+            status: DriverAuthStatus::ApiKey,
+        }])
+        .unwrap();
+        seed_runner_45(&db, "r1", "org-saas", "offline", Some(&drivers_json));
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let body = list_drivers_dispatch(&state, "org-saas", Some("r1")).await;
+        assert_eq!(body["runner_id"], "r1");
+        assert_eq!(
+            body["runner_status"], "offline",
+            "must signal that data is from the DB cache, not a live runner"
+        );
+        let entries = body["drivers"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["auth_status"]["kind"], "api_key");
+    }
+
+    #[tokio::test]
+    async fn saas_emits_never_reported_when_no_drivers_yet() {
+        // Fresh runner row, no in-memory cache, no drivers_json — UI
+        // should know to show "waiting for runner to report".
+        let db = db_with_runners_schema_45();
+        seed_runner_45(&db, "r1", "org-saas", "online", None);
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let body = list_drivers_dispatch(&state, "org-saas", Some("r1")).await;
+        assert_eq!(body["runner_status"], "never_reported");
+        assert!(body["drivers"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn saas_resolves_default_runner_when_id_omitted() {
+        // Two runners; default picks the most-recent online one.
+        let db = db_with_runners_schema_45();
+        // Insert offline first (older), online second so last_seen_at
+        // ordering picks the online one.
+        seed_runner_45(&db, "r-offline", "org-saas", "offline", None);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        seed_runner_45(&db, "r-online", "org-saas", "online", None);
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let body = list_drivers_dispatch(&state, "org-saas", None).await;
+        assert_eq!(body["runner_id"], "r-online");
     }
 }

@@ -155,4 +155,103 @@ describe("runner-store", () => {
     expect(s.loaded).toBe(false);
     expect(s.lastRunnersFetchedAt).toBeNull();
   });
+
+  it("applyConnected auto-selects the first connecting runner when no selection is set", () => {
+    useRunnerStore.setState({
+      mode: "saas",
+      loaded: true,
+      runners: [],
+      selectedRunnerId: null,
+    });
+    useRunnerStore
+      .getState()
+      .applyConnected({ runner_id: "r1", runner_name: "primary" });
+    expect(useRunnerStore.getState().selectedRunnerId).toBe("r1");
+  });
+
+  it("applyConnected does not override an existing selection", () => {
+    // User explicitly chose r2 earlier; a new r1 connecting later must
+    // not steal focus.
+    useRunnerStore.setState({
+      mode: "saas",
+      loaded: true,
+      runners: [],
+      selectedRunnerId: "r2",
+    });
+    useRunnerStore
+      .getState()
+      .applyConnected({ runner_id: "r1", runner_name: "secondary" });
+    expect(useRunnerStore.getState().selectedRunnerId).toBe("r2");
+  });
+
+  it("applyDriversTouch caches the typed driver list when one is supplied", () => {
+    useRunnerStore.setState({
+      mode: "saas",
+      loaded: true,
+      runners: [seedRunner({ id: "r1" })],
+      driversByRunnerId: {},
+    });
+    useRunnerStore.getState().applyDriversTouch({
+      runner_id: "r1",
+      drivers: [
+        { name: "claude", status: { state: "api_key" } },
+        { name: "aider", status: { state: "not_installed" } },
+      ],
+    });
+    const map = useRunnerStore.getState().driversByRunnerId;
+    expect(map.r1).toHaveLength(2);
+    expect(map.r1[0]).toMatchObject({
+      name: "claude",
+      status: { state: "api_key" },
+    });
+  });
+
+  it("setSelectedRunnerId updates the slot (legacy 4.1 listeners need not refetch immediately)", () => {
+    // The Sidebar effect refetches /api/drivers on the next render —
+    // this test only pins the store transition.
+    useRunnerStore.setState({
+      mode: "saas",
+      loaded: true,
+      runners: [seedRunner({ id: "r1" })],
+      selectedRunnerId: "r1",
+    });
+    useRunnerStore.getState().setSelectedRunnerId("r2");
+    expect(useRunnerStore.getState().selectedRunnerId).toBe("r2");
+  });
+
+  it("fetchRunners seeds driversByRunnerId from row payload", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              runners: [
+                {
+                  id: "r1",
+                  name: "primary",
+                  status: "online",
+                  hostname: "h",
+                  version: "1.0",
+                  lastSeenAt: null,
+                  createdAt: null,
+                  drivers: [
+                    { name: "claude", status: { state: "api_key" } },
+                  ],
+                },
+              ],
+              mode: "saas",
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+      ),
+    );
+    await useRunnerStore.getState().fetchRunners();
+    const s = useRunnerStore.getState();
+    expect(s.driversByRunnerId.r1).toEqual([
+      { name: "claude", status: { state: "api_key" } },
+    ]);
+    // First runner becomes the default selection.
+    expect(s.selectedRunnerId).toBe("r1");
+  });
 });

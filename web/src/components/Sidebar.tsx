@@ -3,6 +3,7 @@ import { Link, NavLink, useLocation } from "react-router-dom";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
+import { useRunnerStore } from "../stores/runner-store.js";
 import { postJson } from "../api.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
@@ -386,24 +387,72 @@ function EffortSelector() {
 /// Compact driver auth status: one row per installed driver, showing whether
 /// it's ready to spawn agents. Rendered under the effort selector so users
 /// see auth problems without digging into a settings page.
+///
+/// SaaS mode: scoped to the runner the user has currently selected
+/// (`useRunnerStore.selectedRunnerId`). Switching runners refetches via
+/// `/api/drivers?runner_id=…` so the list reflects the runner's local
+/// install state, not the dashboard's. Standalone mode: no runner is
+/// selected, so we fetch the server's local registry — same surface the
+/// historical `/api/drivers` returned.
 function DriverStatusList() {
   const drivers = useSettingsStore((s) => s.drivers);
+  const driversRunnerStatus = useSettingsStore((s) => s.driversRunnerStatus);
   const fetchDrivers = useSettingsStore((s) => s.fetchDrivers);
+  const selectedRunnerId = useRunnerStore((s) => s.selectedRunnerId);
+  const runners = useRunnerStore((s) => s.runners);
+  const mode = useRunnerStore((s) => s.mode);
   const [expanded, setExpanded] = useState<string | null>(null);
 
+  // Refetch whenever the user switches runners — the inventory of
+  // `claude` / `aider` / … on runner A says nothing about runner B.
+  // In standalone mode (`mode==="standalone"`), pass `null` so the
+  // server returns its local registry; in SaaS mode pass the selected
+  // runner id (or null until a runner is selected, falling back to
+  // the local registry shape so the sidebar shows driver names + caps).
   useEffect(() => {
-    fetchDrivers().catch(() => {
+    const target = mode === "saas" ? selectedRunnerId : null;
+    fetchDrivers(target).catch(() => {
       // Silently ignore — if /api/drivers is down we fall back to assuming ready.
     });
-  }, [fetchDrivers]);
+  }, [fetchDrivers, mode, selectedRunnerId]);
 
-  if (drivers.length === 0) return null;
+  if (drivers.length === 0) {
+    if (mode === "saas" && driversRunnerStatus === "never_reported") {
+      return (
+        <div className="px-2 pb-2 text-[10px] text-gray-500 italic">
+          Waiting for runner to report drivers…
+        </div>
+      );
+    }
+    return null;
+  }
+
+  const runnerLabel =
+    mode === "saas" && selectedRunnerId
+      ? (runners.find((r) => r.id === selectedRunnerId)?.name ??
+        selectedRunnerId.slice(0, 8))
+      : null;
 
   return (
     <div className="px-2 pb-2">
-      <div className="text-[9px] uppercase tracking-wider text-gray-600 mb-0.5 px-1">
-        Drivers
+      <div className="flex items-baseline justify-between mb-0.5 px-1">
+        <div className="text-[9px] uppercase tracking-wider text-gray-600">
+          Drivers
+        </div>
+        {runnerLabel && (
+          <div
+            className="text-[9px] text-gray-600 truncate max-w-[60%]"
+            title={`Drivers reflect runner ${runnerLabel}'s install state`}
+          >
+            on {runnerLabel}
+          </div>
+        )}
       </div>
+      {driversRunnerStatus === "offline" && (
+        <div className="px-1 mb-1 text-[9px] text-amber-400/80">
+          Runner offline · last-known state
+        </div>
+      )}
       {drivers.map((d) => {
         const auth = d.auth_status;
         // Map auth kind → label + color. `unknown` is intentionally rendered

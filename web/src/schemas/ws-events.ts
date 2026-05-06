@@ -277,6 +277,10 @@ const RunnerDrivers = v.object({
   type: v.literal("runner_drivers"),
   data: v.object({
     runner_id: v.string(),
+    // Loose-typed: the runner protocol may add `DriverAuthStatus`
+    // variants we haven't modelled yet (future drivers / cloud
+    // providers). The handler casts to `RunnerDriverInfo[]` and the
+    // RunnersPage chip ignores variants it doesn't recognize.
     drivers: v.unknown(),
   }),
 });

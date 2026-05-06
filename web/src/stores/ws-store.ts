@@ -8,7 +8,10 @@ import {
   useAgentStore,
 } from "./agent-store.js";
 import { useSettingsStore } from "./settings-store.js";
-import { useRunnerStore } from "./runner-store.js";
+import {
+  useRunnerStore,
+  type RunnerDriverInfo,
+} from "./runner-store.js";
 import { parseWsMessage, type WsMessage } from "../schemas/ws-events.js";
 
 const MAX_RECONNECT_DELAY = 30_000;
@@ -723,10 +726,18 @@ function dispatch(msg: WsMessage) {
       break;
     }
     case "runner_drivers": {
-      // Per-runner driver inventory lands in 4.5 — for 4.1 we only refresh
-      // the runner's `lastSeenAt` so the indicator's tooltip stays accurate.
+      // Forwards the typed driver inventory to the runner-store so the
+      // RunnersPage chip and DriverStatusList reflect the runner's
+      // latest auth state without a refetch. The `drivers` field is
+      // schema-typed as `unknown` (4.1) — cast at the boundary; the
+      // store handler tolerates `undefined` and unfamiliar variants.
       const d = msg.data;
-      useRunnerStore.getState().applyDriversTouch({ runner_id: d.runner_id });
+      const drivers = Array.isArray(d.drivers)
+        ? (d.drivers as RunnerDriverInfo[])
+        : undefined;
+      useRunnerStore
+        .getState()
+        .applyDriversTouch({ runner_id: d.runner_id, drivers });
       break;
     }
   }

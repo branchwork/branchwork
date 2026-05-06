@@ -23,7 +23,7 @@ use crate::ws::broadcast_event;
 
 use super::outbox;
 use super::runner_protocol::{
-    CiAggregate, Envelope, FolderEntry, GhRun, MergeOutcome, WireMessage,
+    CiAggregate, DriverAuthInfo, Envelope, FolderEntry, GhRun, MergeOutcome, WireMessage,
 };
 
 // ── Runner registry (in-memory, lives in AppState) ──────────────────────────
@@ -97,6 +97,11 @@ pub struct ConnectedRunner {
     /// Runner metadata from the most recent `runner_hello`.
     pub hostname: Option<String>,
     pub version: Option<String>,
+    /// Last driver inventory + auth status the runner pushed via
+    /// `RunnerHello` or `DriverAuthReport`. Populated on every report so
+    /// `list_drivers_dispatch` can answer without a wire round-trip.
+    /// `None` until the first report lands.
+    pub drivers: Option<Vec<DriverAuthInfo>>,
     /// Pending request/response oneshots, keyed by `req_id`. The HTTP
     /// caller registers a sender, sends the request frame best-effort, and
     /// awaits the receiver with a short timeout. The WS reader resolves the
@@ -246,6 +251,7 @@ async fn handle_runner_ws(
                             command_tx: cmd_tx.clone(),
                             hostname: None,
                             version: None,
+                            drivers: None,
                             pending: Arc::new(Mutex::new(HashMap::new())),
                         },
                     );
@@ -363,12 +369,15 @@ async fn handle_runner_message(
             version,
             drivers,
         } => {
+            let drivers_json = serde_json::to_string(drivers).ok();
+
             // Update runner metadata.
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
-                    "UPDATE runners SET hostname = ?1, version = ?2 WHERE id = ?3",
-                    params![hostname, version, runner_id],
+                    "UPDATE runners SET hostname = ?1, version = ?2, drivers_json = ?3 \
+                     WHERE id = ?4",
+                    params![hostname, version, drivers_json, runner_id],
                 )
                 .ok();
             }
@@ -377,6 +386,7 @@ async fn handle_runner_message(
             if let Some(runner) = state.runners.lock().await.get_mut(runner_id) {
                 runner.hostname = Some(hostname.clone());
                 runner.version = Some(version.clone());
+                runner.drivers = Some(drivers.clone());
             }
 
             // Broadcast driver auth to dashboard.
@@ -564,6 +574,22 @@ async fn handle_runner_message(
         }
 
         WireMessage::DriverAuthReport { drivers } => {
+            // Persist + cache the latest snapshot so `list_drivers_dispatch`
+            // can serve it without a wire round-trip and the dashboard can
+            // surface the inventory even after the runner disconnects.
+            let drivers_json = serde_json::to_string(drivers).ok();
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute(
+                    "UPDATE runners SET drivers_json = ?1 WHERE id = ?2",
+                    params![drivers_json, runner_id],
+                )
+                .ok();
+            }
+            if let Some(runner) = state.runners.lock().await.get_mut(runner_id) {
+                runner.drivers = Some(drivers.clone());
+            }
+
             broadcast_event(
                 &state.broadcast_tx,
                 "runner_drivers",
@@ -830,11 +856,22 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
         let conn = state.db.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, status, hostname, version, last_seen_at, created_at \
+                "SELECT id, name, status, hostname, version, last_seen_at, created_at, \
+                        drivers_json \
                  FROM runners WHERE org_id = ?1 ORDER BY last_seen_at DESC",
             )
             .unwrap();
         stmt.query_map(params![user.org_id], |row| {
+            // Surface the runner's last-known driver inventory directly on
+            // the row so the `/runners` page can render the per-row
+            // inventory chip without a second `/api/drivers?runner_id=`
+            // round-trip per row. JSON parses lazily — a corrupt row falls
+            // back to an empty array rather than failing the whole list.
+            let drivers_json: Option<String> = row.get(7)?;
+            let drivers = drivers_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .unwrap_or(serde_json::Value::Array(Vec::new()));
             Ok(serde_json::json!({
                 "id": row.get::<_, Option<String>>(0)?,
                 "name": row.get::<_, Option<String>>(1)?,
@@ -843,6 +880,7 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
                 "version": row.get::<_, Option<String>>(4)?,
                 "lastSeenAt": row.get::<_, Option<String>>(5)?,
                 "createdAt": row.get::<_, Option<String>>(6)?,
+                "drivers": drivers,
             }))
         })
         .unwrap()

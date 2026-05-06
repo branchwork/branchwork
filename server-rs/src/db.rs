@@ -706,6 +706,15 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE plan_snapshots ADD COLUMN restored_at TEXT;")
         .ok();
 
+    // Last-known driver inventory the runner pushed via `RunnerHello` or
+    // `DriverAuthReport`. JSON-encoded `Vec<DriverAuthInfo>` (see
+    // `saas::runner_protocol::DriverAuthInfo`). Persisted so the dashboard
+    // can surface a runner's drivers + auth state even while the runner is
+    // offline; refreshed on every report. NULL until the runner has
+    // reported once.
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN drivers_json TEXT;")
+        .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 

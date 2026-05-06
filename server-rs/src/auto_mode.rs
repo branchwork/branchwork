@@ -1768,6 +1768,7 @@ mod tests {
                 command_tx: cmd_tx,
                 hostname: None,
                 version: None,
+                drivers: None,
                 pending,
             },
         );

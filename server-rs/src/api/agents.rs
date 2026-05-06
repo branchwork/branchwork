@@ -926,42 +926,43 @@ pub async fn discard_agent_branch(
     }
 }
 
-/// `GET /api/drivers` — list agent drivers the server knows about.
+/// Query parameters for `GET /api/drivers`. Optional `runner_id` selects
+/// which runner's inventory to return in SaaS mode; absent means "the
+/// most recently-seen runner in the org" (matches the dispatch
+/// convention used by `runner_request`).
+#[derive(Deserialize)]
+pub struct ListDriversQuery {
+    pub runner_id: Option<String>,
+}
+
+/// `GET /api/drivers` — list agent drivers + auth status.
 ///
-/// Response: `{ drivers: [{ name, binary }], default: "claude" }`. The
-/// first entry is always [`crate::agents::driver::DEFAULT_DRIVER`] so UIs
-/// have a stable fallback to pre-select.
-pub async fn list_drivers(State(state): State<AppState>) -> impl IntoResponse {
-    let reg = &state.registry.drivers;
-    let entries: Vec<serde_json::Value> = reg
-        .names()
-        .into_iter()
-        .map(|name| {
-            let driver = reg.get(&name);
-            let binary = driver
-                .as_ref()
-                .map(|d| d.binary().to_string())
-                .unwrap_or_default();
-            let caps = driver
-                .as_ref()
-                .map(|d| d.capabilities())
-                .unwrap_or_default();
-            let auth = driver
-                .as_ref()
-                .map(|d| d.auth_status())
-                .unwrap_or(crate::agents::driver::AuthStatus::Unknown);
-            serde_json::json!({
-                "name": name,
-                "binary": binary,
-                "capabilities": caps,
-                "auth_status": auth,
-            })
-        })
-        .collect();
-    Json(serde_json::json!({
-        "drivers": entries,
-        "default": crate::agents::driver::DEFAULT_DRIVER,
-    }))
+/// In standalone deployments this returns the server's local registry —
+/// the historical contract. In SaaS deployments (`org_has_runner` is
+/// true) it returns the **runner's** driver inventory, because agents
+/// run there and the dashboard host has no agent CLIs. The mode switch
+/// is hidden in [`crate::saas::dispatch::list_drivers_dispatch`]. The
+/// optional `?runner_id=<id>` query selects which runner to inspect when
+/// the user has multiple; falls back to the most recently-seen runner.
+///
+/// Response shape (frozen for the dashboard):
+/// `{ drivers: [{ name, binary, capabilities, auth_status }], default,
+///    runner_id?, runner_status? }`. The two `runner_*` fields are
+/// SaaS-only and let the dashboard render an offline / never-reported
+/// chip when the latest data came from the DB rather than a live runner.
+pub async fn list_drivers(
+    State(state): State<AppState>,
+    user: OptionalAuthUser,
+    Query(q): Query<ListDriversQuery>,
+) -> impl IntoResponse {
+    let org_id = user
+        .0
+        .as_ref()
+        .map(|u| u.org_id.as_str())
+        .unwrap_or("default-org");
+    let body =
+        crate::saas::dispatch::list_drivers_dispatch(&state, org_id, q.runner_id.as_deref()).await;
+    Json(body)
 }
 
 pub async fn get_events(State(state): State<AppState>) -> impl IntoResponse {
