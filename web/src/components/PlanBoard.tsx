@@ -16,6 +16,7 @@ import { Button } from "./ui/Button.js";
 import { Modal } from "./ui/Modal.js";
 import { toastError } from "../lib/toast.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
+import { StaleDataChip } from "./StaleDataChip.js";
 
 export function PlanBoard() {
   const plan = usePlanStore((s) => s.selectedPlan);
@@ -153,6 +154,10 @@ export function PlanBoard() {
           {isMd && (
             <span className="text-amber-500/60 font-mono">.md</span>
           )}
+          {/* Stale-data marker. Self-gates on WS-disconnect + 60s of
+              cache age — surfaces "this plan view may be out of date"
+              right alongside the displayed Modified timestamp. */}
+          <StaleDataChip slice="plans" />
         </div>
         <div className="flex items-center gap-3">
           <h2 className="text-xl font-bold">

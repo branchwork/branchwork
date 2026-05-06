@@ -4,6 +4,7 @@ import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useRouteSelection } from "../hooks/use-route-selection.js";
+import { StaleDataChip } from "./StaleDataChip.js";
 
 export function AgentTree() {
   const agents = useAgentStore((s) => s.agents);
@@ -112,12 +113,15 @@ export function AgentTree() {
 
   return (
     <div className="p-6">
-      <h2 className="text-xl font-bold mb-2">
-        Agents
-        <span className="text-sm font-normal text-gray-500 ml-2">
+      <h2 className="text-xl font-bold mb-2 flex items-center gap-2 flex-wrap">
+        <span>Agents</span>
+        <span className="text-sm font-normal text-gray-500">
           {agents.filter((a) => a.status === "running" || a.status === "starting").length} active
           / {agents.length} total
         </span>
+        {/* Stale marker for the agent rows below. Self-gates on
+            WS-disconnect + 60s of cache age. */}
+        <StaleDataChip slice="agents" />
       </h2>
 
       {/* Filters */}

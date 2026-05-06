@@ -58,6 +58,18 @@ interface WsStore {
   connected: boolean;
   socket: WebSocket | null;
   reconnectAttempt: number;
+  /// ms-since-epoch when the WS dropped from `connected:true` to closed.
+  /// Cleared on reconnect (back to `null`). Read by `<ConnectionBanner/>`
+  /// to gate the warning banner behind a 2s grace window so a momentary
+  /// blip (network blip, server restart of <2s) doesn't flash a banner
+  /// at the user. Also read by `<StaleDataChip/>` to decide whether to
+  /// surface "this is stale" alongside cached data: chip shows when WS
+  /// is disconnected AND `lastFetchedAt` is >60s old.
+  ///
+  /// Note this is intentionally module-level rather than per-fetch:
+  /// the moment WS drops we lose authoritative live updates for every
+  /// slice, so a single timestamp is the right granularity.
+  disconnectedSince: number | null;
   connect: () => void;
   disconnect: () => void;
   /// Disconnect the socket, clear all subscriptions, and reset state.
@@ -117,6 +129,12 @@ export const useWsStore = create<WsStore>((set, get) => ({
   connected: false,
   socket: null,
   reconnectAttempt: 0,
+  /// Seeded as `null` (the "we never connected yet" signal) so the
+  /// banner stays hidden during the initial bootstrap — the user sees
+  /// "Disconnected. Reconnecting…" only once we've actually been
+  /// connected and lost it. App.tsx flips us to a real timestamp via
+  /// the close handler below.
+  disconnectedSince: null,
 
   connect: () => {
     const { socket } = get();
@@ -136,7 +154,11 @@ export const useWsStore = create<WsStore>((set, get) => ({
 
     ws.onopen = () => {
       const wasReconnect = get().reconnectAttempt > 0;
-      set({ connected: true, reconnectAttempt: 0 });
+      // Clear `disconnectedSince` on every successful open (initial *and*
+      // reconnect) so the banner / stale chip disappear the moment the
+      // socket recovers. The wasReconnect flag below still drives the
+      // refetch sweep — that's a separate signal.
+      set({ connected: true, reconnectAttempt: 0, disconnectedSince: null });
       if (wasReconnect) {
         // Refetch every cached slice — events during the disconnect were
         // lost, so without this the dashboard could show a stale agent
@@ -165,7 +187,17 @@ export const useWsStore = create<WsStore>((set, get) => ({
     };
 
     ws.onclose = () => {
-      set({ connected: false, socket: null });
+      // Stamp `disconnectedSince` only on the FIRST close in a streak.
+      // A retry that fails synchronously fires another onclose; we want
+      // ConnectionBanner's 2s grace measured from the original drop, not
+      // from each retry, otherwise long disconnects keep resetting the
+      // grace window and the banner never appears.
+      const prev = get().disconnectedSince;
+      set({
+        connected: false,
+        socket: null,
+        disconnectedSince: prev ?? Date.now(),
+      });
       scheduleReconnect(get);
     };
 
@@ -180,7 +212,12 @@ export const useWsStore = create<WsStore>((set, get) => ({
     const { socket } = get();
     if (socket) {
       socket.close();
-      set({ socket: null, connected: false, reconnectAttempt: 0 });
+      set({
+        socket: null,
+        connected: false,
+        reconnectAttempt: 0,
+        disconnectedSince: null,
+      });
     }
   },
 
@@ -202,7 +239,12 @@ export const useWsStore = create<WsStore>((set, get) => ({
     // braces for any subscriber whose cleanup didn't reach the Set
     // (e.g. an old test that registered without unmounting).
     wsSubscriptions.clear();
-    set({ socket: null, connected: false, reconnectAttempt: 0 });
+    set({
+      socket: null,
+      connected: false,
+      reconnectAttempt: 0,
+      disconnectedSince: null,
+    });
   },
 }));
 

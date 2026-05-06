@@ -6,6 +6,7 @@ import { useSettingsStore } from "../stores/settings-store.js";
 import { BulkDeleteModal } from "./BulkDeleteModal.js";
 import { formatRelative } from "../lib/time.js";
 import { isPlanDone } from "../lib/predicates.js";
+import { StaleDataChip } from "./StaleDataChip.js";
 
 /// Auto-namer shape used by the Claude Code CLI: three lowercase
 /// hyphen-separated tokens with the middle token ending in `-ing`
@@ -234,7 +235,12 @@ export function ProjectDashboard() {
       {/* Dashboard header */}
       <div className="mb-6 flex items-start justify-between gap-3">
         <div>
-          <h2 className="text-xl font-bold mb-1">Projects</h2>
+          <h2 className="text-xl font-bold mb-1 flex items-center gap-2">
+            Projects
+            {/* Stale-data marker for the project totals + per-project
+                "Updated" stat below. Self-gates on WS-disconnect + 60s. */}
+            <StaleDataChip slice="plans" />
+          </h2>
           <div className="text-xs text-gray-500 flex items-center gap-3 flex-wrap">
             <span>
               {totalProjects} project{totalProjects !== 1 ? "s" : ""}

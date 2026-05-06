@@ -17,6 +17,7 @@ import { LoginPage } from "./components/LoginPage.js";
 import { AdminPage } from "./components/AdminPage.js";
 import { RunnersPage } from "./components/RunnersPage.js";
 import { Toaster } from "./components/Toaster.js";
+import { ConnectionBanner } from "./components/ConnectionBanner.js";
 import { EnsurePlan } from "./components/EnsurePlan.js";
 import { EnsureAgents } from "./components/EnsureAgents.js";
 import { NotFoundPage } from "./components/NotFoundPage.js";
@@ -98,6 +99,7 @@ export function App() {
 
   return (
     <div className="flex h-screen bg-gray-950 text-gray-100">
+      <ConnectionBanner />
       <RouteSync />
       <Sidebar />
 

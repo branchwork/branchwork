@@ -7,6 +7,7 @@ import { postJson } from "../api.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
 import { isPlanDone } from "../lib/predicates.js";
+import { StaleDataChip } from "./StaleDataChip.js";
 
 export function Sidebar() {
   const plans = usePlanStore((s) => s.plans);
@@ -214,6 +215,13 @@ export function Sidebar() {
 
       {/* Plan list grouped by project */}
       <div className="flex-1 overflow-auto p-2">
+        {/* Stale-data marker for the whole plan list. Self-gates: only
+            appears when WS is disconnected AND lastPlansFetchedAt is
+            >60s old. Sits at the top of the list because the plan rows
+            below all share the same fetch lifecycle. */}
+        <div className="px-2 mb-1.5 empty:hidden">
+          <StaleDataChip slice="plans" />
+        </div>
         {warnings.length > 0 && (
           <div className="mb-3 space-y-1">
             {warnings.map((w) => (
