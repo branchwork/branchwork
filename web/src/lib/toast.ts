@@ -11,3 +11,11 @@ export function toastError(e: unknown, prefix?: string): string {
   const title = prefix ? `${prefix}: ${msg}` : msg;
   return useToastStore.getState().push({ kind: "error", title });
 }
+
+/// Push a `kind: "warn"` toast with a literal title — for known,
+/// caller-controlled copy (e.g. session expired) where there is no
+/// throwable to extract a message from. Auto-dismisses on the warn
+/// kind's default TTL; pass `body` for a second line of detail.
+export function toastWarn(title: string, body?: string): string {
+  return useToastStore.getState().push({ kind: "warn", title, body });
+}
