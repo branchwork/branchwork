@@ -4,6 +4,8 @@ import { usePlanStore } from "../stores/plan-store.js";
 import { useWsStore } from "../stores/ws-store.js";
 import { formatTimestamp } from "../lib/time.js";
 import { errorMessage } from "../lib/error.js";
+import { Modal } from "./ui/Modal.js";
+import { Button } from "./ui/Button.js";
 
 /// One row from `GET /api/snapshots`. Mirrors the Rust
 /// `SnapshotListEntry` (camelCased on the wire).
@@ -421,21 +423,18 @@ export function ArchivePanel() {
         )}
       </div>
 
-      {/* Second-confirm modal for permanent purge */}
-      {confirmPurge && (
-        <ConfirmPurgeModal
-          entry={confirmPurge}
-          busy={purging[confirmPurge.id] === true}
-          onCancel={() => setConfirmPurge(null)}
-          onConfirm={() => purgeSnapshot(confirmPurge)}
-        />
-      )}
+      <ConfirmPurgeModal
+        entry={confirmPurge}
+        busy={confirmPurge ? purging[confirmPurge.id] === true : false}
+        onCancel={() => setConfirmPurge(null)}
+        onConfirm={() => confirmPurge && purgeSnapshot(confirmPurge)}
+      />
     </div>
   );
 }
 
 interface ConfirmPurgeModalProps {
-  entry: SnapshotEntry;
+  entry: SnapshotEntry | null;
   busy: boolean;
   onCancel: () => void;
   onConfirm: () => void;
@@ -448,43 +447,38 @@ function ConfirmPurgeModal({
   onConfirm,
 }: ConfirmPurgeModalProps) {
   return (
-    <div
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
-      role="dialog"
-      aria-modal="true"
+    <Modal
+      open={entry !== null}
+      onClose={() => {
+        if (!busy) onCancel();
+      }}
+      title={entry ? `Purge snapshot for ${entry.planName}?` : ""}
+      description="This will immediately remove the snapshot row and its archived YAML. The plan cannot be restored after this. Use this only to clean up scratch plans you do not want to wait out the retention window for."
     >
-      <div className="bg-gray-900 border border-red-800/50 rounded-lg shadow-xl max-w-md w-full mx-4 p-5">
-        <h3 className="text-base font-semibold text-red-300 mb-2">
-          Purge snapshot for {entry.planName}?
-        </h3>
-        <p className="text-xs text-gray-400 leading-relaxed">
-          This will immediately remove the snapshot row and its archived
-          YAML. The plan cannot be restored after this. Use this only to
-          clean up scratch plans you do not want to wait out the
-          retention window for.
+      {entry?.archivePath && (
+        <p className="mt-2 text-[10px] text-gray-600 font-mono break-all">
+          {entry.archivePath}
         </p>
-        {entry.archivePath && (
-          <p className="mt-2 text-[10px] text-gray-600 font-mono break-all">
-            {entry.archivePath}
-          </p>
-        )}
-        <div className="mt-4 flex items-center justify-end gap-2">
-          <button
-            onClick={onCancel}
-            disabled={busy}
-            className="text-xs px-3 py-1.5 bg-gray-800 border border-gray-700 hover:border-gray-500 text-gray-300 rounded transition disabled:opacity-40"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={busy}
-            className="text-xs px-3 py-1.5 bg-red-700 hover:bg-red-600 disabled:bg-red-800/50 text-white rounded transition"
-          >
-            {busy ? "Purging…" : "Purge permanently"}
-          </button>
-        </div>
+      )}
+      <div className="mt-4 flex items-center justify-end gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onCancel}
+          disabled={busy}
+        >
+          Cancel
+        </Button>
+        <Button
+          variant="danger"
+          size="sm"
+          onClick={onConfirm}
+          disabled={busy}
+          loading={busy}
+        >
+          {busy ? "Purging…" : "Purge permanently"}
+        </Button>
       </div>
-    </div>
+    </Modal>
   );
 }

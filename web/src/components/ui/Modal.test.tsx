@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import axe from "axe-core";
 import { Modal } from "./Modal.js";
 
 afterEach(cleanup);
@@ -102,5 +103,28 @@ describe("Modal", () => {
     const backdrop = screen.getByRole("dialog").parentElement as HTMLElement;
     fireEvent.click(backdrop);
     expect(calls).toBe(1);
+  });
+
+  it("axe-core reports zero structural a11y violations on the rendered dialog", async () => {
+    render(
+      <Modal
+        open
+        onClose={() => {}}
+        title="Confirm delete"
+        description="This action cannot be undone."
+      >
+        <div className="mt-4 flex justify-end gap-2">
+          <button type="button">Cancel</button>
+          <button type="button">Confirm</button>
+        </div>
+      </Modal>,
+    );
+    const dialog = screen.getByRole("dialog");
+    const results = await axe.run(dialog, {
+      runOnly: { type: "tag", values: ["wcag2a", "wcag2aa"] },
+      // jsdom has no layout — color-contrast is not checkable here.
+      rules: { "color-contrast": { enabled: false } },
+    });
+    expect(results.violations).toEqual([]);
   });
 });

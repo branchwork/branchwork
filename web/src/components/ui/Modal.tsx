@@ -20,8 +20,17 @@ interface ModalProps {
   /// omitted, the dialog itself takes focus (it is `tabIndex={-1}`), so
   /// keyboard users can Tab into the first focusable child.
   initialFocusRef?: RefObject<HTMLElement | null>;
+  /// Panel max-width. Default `md` matches the original confirmation
+  /// dialogs; `2xl` is for table-driven dialogs (e.g. StaleBranchesButton)
+  /// that need to fit a row preview without horizontal scroll.
+  size?: "md" | "2xl";
   children: ReactNode;
 }
+
+const SIZE_CLASS: Record<NonNullable<ModalProps["size"]>, string> = {
+  md: "max-w-md",
+  "2xl": "max-w-2xl",
+};
 
 /// Portal-rendered modal. Implements the contract surfaced by audit §8
 /// (StaleBranchesButton modal had no focus trap, no Esc, no return-focus
@@ -35,8 +44,11 @@ interface ModalProps {
 ///   opened.
 /// - Backdrop click dismisses only when explicitly opted in.
 ///
-/// Existing modals (`BulkDeleteModal`, `DeletePlanModal`) hand-rolled
-/// each of these behaviours; 0.6 will migrate them onto this primitive.
+/// `BulkDeleteModal` and `DeletePlanModal` hand-rolled the same
+/// contract before this primitive existed; both still pass their own
+/// axe tests and were left in place during 6.1 because the refactor
+/// is a deduplication, not an a11y fix. Migrating them remains a
+/// follow-up.
 export function Modal({
   open,
   onClose,
@@ -45,6 +57,7 @@ export function Modal({
   description,
   closeOnBackdropClick = false,
   initialFocusRef,
+  size = "md",
   children,
 }: ModalProps) {
   const titleId = useId();
@@ -115,7 +128,7 @@ export function Modal({
         aria-labelledby={titleId}
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
-        className="bg-gray-900 border border-gray-700 rounded-md shadow-xl p-5 w-full max-w-md outline-none"
+        className={`bg-gray-900 border border-gray-700 rounded-md shadow-xl p-5 w-full ${SIZE_CLASS[size]} max-h-[85vh] overflow-y-auto outline-none`}
         onClick={(e) => e.stopPropagation()}
       >
         <h2

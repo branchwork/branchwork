@@ -663,102 +663,102 @@ function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
       >
         Clean Branches
       </button>
-      {open && (
-        <div
-          className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center"
-          onClick={() => !busy && setOpen(false)}
-        >
-          <div
-            className="bg-gray-900 border border-gray-700 rounded-md shadow-xl p-4 max-w-2xl w-full max-h-[70vh] overflow-auto"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 className="text-sm font-semibold mb-3">
-              Stale branches for <span className="font-mono">{planName}</span>
-            </h3>
-            {loading ? (
-              <div className="text-gray-500 text-xs">Loading...</div>
-            ) : branches.length === 0 ? (
-              <div className="text-gray-500 text-xs">No branchwork/* branches found.</div>
-            ) : (
-              <>
-                <table className="w-full text-xs">
-                  <thead className="text-gray-500">
-                    <tr className="text-left border-b border-gray-800">
-                      <th className="py-1 pr-2">Pick</th>
-                      <th className="py-1 pr-2">Branch</th>
-                      <th className="py-1 pr-2">Commits ahead</th>
-                      <th className="py-1 pr-2">Age</th>
-                      <th className="py-1 pr-2">Agent</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {branches.map((b) => {
-                      const risky = b.hasUniqueCommits;
-                      return (
-                        <tr key={b.name} className="border-b border-gray-800/50">
-                          <td className="py-1 pr-2">
-                            <input
-                              type="checkbox"
-                              checked={selected.has(b.name)}
-                              disabled={risky && !force}
-                              onChange={(e) => {
-                                const next = new Set(selected);
-                                if (e.target.checked) next.add(b.name);
-                                else next.delete(b.name);
-                                setSelected(next);
-                              }}
-                            />
-                          </td>
-                          <td className="py-1 pr-2 font-mono text-gray-300">{b.name}</td>
-                          <td
-                            className={`py-1 pr-2 ${
-                              risky ? "text-amber-400" : "text-gray-500"
-                            }`}
-                          >
-                            {b.commitsAheadOfTrunk ?? "?"}
-                          </td>
-                          <td className="py-1 pr-2 text-gray-500">
-                            {b.lastCommitAgeSecs != null
-                              ? formatAge(b.lastCommitAgeSecs)
-                              : "?"}
-                          </td>
-                          <td className="py-1 pr-2 font-mono text-gray-600">
-                            {b.agentId ? b.agentId.slice(0, 8) : "-"}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-                <label className="flex items-center gap-2 mt-3 text-xs text-amber-400">
-                  <input
-                    type="checkbox"
-                    checked={force}
-                    onChange={(e) => setForce(e.target.checked)}
-                  />
-                  Allow branches with unique commits (force)
-                </label>
-              </>
-            )}
-            <div className="flex justify-end gap-2 mt-4">
-              <button
-                onClick={() => setOpen(false)}
-                disabled={busy}
-                className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={purge}
-                disabled={busy || selected.size === 0}
-                className="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-600 disabled:opacity-50 text-white rounded transition"
-              >
-                {busy ? "Purging..." : `Delete ${selected.size}`}
-              </button>
-            </div>
+      <Modal
+        open={open}
+        onClose={() => {
+          if (!busy) setOpen(false);
+        }}
+        title={`Stale branches for ${planName}`}
+        size="2xl"
+      >
+        <div className="mt-3">
+          {loading ? (
+            <div className="text-gray-500 text-xs">Loading...</div>
+          ) : branches.length === 0 ? (
+            <div className="text-gray-500 text-xs">No branchwork/* branches found.</div>
+          ) : (
+            <>
+              <table className="w-full text-xs">
+                <thead className="text-gray-500">
+                  <tr className="text-left border-b border-gray-800">
+                    <th className="py-1 pr-2">Pick</th>
+                    <th className="py-1 pr-2">Branch</th>
+                    <th className="py-1 pr-2">Commits ahead</th>
+                    <th className="py-1 pr-2">Age</th>
+                    <th className="py-1 pr-2">Agent</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {branches.map((b) => {
+                    const risky = b.hasUniqueCommits;
+                    return (
+                      <tr key={b.name} className="border-b border-gray-800/50">
+                        <td className="py-1 pr-2">
+                          <input
+                            type="checkbox"
+                            aria-label={`Select branch ${b.name}`}
+                            checked={selected.has(b.name)}
+                            disabled={risky && !force}
+                            onChange={(e) => {
+                              const next = new Set(selected);
+                              if (e.target.checked) next.add(b.name);
+                              else next.delete(b.name);
+                              setSelected(next);
+                            }}
+                          />
+                        </td>
+                        <td className="py-1 pr-2 font-mono text-gray-300">{b.name}</td>
+                        <td
+                          className={`py-1 pr-2 ${
+                            risky ? "text-amber-400" : "text-gray-500"
+                          }`}
+                        >
+                          {b.commitsAheadOfTrunk ?? "?"}
+                        </td>
+                        <td className="py-1 pr-2 text-gray-500">
+                          {b.lastCommitAgeSecs != null
+                            ? formatAge(b.lastCommitAgeSecs)
+                            : "?"}
+                        </td>
+                        <td className="py-1 pr-2 font-mono text-gray-600">
+                          {b.agentId ? b.agentId.slice(0, 8) : "-"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <label className="flex items-center gap-2 mt-3 text-xs text-amber-400">
+                <input
+                  type="checkbox"
+                  checked={force}
+                  onChange={(e) => setForce(e.target.checked)}
+                />
+                Allow branches with unique commits (force)
+              </label>
+            </>
+          )}
+          <div className="flex justify-end gap-2 mt-4">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setOpen(false)}
+              disabled={busy}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              size="sm"
+              onClick={purge}
+              disabled={busy || selected.size === 0}
+              loading={busy}
+            >
+              {busy ? "Purging..." : `Delete ${selected.size}`}
+            </Button>
           </div>
         </div>
-      )}
+      </Modal>
     </>
   );
 }
