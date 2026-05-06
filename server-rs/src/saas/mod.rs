@@ -15,6 +15,7 @@
 
 pub mod billing;
 pub mod dispatch;
+pub mod install_runner;
 pub mod outbox;
 pub mod runner_protocol;
 pub mod runner_rpc;

@@ -507,11 +507,12 @@ fn migrate(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_runners_org ON runners(org_id);
 
         CREATE TABLE IF NOT EXISTS runner_tokens (
-            token_hash   TEXT PRIMARY KEY,
-            runner_name  TEXT NOT NULL,
-            org_id       TEXT NOT NULL DEFAULT 'default-org',
-            created_by   TEXT NOT NULL,
-            created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            token_hash         TEXT PRIMARY KEY,
+            runner_name        TEXT NOT NULL,
+            org_id             TEXT NOT NULL DEFAULT 'default-org',
+            created_by         TEXT NOT NULL,
+            created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+            claimed_runner_id  TEXT,
             FOREIGN KEY (created_by) REFERENCES users(id)
         );
         CREATE INDEX IF NOT EXISTS idx_runner_tokens_org ON runner_tokens(org_id);
@@ -773,6 +774,15 @@ fn migrate(conn: &Connection) {
     // offline; refreshed on every report. NULL until the runner has
     // reported once.
     conn.execute_batch("ALTER TABLE runners ADD COLUMN drivers_json TEXT;")
+        .ok();
+
+    // Single-use binding for runner enrolment tokens: `claimed_runner_id`
+    // is NULL until the first runner connects with this token, then bound
+    // to that runner's id. Subsequent connects with the same token but a
+    // different runner_id are rejected by `claim_or_verify_token`. Existing
+    // rows pre-migration are left NULL and behave as unclaimed (the first
+    // reconnect re-binds them in place).
+    conn.execute_batch("ALTER TABLE runner_tokens ADD COLUMN claimed_runner_id TEXT;")
         .ok();
 
     // Seed the default org and migrate orphaned users/plans into it.

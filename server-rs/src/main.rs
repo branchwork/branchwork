@@ -421,6 +421,18 @@ async fn run_server(cli: Cli) {
             "/api/runners/tokens",
             post(saas::runner_ws::create_runner_token),
         )
+        // 4.8: one-line runner install — public script + auth-gated command
+        // mint. Public script is templated with the dashboard's public URL
+        // at request time so `curl|sh` lands a runner that knows where to
+        // call home, no hand-edits needed.
+        .route(
+            "/install-runner.sh",
+            get(saas::install_runner::serve_install_script),
+        )
+        .route(
+            "/api/runners/install-command",
+            post(saas::install_runner::issue_install_command),
+        )
         .route("/api/runners", get(saas::runner_ws::list_runners))
         .route(
             "/api/runners/{runner_id}/commands",

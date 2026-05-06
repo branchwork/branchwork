@@ -124,21 +124,53 @@ pub struct RunnerWsQuery {
     token: String,
 }
 
-/// Validate the runner API token. Returns `(runner_name, org_id)` on success.
-fn validate_runner_token(db: &Db, token: &str) -> Option<(String, String)> {
+/// Validate the runner API token. Returns `(runner_name, org_id, claimed_runner_id)`
+/// on success. `claimed_runner_id` is `None` until the first runner connects with
+/// this token; the WS handler enforces the single-use binding (matching incoming
+/// runner_id is allowed for reconnect, mismatch is rejected).
+fn validate_runner_token(db: &Db, token: &str) -> Option<(String, String, Option<String>)> {
     let hash = sha256_hex(token);
     let conn = db.lock().unwrap();
     conn.query_row(
-        "SELECT runner_name, org_id FROM runner_tokens WHERE token_hash = ?1",
+        "SELECT runner_name, org_id, claimed_runner_id FROM runner_tokens WHERE token_hash = ?1",
         params![hash],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .ok()
 }
 
+/// Claim the token for `runner_id`, or verify the existing claim matches.
+/// Returns `Ok(())` when the token is unclaimed (then claims it) or already
+/// claimed by `runner_id`; `Err(claimed_id)` when the token is claimed by a
+/// different runner. The check is per-token so a token re-pasted on a second
+/// host fails closed without affecting that runner's other tokens.
+pub fn claim_or_verify_token(db: &Db, token_hash: &str, runner_id: &str) -> Result<(), String> {
+    let conn = db.lock().unwrap();
+    let claimed: Option<String> = conn
+        .query_row(
+            "SELECT claimed_runner_id FROM runner_tokens WHERE token_hash = ?1",
+            params![token_hash],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    match claimed {
+        Some(existing) if existing != runner_id => Err(existing),
+        Some(_) => Ok(()),
+        None => {
+            conn.execute(
+                "UPDATE runner_tokens SET claimed_runner_id = ?1 WHERE token_hash = ?2",
+                params![runner_id, token_hash],
+            )
+            .ok();
+            Ok(())
+        }
+    }
+}
+
 /// Simple SHA-256 hex hash for token storage. We don't need bcrypt here —
 /// API tokens are high-entropy random strings, not user-chosen passwords.
-fn sha256_hex(input: &str) -> String {
+pub(crate) fn sha256_hex(input: &str) -> String {
     // Use a basic hash. Since we don't want to add a sha2 crate dependency,
     // we'll use a simple approach: store tokens as-is (they're already random
     // 256-bit hex strings). In production you'd want proper hashing.
@@ -155,11 +187,13 @@ pub async fn runner_ws_handler(
     State(state): State<AppState>,
     Query(query): Query<RunnerWsQuery>,
 ) -> Response {
-    let Some((runner_name, org_id)) = validate_runner_token(&state.db, &query.token) else {
+    let Some((runner_name, org_id, _claimed)) = validate_runner_token(&state.db, &query.token)
+    else {
         return (axum::http::StatusCode::UNAUTHORIZED, "invalid_token").into_response();
     };
 
-    ws.on_upgrade(move |socket| handle_runner_ws(socket, state, runner_name, org_id))
+    let token_hash = sha256_hex(&query.token);
+    ws.on_upgrade(move |socket| handle_runner_ws(socket, state, runner_name, org_id, token_hash))
 }
 
 /// Per-runner WebSocket event loop.
@@ -168,6 +202,7 @@ async fn handle_runner_ws(
     state: AppState,
     runner_name: String,
     org_id: String,
+    token_hash: String,
 ) {
     let (mut ws_sink, mut ws_stream) = {
         use futures_util::StreamExt;
@@ -227,6 +262,23 @@ async fn handle_runner_ws(
             {
                 let mut id_guard = runner_id.lock().await;
                 if id_guard.is_none() {
+                    // Single-use token enforcement: a token unclaimed at
+                    // issue time is bound to the first runner_id it sees.
+                    // A token re-pasted on a different host (fresh runner_id
+                    // from `load_or_generate_runner_id`) gets rejected here
+                    // — the WS already passed initial token-validity, but
+                    // the per-runner_id binding fails closed. Restarts on
+                    // the same host re-use the persisted runner_id and
+                    // sail through.
+                    if let Err(claimed_by) = claim_or_verify_token(&state.db, &token_hash, &rid) {
+                        eprintln!(
+                            "[runner-ws] token already used: claimed_by={claimed_by} incoming={rid}"
+                        );
+                        // Drop the connection — the runner sees its WS close
+                        // and the operator gets the error in the runner log.
+                        break;
+                    }
+
                     *id_guard = Some(rid.clone());
 
                     // Update runner status in DB.
@@ -950,6 +1002,78 @@ mod deployment_mode_tests {
     #[test]
     fn saas_when_both_signals() {
         assert_eq!(deployment_mode_from_signals(true, true), "saas");
+    }
+}
+
+#[cfg(test)]
+mod claim_token_tests {
+    //! `claim_or_verify_token` is the single-use binding that backs the
+    //! `Token is single-use (re-running the same command fails …)`
+    //! acceptance criterion of plan/dashboard-ui-overhaul/4.8.
+
+    use super::*;
+    use rusqlite::Connection;
+    use std::sync::{Arc, Mutex};
+
+    fn fresh_db_with_token(token_hash: &str) -> Db {
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal schema for this test — only the columns
+        // claim_or_verify_token actually reads/writes.
+        conn.execute_batch(
+            "CREATE TABLE runner_tokens (
+                token_hash         TEXT PRIMARY KEY,
+                runner_name        TEXT NOT NULL,
+                org_id             TEXT NOT NULL DEFAULT 'default-org',
+                created_by         TEXT NOT NULL,
+                created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+                claimed_runner_id  TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runner_tokens (token_hash, runner_name, created_by) VALUES (?1, 'r', 'u')",
+            params![token_hash],
+        )
+        .unwrap();
+        Arc::new(Mutex::new(conn))
+    }
+
+    #[test]
+    fn first_claim_binds_runner_id() {
+        let db = fresh_db_with_token("hash-a");
+        assert!(claim_or_verify_token(&db, "hash-a", "runner-1").is_ok());
+        // After the claim, the row carries the runner_id.
+        let claimed: Option<String> = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT claimed_runner_id FROM runner_tokens WHERE token_hash = ?1",
+                params!["hash-a"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed.as_deref(), Some("runner-1"));
+    }
+
+    #[test]
+    fn same_runner_reconnect_is_ok() {
+        // The runner restarting picks up the same persisted runner_id and
+        // re-uses the token. Must succeed — otherwise every server reboot
+        // bricks every runner.
+        let db = fresh_db_with_token("hash-b");
+        claim_or_verify_token(&db, "hash-b", "runner-1").unwrap();
+        assert!(claim_or_verify_token(&db, "hash-b", "runner-1").is_ok());
+    }
+
+    #[test]
+    fn different_runner_is_rejected() {
+        // The acceptance bullet — pasting the same install command on a
+        // second host produces a fresh runner_id, which must NOT pass the
+        // claim check.
+        let db = fresh_db_with_token("hash-c");
+        claim_or_verify_token(&db, "hash-c", "runner-1").unwrap();
+        let err = claim_or_verify_token(&db, "hash-c", "runner-2").unwrap_err();
+        assert_eq!(err, "runner-1");
     }
 }
 

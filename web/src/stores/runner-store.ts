@@ -67,6 +67,19 @@ export interface RunnerTokenIssued {
   runner_name: string;
 }
 
+/// Server response for `POST /api/runners/install-command` (4.8). Bundles
+/// the freshly-issued token, the ready-to-paste `curl … | sh -s -- '<TOKEN>'`
+/// command, the resolved SaaS URL, and the runner_name as the dashboard
+/// will key WS `runner_connected` events. The token field is kept on the
+/// response so a clipboard-aware modal can fall back to copying the raw
+/// token if the operator wants to paste it into a custom installer.
+export interface RunnerInstallCommand {
+  token: string;
+  command: string;
+  runner_name: string;
+  saas_url: string;
+}
+
 /// Snapshot of one driver's auth state on a runner. Mirrors the
 /// server-side `DriverAuthInfo` wire shape (snake_case `state` tag) and
 /// is surfaced verbatim by `GET /api/runners` per row, so each row can
@@ -149,6 +162,14 @@ interface RunnerStore {
   /// nothing stores it. On success we refetch `/api/runners` so a row
   /// appears once the runner connects via `branchwork-runner --token`.
   createRunnerToken: (runnerName: string) => Promise<RunnerTokenIssued>;
+  /// Mint a token AND format the one-line install command. Used by the
+  /// `/runners` page's Add-runner modal (4.8). Same DB write path as
+  /// `createRunnerToken`, just with the formatted command appended so
+  /// the modal shows a copy-pasteable `curl … | sh` line. The runner
+  /// name on the response is the trimmed value the server stored — the
+  /// modal subscribes to `runner_connected` WS events keyed by this
+  /// name to flip to its "Connected!" state.
+  fetchInstallCommand: (runnerName: string) => Promise<RunnerInstallCommand>;
   /// Wired from `ws-store.ts` for `runner_connected`. Optimistically inserts
   /// or updates the row so the indicator flips to emerald the moment the
   /// runner registers, without waiting for a refetch.
@@ -281,6 +302,18 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
     // WS handshake lands. The refetch is a best-effort warmup so a row
     // shows up faster if the runner is already running. WS
     // `runner_connected` will reconcile in any case.
+    void get().fetchRunners();
+    return issued;
+  },
+
+  fetchInstallCommand: async (runnerName) => {
+    const issued = await postJson<RunnerInstallCommand>(
+      "/api/runners/install-command",
+      { runner_name: runnerName },
+    );
+    // Same warmup as createRunnerToken: prefetch /api/runners so the
+    // row appears as soon as the runner connects, without waiting for
+    // the next page-level refetch.
     void get().fetchRunners();
     return issued;
   },
