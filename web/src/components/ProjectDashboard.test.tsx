@@ -299,3 +299,140 @@ describe("ProjectDashboard stale filter", () => {
     expect(squidBox.checked).toBe(true);
   });
 });
+
+describe("ProjectDashboard render with plans", () => {
+  function setupSeveral() {
+    const recent = new Date(Date.now() - 5 * 86400000).toISOString();
+    usePlanStore.setState({
+      plans: [
+        plan({
+          name: "alpha-plan",
+          title: "Alpha plan",
+          project: "alpha",
+          taskCount: 4,
+          doneCount: 2,
+          createdAt: recent,
+          modifiedAt: recent,
+        }),
+        plan({
+          name: "alpha-other",
+          title: "Alpha other",
+          project: "alpha",
+          taskCount: 3,
+          doneCount: 3,
+          createdAt: recent,
+          modifiedAt: recent,
+        }),
+        plan({
+          name: "beta-plan",
+          title: "Beta plan",
+          project: "beta",
+          taskCount: 2,
+          doneCount: 1,
+          createdAt: recent,
+          modifiedAt: recent,
+        }),
+      ],
+    });
+  }
+
+  it("groups plans by project and renders each project header", () => {
+    setupSeveral();
+    render(<ProjectDashboard />);
+    expect(screen.getByText("alpha")).toBeTruthy();
+    expect(screen.getByText("beta")).toBeTruthy();
+    // The summary line names the totals — 2 projects / 3 plans.
+    const heading = screen.getByText(/^Projects$/i).closest("h2") as HTMLElement;
+    const headerBlock = heading.parentElement as HTMLElement;
+    expect(headerBlock.textContent).toMatch(/2\s*projects/);
+    expect(headerBlock.textContent).toMatch(/3\s*plans/);
+  });
+
+  it("renders a Loading state when loading is true and plans are empty", () => {
+    usePlanStore.setState({ plans: [], loading: true });
+    render(<ProjectDashboard />);
+    expect(screen.getByText(/Loading\.\.\./i)).toBeTruthy();
+  });
+
+  it("renders the 'No plans yet' empty state when neither loading nor any plans", () => {
+    usePlanStore.setState({ plans: [], loading: false });
+    render(<ProjectDashboard />);
+    expect(screen.getByText("No plans yet")).toBeTruthy();
+    expect(
+      screen.getByText(/Plans are loaded from ~\/.claude\/plans\//i),
+    ).toBeTruthy();
+  });
+});
+
+describe("ProjectDashboard plan navigation", () => {
+  it("plan rows render as <Link> targeting /plans/:name", () => {
+    const recent = new Date(Date.now() - 1 * 86400000).toISOString();
+    usePlanStore.setState({
+      plans: [
+        plan({
+          name: "navigate-me",
+          title: "Navigate me",
+          project: "alpha",
+          taskCount: 2,
+          doneCount: 0,
+          createdAt: recent,
+          modifiedAt: recent,
+        }),
+      ],
+    });
+    render(<ProjectDashboard />);
+    const link = screen.getByText("Navigate me").closest("a") as HTMLAnchorElement;
+    expect(link).not.toBeNull();
+    // Memory router renders react-router <Link> as <a href> internally.
+    expect(link.getAttribute("href")).toBe("/plans/navigate-me");
+  });
+
+  it("clicking a plan calls usePlanStore.selectPlan with the plan name", () => {
+    const selectPlan = vi.fn().mockResolvedValue(undefined);
+    const recent = new Date(Date.now() - 1 * 86400000).toISOString();
+    usePlanStore.setState({
+      selectPlan,
+      plans: [
+        plan({
+          name: "navigate-me",
+          title: "Navigate me",
+          project: "alpha",
+          taskCount: 2,
+          doneCount: 0,
+          createdAt: recent,
+          modifiedAt: recent,
+        }),
+      ],
+    });
+    render(<ProjectDashboard />);
+    const link = screen.getByText("Navigate me").closest("a") as HTMLAnchorElement;
+    fireEvent.click(link);
+    expect(selectPlan).toHaveBeenCalledWith("navigate-me");
+  });
+
+  it("does NOT call selectPlan when selection mode is on (clicking the row toggles the checkbox)", () => {
+    const selectPlan = vi.fn().mockResolvedValue(undefined);
+    const recent = new Date(Date.now() - 1 * 86400000).toISOString();
+    usePlanStore.setState({
+      selectPlan,
+      plans: [
+        plan({
+          name: "navigate-me",
+          title: "Navigate me",
+          project: "alpha",
+          taskCount: 2,
+          doneCount: 0,
+          createdAt: recent,
+          modifiedAt: recent,
+        }),
+      ],
+    });
+    render(<ProjectDashboard />);
+    fireEvent.click(screen.getByText(/^Select$/));
+    // After Select, the row becomes a <label> wrapping a checkbox.
+    const cb = screen.getByRole("checkbox") as HTMLInputElement;
+    fireEvent.click(cb);
+    expect(cb.checked).toBe(true);
+    expect(selectPlan).not.toHaveBeenCalled();
+  });
+});

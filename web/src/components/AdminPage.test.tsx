@@ -144,3 +144,138 @@ describe("AdminPage retention input", () => {
     );
   });
 });
+
+describe("AdminPage default-effort buttons", () => {
+  it("renders all four levels and marks the active one", () => {
+    useSettingsStore.setState({ effort: "medium" });
+    render(<AdminPage />);
+    for (const label of ["Low", "Medium", "High", "Max"]) {
+      expect(screen.getByText(label)).toBeTruthy();
+    }
+    // Active button carries the indigo accent. We assert by class
+    // since there is no aria-pressed wired up (kept the assertion
+    // weaker than the visual contract on purpose).
+    const medium = screen.getByText("Medium");
+    expect(medium.className).toMatch(/bg-indigo-600/);
+    const low = screen.getByText("Low");
+    expect(low.className).not.toMatch(/bg-indigo-600/);
+  });
+
+  it("clicking a level calls setEffort with that value", () => {
+    const setEffort = vi.fn().mockResolvedValue(undefined);
+    useSettingsStore.setState({ setEffort });
+    render(<AdminPage />);
+    fireEvent.click(screen.getByText("Low"));
+    expect(setEffort).toHaveBeenCalledWith("low");
+    fireEvent.click(screen.getByText("Max"));
+    expect(setEffort).toHaveBeenCalledWith("max");
+    expect(setEffort).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("AdminPage skip-permissions toggle", () => {
+  it("renders the checkbox checked when skipPermissions is true", () => {
+    useSettingsStore.setState({ skipPermissions: true });
+    render(<AdminPage />);
+    const cb = screen.getByRole("checkbox") as HTMLInputElement;
+    expect(cb.checked).toBe(true);
+    // The label flips to "On" when enabled.
+    expect(screen.getByText(/^On$/)).toBeTruthy();
+  });
+
+  it("renders the checkbox unchecked when skipPermissions is false", () => {
+    useSettingsStore.setState({ skipPermissions: false });
+    render(<AdminPage />);
+    const cb = screen.getByRole("checkbox") as HTMLInputElement;
+    expect(cb.checked).toBe(false);
+    expect(screen.getByText(/^Off$/)).toBeTruthy();
+  });
+
+  it("toggling the checkbox calls setSkipPermissions with the new value", () => {
+    const setSkipPermissions = vi.fn().mockResolvedValue(undefined);
+    useSettingsStore.setState({ skipPermissions: false, setSkipPermissions });
+    render(<AdminPage />);
+    const cb = screen.getByRole("checkbox") as HTMLInputElement;
+    fireEvent.click(cb);
+    expect(setSkipPermissions).toHaveBeenCalledWith(true);
+  });
+});
+
+describe("AdminPage notification webhook", () => {
+  it("seeds the input from the store value", () => {
+    useSettingsStore.setState({
+      webhookUrl: "https://hooks.slack.com/services/AAA",
+    });
+    render(<AdminPage />);
+    const input = screen.getByPlaceholderText(
+      /hooks\.slack\.com/i,
+    ) as HTMLInputElement;
+    expect(input.value).toBe("https://hooks.slack.com/services/AAA");
+  });
+
+  it("Save is disabled until the input is dirty", () => {
+    useSettingsStore.setState({ webhookUrl: null });
+    render(<AdminPage />);
+    const save = screen.getByText(/^Save$/) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    const input = screen.getByPlaceholderText(
+      /hooks\.slack\.com/i,
+    ) as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { value: "https://hooks.slack.com/services/abc" },
+    });
+    expect(save.disabled).toBe(false);
+  });
+
+  it("Save POSTs the trimmed URL via setWebhookUrl and shows Saved", async () => {
+    const setWebhookUrl = vi.fn().mockResolvedValue(undefined);
+    useSettingsStore.setState({ webhookUrl: null, setWebhookUrl });
+    render(<AdminPage />);
+    const input = screen.getByPlaceholderText(
+      /hooks\.slack\.com/i,
+    ) as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { value: "  https://hooks.slack.com/services/xyz  " },
+    });
+    fireEvent.click(screen.getByText(/^Save$/));
+    await waitFor(() =>
+      expect(setWebhookUrl).toHaveBeenCalledWith(
+        "https://hooks.slack.com/services/xyz",
+      ),
+    );
+    await waitFor(() => expect(screen.getByText(/^Saved\.$/)).toBeTruthy());
+  });
+
+  it("clearing the input and saving sends null (clears the webhook)", async () => {
+    const setWebhookUrl = vi.fn().mockResolvedValue(undefined);
+    useSettingsStore.setState({
+      webhookUrl: "https://hooks.slack.com/services/EXISTING",
+      setWebhookUrl,
+    });
+    render(<AdminPage />);
+    const input = screen.getByPlaceholderText(
+      /hooks\.slack\.com/i,
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.click(screen.getByText(/^Save$/));
+    await waitFor(() => expect(setWebhookUrl).toHaveBeenCalledWith(null));
+  });
+
+  it("surfaces an error when the webhook save throws", async () => {
+    const setWebhookUrl = vi
+      .fn()
+      .mockRejectedValue(new Error("hook url rejected"));
+    useSettingsStore.setState({ webhookUrl: null, setWebhookUrl });
+    render(<AdminPage />);
+    const input = screen.getByPlaceholderText(
+      /hooks\.slack\.com/i,
+    ) as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { value: "https://example.invalid/hook" },
+    });
+    fireEvent.click(screen.getByText(/^Save$/));
+    await waitFor(() =>
+      expect(screen.getByText(/hook url rejected/i)).toBeTruthy(),
+    );
+  });
+});
