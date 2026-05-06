@@ -65,12 +65,19 @@ const AgentBranchDiscarded = v.object({
   data: v.unknown(),
 });
 
+/// Two emitters carry different payload shapes:
+/// - `agents/mod.rs::boot_sweep` sends `{agent_id, branch, reason}` when
+///   an orphaned task branch is cleared from the registry on startup.
+/// - `api/plans.rs::clear_stale_branches` sends `{branch}` only when the
+///   user clears a stale branch from the dashboard. No agent row is
+///   associated, so `agent_id` is absent.
+/// Schema accepts both: `branch` is the only invariant.
 const AgentBranchCleared = v.object({
   type: v.literal("agent_branch_cleared"),
   data: v.object({
-    agent_id: v.string(),
+    agent_id: v.optional(v.string()),
     branch: v.string(),
-    reason: v.string(),
+    reason: v.optional(v.string()),
   }),
 });
 

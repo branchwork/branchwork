@@ -237,6 +237,15 @@ interface PlanStore {
   removePlan: (planName: string) => void;
   patchTaskStatus: (planName: string, taskNumber: string, status: string) => void;
   patchTaskCi: (planName: string, taskNumber: string, ci: CiStatus) => void;
+  /// Drop the CI badge for a single task on the selected plan. Driven by
+  /// `ci_run_dismissed` — the server already wrote `dismissed_at` on the
+  /// row; the badge here is the local UI state the dashboard reads from.
+  clearTaskCi: (planName: string, taskNumber: string) => void;
+  /// Patch a task's reported cost (and bump the plan-list aggregate by
+  /// the signed delta). Driven by `task_cost_reported` — agents call this
+  /// via the MCP cost-report tool, so the row may not yet exist locally;
+  /// missing tasks no-op silently and the next plan refetch reconciles.
+  patchTaskCost: (planName: string, taskNumber: string, amountUsd: number) => void;
   patchPlanVerdict: (planName: string, verdict: PlanVerdict) => void;
   savePlan: (plan: ParsedPlan) => Promise<void>;
   addWarning: (w: PlanWarning) => void;
@@ -360,6 +369,58 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     const { selectedPlan } = get();
     if (selectedPlan?.name !== planName) return;
     set({ selectedPlan: { ...selectedPlan, verdict } });
+  },
+
+  clearTaskCi: (planName, taskNumber) => {
+    const { selectedPlan } = get();
+    if (selectedPlan?.name !== planName) return;
+    const patched = {
+      ...selectedPlan,
+      phases: selectedPlan.phases.map((p) => ({
+        ...p,
+        tasks: p.tasks.map((t) =>
+          t.number === taskNumber ? { ...t, ci: null } : t
+        ),
+      })),
+    };
+    set({ selectedPlan: patched });
+  },
+
+  patchTaskCost: (planName, taskNumber, amountUsd) => {
+    const { selectedPlan, plans } = get();
+    let prevCost: number | undefined;
+    let touched = false;
+
+    if (selectedPlan?.name === planName) {
+      const patchedPhases = selectedPlan.phases.map((p) => ({
+        ...p,
+        tasks: p.tasks.map((t) => {
+          if (t.number !== taskNumber) return t;
+          touched = true;
+          prevCost = t.costUsd;
+          return { ...t, costUsd: amountUsd };
+        }),
+      }));
+      const aggregateDelta = amountUsd - (prevCost ?? 0);
+      const patched: ParsedPlan = {
+        ...selectedPlan,
+        phases: patchedPhases,
+        totalCostUsd: (selectedPlan.totalCostUsd ?? 0) + aggregateDelta,
+      };
+      set({ selectedPlan: patched });
+    }
+
+    // Mirror the aggregate delta on the summary list so ProjectDashboard
+    // does not need a second refetch. When `prevCost` is unknown (the
+    // task lives on a non-selected plan), fall back to additive +N — the
+    // debounced fetchPlans on `task_status_changed` reconciles drift.
+    const delta = touched ? amountUsd - (prevCost ?? 0) : amountUsd;
+    const updatedPlans = plans.map((p) =>
+      p.name === planName
+        ? { ...p, totalCostUsd: (p.totalCostUsd ?? 0) + delta }
+        : p
+    );
+    set({ plans: updatedPlans });
   },
 
   patchTaskStatus: (planName, taskNumber, status) => {

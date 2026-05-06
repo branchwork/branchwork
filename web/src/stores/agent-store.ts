@@ -66,6 +66,11 @@ interface AgentStore {
   discardAgentBranch: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
   addAgent: (agent: Agent) => void;
   updateAgentStatus: (agentId: string, status: string) => void;
+  /// Set `branch = null` on an agent row matched by id (when the WS
+  /// frame carries `agent_id`) or by branch name (when the boot-sweep
+  /// path emits only `{branch}`). Driven by `agent_branch_cleared`.
+  /// No-op if no row matches — the next `fetchAgents()` reconciles.
+  clearAgentBranch: (match: { agentId?: string; branch?: string }) => void;
   appendOutput: (agentId: string, line: AgentOutputLine) => void;
 }
 
@@ -169,6 +174,17 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
       agents: s.agents.map((a) =>
         a.id === agentId ? { ...a, status } : a
       ),
+    })),
+
+  clearAgentBranch: ({ agentId, branch }) =>
+    set((s) => ({
+      agents: s.agents.map((a) => {
+        if (agentId && a.id === agentId) return { ...a, branch: null };
+        if (!agentId && branch && a.branch === branch) {
+          return { ...a, branch: null };
+        }
+        return a;
+      }),
     })),
 
   appendOutput: (agentId, line) =>

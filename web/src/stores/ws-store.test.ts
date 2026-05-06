@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useAgentStore } from "./agent-store.js";
+import { useAgentStore, type Agent } from "./agent-store.js";
 import {
   usePlanStore,
   type ParsedPlan,
@@ -15,7 +15,47 @@ afterEach(() => {
     plans: [],
     selectedPlan: null,
   });
+  useAgentStore.setState({ agents: [] });
 });
+
+function makeAgent(overrides: Partial<Agent> = {}): Agent {
+  return {
+    id: "agent-1",
+    session_id: "session-1",
+    pid: null,
+    parent_agent_id: null,
+    plan_name: null,
+    task_id: null,
+    cwd: "/tmp",
+    status: "running",
+    mode: "pty",
+    prompt: null,
+    started_at: "2026-04-12T00:00:00Z",
+    finished_at: null,
+    last_tool: null,
+    last_activity_at: null,
+    base_commit: null,
+    branch: null,
+    source_branch: null,
+    cost_usd: null,
+    driver: null,
+    ...overrides,
+  };
+}
+
+function makePlan(overrides: Partial<ParsedPlan> = {}): ParsedPlan {
+  return {
+    name: "p",
+    filePath: "p.yaml",
+    title: "P",
+    context: "",
+    project: null,
+    createdAt: "2026-04-12T00:00:00Z",
+    modifiedAt: "2026-04-12T00:00:00Z",
+    phases: [],
+    ...overrides,
+  };
+}
 
 describe("ws-store handleWsMessage", () => {
   it("refreshes agents on task_advanced", () => {
@@ -216,6 +256,260 @@ describe("ws-store handleWsMessage", () => {
     expect(() => handleWsMessage("<<not even json>>")).not.toThrow();
     expect(warn).toHaveBeenCalled();
     expect(String(warn.mock.calls[0][0])).toMatch(/malformed/);
+
+    warn.mockRestore();
+  });
+
+  it(
+    "phase_advanced refetches the selected plan and pushes a toast",
+    () => {
+      const selected = makePlan({ name: "alpha", title: "Alpha" });
+      const selectPlan = vi.fn().mockResolvedValue(undefined);
+      usePlanStore.setState({ selectedPlan: selected, selectPlan });
+
+      handleWsMessage({
+        type: "phase_advanced",
+        data: { plan_name: "alpha", from_phase: 1, to_phase: 2 },
+      });
+
+      expect(selectPlan).toHaveBeenCalledWith("alpha");
+      const toasts = usePlanStore.getState().toasts;
+      expect(toasts).toHaveLength(1);
+      expect(toasts[0].message).toMatch(/alpha.*Phase 2/);
+    },
+  );
+
+  it(
+    "phase_advanced for a non-selected plan still pushes a toast " +
+      "but does not refetch",
+    () => {
+      const other = makePlan({ name: "beta" });
+      const selectPlan = vi.fn().mockResolvedValue(undefined);
+      usePlanStore.setState({ selectedPlan: other, selectPlan });
+
+      handleWsMessage({
+        type: "phase_advanced",
+        data: { plan_name: "alpha", from_phase: 1, to_phase: 2 },
+      });
+
+      expect(selectPlan).not.toHaveBeenCalled();
+      expect(usePlanStore.getState().toasts).toHaveLength(1);
+    },
+  );
+
+  it("task_cost_reported updates the per-task cost and the plan aggregate", () => {
+    const selected = makePlan({
+      name: "alpha",
+      totalCostUsd: 0.5,
+      phases: [
+        {
+          number: 1,
+          title: "P1",
+          description: "",
+          tasks: [
+            {
+              number: "1.1",
+              title: "T1",
+              description: "",
+              filePaths: [],
+              acceptance: "",
+              costUsd: 0.2,
+            },
+          ],
+        },
+      ],
+    });
+    const summary: PlanSummary = {
+      name: "alpha",
+      title: "Alpha",
+      project: null,
+      phaseCount: 1,
+      taskCount: 1,
+      doneCount: 0,
+      createdAt: "2026-04-12T00:00:00Z",
+      modifiedAt: "2026-04-12T00:00:00Z",
+      totalCostUsd: 0.5,
+    };
+    usePlanStore.setState({ selectedPlan: selected, plans: [summary] });
+
+    handleWsMessage({
+      type: "task_cost_reported",
+      data: { plan_name: "alpha", task_number: "1.1", amount_usd: 0.7 },
+    });
+
+    const next = usePlanStore.getState();
+    expect(next.selectedPlan!.phases[0].tasks[0].costUsd).toBeCloseTo(0.7);
+    // Aggregate is bumped by the signed delta (+0.5 = 0.7 - 0.2)
+    expect(next.selectedPlan!.totalCostUsd).toBeCloseTo(1.0);
+    expect(next.plans[0].totalCostUsd).toBeCloseTo(1.0);
+  });
+
+  it("task_cost_reported on a non-selected plan still bumps the summary", () => {
+    const summary: PlanSummary = {
+      name: "alpha",
+      title: "Alpha",
+      project: null,
+      phaseCount: 1,
+      taskCount: 1,
+      doneCount: 0,
+      createdAt: "2026-04-12T00:00:00Z",
+      modifiedAt: "2026-04-12T00:00:00Z",
+      totalCostUsd: 0.5,
+    };
+    usePlanStore.setState({ selectedPlan: null, plans: [summary] });
+
+    handleWsMessage({
+      type: "task_cost_reported",
+      data: { plan_name: "alpha", task_number: "1.1", amount_usd: 0.3 },
+    });
+
+    // Non-selected: store has no per-task data, so the unsigned +amount
+    // fallback applies. Next plan refetch reconciles drift.
+    expect(usePlanStore.getState().plans[0].totalCostUsd).toBeCloseTo(0.8);
+  });
+
+  it("plan_reset refetches the selected plan, refreshes the list, and toasts", async () => {
+    const selected = makePlan({ name: "alpha" });
+    const selectPlan = vi.fn().mockResolvedValue(undefined);
+    const fetchPlans = vi.fn().mockResolvedValue(undefined);
+    usePlanStore.setState({ selectedPlan: selected, selectPlan, fetchPlans });
+
+    handleWsMessage({
+      type: "plan_reset",
+      data: { plan_name: "alpha", cleared: 4 },
+    });
+
+    expect(selectPlan).toHaveBeenCalledWith("alpha");
+    expect(fetchPlans).toHaveBeenCalledTimes(1);
+    const toasts = usePlanStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].message).toMatch(/alpha.*4 tasks/);
+  });
+
+  it("plan_reset with cleared=1 toasts in the singular", () => {
+    const fetchPlans = vi.fn().mockResolvedValue(undefined);
+    usePlanStore.setState({ selectedPlan: null, fetchPlans });
+
+    handleWsMessage({
+      type: "plan_reset",
+      data: { plan_name: "alpha", cleared: 1 },
+    });
+
+    expect(usePlanStore.getState().toasts[0].message).toMatch(/1 task\)/);
+  });
+
+  it("ci_run_dismissed clears the CI badge on the matching task", () => {
+    const selected = makePlan({
+      name: "alpha",
+      phases: [
+        {
+          number: 1,
+          title: "P1",
+          description: "",
+          tasks: [
+            {
+              number: "1.1",
+              title: "T1",
+              description: "",
+              filePaths: [],
+              acceptance: "",
+              ci: {
+                id: 7,
+                status: "failure",
+                conclusion: "failure",
+                runUrl: null,
+                commitSha: null,
+                updatedAt: "2026-04-12T00:00:00Z",
+              },
+            },
+          ],
+        },
+      ],
+    });
+    usePlanStore.setState({ selectedPlan: selected });
+
+    handleWsMessage({
+      type: "ci_run_dismissed",
+      data: { id: 7, plan_name: "alpha", task_number: "1.1" },
+    });
+
+    const ci = usePlanStore.getState().selectedPlan!.phases[0].tasks[0].ci;
+    expect(ci).toBeNull();
+  });
+
+  it(
+    "agent_branch_cleared with agent_id patches branch on the matching agent",
+    () => {
+      useAgentStore.setState({
+        agents: [
+          makeAgent({ id: "a-1", branch: "feature/foo" }),
+          makeAgent({ id: "a-2", branch: "feature/bar" }),
+        ],
+      });
+
+      handleWsMessage({
+        type: "agent_branch_cleared",
+        data: {
+          agent_id: "a-1",
+          branch: "feature/foo",
+          reason: "boot_sweep: branch not present in project git",
+        },
+      });
+
+      const agents = useAgentStore.getState().agents;
+      expect(agents.find((a) => a.id === "a-1")!.branch).toBeNull();
+      expect(agents.find((a) => a.id === "a-2")!.branch).toBe("feature/bar");
+    },
+  );
+
+  it(
+    "agent_branch_cleared without agent_id falls back to matching by branch",
+    () => {
+      useAgentStore.setState({
+        agents: [
+          makeAgent({ id: "a-1", branch: "feature/foo" }),
+          makeAgent({ id: "a-2", branch: "feature/foo" }),
+          makeAgent({ id: "a-3", branch: "feature/bar" }),
+        ],
+      });
+
+      handleWsMessage({
+        type: "agent_branch_cleared",
+        data: { branch: "feature/foo" },
+      });
+
+      const agents = useAgentStore.getState().agents;
+      expect(agents.find((a) => a.id === "a-1")!.branch).toBeNull();
+      expect(agents.find((a) => a.id === "a-2")!.branch).toBeNull();
+      expect(agents.find((a) => a.id === "a-3")!.branch).toBe("feature/bar");
+    },
+  );
+
+  it("hook_event is logged via the validator instead of swallowed", () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+
+    handleWsMessage({
+      type: "hook_event",
+      data: { session_id: "s-1", hook_type: "PreToolUse", tool_name: "bash" },
+    });
+
+    expect(debug).toHaveBeenCalled();
+    expect(String(debug.mock.calls[0][0])).toMatch(/hook_event/);
+
+    debug.mockRestore();
+  });
+
+  it("runner_connected validates and is accepted as a no-op (Phase 4)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(() =>
+      handleWsMessage({
+        type: "runner_connected",
+        data: { runner_id: "r-1", runner_name: "alpha" },
+      }),
+    ).not.toThrow();
+    // No `dropped malformed` warning — the schema accepted the payload.
+    expect(warn).not.toHaveBeenCalled();
 
     warn.mockRestore();
   });

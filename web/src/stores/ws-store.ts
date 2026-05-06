@@ -392,20 +392,101 @@ function dispatch(msg: WsMessage) {
       });
       break;
     }
-    // Events the validator accepts but the dashboard does not act on
-    // yet — Phase 2 of dashboard-ui-overhaul wires the handlers (audit
-    // §4). Listing them keeps `noFallthroughCasesInSwitch` happy while
-    // making the gap explicit instead of letting them land in a TODO.
-    case "hook_event":
+    case "phase_advanced": {
+      // Cross-phase advance from `try_auto_advance`. Refresh the selected
+      // plan so the new phase's tasks render with their current statuses
+      // (intra-phase advances ride `task_status_changed` instead — those
+      // already debounce-refetch the plan list).
+      const d = msg.data;
+      const planStoreNow = usePlanStore.getState();
+      if (planStoreNow.selectedPlan?.name === d.plan_name) {
+        planStoreNow.selectPlan(d.plan_name).catch(() => {
+          // Swallow: the next plan_updated / task_status_changed will retry.
+        });
+      }
+      const taskLabel = `Phase ${d.to_phase}`;
+      planStoreNow.pushToast({
+        kind: "info",
+        message: `${d.plan_name}: advanced to ${taskLabel}`,
+        ttlMs: 8_000,
+      });
+      notify(
+        `Phase ${d.to_phase} advanced`,
+        d.plan_name,
+        `phase-advanced-${d.plan_name}-${d.to_phase}`,
+      );
+      break;
+    }
+    case "task_cost_reported": {
+      // Agents report their cost via the MCP cost-report tool; the server
+      // already wrote the row, this just keeps the per-task pill + the
+      // ProjectDashboard aggregate in sync without a refetch.
+      const d = msg.data;
+      planStore.patchTaskCost(d.plan_name, d.task_number, d.amount_usd);
+      break;
+    }
+    case "plan_reset": {
+      // The user wiped `task_status` for the plan via the reset endpoint.
+      // Refresh the selected plan (so per-task statuses go back to derived)
+      // and the summary list (so doneCount drops to zero) — the server
+      // already deleted the rows. Toast surfaces the count cleared so a
+      // mistaken reset is recoverable via undo (future work).
+      const d = msg.data;
+      const planStoreNow = usePlanStore.getState();
+      if (planStoreNow.selectedPlan?.name === d.plan_name) {
+        planStoreNow.selectPlan(d.plan_name).catch(() => {
+          // Swallow — next event will reconcile.
+        });
+      }
+      planStoreNow.fetchPlans().catch(() => {});
+      const cleared = typeof d.cleared === "number" ? d.cleared : null;
+      const suffix = cleared !== null ? ` (${cleared} task${cleared === 1 ? "" : "s"})` : "";
+      planStoreNow.pushToast({
+        kind: "info",
+        message: `Reset task statuses for ${d.plan_name}${suffix}`,
+        ttlMs: 6_000,
+      });
+      break;
+    }
+    case "ci_run_dismissed": {
+      // CI badge in TaskCard is mirrored from PlanTask.ci. The server
+      // marked `dismissed_at` on the row; clear the badge locally so the
+      // user sees it disappear immediately instead of waiting for the
+      // next plan refetch.
+      const d = msg.data;
+      planStore.clearTaskCi(d.plan_name, d.task_number);
+      break;
+    }
+    case "agent_branch_cleared": {
+      // Two emitters with different shapes — see the schema comment.
+      // When `agent_id` is present, patch the row in-place; when absent
+      // (clear-stale-branches admin path), fall back to matching every
+      // agent row that points at that branch.
+      const d = msg.data;
+      agentStore.clearAgentBranch({
+        agentId: d.agent_id ?? undefined,
+        branch: d.branch,
+      });
+      break;
+    }
+    case "hook_event": {
+      // Phase 2 reserves a real consumer — today the dashboard doesn't
+      // surface raw hook frames anywhere. Logging through the validator
+      // is at least a breadcrumb so future bug reports can confirm the
+      // event arrived, instead of the silent `break;` that hid drops.
+      console.debug("[ws] hook_event accepted (no consumer)", msg.data);
+      break;
+    }
     case "audit_log":
-    case "phase_advanced":
-    case "task_cost_reported":
-    case "plan_reset":
-    case "ci_run_dismissed":
-    case "agent_branch_cleared":
+      // AuditLog component reads from /api/audit directly + has its own
+      // ws listener (audit §4 cross-listed); the ws-store does not need
+      // to fan out here. Keep the case to mute noFallthroughCasesInSwitch.
+      break;
     case "runner_connected":
     case "runner_disconnected":
     case "runner_drivers":
+      // Schemas land in Phase 2; the runner-status UI consumer is
+      // wired in Phase 4 alongside the `/runners` page (audit §17).
       break;
   }
 }
