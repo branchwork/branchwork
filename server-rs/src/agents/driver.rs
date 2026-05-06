@@ -202,6 +202,15 @@ pub trait AgentDriver: Send + Sync {
         None
     }
 
+    /// Extra environment variables the driver wants set on the spawned CLI
+    /// process. Default is empty. Used to flag containerised/sandboxed
+    /// launches (e.g. Claude Code's `CLAUDE_CODE_SANDBOXED=1`, which skips
+    /// the interactive "Trust this workspace?" dialog the binary would
+    /// otherwise block on when first run in a never-seen folder).
+    fn extra_env(&self) -> Vec<(&'static str, &'static str)> {
+        Vec::new()
+    }
+
     /// Check whether the CLI is installed and authenticated. Default
     /// implementation just confirms the binary is on PATH and reports
     /// [`AuthStatus::Unknown`] otherwise — drivers that know how to read
@@ -317,6 +326,17 @@ impl AgentDriver for ClaudeDriver {
             }
         });
         Some(cfg.to_string())
+    }
+
+    fn extra_env(&self) -> Vec<(&'static str, &'static str)> {
+        // CLAUDE_CODE_SANDBOXED=1 is the official Anthropic-supported escape
+        // hatch for containerised / sandboxed launches: the binary's first
+        // check inside its trust-workspace gate short-circuits to allow when
+        // this var is set. Skipping the dialog matters when the runner spawns
+        // claude into a never-seen folder (e.g. a fresh `CreateFolder` path)
+        // — without it the PTY blocks at the prompt and the supervisor exits
+        // before the agent ever runs.
+        vec![("CLAUDE_CODE_SANDBOXED", "1")]
     }
 
     fn stop_hook_config(&self, session_id: &str, hook_url: &str) -> Option<serde_json::Value> {
@@ -1034,6 +1054,28 @@ Tokens: 200 sent, 75 received. Cost: $0.0150 message, $0.0250 session.
         assert!(AiderDriver::new().mcp_config_json(3100).is_none());
         assert!(CodexDriver::new().mcp_config_json(3100).is_none());
         assert!(GeminiDriver::new().mcp_config_json(3100).is_none());
+    }
+
+    #[test]
+    fn claude_extra_env_sets_sandbox_flag() {
+        // CLAUDE_CODE_SANDBOXED=1 must be set on every spawned claude process
+        // — it's how the binary skips the trust-workspace dialog. Regression
+        // test for the 2026-05-06 incident where a runner-spawned agent
+        // blocked at the prompt and the supervisor exited zombie.
+        let env = ClaudeDriver::new().extra_env();
+        assert!(
+            env.iter()
+                .any(|(k, v)| *k == "CLAUDE_CODE_SANDBOXED" && *v == "1"),
+            "claude driver must set CLAUDE_CODE_SANDBOXED=1: {env:?}",
+        );
+    }
+
+    #[test]
+    fn non_claude_drivers_have_no_extra_env() {
+        // Default trait impl is empty Vec — only Claude opts in today.
+        assert!(AiderDriver::new().extra_env().is_empty());
+        assert!(CodexDriver::new().extra_env().is_empty());
+        assert!(GeminiDriver::new().extra_env().is_empty());
     }
 
     #[test]

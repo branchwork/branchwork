@@ -162,6 +162,7 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         settings_path: settings_path.as_deref(),
         skip_permissions,
     });
+    let extra_env = driver.extra_env();
     let formatted_prompt = driver.format_prompt(&prompt);
 
     let daemon_pid = match supervisor::spawn_session_daemon(
@@ -170,6 +171,7 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         cwd,
         120,
         40,
+        &extra_env,
         &cli_cmd,
     )
     .await
@@ -1380,5 +1382,56 @@ mod tests {
                 .any(|e| e.contains("agent_stopped") && e.contains(agent_id)),
             "must not broadcast a duplicate stop: {events:?}"
         );
+    }
+
+    /// Regression for the 2026-05-06 trust-dialog incident: a runner-spawned
+    /// claude on a freshly-created folder blocked at the "Trust this
+    /// workspace?" prompt, the supervisor exited, and the dashboard saw
+    /// nothing. The fix is `CLAUDE_CODE_SANDBOXED=1` in the env passed to
+    /// claude — the binary's first check inside its trust-workspace gate
+    /// short-circuits to allow when this var is set. Verify the var flows
+    /// from `ClaudeDriver::extra_env()` all the way into the argv handed to
+    /// `branchwork-server session …` (i.e. `--env CLAUDE_CODE_SANDBOXED=1`).
+    #[test]
+    fn pty_spawn_args_include_claude_sandboxed_env() {
+        use crate::agents::driver::{AgentDriver, ClaudeDriver};
+        use std::path::PathBuf;
+        use supervisor::build_session_daemon_args;
+
+        let driver = ClaudeDriver::new();
+        let extra_env = driver.extra_env();
+        assert!(
+            extra_env
+                .iter()
+                .any(|(k, v)| *k == "CLAUDE_CODE_SANDBOXED" && *v == "1"),
+            "claude driver must declare CLAUDE_CODE_SANDBOXED=1: {extra_env:?}",
+        );
+
+        let socket = PathBuf::from("/tmp/agent-abc.sock");
+        let cwd = PathBuf::from("/tmp/project");
+        let cmd: Vec<String> = vec!["claude".into(), "--session-id".into(), "abc".into()];
+        let args = build_session_daemon_args(&socket, &cwd, 120, 40, &extra_env, &cmd);
+
+        // The `--env` flag must appear before the `--` separator so clap on
+        // the daemon side parses it as a SessionArgs flag, not part of `cmd`.
+        let separator = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("argv must contain '--' separator");
+        let env_idx = args
+            .iter()
+            .position(|a| a == "--env")
+            .expect("argv must include --env flag for claude driver");
+        assert!(env_idx < separator, "--env must come before --: {args:?}",);
+        assert_eq!(
+            args.get(env_idx + 1).map(String::as_str),
+            Some("CLAUDE_CODE_SANDBOXED=1"),
+            "--env flag must carry CLAUDE_CODE_SANDBOXED=1: {args:?}",
+        );
+
+        // And the cmd portion (post-`--`) is unchanged: drivers don't get to
+        // rewrite their own argv via extra_env.
+        let post_sep: Vec<String> = args[separator + 1..].to_vec();
+        assert_eq!(post_sep, cmd, "post-'--' argv must equal cli cmd: {args:?}");
     }
 }

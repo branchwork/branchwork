@@ -53,6 +53,13 @@ pub struct SessionArgs {
     #[arg(long, default_value_t = 40)]
     pub rows: u16,
 
+    /// Extra environment variables, in `KEY=VALUE` form. Repeat the flag once
+    /// per variable. Drivers declare these via [`AgentDriver::extra_env`]; the
+    /// canonical case today is `CLAUDE_CODE_SANDBOXED=1` for the claude CLI,
+    /// which skips its first-run trust-workspace dialog.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
     /// Command (and args) to run inside the PTY, after `--`.
     #[arg(
         trailing_var_arg = true,
@@ -180,12 +187,51 @@ pub fn log_path(socket: &Path) -> PathBuf {
     socket.with_extension("log")
 }
 
+/// Build the argv passed to `branchwork-server session …` for a new agent
+/// daemon. Pure: returns owned strings so tests can inspect them without
+/// chasing lifetimes through `spawn_detached`.
+///
+/// `extra_env` becomes one `--env KEY=VALUE` flag per pair, before `--`.
+// Used in pty_agent + supervisor tests; the standalone session_daemon binary
+// (which `#[path]`-includes this file) never builds args, only consumes them.
+#[allow(dead_code)]
+pub fn build_session_daemon_args(
+    socket: &Path,
+    cwd: &Path,
+    cols: u16,
+    rows: u16,
+    extra_env: &[(&str, &str)],
+    cmd: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "session".to_string(),
+        "--socket".to_string(),
+        socket.to_string_lossy().to_string(),
+        "--cwd".to_string(),
+        cwd.to_string_lossy().to_string(),
+        "--cols".to_string(),
+        cols.to_string(),
+        "--rows".to_string(),
+        rows.to_string(),
+    ];
+    for (k, v) in extra_env {
+        args.push("--env".to_string());
+        args.push(format!("{k}={v}"));
+    }
+    args.push("--".to_string());
+    for a in cmd {
+        args.push(a.clone());
+    }
+    args
+}
+
 /// Spawn `branchwork-server session …` detached, then block (async) until the
 /// daemon has written its pidfile and the listener is accepting connections.
 /// Returns the durable daemon PID.
 ///
 /// `cmd` is the command (argv[0] + args) to run inside the PTY, e.g.
-/// `["claude", "--session-id", …]`.
+/// `["claude", "--session-id", …]`. `extra_env` is forwarded as repeated
+/// `--env KEY=VALUE` flags so the daemon can set them on the spawned CLI.
 // See `spawn_detached` — used from the main binary, unused in the
 // standalone session_daemon binary.
 #[allow(dead_code)]
@@ -195,6 +241,7 @@ pub async fn spawn_session_daemon(
     cwd: &Path,
     cols: u16,
     rows: u16,
+    extra_env: &[(&str, &str)],
     cmd: &[String],
 ) -> io::Result<u32> {
     // Clear any stale pidfile from a previous crashed daemon.
@@ -202,26 +249,8 @@ pub async fn spawn_session_daemon(
     #[cfg(unix)]
     let _ = std::fs::remove_file(&pid_path);
 
-    let socket_str = socket.to_string_lossy().to_string();
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let cols_str = cols.to_string();
-    let rows_str = rows.to_string();
-
-    let mut args: Vec<&str> = vec![
-        "session",
-        "--socket",
-        &socket_str,
-        "--cwd",
-        &cwd_str,
-        "--cols",
-        &cols_str,
-        "--rows",
-        &rows_str,
-        "--",
-    ];
-    for a in cmd {
-        args.push(a.as_str());
-    }
+    let owned_args = build_session_daemon_args(socket, cwd, cols, rows, extra_env, cmd);
+    let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
     let _ = spawn_detached(exe, &args)?;
 
     // Wait (up to ~5s) for the daemon to write its pidfile.
@@ -257,6 +286,7 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
         cwd,
         cols,
         rows,
+        env,
         cmd,
     } = args;
     if cmd.is_empty() {
@@ -304,6 +334,19 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
     }
     builder.cwd(&cwd);
     builder.env("TERM", "xterm-256color");
+    // Driver-supplied env vars (e.g. `CLAUDE_CODE_SANDBOXED=1`). Malformed
+    // entries — anything missing the `=` separator — are silently dropped
+    // rather than failing the spawn; the supervisor argv is built by the
+    // server, never by user input, so a malformed value would be a bug not a
+    // user error, but we'd rather still launch the agent than surface it as
+    // a daemon-startup failure the operator can't easily recover from.
+    for kv in &env {
+        if let Some((k, v)) = kv.split_once('=')
+            && !k.is_empty()
+        {
+            builder.env(k, v);
+        }
+    }
 
     let child = pair
         .slave
@@ -700,6 +743,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             cols: 80,
             rows: 24,
+            env: Vec::new(),
             // Delay the print so the client has time to connect and subscribe
             // to the broadcast. Output emitted before anyone's listening is
             // intentionally dropped (the on-disk log is the historical record).
@@ -758,6 +802,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             cols: 80,
             rows: 24,
+            env: Vec::new(),
             cmd: shell(&echo_line("logged-line")),
         };
         let daemon = tokio::spawn(async move { run_daemon(args).await });
@@ -784,6 +829,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             cols: 80,
             rows: 24,
+            env: Vec::new(),
             // Long-running: two prints spaced out, so the second one arrives
             // only after the first client has dropped.
             cmd: shell(&format!(
@@ -848,5 +894,55 @@ mod tests {
         });
         let name = socket_name(&p).expect("socket name");
         assert!(name.is_path());
+    }
+
+    #[test]
+    fn build_session_daemon_args_threads_extra_env() {
+        // Two env pairs end up as two `--env KEY=VALUE` flags, in order,
+        // before the `--` separator. The cmd portion is appended verbatim.
+        let socket = PathBuf::from("/tmp/agent.sock");
+        let cwd = PathBuf::from("/tmp/proj");
+        let env: &[(&str, &str)] = &[("CLAUDE_CODE_SANDBOXED", "1"), ("FOO", "bar")];
+        let cmd: Vec<String> = vec!["claude".into(), "--verbose".into()];
+
+        let args = build_session_daemon_args(&socket, &cwd, 120, 40, env, &cmd);
+
+        assert_eq!(args.first().map(String::as_str), Some("session"));
+        let separator = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("'--' separator must be present");
+
+        // Both env entries appear before the separator, in declaration order.
+        let env_positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| (a == "--env").then_some(i))
+            .collect();
+        assert_eq!(env_positions.len(), 2, "expected 2 --env flags: {args:?}");
+        assert!(
+            env_positions.iter().all(|&i| i < separator),
+            "--env must precede '--': {args:?}",
+        );
+        assert_eq!(args[env_positions[0] + 1], "CLAUDE_CODE_SANDBOXED=1");
+        assert_eq!(args[env_positions[1] + 1], "FOO=bar");
+
+        // cmd is appended verbatim after '--'.
+        assert_eq!(args[separator + 1..], cmd[..]);
+    }
+
+    #[test]
+    fn build_session_daemon_args_omits_env_flag_when_empty() {
+        // No driver-supplied env => no `--env` flags at all (don't emit empty
+        // pairs). The trailing `--` plus cmd are still present.
+        let socket = PathBuf::from("/tmp/agent.sock");
+        let cwd = PathBuf::from("/tmp/proj");
+        let cmd: Vec<String> = vec!["aider".into()];
+
+        let args = build_session_daemon_args(&socket, &cwd, 120, 40, &[], &cmd);
+
+        assert!(!args.iter().any(|a| a == "--env"), "no --env: {args:?}");
+        let separator = args.iter().position(|a| a == "--").expect("'--'");
+        assert_eq!(args[separator + 1..], cmd[..]);
     }
 }

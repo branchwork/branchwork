@@ -109,6 +109,12 @@ Pre-accept it once by adding this to `~/.claude/settings.json` (top level, **not
 
 Branchwork can also run with the toggle off; in that mode Claude Code asks for per-tool approval inside the session and the disclaimer never appears.
 
+#### Claude Code: trust-workspace dialog is auto-skipped
+
+Branchwork sets `CLAUDE_CODE_SANDBOXED=1` on every spawned `claude` process. This is the official Anthropic-supported flag for containerised / sandboxed launches: the binary's first check inside its trust-workspace gate short-circuits to allow when this var is set, so agents spawned into a never-seen folder come up directly to their main UI instead of blocking at "Trust this workspace?". This is essential for SaaS runner deployments where new project folders are created on the fly.
+
+The flag is process-scoped — it only applies to `claude` invocations Branchwork spawns. Users running `claude` standalone in their terminal for non-Branchwork sessions still get the normal trust-workspace UX.
+
 ## Project structure
 
 ```

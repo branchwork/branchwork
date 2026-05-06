@@ -1364,6 +1364,22 @@ fn list_home_folders() -> Vec<FolderEntry> {
 // ── Agent spawning ──────────────────────────────────────────────────────────
 
 /// Spawn a session daemon for an agent and wire up I/O forwarding.
+/// Driver-specific env vars to set on the spawned CLI process. Mirrors
+/// `AgentDriver::extra_env` in the server crate — kept as a tiny inline lookup
+/// because the runner binary does not pull in the driver module. Only Claude
+/// declares env vars today; other drivers return an empty slice.
+///
+/// `CLAUDE_CODE_SANDBOXED=1` is the official Anthropic-supported flag for
+/// containerised launches: it short-circuits Claude Code's trust-workspace
+/// gate so the binary never blocks at the "Trust this folder?" dialog when
+/// the runner spawns it into a freshly-created project directory.
+fn extra_env_for_driver(driver: &str) -> &'static [(&'static str, &'static str)] {
+    match driver {
+        "claude" => &[("CLAUDE_CODE_SANDBOXED", "1")],
+        _ => &[],
+    }
+}
+
 async fn spawn_agent(
     state: &RunnerState,
     agent_id: &str,
@@ -1379,7 +1395,8 @@ async fn spawn_agent(
     let socket_path = sockets_dir.join(format!("{agent_id}.sock"));
 
     // Build the command to spawn. The session daemon expects:
-    // branchwork-server session --socket <path> --cwd <dir> [--cols C --rows R] -- <cmd...>
+    // branchwork-server session --socket <path> --cwd <dir> [--cols C --rows R]
+    //   [--env K=V ...] -- <cmd...>
     let binary = match driver {
         "claude" => "claude",
         "aider" => "aider",
@@ -1394,9 +1411,20 @@ async fn spawn_agent(
         socket_path.display().to_string(),
         "--cwd".to_string(),
         cwd.display().to_string(),
-        "--".to_string(),
-        binary.to_string(),
     ];
+
+    // Driver-specific env vars. Mirrors `AgentDriver::extra_env` from the
+    // server's driver registry — kept inline because the runner binary does
+    // not pull in the full driver module via `#[path]`. Only Claude declares
+    // env vars today (CLAUDE_CODE_SANDBOXED=1, which skips the trust-workspace
+    // dialog the binary would otherwise block on in a never-seen folder).
+    for (k, v) in extra_env_for_driver(binary) {
+        args.push("--env".to_string());
+        args.push(format!("{k}={v}"));
+    }
+
+    args.push("--".to_string());
+    args.push(binary.to_string());
 
     // Add effort for Claude.
     if binary == "claude"
@@ -1757,6 +1785,29 @@ mod tests {
         let encoded = base64_encode(input);
         let decoded = base64_decode(&encoded).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    /// Regression for the 2026-05-06 trust-dialog incident: the runner-side
+    /// spawn path must inject `CLAUDE_CODE_SANDBOXED=1` into the session
+    /// daemon's argv so the spawned `claude` skips the trust-workspace
+    /// dialog. Mirrors `pty_agent::tests::pty_spawn_args_include_claude_sandboxed_env`.
+    #[test]
+    fn extra_env_for_driver_returns_sandbox_flag_for_claude() {
+        let env = extra_env_for_driver("claude");
+        assert!(
+            env.iter()
+                .any(|(k, v)| *k == "CLAUDE_CODE_SANDBOXED" && *v == "1"),
+            "claude driver must declare CLAUDE_CODE_SANDBOXED=1: {env:?}",
+        );
+    }
+
+    #[test]
+    fn extra_env_for_driver_is_empty_for_other_drivers() {
+        // Aider / Codex / Gemini have no portable sandbox flag — return empty.
+        assert!(extra_env_for_driver("aider").is_empty());
+        assert!(extra_env_for_driver("codex").is_empty());
+        assert!(extra_env_for_driver("gemini").is_empty());
+        assert!(extra_env_for_driver("unknown").is_empty());
     }
 
     #[test]
