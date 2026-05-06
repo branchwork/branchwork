@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Link, NavLink, useLocation } from "react-router-dom";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
@@ -14,15 +14,23 @@ import { TouchTarget } from "./ui/TouchTarget.js";
 
 export function Sidebar() {
   const plans = usePlanStore((s) => s.plans);
-  const selectedPlan = usePlanStore((s) => s.selectedPlan);
+  const selectedPlanName = usePlanStore((s) => s.selectedPlan?.name ?? null);
   const selectPlan = usePlanStore((s) => s.selectPlan);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const warnings = usePlanStore((s) => s.warnings);
   const dismissWarning = usePlanStore((s) => s.dismissWarning);
-  const agents = useAgentStore((s) => s.agents);
-  const activeCount = agents.filter(
-    (a) => a.status === "running" || a.status === "starting"
-  ).length;
+  // Primitive selector — `activeCount` is a number, so the default
+  // `Object.is` comparison short-circuits when the count is unchanged.
+  // Audit §10 minor: pre-fix the bare `s => s.agents` selector caused
+  // the whole Sidebar to re-render on every agent-store update (status,
+  // last_activity_at, etc.) even when the badge value didn't change.
+  const activeCount = useAgentStore((s) => {
+    let n = 0;
+    for (const a of s.agents) {
+      if (a.status === "running" || a.status === "starting") n += 1;
+    }
+    return n;
+  });
   const [convertingAll, setConvertingAll] = useState(false);
   const [showDone, setShowDone] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState("");
@@ -45,7 +53,7 @@ export function Sidebar() {
     try {
       await postJson("/api/plans/convert-all", {});
       await fetchPlans();
-      if (selectedPlan) await selectPlan(selectedPlan.name);
+      if (selectedPlanName) await selectPlan(selectedPlanName);
     } catch (e) {
       toastError(e, "Convert failed");
     } finally {
@@ -84,44 +92,14 @@ export function Sidebar() {
   }, [plans, search]);
 
   function renderPlanItem(p: PlanSummary, dimmed = false) {
-    const pct = p.taskCount > 0 ? Math.round((p.doneCount / p.taskCount) * 100) : 0;
-    const isSelected = selectedPlan?.name === p.name;
+    const isSelected = selectedPlanName === p.name;
     return (
-      <li key={p.name}>
-        <TouchTarget>
-          <Link
-            to={`/plans/${p.name}`}
-            className={`block w-full text-left px-2 py-1.5 rounded text-sm transition ${
-              isSelected
-                ? "bg-gray-800 text-white"
-                : dimmed
-                ? "text-gray-600 hover:text-gray-400 hover:bg-gray-800/50"
-                : "text-gray-400 hover:text-gray-200 hover:bg-gray-800/50"
-            }`}
-            title={p.title}
-          >
-            <div className="truncate flex items-center gap-1.5">
-              {dimmed && (
-                <span aria-hidden="true" className="text-emerald-600 text-[10px]">
-                  &#10003;
-                </span>
-              )}
-              <span className="truncate">{p.title}</span>
-            </div>
-            <div className="text-[9px] font-mono text-gray-700 truncate">{p.name}</div>
-            <div className="text-[10px] text-gray-600 flex items-center gap-1">
-              {p.taskCount > 0 && (
-                <>
-                  <span>{p.doneCount}/{p.taskCount}</span>
-                  <span className="text-gray-700">({pct}%)</span>
-                </>
-              )}
-              {p.taskCount === 0 && <span>{p.phaseCount} phases</span>}
-              <span className="text-gray-700 ml-auto">{formatRelative(p.modifiedAt)}</span>
-            </div>
-          </Link>
-        </TouchTarget>
-      </li>
+      <PlanItem
+        key={p.name}
+        plan={p}
+        isSelected={isSelected}
+        dimmed={dimmed}
+      />
     );
   }
 
@@ -339,6 +317,69 @@ export function Sidebar() {
 }
 
 /// "Plans" highlights for both `/` and `/plans/...` (any plan board).
+/// Per-row plan tile in the sidebar's grouped list. Wrapped in `memo` so
+/// selecting a different plan (which changes `selectedPlanName` upstream
+/// and therefore `isSelected` for exactly two rows) does NOT re-render
+/// every other plan row. Audit §10 minor / acceptance: "Selecting a plan
+/// does not re-render Sidebar plan rows."
+interface PlanItemProps {
+  plan: PlanSummary;
+  isSelected: boolean;
+  dimmed: boolean;
+}
+
+const PlanItem = memo(function PlanItem({
+  plan: p,
+  isSelected,
+  dimmed,
+}: PlanItemProps) {
+  const pct =
+    p.taskCount > 0 ? Math.round((p.doneCount / p.taskCount) * 100) : 0;
+  return (
+    <li>
+      <TouchTarget>
+        <Link
+          to={`/plans/${p.name}`}
+          className={`block w-full text-left px-2 py-1.5 rounded text-sm transition ${
+            isSelected
+              ? "bg-gray-800 text-white"
+              : dimmed
+                ? "text-gray-600 hover:text-gray-400 hover:bg-gray-800/50"
+                : "text-gray-400 hover:text-gray-200 hover:bg-gray-800/50"
+          }`}
+          title={p.title}
+        >
+          <div className="truncate flex items-center gap-1.5">
+            {dimmed && (
+              <span aria-hidden="true" className="text-emerald-600 text-[10px]">
+                &#10003;
+              </span>
+            )}
+            <span className="truncate">{p.title}</span>
+          </div>
+          <div className="text-[9px] font-mono text-gray-700 truncate">
+            {p.name}
+          </div>
+          <div className="text-[10px] text-gray-600 flex items-center gap-1">
+            {p.taskCount > 0 && (
+              <>
+                <span>
+                  {p.doneCount}/{p.taskCount}
+                </span>
+                <span className="text-gray-700">({pct}%)</span>
+              </>
+            )}
+            {p.taskCount === 0 && <span>{p.phaseCount} phases</span>}
+            <span className="text-gray-700 ml-auto">
+              {formatRelative(p.modifiedAt)}
+            </span>
+          </div>
+        </Link>
+      </TouchTarget>
+    </li>
+  );
+});
+
 /// NavLink's default `end` matches only on exact equality, which would
 /// drop the highlight when a plan is open — explicit matcher keeps it
 /// lit across the whole plans subtree.

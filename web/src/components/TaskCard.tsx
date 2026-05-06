@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { memo, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import type { PlanTask } from "../stores/plan-store.js";
 import { postJson, putJson, deleteJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
@@ -15,6 +16,7 @@ import { TouchTarget } from "./ui/TouchTarget.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
+import { useCompletedTasks } from "../lib/plan-context.js";
 
 interface Props {
   task: PlanTask;
@@ -62,13 +64,34 @@ function authStatusLabel(auth: AuthStatus | undefined): string {
   }
 }
 
-export function TaskCard({ task, planName, phaseNumber }: Props) {
+function TaskCardInner({ task, planName, phaseNumber }: Props) {
   const [starting, setStarting] = useState(false);
   const [checking, setChecking] = useState(false);
   const [fixingCi, setFixingCi] = useState(false);
   const [agentId, setAgentId] = useState<string | null>(null);
   const [merging, setMerging] = useState(false);
-  const agents = useAgentStore((s) => s.agents);
+  // Narrow agents subscription: pick out the two rows this task actually
+  // cares about (the running one for the lock + click-to-open behaviour,
+  // and the completed-with-branch one for the merge banner). `useShallow`
+  // shallow-compares the returned object's keys, so unrelated agent
+  // updates that don't change either reference don't re-render this card.
+  // Audit §10 minor: pre-fix every TaskCard re-rendered on every agent
+  // store update because they all subscribed to `s.agents` directly.
+  const { branchAgent, runningAgent } = useAgentStore(
+    useShallow((s) => {
+      let branch: import("../stores/agent-store.js").Agent | undefined;
+      let running: import("../stores/agent-store.js").Agent | undefined;
+      for (const a of s.agents) {
+        if (a.plan_name !== planName || a.task_id !== task.number) continue;
+        if (a.status === "running" || a.status === "starting") {
+          if (!running) running = a;
+        } else if (a.branch) {
+          if (!branch) branch = a;
+        }
+      }
+      return { branchAgent: branch, runningAgent: running };
+    }),
+  );
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const goToAgent = useGoToAgent();
   const mergeAgentBranch = useAgentStore((s) => s.mergeAgentBranch);
@@ -76,15 +99,6 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const [discarding, setDiscarding] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
-  // Find a completed agent with an unmerged branch for this task
-  const branchAgent = agents.find(
-    (a) =>
-      a.plan_name === planName &&
-      a.task_id === task.number &&
-      a.branch &&
-      a.status !== "running" &&
-      a.status !== "starting"
-  );
   // undefined/true → show Merge; false → hide Merge (task not expected to produce a commit)
   const canMerge = task.producesCommit !== false;
   // Task is locked while any agent for it is running/starting (possibly
@@ -92,12 +106,6 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   // `agentId` state alone). Locked tasks hide the driver selector and
   // disable Check/Start/Continue/Retry so the user can't trigger duplicate
   // work or swap drivers mid-run. Kill/Finish stay available.
-  const runningAgent = agents.find(
-    (a) =>
-      a.plan_name === planName &&
-      a.task_id === task.number &&
-      (a.status === "running" || a.status === "starting")
-  );
   const taskLocked = !!runningAgent;
   const plan = usePlanStore((s) => s.selectedPlan);
   const selectPlan = usePlanStore((s) => s.selectPlan);
@@ -137,12 +145,10 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const cfg = statusConfig[status] ?? statusConfig.pending;
 
   // Dependency gate: any declared dep not completed/skipped blocks Start.
-  const completedSet = new Set<string>(
-    (plan?.phases ?? [])
-      .flatMap((p) => p.tasks)
-      .filter((t) => t.status === "completed" || t.status === "skipped")
-      .map((t) => t.number)
-  );
+  // The plan-wide done/skipped Set is built once at PlanBoard and shared
+  // via `CompletedTasksContext` (audit §10 minor) — pre-fix every card
+  // rebuilt the Set over every task in the plan on every render.
+  const completedSet = useCompletedTasks();
   const unmetDeps = (task.dependencies ?? []).filter((d) => !completedSet.has(d));
   const blocked = unmetDeps.length > 0;
 
@@ -721,3 +727,11 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
     </div>
   );
 }
+
+/// Wrapped with `memo` so an unrelated agent-store update — once the
+/// useShallow selector inside `TaskCardInner` short-circuits — doesn't
+/// re-render every card on the board. Re-renders are gated on the props
+/// `task` / `planName` / `phaseNumber` and on the live store
+/// subscriptions inside the inner component (which are now narrow).
+/// Audit §10 minor.
+export const TaskCard = memo(TaskCardInner);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { PlanPhase, PlanTask } from "../stores/plan-store.js";
 import { postJson } from "../api.js";
@@ -157,7 +157,7 @@ function TaskGrid(props: VirtualizedTaskGridProps) {
   );
 }
 
-export function PhaseCard({ phase, planName, statusFilter }: Props) {
+function PhaseCardInner({ phase, planName, statusFilter }: Props) {
   const total = phase.tasks.length;
   const done = phase.tasks.filter(
     (t) => t.status === "completed" || t.status === "skipped"
@@ -332,3 +332,9 @@ export function PhaseCard({ phase, planName, statusFilter }: Props) {
     </div>
   );
 }
+
+/// Wrapped with `memo` so a re-render of `PlanBoard` (e.g. a status-filter
+/// toggle that doesn't change `phase`) doesn't fan out to every phase.
+/// Re-renders are gated on the props `phase` / `planName` / `statusFilter`.
+/// Audit §10 minor.
+export const PhaseCard = memo(PhaseCardInner);

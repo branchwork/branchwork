@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   usePlanStore,
   type ParsedPlan,
@@ -18,6 +18,7 @@ import { TouchTarget } from "./ui/TouchTarget.js";
 import { toastError } from "../lib/toast.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
 import { StaleDataChip } from "./StaleDataChip.js";
+import { CompletedTasksContext } from "../lib/plan-context.js";
 
 export function PlanBoard() {
   const plan = usePlanStore((s) => s.selectedPlan);
@@ -42,6 +43,22 @@ export function PlanBoard() {
   const goToAgent = useGoToAgent();
 
   const isMd = plan?.filePath?.endsWith(".md") ?? false;
+
+  // Plan-wide set of completed/skipped task numbers. Computed once per
+  // `plan` ref change and passed to descendants via `CompletedTasksContext`,
+  // so each TaskCard's dependency-gate check is O(deps) instead of every
+  // card rebuilding a fresh Set over every task in the plan (audit §10
+  // minor). `useMemo` is hoisted above the early returns so React's hook
+  // order stays stable across renders.
+  const completedSet = useMemo<ReadonlySet<string>>(() => {
+    if (!plan) return new Set<string>();
+    return new Set<string>(
+      plan.phases
+        .flatMap((p) => p.tasks)
+        .filter((t) => t.status === "completed" || t.status === "skipped")
+        .map((t) => t.number),
+    );
+  }, [plan]);
 
   if (loading) {
     return (
@@ -315,12 +332,18 @@ export function PlanBoard() {
         ))}
       </div>
 
-      {/* Phase cards -- vertical layout */}
-      <div className="space-y-3 pb-4">
-        {plan.phases.map((phase) => (
-          <PhaseCard key={phase.number} phase={phase} planName={plan.name} statusFilter={statusFilter} />
-        ))}
-      </div>
+      {/* Phase cards -- vertical layout. The CompletedTasksContext
+          provider hoists the plan-wide done/skipped Set to a single
+          allocation per plan render (audit §10 minor): every TaskCard
+          dependency-gate check reads from this Set instead of rebuilding
+          its own. */}
+      <CompletedTasksContext.Provider value={completedSet}>
+        <div className="space-y-3 pb-4">
+          {plan.phases.map((phase) => (
+            <PhaseCard key={phase.number} phase={phase} planName={plan.name} statusFilter={statusFilter} />
+          ))}
+        </div>
+      </CompletedTasksContext.Provider>
 
       <VerificationSection verification={plan.verification ?? null} />
     </div>
