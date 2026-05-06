@@ -285,7 +285,19 @@ const RunnerDrivers = v.object({
   }),
 });
 
+/// Transport-level hello sent once by the server immediately after
+/// the WS upgrade succeeds (see `server-rs/src/ws.rs:30-42`). Not a
+/// domain event — no broadcast catalogue entry, no DB row, no UI
+/// reaction beyond optionally reading `timestamp` for clock-skew
+/// telemetry. Listed here so the validator stops flagging it as
+/// malformed; ws-store treats it as a no-op.
+const Connected = v.object({
+  type: v.literal("connected"),
+  timestamp: v.string(),
+});
+
 export const WsMessageSchema = v.variant("type", [
+  Connected,
   PlanUpdated,
   PlanDeleted,
   AgentStarted,
