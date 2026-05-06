@@ -69,10 +69,12 @@ export function AgentTree() {
         >
           <div className="flex items-center gap-2">
             <span
+              aria-hidden="true"
               className={`w-2 h-2 rounded-full flex-shrink-0 ${
                 statusDot[agent.status] ?? "bg-gray-600"
               }`}
             />
+            <span className="sr-only">Status: {agent.status}</span>
             <span className="text-sm font-medium truncate">
               {agent.plan_name
                 ? `Task ${agent.task_id}`
@@ -170,7 +172,9 @@ export function AgentTree() {
 
       {agents.length === 0 ? (
         <div className="text-center py-12">
-          <div className="text-4xl mb-3 text-gray-700">&#9881;</div>
+          <div aria-hidden="true" className="text-4xl mb-3 text-gray-700">
+            &#9881;
+          </div>
           <p className="text-gray-500">No agents yet</p>
           <p className="text-xs text-gray-600 mt-1">
             Start a task from the Plan Board or wait for hook events

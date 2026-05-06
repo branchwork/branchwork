@@ -7,6 +7,7 @@ import {
   screen,
 } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
+import axe from "axe-core";
 import { Sidebar } from "./Sidebar.js";
 import { useUiStore } from "../stores/ui-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
@@ -104,6 +105,75 @@ describe("Sidebar", () => {
     const backdrop = screen.getByTestId("sidebar-backdrop");
     fireEvent.click(backdrop);
     expect(useUiStore.getState().sidebarOpen).toBe(false);
+  });
+
+  it("dismiss-warning button has an accessible name", () => {
+    usePlanStore.setState({
+      warnings: [
+        {
+          name: "broken-plan",
+          file: "broken-plan.yaml",
+          error: "yaml syntax error",
+          timestamp: Date.now(),
+        },
+      ],
+    });
+    renderSidebar();
+    // Sidebar starts closed (aria-hidden). Opening it makes the warning
+    // banner reachable to RTL's role-based queries.
+    act(() => {
+      useUiStore.getState().openSidebar();
+    });
+    const btn = screen.getByRole("button", {
+      name: "Dismiss broken-plan.yaml warning",
+    });
+    expect(btn.tagName).toBe("BUTTON");
+  });
+
+  it("Admin link's accessible name omits the gear glyph", () => {
+    renderSidebar();
+    act(() => {
+      useUiStore.getState().openSidebar();
+    });
+    // The visible text is "⚙ Admin", but the gear is wrapped in
+    // aria-hidden so screen readers read just "Admin".
+    const link = screen.getByRole("link", { name: "Admin" });
+    expect(link.getAttribute("href")).toBe("/admin");
+  });
+
+  it("axe-core reports zero icon-button-name violations on the rendered sidebar", async () => {
+    usePlanStore.setState({
+      plans: [
+        {
+          name: "alpha",
+          title: "Alpha plan",
+          project: "branchwork",
+          phaseCount: 1,
+          taskCount: 0,
+          doneCount: 0,
+          createdAt: new Date().toISOString(),
+          modifiedAt: new Date().toISOString(),
+        },
+      ],
+      warnings: [
+        {
+          name: "broken-plan",
+          file: "broken-plan.yaml",
+          error: "yaml syntax error",
+          timestamp: Date.now(),
+        },
+      ],
+    });
+    const { container } = renderSidebar();
+    act(() => {
+      useUiStore.getState().openSidebar();
+    });
+    const results = await axe.run(container, {
+      runOnly: { type: "tag", values: ["wcag2a", "wcag2aa"] },
+      // jsdom has no layout — color-contrast is not checkable here.
+      rules: { "color-contrast": { enabled: false } },
+    });
+    expect(results.violations).toEqual([]);
   });
 
   it("auto-closes the sidebar on route change", () => {

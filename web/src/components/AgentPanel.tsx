@@ -52,10 +52,12 @@ export function AgentPanel() {
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span
+              aria-hidden="true"
               className={`w-2 h-2 rounded-full flex-shrink-0 ${
                 isActive ? "bg-emerald-500 animate-pulse" : agent.status === "completed" ? "bg-emerald-500" : "bg-red-500"
               }`}
             />
+            <span className="sr-only">Status: {agent.status}</span>
             <span className="text-sm font-medium truncate">
               {agent.task_id ? `Task ${agent.task_id}` : agent.id.slice(0, 8)}
             </span>

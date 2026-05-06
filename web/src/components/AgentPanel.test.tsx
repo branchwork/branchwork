@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { DiffView } from "./AgentPanel.js";
-import { useAgentStore, type AgentDiff } from "../stores/agent-store.js";
+import axe from "axe-core";
+import { MemoryRouter } from "react-router-dom";
+import { AgentPanel, DiffView } from "./AgentPanel.js";
+import { useAgentStore, type Agent, type AgentDiff } from "../stores/agent-store.js";
+import { usePlanStore } from "../stores/plan-store.js";
+import { useSettingsStore } from "../stores/settings-store.js";
 
 const AGENT_ID = "agent-1";
 
@@ -134,6 +138,51 @@ describe("AgentPanel DiffView merge dropdown", () => {
     expect(mergeAgentBranch).not.toHaveBeenCalled();
   });
 
+  it("animated header status dot exposes its state to screen readers via sr-only", () => {
+    const agent: Agent = {
+      id: AGENT_ID,
+      session_id: "sess-1",
+      pid: null,
+      parent_agent_id: null,
+      plan_name: null,
+      task_id: null,
+      cwd: "/tmp/wd",
+      status: "running",
+      // Non-pty avoids mounting xterm in jsdom — this test is about the
+      // header dot's accessible name, not the terminal.
+      mode: "stream-json",
+      prompt: null,
+      started_at: new Date().toISOString(),
+      finished_at: null,
+      last_tool: null,
+      last_activity_at: null,
+      base_commit: null,
+      branch: null,
+      source_branch: null,
+      cost_usd: null,
+      driver: "claude",
+    };
+    useAgentStore.setState({
+      agents: [agent],
+      selectedAgentId: AGENT_ID,
+      agentOutput: { [AGENT_ID]: [] },
+      fetchAgentOutput: vi.fn().mockResolvedValue(undefined),
+    });
+    usePlanStore.setState({ plans: [] });
+    useSettingsStore.setState({ drivers: [] });
+
+    render(
+      <MemoryRouter>
+        <AgentPanel />
+      </MemoryRouter>
+    );
+    // sr-only span sits next to the colour-only dot so SRs announce
+    // the running state. The visible status text further along the
+    // row is fine; this is the assertion that color-only conveyance
+    // got a text equivalent.
+    expect(screen.getByText(/Status:\s*running/i)).toBeTruthy();
+  });
+
   it("default click (no dropdown interaction) calls mergeAgentBranch with no target", async () => {
     const targets: MergeTargets = {
       default: "master",
@@ -158,5 +207,26 @@ describe("AgentPanel DiffView merge dropdown", () => {
     // No dropdown interaction → selectedTarget remains null → second arg is undefined.
     // The agent-store turns undefined target into a `{}` body in the POST call.
     expect(mergeAgentBranch).toHaveBeenCalledWith(AGENT_ID, undefined);
+  });
+
+  it("axe-core reports zero icon-button-name violations on the diff footer", async () => {
+    const targets: MergeTargets = {
+      default: "master",
+      available: ["feature/x"],
+    };
+    const fetchMergeTargets = vi.fn().mockResolvedValue(targets);
+    seedStore({ fetchMergeTargets, mergeAgentBranch });
+
+    const { container } = renderDiffView();
+    // Wait for the footer's main merge button to render so axe sees
+    // the chevron + dropdown alongside it.
+    await screen.findByRole("button", { name: /Merge into master/ });
+
+    const results = await axe.run(container, {
+      runOnly: { type: "tag", values: ["wcag2a", "wcag2aa"] },
+      // jsdom has no layout — color-contrast is not checkable here.
+      rules: { "color-contrast": { enabled: false } },
+    });
+    expect(results.violations).toEqual([]);
   });
 });

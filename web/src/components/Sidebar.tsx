@@ -101,7 +101,11 @@ export function Sidebar() {
             title={p.title}
           >
             <div className="truncate flex items-center gap-1.5">
-              {dimmed && <span className="text-emerald-600 text-[10px]">&#10003;</span>}
+              {dimmed && (
+                <span aria-hidden="true" className="text-emerald-600 text-[10px]">
+                  &#10003;
+                </span>
+              )}
               <span className="truncate">{p.title}</span>
             </div>
             <div className="text-[9px] font-mono text-gray-700 truncate">{p.name}</div>
@@ -232,7 +236,7 @@ export function Sidebar() {
             }`
           }
         >
-          ⚙ Admin
+          <span aria-hidden="true">⚙ </span>Admin
         </NavLink>
       </div>
 
@@ -269,9 +273,10 @@ export function Sidebar() {
                   </span>
                   <button
                     onClick={() => dismissWarning(w.name)}
+                    aria-label={`Dismiss ${w.name}.yaml warning`}
                     className="text-gray-600 hover:text-gray-400 flex-shrink-0"
                   >
-                    x
+                    <span aria-hidden="true">x</span>
                   </button>
                 </div>
                 <p className="text-amber-500/70 text-[10px] mt-0.5 line-clamp-2">
@@ -285,6 +290,7 @@ export function Sidebar() {
           <div key={project} className="mb-3">
             <h3 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider px-2 mb-1 flex items-center gap-1.5">
               <span
+                aria-hidden="true"
                 className={`w-1.5 h-1.5 rounded-full ${
                   project === "Unassigned" ? "bg-gray-600" : "bg-indigo-500"
                 }`}
@@ -309,10 +315,12 @@ export function Sidebar() {
                   }
                   className="w-full text-left px-2 py-1 text-[10px] text-gray-600 hover:text-gray-400 transition flex items-center gap-1"
                 >
-                  <span className="text-[8px]">
+                  <span aria-hidden="true" className="text-[8px]">
                     {showDone[project] ? "▼" : "▶"}
                   </span>
-                  <span className="text-emerald-700">&#10003;</span>
+                  <span aria-hidden="true" className="text-emerald-700">
+                    &#10003;
+                  </span>
                   {done.length} completed plan{done.length !== 1 ? "s" : ""}
                 </button>
                 {showDone[project] && (
