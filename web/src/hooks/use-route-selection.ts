@@ -2,7 +2,6 @@ import { useCallback } from "react";
 import {
   useLocation,
   useNavigate,
-  useParams,
   useSearchParams,
 } from "react-router-dom";
 
@@ -15,23 +14,49 @@ import {
 ///
 /// The admin section comes from /admin/:section?, populated only when
 /// the AdminPage route picks up a sub-section.
+///
+/// Implementation note: this hook is called from `RouteSync` and
+/// `AgentRail`, both of which sit OUTSIDE the `<Routes>` element in
+/// `App.tsx` — RouteSync as a sibling to the Routes (so its effect
+/// fires regardless of which route is active), AgentRail as the right
+/// rail next to whichever main route is rendered. In react-router v6
+/// `useParams()` returns `{}` when called outside a matched `<Route>`,
+/// so we cannot use it here. Instead we read `useLocation().pathname`
+/// (always available) and pattern-match the prefixes ourselves. The
+/// regexes match exactly the routes declared in App.tsx.
+const PLAN_PATH_RE = /^\/plans\/([^/]+)\/?$/;
+const AGENT_PATH_RE = /^\/agents\/([^/]+)\/?$/;
+const ADMIN_PATH_RE = /^\/admin\/([^/]+)\/?$/;
+
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    // Malformed % escapes shouldn't crash the dashboard. Fall back to
+    // the raw segment — useParams takes the same defensive stance.
+    return s;
+  }
+}
+
 export function useRouteSelection(): {
   routePlanName: string | undefined;
   routeAgentId: string | null;
   adminSection: string | undefined;
 } {
-  const params = useParams<{
-    planName?: string;
-    agentId?: string;
-    section?: string;
-  }>();
+  const { pathname } = useLocation();
   const [searchParams] = useSearchParams();
   const overlayAgent = searchParams.get("agent");
-  return {
-    routePlanName: params.planName,
-    routeAgentId: params.agentId ?? overlayAgent ?? null,
-    adminSection: params.section,
-  };
+
+  const planMatch = PLAN_PATH_RE.exec(pathname);
+  const agentMatch = AGENT_PATH_RE.exec(pathname);
+  const adminMatch = ADMIN_PATH_RE.exec(pathname);
+
+  const routePlanName = planMatch ? safeDecode(planMatch[1]) : undefined;
+  const pathAgentId = agentMatch ? safeDecode(agentMatch[1]) : null;
+  const routeAgentId = pathAgentId ?? overlayAgent ?? null;
+  const adminSection = adminMatch ? safeDecode(adminMatch[1]) : undefined;
+
+  return { routePlanName, routeAgentId, adminSection };
 }
 
 /// Returns a navigation helper that updates the `?agent=<id>` overlay
