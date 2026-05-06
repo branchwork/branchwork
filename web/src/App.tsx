@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
+import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { usePlanStore } from "./stores/plan-store.js";
 import { useAgentStore } from "./stores/agent-store.js";
 import { useWsStore } from "./stores/ws-store.js";
@@ -14,18 +15,15 @@ import { AuditLog } from "./components/AuditLog.js";
 import { ArchivePanel } from "./components/ArchivePanel.js";
 import { LoginPage } from "./components/LoginPage.js";
 import { AdminPage } from "./components/AdminPage.js";
+import { RunnersPage } from "./components/RunnersPage.js";
 import { Toaster } from "./components/Toaster.js";
-
-type View = "plans" | "agents" | "new-plan" | "audit" | "archive" | "admin";
+import { useRouteSelection } from "./hooks/use-route-selection.js";
 
 export function App() {
-  const [view, setView] = useState<View>("plans");
   const connected = useWsStore((s) => s.connected);
   const connect = useWsStore((s) => s.connect);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
-  const selectedPlan = usePlanStore((s) => s.selectedPlan);
   const fetchAgents = useAgentStore((s) => s.fetchAgents);
-  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
 
   const fetchSettings = useSettingsStore((s) => s.fetchSettings);
   const fetchDrivers = useSettingsStore((s) => s.fetchDrivers);
@@ -78,28 +76,29 @@ export function App() {
 
   return (
     <div className="flex h-screen bg-gray-950 text-gray-100">
-      <Sidebar
-        view={view}
-        onViewChange={setView}
-      />
+      <RouteSync />
+      <Sidebar />
 
       <main className="flex-1 flex overflow-hidden">
         <div className="flex-1 overflow-auto">
-          {view === "plans" && (selectedPlan ? <PlanBoard /> : <ProjectDashboard />)}
-          {view === "agents" && <AgentTree />}
-          {view === "audit" && <AuditLog />}
-          {view === "archive" && <ArchivePanel />}
-          {view === "admin" && <AdminPage />}
-          {view === "new-plan" && (
-            <NewPlanForm onClose={() => setView("plans")} />
-          )}
+          <Routes>
+            <Route path="/" element={<ProjectDashboard />} />
+            <Route path="/plans" element={<ProjectDashboard />} />
+            <Route path="/plans/:planName" element={<PlanBoard />} />
+            <Route path="/agents" element={<AgentTree />} />
+            <Route path="/agents/:agentId" element={<AgentTree />} />
+            <Route path="/audit" element={<AuditLog />} />
+            <Route path="/archive" element={<ArchivePanel />} />
+            <Route path="/admin" element={<AdminPage />} />
+            <Route path="/admin/:section" element={<AdminPage />} />
+            <Route path="/runners" element={<RunnersPage />} />
+            <Route path="/new-plan" element={<NewPlanRoute />} />
+            <Route path="/login" element={<Navigate to="/" replace />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
         </div>
 
-        {selectedAgentId && (
-          <div className="w-[600px] border-l border-gray-800 h-full">
-            <AgentPanel />
-          </div>
-        )}
+        <AgentRail />
       </main>
 
       <Toaster />
@@ -125,4 +124,60 @@ export function App() {
       </div>
     </div>
   );
+}
+
+/// One-way URL → store sync. After 1.1 the URL is the source of truth
+/// for selected plan / agent; this component watches the route and
+/// pushes the resolved id into the store so existing components that
+/// still read `selectedPlan` / `selectedAgentId` keep rendering. The
+/// reverse direction (store → URL) is driven by Link / navigate at the
+/// click site, not here, so we never get into a feedback loop.
+function RouteSync() {
+  const { routePlanName, routeAgentId } = useRouteSelection();
+  const selectPlan = usePlanStore((s) => s.selectPlan);
+  const clearSelectedPlan = usePlanStore((s) => s.clearSelectedPlan);
+  const selectedPlanName = usePlanStore((s) => s.selectedPlan?.name ?? null);
+  const selectAgent = useAgentStore((s) => s.selectAgent);
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
+
+  useEffect(() => {
+    if (routePlanName) {
+      if (routePlanName !== selectedPlanName) {
+        selectPlan(routePlanName).catch(() => {});
+      }
+    } else if (selectedPlanName) {
+      clearSelectedPlan();
+    }
+  }, [routePlanName, selectedPlanName]);
+
+  useEffect(() => {
+    const next = routeAgentId ?? null;
+    if (next !== selectedAgentId) {
+      selectAgent(next);
+    }
+  }, [routeAgentId, selectedAgentId]);
+
+  return null;
+}
+
+/// Right-rail AgentPanel mounts only when an agent id sits in the URL,
+/// either as the deep-link path /agents/:agentId or as the cross-route
+/// `?agent=<id>` overlay. Keeps today's behaviour where the agent
+/// panel can sit beside any main view (notably PlanBoard).
+function AgentRail() {
+  const { routeAgentId } = useRouteSelection();
+  if (!routeAgentId) return null;
+  return (
+    <div className="w-[600px] border-l border-gray-800 h-full">
+      <AgentPanel />
+    </div>
+  );
+}
+
+/// /new-plan renders the modal and routes back to /plans on close.
+/// Wraps the existing NewPlanForm prop so its onClose contract stays
+/// router-agnostic — tests still drive it with a plain callback.
+function NewPlanRoute() {
+  const navigate = useNavigate();
+  return <NewPlanForm onClose={() => navigate("/plans")} />;
 }

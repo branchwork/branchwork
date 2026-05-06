@@ -6,6 +6,7 @@ import { formatRelative } from "../lib/time.js";
 import { httpErrorBody } from "../lib/error.js";
 import { toastError } from "../lib/toast.js";
 import { Button } from "./ui/Button.js";
+import { useGoToAgent } from "../hooks/use-route-selection.js";
 
 interface Folder {
   name: string;
@@ -43,6 +44,7 @@ export function NewPlanForm({ onClose }: Props) {
   const [confirmCreate, setConfirmCreate] = useState<string | null>(null);
   const [runnerStatus, setRunnerStatus] = useState<RunnerStatus | null>(null);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+  const goToAgent = useGoToAgent();
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
 
   useEffect(() => {
@@ -93,6 +95,7 @@ export function NewPlanForm({ onClose }: Props) {
       );
 
       selectAgent(res.agentId);
+      goToAgent(res.agentId);
       // Plan will appear via file watcher once the agent writes it
       setTimeout(() => fetchPlans(), 5000);
       setTimeout(() => fetchPlans(), 15000);

@@ -12,6 +12,7 @@ import { EditableText } from "./EditableText.js";
 import { Button } from "./ui/Button.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
+import { useGoToAgent } from "../hooks/use-route-selection.js";
 
 interface Props {
   task: PlanTask;
@@ -68,6 +69,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
   const [merging, setMerging] = useState(false);
   const agents = useAgentStore((s) => s.agents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+  const goToAgent = useGoToAgent();
   const mergeAgentBranch = useAgentStore((s) => s.mergeAgentBranch);
   const discardAgentBranch = useAgentStore((s) => s.discardAgentBranch);
   const [discarding, setDiscarding] = useState(false);
@@ -160,6 +162,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       });
       setAgentId(res.agentId);
       selectAgent(res.agentId);
+      goToAgent(res.agentId);
       await updateStatus("in_progress");
     } catch (e) {
       toastError(e, "Start failed");
@@ -177,6 +180,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       );
       setAgentId(res.agentId);
       selectAgent(res.agentId);
+      goToAgent(res.agentId);
       // Refresh plan after a delay to pick up the result
       setTimeout(() => selectPlan(planName), 3000);
       setTimeout(() => selectPlan(planName), 10000);
@@ -203,6 +207,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
       );
       setAgentId(res.agentId);
       selectAgent(res.agentId);
+      goToAgent(res.agentId);
     } catch (e) {
       toastError(e, "Fix CI failed");
     } finally {
@@ -245,6 +250,7 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
           return;
         }
         selectAgent(runningAgent.id);
+        goToAgent(runningAgent.id);
       }
     : undefined;
 
@@ -537,7 +543,10 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
 
           {agentId && (
             <button
-              onClick={() => selectAgent(agentId)}
+              onClick={() => {
+                selectAgent(agentId);
+                goToAgent(agentId);
+              }}
               className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition"
             >
               View

@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   fireEvent,
-  render,
   screen,
   waitFor,
 } from "@testing-library/react";
+import { renderWithRouter as render } from "../test-helpers/render.js";
 import axe from "axe-core";
 import { BulkDeleteModal } from "./BulkDeleteModal.js";
 import { usePlanStore } from "../stores/plan-store.js";

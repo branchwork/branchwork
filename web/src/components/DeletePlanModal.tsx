@@ -6,6 +6,7 @@ import {
 } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { errorMessage } from "../lib/error.js";
+import { useGoToAgent } from "../hooks/use-route-selection.js";
 
 interface DeletePlanModalProps {
   planName: string;
@@ -121,6 +122,7 @@ export function DeletePlanModal({
   const deletePlan = usePlanStore((s) => s.deletePlan);
   const previewDeletePlan = usePlanStore((s) => s.previewDeletePlan);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+  const goToAgent = useGoToAgent();
 
   // Kick off the dry-run preview on open. The cascade is independent
   // of soft/hard (both flush the same DB rows; only the file action
@@ -285,6 +287,7 @@ export function DeletePlanModal({
 
   function onAgentClick(id: string) {
     selectAgent(id);
+    goToAgent(id);
     onClose();
   }
 

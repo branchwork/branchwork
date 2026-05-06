@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, screen } from "@testing-library/react";
+import { renderWithRouter as render } from "../test-helpers/render.js";
 import { TaskCard } from "./TaskCard.js";
 import {
   usePlanStore,

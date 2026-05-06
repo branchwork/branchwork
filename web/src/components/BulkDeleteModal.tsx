@@ -3,6 +3,7 @@ import { HttpError } from "../api.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { errorMessage } from "../lib/error.js";
+import { useGoToAgent } from "../hooks/use-route-selection.js";
 
 interface BulkDeleteModalProps {
   planNames: string[];
@@ -85,6 +86,7 @@ export function BulkDeleteModal({
 
   const deletePlan = usePlanStore((s) => s.deletePlan);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+  const goToAgent = useGoToAgent();
 
   useEffect(() => {
     triggerRef.current = (document.activeElement as HTMLElement | null) ?? null;
@@ -235,6 +237,7 @@ export function BulkDeleteModal({
 
   function onAgentClick(id: string) {
     selectAgent(id);
+    goToAgent(id);
     onClose();
   }
 

@@ -11,6 +11,7 @@ import {
   parseStreamJsonLine,
   parseVerdictJson,
 } from "../schemas/stream-json.js";
+import { useGoToAgent } from "../hooks/use-route-selection.js";
 
 type Tab = "output" | "diff";
 
@@ -20,6 +21,7 @@ export function AgentPanel() {
   const killAgent = useAgentStore((s) => s.killAgent);
   const finishAgent = useAgentStore((s) => s.finishAgent);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+  const goToAgent = useGoToAgent();
   const plans = usePlanStore((s) => s.plans);
   const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
 
@@ -95,7 +97,10 @@ export function AgentPanel() {
             </>
           )}
           <button
-            onClick={() => selectAgent(null)}
+            onClick={() => {
+              selectAgent(null);
+              goToAgent(null);
+            }}
             className="px-2 py-1 text-xs text-gray-500 hover:text-gray-300 rounded transition"
           >
             Close

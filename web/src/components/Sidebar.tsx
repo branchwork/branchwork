@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link, NavLink, useLocation } from "react-router-dom";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
@@ -7,18 +8,10 @@ import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
 import { isPlanDone } from "../lib/predicates.js";
 
-interface Props {
-  view: "plans" | "agents" | "new-plan" | "audit" | "archive" | "admin";
-  onViewChange: (
-    v: "plans" | "agents" | "new-plan" | "audit" | "archive" | "admin",
-  ) => void;
-}
-
-export function Sidebar({ view, onViewChange }: Props) {
+export function Sidebar() {
   const plans = usePlanStore((s) => s.plans);
   const selectedPlan = usePlanStore((s) => s.selectedPlan);
   const selectPlan = usePlanStore((s) => s.selectPlan);
-  const clearSelectedPlan = usePlanStore((s) => s.clearSelectedPlan);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const warnings = usePlanStore((s) => s.warnings);
   const dismissWarning = usePlanStore((s) => s.dismissWarning);
@@ -77,12 +70,13 @@ export function Sidebar({ view, onViewChange }: Props) {
 
   function renderPlanItem(p: PlanSummary, dimmed = false) {
     const pct = p.taskCount > 0 ? Math.round((p.doneCount / p.taskCount) * 100) : 0;
+    const isSelected = selectedPlan?.name === p.name;
     return (
       <li key={p.name}>
-        <button
-          onClick={() => selectPlan(p.name)}
-          className={`w-full text-left px-2 py-1.5 rounded text-sm transition ${
-            selectedPlan?.name === p.name
+        <Link
+          to={`/plans/${p.name}`}
+          className={`block w-full text-left px-2 py-1.5 rounded text-sm transition ${
+            isSelected
               ? "bg-gray-800 text-white"
               : dimmed
               ? "text-gray-600 hover:text-gray-400 hover:bg-gray-800/50"
@@ -105,7 +99,7 @@ export function Sidebar({ view, onViewChange }: Props) {
             {p.taskCount === 0 && <span>{p.phaseCount} phases</span>}
             <span className="text-gray-700 ml-auto">{formatRelative(p.modifiedAt)}</span>
           </div>
-        </button>
+        </Link>
       </li>
     );
   }
@@ -113,39 +107,29 @@ export function Sidebar({ view, onViewChange }: Props) {
   return (
     <aside className="w-64 bg-gray-900 border-r border-gray-800 flex flex-col">
       {/* Logo — click to return to project dashboard */}
-      <button
-        onClick={() => {
-          clearSelectedPlan();
-          onViewChange("plans");
-        }}
-        className="p-4 border-b border-gray-800 text-left hover:bg-gray-800/30 transition"
+      <Link
+        to="/"
+        className="p-4 border-b border-gray-800 text-left hover:bg-gray-800/30 transition block"
         title="Back to project dashboard"
       >
         <h1 className="text-lg font-bold tracking-tight">
           Branch<span className="text-indigo-400">work</span>
         </h1>
         <p className="text-xs text-gray-500 mt-0.5">Claude Code Dashboard</p>
-      </button>
+      </Link>
 
       {/* Nav */}
       <nav className="p-2 flex gap-1">
-        <button
-          onClick={() => onViewChange("plans")}
-          className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition ${
-            view === "plans"
-              ? "bg-indigo-600 text-white"
-              : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
-          }`}
-        >
-          Plans
-        </button>
-        <button
-          onClick={() => onViewChange("agents")}
-          className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition relative ${
-            view === "agents"
-              ? "bg-indigo-600 text-white"
-              : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
-          }`}
+        <PlansNavLink />
+        <NavLink
+          to="/agents"
+          className={({ isActive }) =>
+            `flex-1 px-2 py-1.5 rounded text-xs font-medium transition relative text-center ${
+              isActive
+                ? "bg-indigo-600 text-white"
+                : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+            }`
+          }
         >
           Agents
           {activeCount > 0 && (
@@ -153,28 +137,32 @@ export function Sidebar({ view, onViewChange }: Props) {
               {activeCount}
             </span>
           )}
-        </button>
-        <button
-          onClick={() => onViewChange("audit")}
-          className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition ${
-            view === "audit"
-              ? "bg-indigo-600 text-white"
-              : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
-          }`}
+        </NavLink>
+        <NavLink
+          to="/audit"
+          className={({ isActive }) =>
+            `flex-1 px-2 py-1.5 rounded text-xs font-medium transition text-center ${
+              isActive
+                ? "bg-indigo-600 text-white"
+                : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+            }`
+          }
         >
           Activity
-        </button>
-        <button
-          onClick={() => onViewChange("archive")}
-          className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition ${
-            view === "archive"
-              ? "bg-indigo-600 text-white"
-              : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
-          }`}
+        </NavLink>
+        <NavLink
+          to="/archive"
           title="Soft-deleted plans pending retention"
+          className={({ isActive }) =>
+            `flex-1 px-2 py-1.5 rounded text-xs font-medium transition text-center ${
+              isActive
+                ? "bg-indigo-600 text-white"
+                : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+            }`
+          }
         >
           Archive
-        </button>
+        </NavLink>
       </nav>
 
       {/* Global actions */}
@@ -188,16 +176,7 @@ export function Sidebar({ view, onViewChange }: Props) {
             {convertingAll ? "Converting..." : "Convert All to YAML"}
           </button>
         )}
-        <button
-          onClick={() => onViewChange("new-plan")}
-          className={`w-full px-3 py-1.5 text-xs border rounded transition ${hasMdPlans ? "mt-1" : ""} ${
-            view === "new-plan"
-              ? "bg-indigo-600 border-indigo-600 text-white"
-              : "bg-gray-800 border-gray-700 hover:border-indigo-600 hover:text-indigo-400 text-gray-400"
-          }`}
-        >
-          + New Plan
-        </button>
+        <NewPlanLink hasMdPlans={hasMdPlans} />
       </div>
 
       {/* Effort level */}
@@ -208,16 +187,18 @@ export function Sidebar({ view, onViewChange }: Props) {
 
       {/* Admin link */}
       <div className="px-2 pb-2">
-        <button
-          onClick={() => onViewChange("admin")}
-          className={`w-full text-left px-2 py-1 text-[10px] rounded transition ${
-            view === "admin"
-              ? "bg-gray-800 text-indigo-400"
-              : "text-gray-600 hover:text-gray-300 hover:bg-gray-800/50"
-          }`}
+        <NavLink
+          to="/admin"
+          className={({ isActive }) =>
+            `block w-full text-left px-2 py-1 text-[10px] rounded transition ${
+              isActive
+                ? "bg-gray-800 text-indigo-400"
+                : "text-gray-600 hover:text-gray-300 hover:bg-gray-800/50"
+            }`
+          }
         >
           ⚙ Admin
-        </button>
+        </NavLink>
       </div>
 
       {/* Search */}
@@ -287,7 +268,7 @@ export function Sidebar({ view, onViewChange }: Props) {
                   className="w-full text-left px-2 py-1 text-[10px] text-gray-600 hover:text-gray-400 transition flex items-center gap-1"
                 >
                   <span className="text-[8px]">
-                    {showDone[project] ? "\u25BC" : "\u25B6"}
+                    {showDone[project] ? "▼" : "▶"}
                   </span>
                   <span className="text-emerald-700">&#10003;</span>
                   {done.length} completed plan{done.length !== 1 ? "s" : ""}
@@ -303,6 +284,45 @@ export function Sidebar({ view, onViewChange }: Props) {
         ))}
       </div>
     </aside>
+  );
+}
+
+/// "Plans" highlights for both `/` and `/plans/...` (any plan board).
+/// NavLink's default `end` matches only on exact equality, which would
+/// drop the highlight when a plan is open — explicit matcher keeps it
+/// lit across the whole plans subtree.
+function PlansNavLink() {
+  const location = useLocation();
+  const isActive =
+    location.pathname === "/" || location.pathname.startsWith("/plans");
+  return (
+    <Link
+      to="/"
+      className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition text-center ${
+        isActive
+          ? "bg-indigo-600 text-white"
+          : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+      }`}
+    >
+      Plans
+    </Link>
+  );
+}
+
+function NewPlanLink({ hasMdPlans }: { hasMdPlans: boolean }) {
+  return (
+    <NavLink
+      to="/new-plan"
+      className={({ isActive }) =>
+        `block w-full text-center px-3 py-1.5 text-xs border rounded transition ${hasMdPlans ? "mt-1" : ""} ${
+          isActive
+            ? "bg-indigo-600 border-indigo-600 text-white"
+            : "bg-gray-800 border-gray-700 hover:border-indigo-600 hover:text-indigo-400 text-gray-400"
+        }`
+      }
+    >
+      + New Plan
+    </NavLink>
   );
 }
 

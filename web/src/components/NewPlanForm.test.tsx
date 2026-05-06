@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { renderWithRouter as render } from "../test-helpers/render.js";
 import { NewPlanForm } from "./NewPlanForm.js";
 import { useToastStore } from "../stores/toast-store.js";
 

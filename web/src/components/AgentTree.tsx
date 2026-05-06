@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
+import { useRouteSelection } from "../hooks/use-route-selection.js";
 
 export function AgentTree() {
   const agents = useAgentStore((s) => s.agents);
@@ -9,8 +11,8 @@ export function AgentTree() {
   const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
   const planTitles = new Map(plans.map((p) => [p.name, p.title]));
   const fetchAgents = useAgentStore((s) => s.fetchAgents);
-  const selectAgent = useAgentStore((s) => s.selectAgent);
-  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
+  const { routeAgentId } = useRouteSelection();
+  const selectedAgentId = routeAgentId;
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const [planFilter, setPlanFilter] = useState<string | null>(null);
 
@@ -56,9 +58,9 @@ export function AgentTree() {
 
     return (
       <div key={agent.id} style={{ paddingLeft: depth * 20 }}>
-        <button
-          onClick={() => selectAgent(agent.id)}
-          className={`w-full text-left p-3 rounded-md border transition mb-1 ${
+        <Link
+          to={`/agents/${agent.id}`}
+          className={`block w-full text-left p-3 rounded-md border transition mb-1 ${
             isSelected
               ? "bg-gray-800 border-indigo-600"
               : "bg-gray-900 border-gray-800 hover:border-gray-700"
@@ -101,7 +103,7 @@ export function AgentTree() {
               {agent.cwd}
             </div>
           </div>
-        </button>
+        </Link>
 
         {children.map((child) => renderAgent(child, depth + 1))}
       </div>

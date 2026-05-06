@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, screen } from "@testing-library/react";
+import { renderWithRouter as render } from "../test-helpers/render.js";
 import { UncommittedWorkBanner } from "./PlanBoard.js";
 import { usePlanStore, type PlanConfig } from "../stores/plan-store.js";
 import { useAgentStore, type Agent } from "../stores/agent-store.js";

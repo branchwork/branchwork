@@ -15,6 +15,7 @@ import { DeletePlanModal } from "./DeletePlanModal.js";
 import { Button } from "./ui/Button.js";
 import { Modal } from "./ui/Modal.js";
 import { toastError } from "../lib/toast.js";
+import { useGoToAgent } from "../hooks/use-route-selection.js";
 
 export function PlanBoard() {
   const plan = usePlanStore((s) => s.selectedPlan);
@@ -36,6 +37,7 @@ export function PlanBoard() {
   const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
   const agents = useAgentStore((s) => s.agents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+  const goToAgent = useGoToAgent();
 
   const isMd = plan?.filePath?.endsWith(".md") ?? false;
 
@@ -94,6 +96,7 @@ export function PlanBoard() {
         {},
       );
       selectAgent(res.agentId);
+      goToAgent(res.agentId);
     } catch (e) {
       toastError(e, "Check Plan failed");
     } finally {
@@ -205,7 +208,10 @@ export function PlanBoard() {
             agents={agents}
             checkingPlan={checkingPlan}
             onCheck={handleCheckPlan}
-            onViewAgent={selectAgent}
+            onViewAgent={(id) => {
+              selectAgent(id);
+              goToAgent(id);
+            }}
           />
           <button
             onClick={() => setConfirmCheckAll(true)}
@@ -890,6 +896,7 @@ export function UncommittedWorkBanner({ planName }: { planName: string }) {
   const config = usePlanStore((s) => s.planConfigs[planName] ?? null);
   const agents = useAgentStore((s) => s.agents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
+  const goToAgent = useGoToAgent();
 
   if (config?.pausedReason !== "agent_left_uncommitted_work") return null;
 
@@ -926,7 +933,11 @@ export function UncommittedWorkBanner({ planName }: { planName: string }) {
       </div>
       <button
         type="button"
-        onClick={() => runningAgent && selectAgent(runningAgent.id)}
+        onClick={() => {
+          if (!runningAgent) return;
+          selectAgent(runningAgent.id);
+          goToAgent(runningAgent.id);
+        }}
         disabled={!runningAgent}
         className="flex-shrink-0 self-center rounded border border-red-700/60 bg-red-900/40 px-3 py-1 text-xs text-red-100 transition hover:bg-red-800/50 hover:text-white disabled:opacity-50 disabled:hover:bg-red-900/40 disabled:hover:text-red-100"
         title={

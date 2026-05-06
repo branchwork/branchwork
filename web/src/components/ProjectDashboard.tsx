@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
@@ -648,9 +649,13 @@ function PlanRow({
   }
 
   return (
-    <button onClick={onClick} className={`${rowBase} ${dimmedClass}`}>
+    <Link
+      to={`/plans/${plan.name}`}
+      onClick={onClick}
+      className={`${rowBase} ${dimmedClass} block`}
+    >
       {inner}
-    </button>
+    </Link>
   );
 }
 
