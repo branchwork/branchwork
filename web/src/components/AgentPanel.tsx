@@ -3,7 +3,12 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
-import { useAgentStore, type AgentOutputLine, type AgentDiff } from "../stores/agent-store.js";
+import {
+  MAX_OUTPUT_LINES,
+  useAgentStore,
+  type AgentOutputLine,
+  type AgentDiff,
+} from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { toastError } from "../lib/toast.js";
@@ -37,6 +42,15 @@ export function AgentPanel() {
   const isPty = agent?.mode === "pty";
   const isActive = agent?.status === "running" || agent?.status === "starting";
   const hasBaseCommit = !!agent?.base_commit;
+
+  // Stream-json agents render from `agentOutput[id]` which is ring-buffered
+  // at MAX_OUTPUT_LINES (audit §10). Surface the cap once the user is
+  // actually looking at a truncated buffer so they know the older transcript
+  // is on disk, not lost.
+  const outputCount = useAgentStore(
+    (s) => (selectedAgentId ? s.agentOutput[selectedAgentId]?.length ?? 0 : 0),
+  );
+  const bufferAtCap = !isPty && outputCount >= MAX_OUTPUT_LINES;
 
   // Reset to output tab when switching agents
   useEffect(() => {
@@ -78,6 +92,14 @@ export function AgentPanel() {
           {agent.branch && (
             <div className="text-[10px] text-indigo-500/70 font-mono truncate">
               {agent.branch}
+            </div>
+          )}
+          {bufferAtCap && (
+            <div
+              className="text-[10px] text-gray-600"
+              title="Older lines are dropped from memory; the on-disk transcript is authoritative."
+            >
+              Showing last {MAX_OUTPUT_LINES.toLocaleString()} lines
             </div>
           )}
         </div>

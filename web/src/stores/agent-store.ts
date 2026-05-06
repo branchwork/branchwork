@@ -40,6 +40,17 @@ export interface AgentOutputLine {
   timestamp: string;
 }
 
+/// Per-agent cap on `agentOutput[id]`. Prevents unbounded memory growth
+/// for long-running stream-json agents — every WS `agent_output` frame
+/// pushed beyond this drops the oldest line (ring-buffer eviction).
+/// Audit §10 (major): pre-fix, a chatty agent could push the renderer
+/// past 100k lines and turn the panel into molasses.
+///
+/// Surface this in the panel header ("Showing last 5000 lines") so the
+/// user knows scrollback isn't infinite — the on-disk transcript is
+/// authoritative; the in-memory buffer is just for live rendering.
+export const MAX_OUTPUT_LINES = 5000;
+
 interface AgentStore {
   agents: Agent[];
   selectedAgentId: string | null;
@@ -224,12 +235,22 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
     })),
 
   appendOutput: (agentId, line) =>
-    set((s) => ({
-      agentOutput: {
-        ...s.agentOutput,
-        [agentId]: [...(s.agentOutput[agentId] ?? []), line],
-      },
-    })),
+    set((s) => {
+      const existing = s.agentOutput[agentId] ?? [];
+      // Ring-buffer eviction: when we'd exceed the cap, drop oldest entries
+      // so the new line slots into a fixed-length window. Bounds per-push
+      // allocation at O(MAX_OUTPUT_LINES) regardless of total throughput.
+      const next =
+        existing.length < MAX_OUTPUT_LINES
+          ? [...existing, line]
+          : [
+              ...existing.slice(existing.length - MAX_OUTPUT_LINES + 1),
+              line,
+            ];
+      return {
+        agentOutput: { ...s.agentOutput, [agentId]: next },
+      };
+    }),
 
   reset: () => {
     inFlightAgentsFetch = null;
