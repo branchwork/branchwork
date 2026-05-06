@@ -10,6 +10,7 @@ import {
 } from "../stores/settings-store.js";
 import { EditableText } from "./EditableText.js";
 import { Button } from "./ui/Button.js";
+import { TouchTarget } from "./ui/TouchTarget.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
@@ -412,21 +413,23 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
                     </button>
                   )}
                   {dismissable && ciRunId != null && (
-                    <button
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        try {
-                          await deleteJson(`/api/ci/${ciRunId}`);
-                          await selectPlan(planName);
-                        } catch (err) {
-                          toastError(err, "Dismiss CI failed");
-                        }
-                      }}
-                      className="ml-0.5 text-[10px] text-gray-500 hover:text-gray-300 hover:bg-gray-800/60 px-1 rounded transition"
-                      title="Dismiss this CI result — won't affect future runs"
-                    >
-                      &#x2715;
-                    </button>
+                    <TouchTarget>
+                      <button
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          try {
+                            await deleteJson(`/api/ci/${ciRunId}`);
+                            await selectPlan(planName);
+                          } catch (err) {
+                            toastError(err, "Dismiss CI failed");
+                          }
+                        }}
+                        className="ml-0.5 text-[10px] text-gray-500 hover:text-gray-300 hover:bg-gray-800/60 px-1 rounded transition"
+                        title="Dismiss this CI result — won't affect future runs"
+                      >
+                        &#x2715;
+                      </button>
+                    </TouchTarget>
                   )}
                 </span>
               );
@@ -451,23 +454,25 @@ export function TaskCard({ task, planName, phaseNumber }: Props) {
           {drivers.length > 1 &&
             !agentId &&
             (status === "pending" || status === "in_progress" || status === "failed") && (
-              <select
-                value={driver}
-                onChange={(e) => setDriver(e.target.value)}
-                disabled={taskLocked}
-                className="text-[10px] bg-gray-800 border border-gray-700 text-gray-300 rounded px-1 py-0.5 focus:outline-none focus:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed"
-                title={
-                  taskLocked
-                    ? "Agent running — wait for it to finish"
-                    : "Agent driver to use when starting this task"
-                }
-              >
-                {drivers.map((d) => (
-                  <option key={d.name} value={d.name}>
-                    {d.name}
-                  </option>
-                ))}
-              </select>
+              <TouchTarget>
+                <select
+                  value={driver}
+                  onChange={(e) => setDriver(e.target.value)}
+                  disabled={taskLocked}
+                  className="text-[10px] bg-gray-800 border border-gray-700 text-gray-300 rounded px-1 py-0.5 focus:outline-none focus:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title={
+                    taskLocked
+                      ? "Agent running — wait for it to finish"
+                      : "Agent driver to use when starting this task"
+                  }
+                >
+                  {drivers.map((d) => (
+                    <option key={d.name} value={d.name}>
+                      {d.name}
+                    </option>
+                  ))}
+                </select>
+              </TouchTarget>
             )}
           {/* Check button — always available except while an agent is running */}
           <button

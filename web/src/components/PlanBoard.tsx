@@ -14,6 +14,7 @@ import { EditableText } from "./EditableText.js";
 import { DeletePlanModal } from "./DeletePlanModal.js";
 import { Button } from "./ui/Button.js";
 import { Modal } from "./ui/Modal.js";
+import { TouchTarget } from "./ui/TouchTarget.js";
 import { toastError } from "../lib/toast.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
 import { StaleDataChip } from "./StaleDataChip.js";
@@ -297,17 +298,18 @@ export function PlanBoard() {
           { value: "completed", label: "Done", color: "text-emerald-400" },
           { value: "failed", label: "Failed", color: "text-red-400" },
         ].map((f) => (
-          <button
-            key={f.value ?? "all"}
-            onClick={() => setStatusFilter(f.value)}
-            className={`px-2 py-0.5 text-[10px] rounded transition ${
-              statusFilter === f.value
-                ? `${f.color ?? "text-gray-200"} bg-gray-800 font-semibold`
-                : "text-gray-600 hover:text-gray-400"
-            }`}
-          >
-            {f.label}
-          </button>
+          <TouchTarget key={f.value ?? "all"}>
+            <button
+              onClick={() => setStatusFilter(f.value)}
+              className={`px-2 py-0.5 text-[10px] rounded transition ${
+                statusFilter === f.value
+                  ? `${f.color ?? "text-gray-200"} bg-gray-800 font-semibold`
+                  : "text-gray-600 hover:text-gray-400"
+              }`}
+            >
+              {f.label}
+            </button>
+          </TouchTarget>
         ))}
       </div>
 

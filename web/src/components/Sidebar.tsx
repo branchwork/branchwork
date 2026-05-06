@@ -10,6 +10,7 @@ import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
 import { isPlanDone } from "../lib/predicates.js";
 import { StaleDataChip } from "./StaleDataChip.js";
+import { TouchTarget } from "./ui/TouchTarget.js";
 
 export function Sidebar() {
   const plans = usePlanStore((s) => s.plans);
@@ -87,33 +88,35 @@ export function Sidebar() {
     const isSelected = selectedPlan?.name === p.name;
     return (
       <li key={p.name}>
-        <Link
-          to={`/plans/${p.name}`}
-          className={`block w-full text-left px-2 py-1.5 rounded text-sm transition ${
-            isSelected
-              ? "bg-gray-800 text-white"
-              : dimmed
-              ? "text-gray-600 hover:text-gray-400 hover:bg-gray-800/50"
-              : "text-gray-400 hover:text-gray-200 hover:bg-gray-800/50"
-          }`}
-          title={p.title}
-        >
-          <div className="truncate flex items-center gap-1.5">
-            {dimmed && <span className="text-emerald-600 text-[10px]">&#10003;</span>}
-            <span className="truncate">{p.title}</span>
-          </div>
-          <div className="text-[9px] font-mono text-gray-700 truncate">{p.name}</div>
-          <div className="text-[10px] text-gray-600 flex items-center gap-1">
-            {p.taskCount > 0 && (
-              <>
-                <span>{p.doneCount}/{p.taskCount}</span>
-                <span className="text-gray-700">({pct}%)</span>
-              </>
-            )}
-            {p.taskCount === 0 && <span>{p.phaseCount} phases</span>}
-            <span className="text-gray-700 ml-auto">{formatRelative(p.modifiedAt)}</span>
-          </div>
-        </Link>
+        <TouchTarget>
+          <Link
+            to={`/plans/${p.name}`}
+            className={`block w-full text-left px-2 py-1.5 rounded text-sm transition ${
+              isSelected
+                ? "bg-gray-800 text-white"
+                : dimmed
+                ? "text-gray-600 hover:text-gray-400 hover:bg-gray-800/50"
+                : "text-gray-400 hover:text-gray-200 hover:bg-gray-800/50"
+            }`}
+            title={p.title}
+          >
+            <div className="truncate flex items-center gap-1.5">
+              {dimmed && <span className="text-emerald-600 text-[10px]">&#10003;</span>}
+              <span className="truncate">{p.title}</span>
+            </div>
+            <div className="text-[9px] font-mono text-gray-700 truncate">{p.name}</div>
+            <div className="text-[10px] text-gray-600 flex items-center gap-1">
+              {p.taskCount > 0 && (
+                <>
+                  <span>{p.doneCount}/{p.taskCount}</span>
+                  <span className="text-gray-700">({pct}%)</span>
+                </>
+              )}
+              {p.taskCount === 0 && <span>{p.phaseCount} phases</span>}
+              <span className="text-gray-700 ml-auto">{formatRelative(p.modifiedAt)}</span>
+            </div>
+          </Link>
+        </TouchTarget>
       </li>
     );
   }
