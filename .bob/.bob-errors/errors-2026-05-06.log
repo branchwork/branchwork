@@ -1,0 +1,22 @@
+
+================================================================================
+ERROR LOGGED: 2026-05-06T21:48:50.260Z
+User ID: Cyril.Poder@ibm.com
+================================================================================
+Error Name: Error
+Error Message: Path validation failed: Attempted path "/home/cpo" resolves outside the allowed workspace directories: /home/cpo/branchwork
+
+Stack Trace:
+Error: Path validation failed: Attempted path "/home/cpo" resolves outside the allowed workspace directories: /home/cpo/branchwork
+    at yYn (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2269:35601)
+    at t.validateToolParams (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2272:3845)
+    at t.build (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:378:62268)
+    at t.buildInvocation (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:3372)
+    at file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:5220
+    at Array.map (<anonymous>)
+    at t._schedule (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:4907)
+    at file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:4237
+    at cR (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:800:17196)
+    at t.schedule (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:3781)
+================================================================================
+

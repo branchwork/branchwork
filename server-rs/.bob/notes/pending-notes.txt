@@ -1,0 +1,8 @@
+{"id":"bfa17775-400b-47ca-a2eb-c89f625f6a01","ts":"2026-05-06T22:15:36.883Z","path":"/home/cpo/branchwork/server-rs/wmcicd/.gitignore","version":"1.0.0","taskID":"5fa1d3fc-b52f-4dd0-a748-de8c1a75122a"}
+{"id":"6cbfd556-b880-43e4-bebb-e71c5bbd1e79","ts":"2026-05-06T22:15:43.525Z","path":"/home/cpo/branchwork/server-rs/wmcicd/.gitattributes","version":"1.0.0","taskID":"5fa1d3fc-b52f-4dd0-a748-de8c1a75122a"}
+{"id":"80799eeb-f813-4a51-9bbb-3b9296099ae6","ts":"2026-05-06T22:15:53.017Z","path":"/home/cpo/branchwork/server-rs/wmcicd/.editorconfig","version":"1.0.0","taskID":"5fa1d3fc-b52f-4dd0-a748-de8c1a75122a"}
+{"id":"451d57e7-a9ad-44d8-9b71-a53e133c5060","ts":"2026-05-06T22:15:59.888Z","path":"/home/cpo/branchwork/server-rs/wmcicd/CODEOWNERS","version":"1.0.0","taskID":"5fa1d3fc-b52f-4dd0-a748-de8c1a75122a"}
+{"id":"f24e57b4-d308-45df-8729-40d076d0dedb","ts":"2026-05-06T22:16:25.002Z","path":"/home/cpo/branchwork/server-rs/wmcicd/README.md","version":"1.0.0","taskID":"5fa1d3fc-b52f-4dd0-a748-de8c1a75122a"}
+{"id":"0c66be6b-efcd-4529-b8a4-d2a3d78f44de","ts":"2026-05-06T22:16:41.947Z","path":"/home/cpo/branchwork/server-rs/wmcicd/docker/base/Dockerfile","version":"1.0.0","taskID":"5fa1d3fc-b52f-4dd0-a748-de8c1a75122a"}
+{"id":"e29b987a-82f8-4044-ac6d-f4411fb8f428","ts":"2026-05-06T22:16:53.730Z","path":"/home/cpo/branchwork/server-rs/wmcicd/docker/service/Dockerfile","version":"1.0.0","taskID":"5fa1d3fc-b52f-4dd0-a748-de8c1a75122a"}
+{"id":"daaf0488-46ce-40f0-aa85-a4b46993dde9","ts":"2026-05-06T22:20:22.458Z","path":"/home/cpo/branchwork/server-rs/wmcicd/versions.env","version":"1.0.0","taskID":"b9fac75d-c1de-4eee-995d-88aac629787f"}

@@ -58,6 +58,8 @@ Ships as a single ~15 MB Rust binary. No Node, no Docker, no daemon to install s
 
 **Supervised sessions, no tmux.** Each interactive agent runs inside a detached supervisor daemon spawned as `branchwork-server session --socket <path>`. The daemon owns the PTY and exposes the session over a Unix socket (Linux/macOS) or named pipe (Windows). PTY output is mirrored to `<socket>.log` so reconnecting clients get the full transcript. No external dependency.
 
+**Bob Shell compatible.** Branchwork exposes an MCP (Model Context Protocol) server that Bob Shell can connect to. Query plans, get task details, update status, and manage your workflow using natural language commands through Bob. See [Bob Shell Integration](docs/bob-shell-integration.md) for setup and usage.
+
 ---
 
 ## Build from source

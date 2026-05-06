@@ -693,6 +693,72 @@ impl AgentDriver for GeminiDriver {
     }
 }
 
+/// Driver for Bob Shell, an AI-powered terminal assistant. Bob uses a
+/// standard REPL interface with a `> ` prompt marker and supports the
+/// Anthropic API for Claude-based interactions.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BobDriver;
+
+impl BobDriver {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl AgentDriver for BobDriver {
+    fn binary(&self) -> &str {
+        "bob"
+    }
+
+    fn spawn_args(&self, opts: &SpawnOpts<'_>) -> Vec<String> {
+        // Bob Shell picks up cwd from the PTY daemon and uses standard
+        // REPL mode. Use --yolo flag to auto-approve all tool actions.
+        let mut cmd = vec![self.binary().to_string()];
+        if opts.skip_permissions {
+            cmd.push("--yolo".to_string());
+        }
+        cmd
+    }
+
+    fn is_ready(&self, output: &[u8]) -> bool {
+        output
+            .windows(GENERIC_REPL_PROMPT_MARKER.len())
+            .any(|w| w == GENERIC_REPL_PROMPT_MARKER)
+    }
+
+    fn parse_cost(&self, _output: &str) -> Option<f64> {
+        // Bob Shell doesn't currently expose cost information in a
+        // parseable format. This can be updated when cost reporting
+        // is added to Bob's output.
+        None
+    }
+
+    fn parse_verdict(&self, output: &str) -> Option<Verdict> {
+        parse_status_json_verdict(output)
+    }
+
+    fn capabilities(&self) -> DriverCapabilities {
+        // Bob Shell operates as an interactive REPL with verdict support
+        // through the standard JSON format. No session-id or cost tracking yet.
+        DriverCapabilities {
+            supports_cost: false,
+            supports_verdict: true,
+            supports_session_id: false,
+            interactive_only: true,
+        }
+    }
+
+    fn auth_status(&self) -> AuthStatus {
+        if !binary_on_path(self.binary()) {
+            return AuthStatus::NotInstalled;
+        }
+        // Bob Shell handles its own authentication internally. If the binary
+        // is installed and accessible, it's ready to use. Report as OAuth
+        // to indicate it's authenticated without exposing any credentials.
+        AuthStatus::Oauth { account: None }
+    }
+}
+
 /// Name that identifies the default driver in the registry and on the
 /// `agents.driver` DB column. Exposed as a constant so API, DB, and UI
 /// layers all agree on the spelling.
@@ -730,6 +796,10 @@ impl DriverRegistry {
         map.insert(
             "gemini".to_string(),
             Arc::new(GeminiDriver::new()) as Arc<dyn AgentDriver>,
+        );
+        map.insert(
+            "bob".to_string(),
+            Arc::new(BobDriver::new()) as Arc<dyn AgentDriver>,
         );
         Self {
             drivers: Arc::new(map),

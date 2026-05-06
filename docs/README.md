@@ -18,6 +18,13 @@ Pages marked _(stub)_ do not exist yet — they are tracked by the
 - [user-guide.md](user-guide.md) — complete walkthrough of the
   dashboard, plan authoring, agent lifecycle, and common workflows.
 
+## Integrations
+
+- [bob-shell-integration.md](bob-shell-integration.md) — Bob Shell
+  integration guide: connect Bob to Branchwork's MCP server, query
+  plans and tasks using natural language, update status, and manage
+  your workflow through Bob's conversational interface.
+
 ## Architecture
 
 The three-binary split, wire protocols, and storage model.
