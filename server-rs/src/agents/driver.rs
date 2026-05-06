@@ -720,6 +720,14 @@ impl AgentDriver for BobDriver {
         cmd
     }
 
+    fn format_prompt(&self, text: &str) -> String {
+        // Bob Shell has a "Shell mode" feature that executes prompts as bash
+        // commands when they match certain patterns. Task prompts that start
+        // with `= 0; ` trigger this behavior, causing syntax errors.
+        // Prefix with a space to ensure Bob treats it as a chat prompt.
+        format!(" {}", text)
+    }
+
     fn is_ready(&self, output: &[u8]) -> bool {
         output
             .windows(GENERIC_REPL_PROMPT_MARKER.len())
