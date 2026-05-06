@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import * as v from "valibot";
 import { fetchJson, HttpError } from "../api.js";
 import { useAuthStore } from "../stores/auth-store.js";
@@ -9,6 +10,38 @@ import { errorMessage } from "../lib/error.js";
 import { toastError } from "../lib/toast.js";
 import { parseWsMessage } from "../schemas/ws-events.js";
 
+/// URL-driven filter state — shareable views.
+///
+/// All filter and search state lives in `?` query params via
+/// `useSearchParams`, NOT component `useState`. Copying the URL
+/// reproduces the filtered view in a new tab. "Reset filters"
+/// clears every recognised key.
+///
+/// Convention for any future filter UI in this app:
+///   1. Read with `searchParams.get("<key>") ?? ""`.
+///   2. Write with `setSearchParams(next, { replace: true })`
+///      so filter typing/selection does not bloat browser history.
+///   3. Reset by deleting the key (or rebuilding the URLSearchParams
+///      without it). Empty string === unset.
+///
+/// Recognised keys here:
+///   - `kind`     — server-side action filter (matches audit row's
+///                  `action`, e.g. `auto_mode.paused`).
+///   - `resource` — server-side resource_type filter (`agent`, `plan`,
+///                  `org`, `task`, `user`, `config`).
+///   - `plan`     — client-side filter against the row's resourceId
+///                  (when resourceType=plan) or `diff.plan`. Applied
+///                  to the current page only — pagination is
+///                  server-side, so cross-page narrowing requires a
+///                  future `plan` parameter on the audit-log API.
+///   - `q`        — client-side substring search across the row
+///                  (action, resourceType/Id, user email, raw diff).
+///                  Same current-page caveat.
+///
+/// Time-range filtering (from/to) follows the same pattern when added:
+/// derive from `searchParams.get("from")` / `"to"`, write back with
+/// `setSearchParams(..., { replace: true })`, document the key here.
+///
 /// Audit-row diff bodies are server-generated JSON whose shape varies
 /// per action. Schema coverage for every action's diff is a v2 concern
 /// (audit §12 — `Agent` / `PlanConfig` / `AuditEntry` redeclarations).
@@ -16,6 +49,8 @@ import { parseWsMessage } from "../schemas/ws-events.js";
 /// renderer's `parsed.<key>` lookups don't blow up on a primitive or
 /// array.
 const DiffObjectSchema = v.record(v.string(), v.unknown());
+
+const FILTER_PARAM_KEYS = ["kind", "resource", "plan", "q"] as const;
 
 interface AuditEntry {
   id: number;
@@ -358,14 +393,53 @@ export function AuditLog() {
   const user = useAuthStore((s) => s.user);
   const orgSlug = user?.orgId ?? "default-org";
   const connected = useWsStore((s) => s.connected);
+  const plans = usePlanStore((s) => s.plans);
 
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
   const [loading, setLoading] = useState(false);
 
-  const [actionFilter, setActionFilter] = useState("");
-  const [resourceFilter, setResourceFilter] = useState("");
+  // Filter state lives in the URL — see top-of-file doc comment for the
+  // recognised keys. `?? ""` so missing-param and empty string both
+  // collapse to "unset" downstream.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const actionFilter = searchParams.get("kind") ?? "";
+  const resourceFilter = searchParams.get("resource") ?? "";
+  const planFilter = searchParams.get("plan") ?? "";
+  const search = searchParams.get("q") ?? "";
+
+  const updateFilter = useCallback(
+    (key: (typeof FILTER_PARAM_KEYS)[number], value: string) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (value) next.set(key, value);
+          else next.delete(key);
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  const clearFilters = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        for (const k of FILTER_PARAM_KEYS) next.delete(k);
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
+
+  const hasActiveFilter =
+    actionFilter !== "" ||
+    resourceFilter !== "" ||
+    planFilter !== "" ||
+    search !== "";
 
   const [exporting, setExporting] = useState(false);
   /// Per-entry state for in-flight Undo POSTs and any diagnostic the
@@ -556,6 +630,42 @@ export function AuditLog() {
   const actionTypes = Object.keys(ACTION_LABELS);
   const resourceTypes = ["agent", "task", "plan", "org", "user", "config"];
 
+  // Client-side narrowing of the current page for `plan` and `q`.
+  // Server already filtered on `kind` (action) and `resource`, so they
+  // do not need to be re-applied here. Pagination is server-side, so
+  // narrowing happens within the page; total count below stays
+  // server-authoritative and a "(N visible)" hint surfaces the gap.
+  const visibleEntries = useMemo(() => {
+    if (!planFilter && !search) return entries;
+    const lcSearch = search.toLowerCase();
+    return entries.filter((e) => {
+      if (planFilter) {
+        const isPlanRow =
+          e.resourceType === "plan" && e.resourceId === planFilter;
+        const parsed = parseDiff(e.diff);
+        const planInDiff =
+          parsed && typeof parsed.plan === "string" && parsed.plan === planFilter;
+        if (!isPlanRow && !planInDiff) return false;
+      }
+      if (search) {
+        const haystack = [
+          e.action,
+          e.resourceType,
+          e.resourceId ?? "",
+          e.userEmail ?? "",
+          ACTION_LABELS[e.action] ?? "",
+          e.diff ?? "",
+        ]
+          .join(" ")
+          .toLowerCase();
+        if (!haystack.includes(lcSearch)) return false;
+      }
+      return true;
+    });
+  }, [entries, planFilter, search]);
+
+  const clientNarrowed = visibleEntries.length !== entries.length;
+
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
@@ -564,14 +674,29 @@ export function AuditLog() {
           <h2 className="text-lg font-semibold text-gray-100">Audit Log</h2>
           <p className="text-xs text-gray-500 mt-0.5">
             {total} event{total !== 1 ? "s" : ""} recorded
+            {clientNarrowed && (
+              <span className="ml-1 text-gray-600">
+                ({visibleEntries.length} visible on this page)
+              </span>
+            )}
           </p>
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Filters */}
+          {/* Filters — values live in the URL (`?kind=…&resource=…&plan=…&q=…`)
+              so the view is shareable. See file-level doc for the contract. */}
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => updateFilter("q", e.target.value)}
+            placeholder="Search…"
+            aria-label="Search audit log"
+            className="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 placeholder:text-gray-600 outline-none focus:border-indigo-600 w-32"
+          />
           <select
             value={actionFilter}
-            onChange={(e) => setActionFilter(e.target.value)}
+            onChange={(e) => updateFilter("kind", e.target.value)}
+            aria-label="Filter by action"
             className="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 outline-none focus:border-indigo-600"
           >
             <option value="">All actions</option>
@@ -583,7 +708,8 @@ export function AuditLog() {
           </select>
           <select
             value={resourceFilter}
-            onChange={(e) => setResourceFilter(e.target.value)}
+            onChange={(e) => updateFilter("resource", e.target.value)}
+            aria-label="Filter by resource"
             className="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 outline-none focus:border-indigo-600"
           >
             <option value="">All resources</option>
@@ -593,6 +719,28 @@ export function AuditLog() {
               </option>
             ))}
           </select>
+          <select
+            value={planFilter}
+            onChange={(e) => updateFilter("plan", e.target.value)}
+            aria-label="Filter by plan"
+            className="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-300 outline-none focus:border-indigo-600 max-w-[180px]"
+          >
+            <option value="">All plans</option>
+            {plans.map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.title || p.name}
+              </option>
+            ))}
+          </select>
+
+          {hasActiveFilter && (
+            <button
+              onClick={clearFilters}
+              className="text-xs px-2 py-1 text-gray-400 hover:text-indigo-400 transition"
+            >
+              Clear
+            </button>
+          )}
 
           <button
             onClick={handleExport}
@@ -610,9 +758,11 @@ export function AuditLog() {
           <div className="flex items-center justify-center h-32 text-gray-600 text-sm">
             Loading...
           </div>
-        ) : entries.length === 0 ? (
+        ) : visibleEntries.length === 0 ? (
           <div className="flex items-center justify-center h-32 text-gray-600 text-sm">
-            No audit entries found.
+            {entries.length === 0
+              ? "No audit entries found."
+              : "No entries match the current filters on this page."}
           </div>
         ) : (
           <table className="w-full text-sm">
@@ -627,7 +777,7 @@ export function AuditLog() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-800/50">
-              {entries.map((e) => (
+              {visibleEntries.map((e) => (
                 <tr
                   key={e.id}
                   className="hover:bg-gray-800/30 transition-colors"

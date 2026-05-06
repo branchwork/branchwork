@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   fireEvent,
-  render,
   screen,
   waitFor,
 } from "@testing-library/react";
@@ -10,6 +9,7 @@ import { AuditLog } from "./AuditLog.js";
 import { useAuthStore } from "../stores/auth-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useWsStore } from "../stores/ws-store.js";
+import { renderWithRouter as render } from "../test-helpers/render.js";
 
 interface MockEntry {
   id: number;
@@ -593,5 +593,218 @@ describe("AuditLog Undo affordance", () => {
     // Button remains so the user can retry after fixing the collision.
     expect(screen.getByRole("button", { name: /Undo/i })).toBeTruthy();
     expect(screen.getByText(/Twin Plan/)).toBeTruthy();
+  });
+});
+
+describe("AuditLog URL-driven filter state", () => {
+  beforeEach(() => {
+    useAuthStore.setState({
+      user: { id: "u1", email: "u@example.com", orgId: "default-org" },
+      loading: false,
+      error: null,
+    });
+    useWsStore.setState({ connected: false } as never);
+    // Plan dropdown reads from plan-store; seed two plans so the
+    // `plan` URL param has a matching <option>.
+    usePlanStore.setState({
+      plans: [
+        {
+          name: "alpha",
+          title: "Alpha",
+          project: null,
+          phaseCount: 0,
+          taskCount: 0,
+          doneCount: 0,
+          createdAt: "",
+          modifiedAt: "",
+        },
+        {
+          name: "beta",
+          title: "Beta",
+          project: null,
+          phaseCount: 0,
+          taskCount: 0,
+          doneCount: 0,
+          createdAt: "",
+          modifiedAt: "",
+        },
+      ],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("reads `kind` from URL and sends it as `action` to the server", async () => {
+    const fetchMock = installFetchMock([
+      entry({
+        id: 60,
+        action: "auto_mode.paused",
+        resourceType: "plan",
+        resourceId: "alpha",
+        diff: JSON.stringify({ plan: "alpha", task: "1.2", reason: "x" }),
+      }),
+    ]);
+
+    render(<AuditLog />, {
+      initialEntries: ["/audit?kind=auto_mode.paused"],
+    });
+
+    // The action <select> reflects the URL value.
+    await waitFor(() => {
+      const sel = screen.getByLabelText(/Filter by action/i) as HTMLSelectElement;
+      expect(sel.value).toBe("auto_mode.paused");
+    });
+    // The fetch went out with `action=auto_mode.paused`.
+    const calls = fetchMock.mock.calls.map((c) => {
+      const input = c[0] as string | URL | Request;
+      return typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.pathname + input.search
+          : input.url;
+    });
+    expect(
+      calls.some((u) => u.includes("/audit-log") && u.includes("action=auto_mode.paused")),
+    ).toBe(true);
+  });
+
+  it("filters by `plan` client-side (matches resourceId or diff.plan)", async () => {
+    installFetchMock([
+      entry({
+        id: 70,
+        action: "plan.create",
+        resourceType: "plan",
+        resourceId: "alpha",
+        diff: JSON.stringify({}),
+      }),
+      entry({
+        id: 71,
+        action: "agent.start",
+        resourceType: "agent",
+        resourceId: "ag-x",
+        diff: JSON.stringify({ plan: "alpha", task: "1.1" }),
+      }),
+      entry({
+        id: 72,
+        action: "plan.create",
+        resourceType: "plan",
+        resourceId: "beta",
+        diff: JSON.stringify({}),
+      }),
+    ]);
+
+    render(<AuditLog />, { initialEntries: ["/audit?plan=alpha"] });
+
+    await waitFor(() => {
+      expect(screen.getByText(/Started agent/i)).toBeTruthy();
+    });
+    // Both alpha rows are visible (one by resourceId, one by diff.plan).
+    expect(screen.getAllByText("alpha").length).toBeGreaterThan(0);
+    // The beta row is filtered out.
+    expect(screen.queryByText("beta")).toBeNull();
+    // Hint surfaces the gap between server total and visible rows.
+    expect(screen.getByText(/visible on this page/i)).toBeTruthy();
+  });
+
+  it("filters by `q` substring across the row", async () => {
+    installFetchMock([
+      entry({
+        id: 80,
+        action: "agent.start",
+        resourceType: "agent",
+        resourceId: "ag-keep",
+        userEmail: "alice@example.com",
+        diff: JSON.stringify({ plan: "p", task: "1.1" }),
+      }),
+      entry({
+        id: 81,
+        action: "agent.start",
+        resourceType: "agent",
+        resourceId: "ag-drop",
+        userEmail: "bob@example.com",
+        diff: JSON.stringify({ plan: "p", task: "1.2" }),
+      }),
+    ]);
+
+    render(<AuditLog />, { initialEntries: ["/audit?q=alice"] });
+
+    await waitFor(() => {
+      expect(screen.getByText("alice@example.com")).toBeTruthy();
+    });
+    expect(screen.queryByText("bob@example.com")).toBeNull();
+  });
+
+  it("Clear button removes every filter param from the URL", async () => {
+    installFetchMock([
+      entry({
+        id: 90,
+        action: "plan.create",
+        resourceType: "plan",
+        resourceId: "alpha",
+        diff: JSON.stringify({ plan: "alpha" }),
+      }),
+    ]);
+
+    render(<AuditLog />, {
+      initialEntries: ["/audit?kind=plan.create&plan=alpha&q=alpha"],
+    });
+
+    const clearBtn = await screen.findByRole("button", { name: /^Clear$/ });
+    fireEvent.click(clearBtn);
+
+    // After clearing, the action filter snaps back to "All actions" and the
+    // search input empties.
+    await waitFor(() => {
+      const sel = screen.getByLabelText(/Filter by action/i) as HTMLSelectElement;
+      expect(sel.value).toBe("");
+    });
+    const q = screen.getByLabelText(/Search audit log/i) as HTMLInputElement;
+    expect(q.value).toBe("");
+    // The Clear button itself disappears once no filter is active.
+    expect(screen.queryByRole("button", { name: /^Clear$/ })).toBeNull();
+  });
+
+  it("typing in search input round-trips through URL state (controlled by useSearchParams)", async () => {
+    installFetchMock([
+      entry({
+        id: 100,
+        action: "agent.start",
+        resourceType: "agent",
+        resourceId: "ag-keep",
+        diff: JSON.stringify({ plan: "p", task: "1.1" }),
+      }),
+      entry({
+        id: 101,
+        action: "agent.start",
+        resourceType: "agent",
+        resourceId: "ag-other",
+        diff: JSON.stringify({ plan: "p", task: "1.2" }),
+      }),
+    ]);
+
+    render(<AuditLog />, { initialEntries: ["/audit"] });
+
+    const q = (await screen.findByLabelText(
+      /Search audit log/i,
+    )) as HTMLInputElement;
+    fireEvent.change(q, { target: { value: "ag-keep" } });
+
+    // The input value comes from `searchParams.get("q") ?? ""`, so it can
+    // only retain the typed value if the change handler wrote it back to
+    // searchParams (i.e. the URL). This proves the round-trip without
+    // depending on MemoryRouter exposing window.location.
+    await waitFor(() => {
+      const after = screen.getByLabelText(
+        /Search audit log/i,
+      ) as HTMLInputElement;
+      expect(after.value).toBe("ag-keep");
+    });
+    // Client-side narrowing kicks in immediately.
+    expect(screen.queryByText("ag-other")).toBeNull();
+    expect(screen.getByText(/visible on this page/i)).toBeTruthy();
   });
 });
