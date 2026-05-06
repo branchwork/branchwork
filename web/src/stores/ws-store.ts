@@ -62,6 +62,48 @@ interface WsStore {
   disconnect: () => void;
 }
 
+type WsEventName = WsMessage["type"];
+
+interface WsSubscription {
+  eventNames: ReadonlySet<WsEventName>;
+  handler: (msg: WsMessage) => void;
+}
+
+/// Module-level subscriber registry. Lives outside the WsStore so its
+/// lifetime is decoupled from the socket: a reconnect tears down + re-
+/// creates the WebSocket, but the subscriber Set is untouched, so
+/// handlers keep firing for the new socket without re-registration.
+///
+/// Audit §4 motivation: components that grabbed `useWsStore.getState()
+/// .socket` and called `addEventListener("message", …)` directly were
+/// bound to a specific socket instance and silently dropped events
+/// after every reconnect — the new socket had no listener until the
+/// component remounted. Routing dispatch through this registry fixes
+/// that without exposing the socket to consumers.
+const wsSubscriptions = new Set<WsSubscription>();
+
+/// Subscribe a handler to one or more WS event types. Returns an
+/// unsubscribe function — call from a `useEffect` cleanup so the
+/// handler is dropped on unmount and unblocks GC of any captured state.
+///
+/// The handler runs AFTER the built-in dispatch switch updates every
+/// store, so subscribers see the same event the rest of the dashboard
+/// just reacted to. Handler exceptions are caught and logged (one
+/// misbehaving subscriber must not break delivery to others).
+export function subscribeToWsEvents<T extends WsEventName>(
+  eventNames: readonly T[],
+  handler: (msg: Extract<WsMessage, { type: T }>) => void,
+): () => void {
+  const sub: WsSubscription = {
+    eventNames: new Set(eventNames),
+    handler: handler as (msg: WsMessage) => void,
+  };
+  wsSubscriptions.add(sub);
+  return () => {
+    wsSubscriptions.delete(sub);
+  };
+}
+
 export const useWsStore = create<WsStore>((set, get) => ({
   connected: false,
   socket: null,
@@ -585,9 +627,10 @@ function dispatch(msg: WsMessage) {
       break;
     }
     case "audit_log":
-      // AuditLog component reads from /api/audit directly + has its own
-      // ws listener (audit §4 cross-listed); the ws-store does not need
-      // to fan out here. Keep the case to mute noFallthroughCasesInSwitch.
+      // No built-in store mutation — AuditLog refetches its own page
+      // via the `subscribeToWsEvents(["audit_log"], …)` API below.
+      // Keeping the case explicit so the switch still discriminates
+      // every WsMessage variant.
       break;
     case "runner_connected":
     case "runner_disconnected":
@@ -595,5 +638,19 @@ function dispatch(msg: WsMessage) {
       // Schemas land in Phase 2; the runner-status UI consumer is
       // wired in Phase 4 alongside the `/runners` page (audit §17).
       break;
+  }
+
+  // Notify external subscribers AFTER the built-in switch so they see
+  // the same event the rest of the dashboard just reacted to.
+  // Subscribers are decoupled from the socket lifecycle (audit §4), so
+  // they survive reconnects without re-registration.
+  for (const sub of wsSubscriptions) {
+    if (sub.eventNames.has(msg.type)) {
+      try {
+        sub.handler(msg);
+      } catch (e) {
+        console.error("[ws] subscriber threw:", e);
+      }
+    }
   }
 }

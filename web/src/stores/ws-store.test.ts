@@ -5,7 +5,11 @@ import {
   type ParsedPlan,
   type PlanSummary,
 } from "./plan-store.js";
-import { handleWsMessage } from "./ws-store.js";
+import {
+  handleWsMessage,
+  subscribeToWsEvents,
+  useWsStore,
+} from "./ws-store.js";
 
 afterEach(() => {
   // Reset zustand stores so seeded state and spies don't leak between
@@ -636,6 +640,132 @@ describe("ws-store handleWsMessage", () => {
       );
 
       vi.unstubAllGlobals();
+    },
+  );
+
+  // Audit §4 acceptance: an external subscriber registered via the
+  // ws-store API must keep receiving events across a reconnect cycle.
+  // Before this refactor, AuditLog grabbed the raw socket and bound a
+  // listener to it; the new socket created on reconnect had no
+  // listener, so audit_log events were silently dropped until the
+  // user remounted the component. Subscribers now live in a module-
+  // level Set decoupled from the WsStore's `socket` field, so
+  // toggling `socket` / `connected` cannot disturb them.
+  it(
+    "subscribeToWsEvents survives a reconnect cycle " +
+      "(audit_log handler keeps firing after socket swap)",
+    () => {
+      const handler = vi.fn();
+      const unsubscribe = subscribeToWsEvents(["audit_log"], handler);
+
+      const auditPayload = (resourceId: string) => ({
+        type: "audit_log" as const,
+        data: {
+          org_id: "default-org",
+          user_email: null,
+          action: "agent.start",
+          resource_type: "agent",
+          resource_id: resourceId,
+        },
+      });
+
+      // First delivery — through the initial "socket".
+      handleWsMessage(auditPayload("ag-1"));
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler.mock.calls[0][0]).toMatchObject({
+        type: "audit_log",
+        data: { resource_id: "ag-1" },
+      });
+
+      // Mimic ws-store reconnect internals: ws.onclose nulls socket
+      // and flips connected=false; ws.onopen later sets a new socket
+      // and connected=true. Subscribers live outside the store, so the
+      // toggle is a no-op for them.
+      useWsStore.setState({ socket: null, connected: false });
+      useWsStore.setState({
+        socket: {} as WebSocket,
+        connected: true,
+      });
+
+      // Delivery through the "new socket" — handler must still fire.
+      handleWsMessage(auditPayload("ag-2"));
+      expect(handler).toHaveBeenCalledTimes(2);
+      expect(handler.mock.calls[1][0]).toMatchObject({
+        type: "audit_log",
+        data: { resource_id: "ag-2" },
+      });
+
+      // Unsubscribe — no further deliveries.
+      unsubscribe();
+      handleWsMessage(auditPayload("ag-3"));
+      expect(handler).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it(
+    "subscribeToWsEvents only invokes the handler for matching event " +
+      "types and ignores everything else",
+    () => {
+      // Stub fetchAgents because the built-in dispatch for
+      // `agent_started` would otherwise hit the real fetch (and bubble
+      // an unhandled rejection out of the store action).
+      useAgentStore.setState({ fetchAgents: vi.fn().mockResolvedValue(undefined) });
+
+      const handler = vi.fn();
+      const unsubscribe = subscribeToWsEvents(["audit_log"], handler);
+
+      // Wrong type — must not fire.
+      handleWsMessage({
+        type: "agent_started",
+        data: {},
+      });
+      expect(handler).not.toHaveBeenCalled();
+
+      // Right type — fires once.
+      handleWsMessage({
+        type: "audit_log",
+        data: {
+          org_id: "default-org",
+          user_email: null,
+          action: "agent.kill",
+          resource_type: "agent",
+          resource_id: "ag-x",
+        },
+      });
+      expect(handler).toHaveBeenCalledTimes(1);
+
+      unsubscribe();
+    },
+  );
+
+  it(
+    "subscribeToWsEvents isolates throwing handlers " +
+      "(other subscribers and built-in dispatch still run)",
+    () => {
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchAgents = vi.fn().mockResolvedValue(undefined);
+      useAgentStore.setState({ fetchAgents });
+
+      const thrower = vi.fn(() => {
+        throw new Error("boom");
+      });
+      const survivor = vi.fn();
+      const unsubA = subscribeToWsEvents(["agent_started"], thrower);
+      const unsubB = subscribeToWsEvents(["agent_started"], survivor);
+
+      handleWsMessage({ type: "agent_started", data: {} });
+
+      expect(thrower).toHaveBeenCalledTimes(1);
+      expect(survivor).toHaveBeenCalledTimes(1);
+      // Built-in dispatch (fetchAgents on agent_started) ran too.
+      expect(fetchAgents).toHaveBeenCalledTimes(1);
+      // The thrown error is swallowed and logged through console.error.
+      expect(error).toHaveBeenCalled();
+      expect(String(error.mock.calls[0][0])).toMatch(/subscriber/);
+
+      unsubA();
+      unsubB();
+      error.mockRestore();
     },
   );
 

@@ -4,11 +4,10 @@ import * as v from "valibot";
 import { fetchJson, HttpError } from "../api.js";
 import { useAuthStore } from "../stores/auth-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
-import { useWsStore } from "../stores/ws-store.js";
+import { subscribeToWsEvents } from "../stores/ws-store.js";
 import { formatTimestamp } from "../lib/time.js";
 import { errorMessage } from "../lib/error.js";
 import { toastError } from "../lib/toast.js";
-import { parseWsMessage } from "../schemas/ws-events.js";
 
 /// URL-driven filter state — shareable views.
 ///
@@ -392,7 +391,6 @@ function UndoCell({
 export function AuditLog() {
   const user = useAuthStore((s) => s.user);
   const orgSlug = user?.orgId ?? "default-org";
-  const connected = useWsStore((s) => s.connected);
   const plans = usePlanStore((s) => s.plans);
 
   const [entries, setEntries] = useState<AuditEntry[]>([]);
@@ -580,22 +578,17 @@ export function AuditLog() {
     fetchLogs(0);
   }, [fetchLogs]);
 
-  // Live refresh: listen for audit_log WS events
+  // Live refresh: subscribe to audit_log via the ws-store. The
+  // subscription survives ws-store reconnects (audit §4), so a dropped
+  // socket no longer leaves the table stale until the user remounts —
+  // the previous direct `socket.addEventListener("message", …)` was
+  // bound to a specific socket instance and silently lost events on
+  // every reconnect.
   useEffect(() => {
-    if (!connected) return;
-    const socket = useWsStore.getState().socket;
-    if (!socket) return;
-
-    const handler = (ev: MessageEvent) => {
-      const parsed = parseWsMessage(ev.data);
-      if (parsed.ok && parsed.value.type === "audit_log") {
-        // Refresh the current page to show the new entry
-        fetchLogs(offset);
-      }
-    };
-    socket.addEventListener("message", handler);
-    return () => socket.removeEventListener("message", handler);
-  }, [connected, offset, fetchLogs]);
+    return subscribeToWsEvents(["audit_log"], () => {
+      fetchLogs(offset);
+    });
+  }, [offset, fetchLogs]);
 
   async function handleExport() {
     setExporting(true);
