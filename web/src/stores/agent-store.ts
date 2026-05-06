@@ -49,6 +49,12 @@ interface AgentStore {
   /// Used by `<EnsureAgents/>` so it can show a loading state on first
   /// nav and only surface "agent not found" once the list is known.
   agentsFetched: boolean;
+  /// ms-since-epoch when the last `fetchAgents()` resolved. ws-store reads
+  /// this to debounce WS-triggered refetches (e.g. an `agent_started` burst
+  /// during plan auto-advance) — refetches scheduled within
+  /// `WS_REFETCH_DEBOUNCE_MS` of the last fetch are skipped because the
+  /// in-flight or just-resolved fetch already carries the new row.
+  lastAgentsFetchedAt: number | null;
   fetchAgents: () => Promise<void>;
   fetchAgentOutput: (agentId: string) => Promise<void>;
   fetchAgentDiff: (agentId: string) => Promise<void>;
@@ -74,16 +80,41 @@ interface AgentStore {
   appendOutput: (agentId: string, line: AgentOutputLine) => void;
 }
 
+/// Module-level handle to the single in-flight `fetchAgents()` round trip.
+/// Coalesces concurrent callers so `agent_started` / `agent_stopped`
+/// bursts during auto-advance don't fan out into N parallel /api/agents
+/// requests racing each other (audit §4). ws-store reads this so it can
+/// `await` the in-flight fetch before applying optimistic patches.
+let inFlightAgentsFetch: Promise<void> | null = null;
+
+/// Read-only accessor for the in-flight fetchAgents promise.
+export function getInFlightAgentsFetch(): Promise<void> | null {
+  return inFlightAgentsFetch;
+}
+
 export const useAgentStore = create<AgentStore>((set, get) => ({
   agents: [],
   selectedAgentId: null,
   agentOutput: {},
   agentDiffs: {},
   agentsFetched: false,
+  lastAgentsFetchedAt: null,
 
-  fetchAgents: async () => {
-    const agents = await fetchJson<Agent[]>("/api/agents");
-    set({ agents, agentsFetched: true });
+  fetchAgents: () => {
+    if (inFlightAgentsFetch) return inFlightAgentsFetch;
+    const promise = (async () => {
+      const agents = await fetchJson<Agent[]>("/api/agents");
+      set({
+        agents,
+        agentsFetched: true,
+        lastAgentsFetchedAt: Date.now(),
+      });
+    })();
+    inFlightAgentsFetch = promise;
+    promise.finally(() => {
+      if (inFlightAgentsFetch === promise) inFlightAgentsFetch = null;
+    });
+    return promise;
   },
 
   fetchAgentOutput: async (agentId: string) => {

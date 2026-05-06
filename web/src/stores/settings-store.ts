@@ -58,6 +58,13 @@ interface SettingsStore {
   loaded: boolean;
   drivers: DriverInfo[];
   defaultDriver: string;
+  /// ms-since-epoch when the last `fetchSettings()` resolved. Mirrors the
+  /// plan-store / agent-store debounce contract so reconnect-driven
+  /// refetches (audit §4: settings + drivers were missed on reconnect)
+  /// can be skipped if a fresh response just landed.
+  lastSettingsFetchedAt: number | null;
+  /// ms-since-epoch when the last `fetchDrivers()` resolved.
+  lastDriversFetchedAt: number | null;
   fetchSettings: () => Promise<void>;
   fetchDrivers: () => Promise<void>;
   setEffort: (level: EffortLevel) => Promise<void>;
@@ -68,6 +75,21 @@ interface SettingsStore {
   driverAuth: (name: string | null | undefined) => AuthStatus | undefined;
 }
 
+/// Module-level handle to the single in-flight `fetchSettings()` round trip.
+/// Coalesces concurrent callers (App.tsx bootstrap + ws-store reconnect)
+/// onto one network request. ws-store also reads this to debounce
+/// reconnect refetches.
+let inFlightSettingsFetch: Promise<void> | null = null;
+let inFlightDriversFetch: Promise<void> | null = null;
+
+export function getInFlightSettingsFetch(): Promise<void> | null {
+  return inFlightSettingsFetch;
+}
+
+export function getInFlightDriversFetch(): Promise<void> | null {
+  return inFlightDriversFetch;
+}
+
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   effort: "high",
   skipPermissions: true,
@@ -76,28 +98,51 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   loaded: false,
   drivers: [],
   defaultDriver: "claude",
+  lastSettingsFetchedAt: null,
+  lastDriversFetchedAt: null,
 
-  fetchSettings: async () => {
-    const data = await fetchJson<{
-      effort: EffortLevel;
-      skip_permissions: boolean;
-      webhook_url: string | null;
-      plan_archive_retention_days?: number;
-    }>("/api/settings");
-    set({
-      effort: data.effort,
-      skipPermissions: data.skip_permissions,
-      webhookUrl: data.webhook_url ?? null,
-      planArchiveRetentionDays: data.plan_archive_retention_days ?? 30,
-      loaded: true,
+  fetchSettings: () => {
+    if (inFlightSettingsFetch) return inFlightSettingsFetch;
+    const promise = (async () => {
+      const data = await fetchJson<{
+        effort: EffortLevel;
+        skip_permissions: boolean;
+        webhook_url: string | null;
+        plan_archive_retention_days?: number;
+      }>("/api/settings");
+      set({
+        effort: data.effort,
+        skipPermissions: data.skip_permissions,
+        webhookUrl: data.webhook_url ?? null,
+        planArchiveRetentionDays: data.plan_archive_retention_days ?? 30,
+        loaded: true,
+        lastSettingsFetchedAt: Date.now(),
+      });
+    })();
+    inFlightSettingsFetch = promise;
+    promise.finally(() => {
+      if (inFlightSettingsFetch === promise) inFlightSettingsFetch = null;
     });
+    return promise;
   },
 
-  fetchDrivers: async () => {
-    const data = await fetchJson<{ drivers: DriverInfo[]; default: string }>(
-      "/api/drivers"
-    );
-    set({ drivers: data.drivers, defaultDriver: data.default });
+  fetchDrivers: () => {
+    if (inFlightDriversFetch) return inFlightDriversFetch;
+    const promise = (async () => {
+      const data = await fetchJson<{ drivers: DriverInfo[]; default: string }>(
+        "/api/drivers"
+      );
+      set({
+        drivers: data.drivers,
+        defaultDriver: data.default,
+        lastDriversFetchedAt: Date.now(),
+      });
+    })();
+    inFlightDriversFetch = promise;
+    promise.finally(() => {
+      if (inFlightDriversFetch === promise) inFlightDriversFetch = null;
+    });
+    return promise;
   },
 
   setEffort: async (level) => {

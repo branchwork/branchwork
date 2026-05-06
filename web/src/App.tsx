@@ -42,13 +42,32 @@ export function App() {
     fetchMe();
   }, [fetchMe]);
 
+  // Bootstrap: await the first fetch of every store BEFORE opening the WS.
+  // Audit §4: previously `connect()` and the four `fetch*()` calls fired
+  // simultaneously, so an early `agent_started` event could fire its own
+  // `fetchAgents()` and race the bootstrap fetch — whichever resolved
+  // second won, sometimes silently dropping fresh rows. Awaiting here
+  // costs ~100–300ms of "first-event latency" but kills the bug class.
+  // Each fetch is wrapped in its own `.catch()` so a single 503 can't
+  // veto WS connection — the store-level error path leaves `*Fetched`
+  // false so the loading shell stays visible, and the next reconnect
+  // refetch reconciles.
   useEffect(() => {
     if (!user) return;
-    connect();
-    fetchPlans().catch(() => {});
-    fetchAgents().catch(() => {});
-    fetchSettings().catch(() => {});
-    fetchDrivers().catch(() => {});
+    let cancelled = false;
+    (async () => {
+      await Promise.allSettled([
+        fetchPlans(),
+        fetchAgents(),
+        fetchSettings(),
+        fetchDrivers(),
+      ]);
+      if (cancelled) return;
+      connect();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [user]);
 
   // Refetch when the tab becomes visible again — covers events missed

@@ -1,10 +1,24 @@
 import { create } from "zustand";
-import { usePlanStore } from "./plan-store.js";
-import { useAgentStore } from "./agent-store.js";
+import {
+  getInFlightPlansFetch,
+  usePlanStore,
+} from "./plan-store.js";
+import {
+  getInFlightAgentsFetch,
+  useAgentStore,
+} from "./agent-store.js";
+import { useSettingsStore } from "./settings-store.js";
 import { parseWsMessage, type WsMessage } from "../schemas/ws-events.js";
 
 const MAX_RECONNECT_DELAY = 30_000;
 const INITIAL_RECONNECT_DELAY = 2_000;
+
+/// Skip a WS-triggered refetch when one resolved within this window. The
+/// in-flight fetch (or the just-resolved fetch) already captured server
+/// state; a second round trip would just race itself. Tuned to be longer
+/// than typical /api/plans latency under load (~hundreds of ms) so back-
+/// to-back WS events collapse to a single fetch.
+const WS_REFETCH_DEBOUNCE_MS = 1_500;
 
 function notificationsSupported(): boolean {
   return typeof window !== "undefined" && "Notification" in window;
@@ -73,9 +87,25 @@ export const useWsStore = create<WsStore>((set, get) => ({
       const wasReconnect = get().reconnectAttempt > 0;
       set({ connected: true, reconnectAttempt: 0 });
       if (wasReconnect) {
-        // Refetch all data — events during the disconnect were lost
-        usePlanStore.getState().fetchPlans();
-        useAgentStore.getState().fetchAgents();
+        // Refetch every cached slice — events during the disconnect were
+        // lost, so without this the dashboard could show a stale agent
+        // status, an outdated webhook URL, or a since-removed driver until
+        // the user navigated.
+        // Audit §4 (minor): settings + drivers + per-plan auto-mode-config
+        // were missed by the original two-call refetch.
+        const planStore = usePlanStore.getState();
+        const settingsStore = useSettingsStore.getState();
+        planStore.fetchPlans().catch(() => {});
+        useAgentStore.getState().fetchAgents().catch(() => {});
+        settingsStore.fetchSettings().catch(() => {});
+        settingsStore.fetchDrivers().catch(() => {});
+        // Per-plan auto-mode-config: only refetch the plans we already
+        // know about (planConfigs is keyed by plans the user has opened
+        // in this session). New plans surface via plan_updated /
+        // plan_created events, which have their own fetch path.
+        for (const planName of Object.keys(planStore.planConfigs)) {
+          planStore.fetchPlanConfig(planName).catch(() => {});
+        }
       }
     };
 
@@ -116,6 +146,52 @@ function scheduleReconnect(get: () => WsStore) {
 
 let planRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
+/// Run `fn` after any in-flight `/api/plans` fetch resolves. With no fetch
+/// in flight, `fn` runs synchronously so existing tests that assert state
+/// immediately after `handleWsMessage(...)` keep working.
+///
+/// Audit §4 race this guards: a slow `/api/plans` response could land
+/// AFTER a WS event arrived and clobber the optimistic patch the handler
+/// applied. Deferring the patch until the response lands flips the order
+/// so the patch is on top — `final state = fetch result + WS patch`.
+function deferBehindPlansFetch(fn: () => void): void {
+  const inFlight = getInFlightPlansFetch();
+  if (!inFlight) {
+    fn();
+    return;
+  }
+  inFlight.then(fn, fn);
+}
+
+/// Same contract as `deferBehindPlansFetch`, but for `/api/agents`. Used
+/// by handlers that mutate the local `agents[]` slice (`updateAgentStatus`,
+/// `clearAgentBranch`) so an overlapping `fetchAgents()` can't clobber
+/// the patch with a stale snapshot.
+function deferBehindAgentsFetch(fn: () => void): void {
+  const inFlight = getInFlightAgentsFetch();
+  if (!inFlight) {
+    fn();
+    return;
+  }
+  inFlight.then(fn, fn);
+}
+
+/// Schedule the debounced `fetchPlans()` refetch shared by `plan_updated`
+/// and `task_status_changed`. At fire time, skip the round-trip when a
+/// fetch is in flight or one resolved within the debounce window — the
+/// optimistic patches we already layered are on top of fetched state, so
+/// a duplicate fetch is wasted bandwidth and another opportunity to race.
+function schedulePlansRefetch(): void {
+  if (planRefreshTimer) clearTimeout(planRefreshTimer);
+  planRefreshTimer = setTimeout(() => {
+    planRefreshTimer = null;
+    if (getInFlightPlansFetch()) return;
+    const last = usePlanStore.getState().lastPlansFetchedAt;
+    if (last !== null && Date.now() - last < WS_REFETCH_DEBOUNCE_MS) return;
+    usePlanStore.getState().fetchPlans().catch(() => {});
+  }, 2000);
+}
+
 // Exported for unit testing. Accepts either a raw JSON string (from
 // `ws.onmessage`) or an already-decoded message object (handy for tests).
 // Validation runs through `parseWsMessage`; malformed payloads are
@@ -136,15 +212,15 @@ function dispatch(msg: WsMessage) {
   switch (msg.type) {
     case "plan_updated": {
       const { plan } = msg.data;
-      if (plan) {
-        planStore.updatePlan(plan as Parameters<typeof planStore.updatePlan>[0]);
-      }
-      // Debounce plan list refresh to avoid flickering
-      if (planRefreshTimer) clearTimeout(planRefreshTimer);
-      planRefreshTimer = setTimeout(() => {
-        planStore.fetchPlans();
-        planRefreshTimer = null;
-      }, 2000);
+      deferBehindPlansFetch(() => {
+        const planStoreNow = usePlanStore.getState();
+        if (plan) {
+          planStoreNow.updatePlan(
+            plan as Parameters<typeof planStoreNow.updatePlan>[0],
+          );
+        }
+        schedulePlansRefetch();
+      });
       break;
     }
     case "plan_deleted": {
@@ -190,11 +266,18 @@ function dispatch(msg: WsMessage) {
         ? lookupTaskTitle(agent.plan_name, agent.task_id)
         : `Agent ${d.id.slice(0, 8)}`;
       notify(`${taskLabel} — ${d.status}`, "Agent finished", `agent-${d.id}`);
-      agentStore.updateAgentStatus(d.id, d.status);
-      // Refetch to pick up fields that may have been updated after initial
-      // insert (branch, cost, base_commit) — ensures the task card's Merge
-      // button shows up immediately when the agent finishes
-      agentStore.fetchAgents();
+      // Defer the patch behind any in-flight fetchAgents — otherwise a slow
+      // /api/agents response could clobber `status` back to running. The
+      // refetch we follow with is coalesced via `getInFlightAgentsFetch`,
+      // so concurrent callers share the same round-trip.
+      deferBehindAgentsFetch(() => {
+        const agentStoreNow = useAgentStore.getState();
+        agentStoreNow.updateAgentStatus(d.id, d.status);
+        // Refetch to pick up fields that may have been updated after initial
+        // insert (branch, cost, base_commit) — ensures the task card's Merge
+        // button shows up immediately when the agent finishes.
+        agentStoreNow.fetchAgents().catch(() => {});
+      });
       break;
     }
     case "agent_branch_merged":
@@ -321,22 +404,31 @@ function dispatch(msg: WsMessage) {
     }
     case "task_checked": {
       const d = msg.data;
-      planStore.patchTaskStatus(d.plan_name, d.task_number, d.status);
+      deferBehindPlansFetch(() => {
+        usePlanStore
+          .getState()
+          .patchTaskStatus(d.plan_name, d.task_number, d.status);
+      });
       break;
     }
     case "plan_checked": {
       const d = msg.data;
-      planStore.patchPlanVerdict(d.plan_name, {
-        verdict: d.verdict,
-        reason: d.reason ?? null,
-        agentId: d.agent_id ?? null,
-        checkedAt: new Date().toISOString(),
-      });
+      // Notification reads only event payload, no store state — fire it
+      // before the deferred patch so the user sees it without waiting on a
+      // possibly-slow in-flight fetch.
       notify(
         `Plan check: ${d.verdict}`,
         d.reason ? `${d.plan_name} — ${d.reason}` : d.plan_name,
         `plan-checked-${d.plan_name}`,
       );
+      deferBehindPlansFetch(() => {
+        usePlanStore.getState().patchPlanVerdict(d.plan_name, {
+          verdict: d.verdict,
+          reason: d.reason ?? null,
+          agentId: d.agent_id ?? null,
+          checkedAt: new Date().toISOString(),
+        });
+      });
       break;
     }
     case "task_status_changed": {
@@ -348,30 +440,26 @@ function dispatch(msg: WsMessage) {
           `task-${d.plan_name}-${d.task_number}`
         );
       }
-      planStore.patchTaskStatus(d.plan_name, d.task_number, d.status);
-      // Debounced authoritative refetch — guarantees convergence to server
-      // truth (doneCount, statuses for non-selected plans, MCP/agent-driven
-      // transitions) even when the signed-delta in patchTaskStatus can't see
-      // the prior value. Shares planRefreshTimer so bursts collapse with
-      // plan_updated events.
-      if (planRefreshTimer) clearTimeout(planRefreshTimer);
-      planRefreshTimer = setTimeout(() => {
-        planStore.fetchPlans();
-        planRefreshTimer = null;
-      }, 2000);
+      // Defer both the optimistic patch AND the debounced refetch behind
+      // any in-flight fetchPlans. Without this, a /api/plans response that
+      // landed AFTER this WS event would clobber the patched `doneCount`
+      // and `selectedPlan.task.status` with the pre-event server snapshot.
+      // See the audit-§4 acceptance test in ws-store.test.ts.
+      deferBehindPlansFetch(() => {
+        usePlanStore
+          .getState()
+          .patchTaskStatus(d.plan_name, d.task_number, d.status);
+        // Authoritative refetch — guarantees convergence to server truth
+        // (doneCount drift on non-selected plans, MCP/agent-driven
+        // transitions) even when the signed-delta in patchTaskStatus
+        // can't see the prior value. Shares planRefreshTimer so bursts
+        // collapse with plan_updated events.
+        schedulePlansRefetch();
+      });
       break;
     }
     case "ci_status_changed": {
       const d = msg.data;
-      planStore.patchTaskCi(d.plan_name, d.task_number, {
-        id: d.id,
-        status: d.status as
-          | "pending" | "running" | "success" | "failure" | "cancelled" | "unknown",
-        conclusion: d.conclusion ?? null,
-        runUrl: d.run_url ?? null,
-        commitSha: d.commit_sha ?? null,
-        updatedAt: new Date().toISOString(),
-      });
       if (d.status === "success" || d.status === "failure") {
         notify(
           `CI ${d.status}: ${lookupTaskTitle(d.plan_name, d.task_number)}`,
@@ -379,6 +467,17 @@ function dispatch(msg: WsMessage) {
           `ci-${d.plan_name}-${d.task_number}`
         );
       }
+      deferBehindPlansFetch(() => {
+        usePlanStore.getState().patchTaskCi(d.plan_name, d.task_number, {
+          id: d.id,
+          status: d.status as
+            | "pending" | "running" | "success" | "failure" | "cancelled" | "unknown",
+          conclusion: d.conclusion ?? null,
+          runUrl: d.run_url ?? null,
+          commitSha: d.commit_sha ?? null,
+          updatedAt: new Date().toISOString(),
+        });
+      });
       break;
     }
     case "plan_warning": {
@@ -422,7 +521,11 @@ function dispatch(msg: WsMessage) {
       // already wrote the row, this just keeps the per-task pill + the
       // ProjectDashboard aggregate in sync without a refetch.
       const d = msg.data;
-      planStore.patchTaskCost(d.plan_name, d.task_number, d.amount_usd);
+      deferBehindPlansFetch(() => {
+        usePlanStore
+          .getState()
+          .patchTaskCost(d.plan_name, d.task_number, d.amount_usd);
+      });
       break;
     }
     case "plan_reset": {
@@ -454,7 +557,9 @@ function dispatch(msg: WsMessage) {
       // user sees it disappear immediately instead of waiting for the
       // next plan refetch.
       const d = msg.data;
-      planStore.clearTaskCi(d.plan_name, d.task_number);
+      deferBehindPlansFetch(() => {
+        usePlanStore.getState().clearTaskCi(d.plan_name, d.task_number);
+      });
       break;
     }
     case "agent_branch_cleared": {
@@ -463,9 +568,11 @@ function dispatch(msg: WsMessage) {
       // (clear-stale-branches admin path), fall back to matching every
       // agent row that points at that branch.
       const d = msg.data;
-      agentStore.clearAgentBranch({
-        agentId: d.agent_id ?? undefined,
-        branch: d.branch,
+      deferBehindAgentsFetch(() => {
+        useAgentStore.getState().clearAgentBranch({
+          agentId: d.agent_id ?? undefined,
+          branch: d.branch,
+        });
       });
       break;
     }

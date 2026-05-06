@@ -8,14 +8,28 @@ import {
 import { handleWsMessage } from "./ws-store.js";
 
 afterEach(() => {
-  // Reset zustand stores so seeded state and spies don't leak between tests.
+  // Reset zustand stores so seeded state and spies don't leak between
+  // tests. Several earlier tests replace store ACTIONS via
+  // `usePlanStore.setState({ fetchPlans: vi.fn() })`; without restoring
+  // them here, later tests that depend on the real coalesce/in-flight
+  // logic would see the spy and silently skip the network round trip.
+  // `getInitialState()` returns the actions defined in `create<...>(...)`
+  // and is the canonical "reset to fresh" entry point in zustand.
+  const planInitial = usePlanStore.getInitialState();
+  const agentInitial = useAgentStore.getInitialState();
   usePlanStore.setState({
     autoModeRuntimes: {},
     toasts: [],
     plans: [],
     selectedPlan: null,
+    fetchPlans: planInitial.fetchPlans,
+    selectPlan: planInitial.selectPlan,
+    patchTaskStatus: planInitial.patchTaskStatus,
   });
-  useAgentStore.setState({ agents: [] });
+  useAgentStore.setState({
+    agents: [],
+    fetchAgents: agentInitial.fetchAgents,
+  });
 });
 
 function makeAgent(overrides: Partial<Agent> = {}): Agent {
@@ -512,5 +526,150 @@ describe("ws-store handleWsMessage", () => {
     expect(warn).not.toHaveBeenCalled();
 
     warn.mockRestore();
+  });
+
+  // Audit §4 acceptance: a slow `/api/plans` response arriving AFTER a
+  // `task_status_changed` event must NOT clobber the WS patch. The handler
+  // defers the patch behind the in-flight fetch so the final state is
+  // "fetch result then WS patch", not "WS patch overwritten by fetch".
+  it(
+    "task_status_changed: WS patch lands on top of in-flight fetchPlans " +
+      "result, not under it (audit §4 race)",
+    async () => {
+      // Server's snapshot at fetch-start time: task 1.1 still pending,
+      // doneCount 0. The fetch resolves AFTER the WS event (at 200ms).
+      // The state change that triggered the WS event happened on the
+      // server but is NOT yet reflected in the fetch response.
+      const fetchedPlans: PlanSummary[] = [
+        {
+          name: "p",
+          title: "P",
+          project: null,
+          phaseCount: 1,
+          taskCount: 1,
+          doneCount: 0,
+          createdAt: "2026-04-12T00:00:00Z",
+          modifiedAt: "2026-04-12T00:00:00Z",
+        },
+      ];
+      const fetchSpy = vi.fn().mockImplementation(async (url: unknown) => {
+        const u = typeof url === "string" ? url : String(url);
+        if (u.endsWith("/api/plans")) {
+          await new Promise((r) => setTimeout(r, 200));
+          return new Response(JSON.stringify(fetchedPlans), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("[]", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      });
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const selectedPlan: ParsedPlan = makePlan({
+        name: "p",
+        phases: [
+          {
+            number: 1,
+            title: "Phase 1",
+            description: "",
+            tasks: [
+              {
+                number: "1.1",
+                title: "Task 1.1",
+                description: "",
+                filePaths: [],
+                acceptance: "",
+                status: "pending",
+              },
+            ],
+          },
+        ],
+      });
+      const initialSummary: PlanSummary = { ...fetchedPlans[0] };
+      usePlanStore.setState({
+        selectedPlan,
+        plans: [initialSummary],
+      });
+
+      // Start the fetch — in flight for 200ms.
+      const fetchPromise = usePlanStore.getState().fetchPlans();
+
+      // 50ms in, fire the WS event. The handler should DEFER the patch
+      // behind the in-flight fetch (no synchronous patch yet).
+      await new Promise((r) => setTimeout(r, 50));
+      handleWsMessage({
+        type: "task_status_changed",
+        data: {
+          plan_name: "p",
+          task_number: "1.1",
+          status: "completed",
+        },
+      });
+
+      // Mid-state assertion: patch has NOT been applied yet because the
+      // fetch is still in flight. (If the patch had run synchronously the
+      // fetch's response would clobber it on resolve.)
+      expect(
+        usePlanStore.getState().selectedPlan!.phases[0].tasks[0].status,
+      ).toBe("pending");
+
+      // Wait for fetch to resolve, then for the deferred .then() callback.
+      await fetchPromise;
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const final = usePlanStore.getState();
+      // `plans[]` was overwritten by the fetch result, then bumped by the
+      // deferred patchTaskStatus's signed delta — doneCount must be 1.
+      // Without deferral: fetch lands AFTER the synchronous patch and resets
+      // doneCount back to 0, even though `selectedPlan.task.status` keeps
+      // the patched "completed" — incoherent state, the bug audit §4
+      // describes.
+      expect(final.plans).toHaveLength(1);
+      expect(final.plans[0].name).toBe("p");
+      expect(final.plans[0].doneCount).toBe(1);
+      expect(final.selectedPlan!.phases[0].tasks[0].status).toBe(
+        "completed",
+      );
+
+      vi.unstubAllGlobals();
+    },
+  );
+
+  // Coalescing: a second `fetchPlans()` call while one is in flight must
+  // share the same network round trip — bootstrap + a WS-driven refetch
+  // must not turn into two parallel /api/plans requests racing each other
+  // (whichever resolves second wins; audit §4).
+  it("fetchPlans coalesces concurrent callers onto one /api/plans request", async () => {
+    let fetchCount = 0;
+    const fetchSpy = vi.fn().mockImplementation(async (url: unknown) => {
+      const u = typeof url === "string" ? url : String(url);
+      if (u.endsWith("/api/plans")) {
+        fetchCount += 1;
+        await new Promise((r) => setTimeout(r, 50));
+        return new Response("[]", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("[]", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const a = usePlanStore.getState().fetchPlans();
+    const b = usePlanStore.getState().fetchPlans();
+    const c = usePlanStore.getState().fetchPlans();
+
+    await Promise.all([a, b, c]);
+    // Single network round trip even though three callers asked.
+    expect(fetchCount).toBe(1);
+
+    vi.unstubAllGlobals();
   });
 });

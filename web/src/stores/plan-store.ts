@@ -213,6 +213,12 @@ interface PlanStore {
   /// surfacing "plan not found" — without it the wrapper can't tell those
   /// two states apart on first nav.
   plansFetched: boolean;
+  /// ms-since-epoch when the last `fetchPlans()` resolved (success or empty
+  /// guard). Read by ws-store to debounce WS-triggered refetches: a refetch
+  /// scheduled within `WS_REFETCH_DEBOUNCE_MS` of the last fetch is skipped
+  /// because the in-flight or just-resolved fetch already carries the
+  /// server's view. Null until the first successful fetch.
+  lastPlansFetchedAt: number | null;
   warnings: PlanWarning[];
   /// Per-plan PlanConfig. Populated by `fetchPlanConfig` on plan open and
   /// updated by PUT responses + WS events that carry pause-state changes.
@@ -274,48 +280,87 @@ interface PlanStore {
   previewDeletePlan: (name: string) => Promise<DeletePlanPreview>;
 }
 
+/// Module-level handle to the single in-flight `fetchPlans()` round trip.
+/// Coalesces concurrent callers (App.tsx bootstrap, ws-store reconnect,
+/// visibility-change refetch) onto one network request, and lets ws-store
+/// `await` the in-flight fetch before applying optimistic patches so a
+/// stale fetch response can't clobber a newer WS event's mutation.
+let inFlightPlansFetch: Promise<void> | null = null;
+
+/// Read-only accessor for the in-flight fetchPlans promise. Returns null
+/// when no fetch is in flight. Exported so ws-store can defer optimistic
+/// patches behind it without poking at module-internal state.
+export function getInFlightPlansFetch(): Promise<void> | null {
+  return inFlightPlansFetch;
+}
+
 export const usePlanStore = create<PlanStore>((set, get) => ({
   plans: [],
   selectedPlan: null,
   loading: false,
   plansFetched: false,
+  lastPlansFetchedAt: null,
   warnings: [],
   planConfigs: {},
   autoModeRuntimes: {},
   toasts: [],
 
-  fetchPlans: async () => {
+  fetchPlans: () => {
+    // Coalesce: any caller that arrives while a fetch is in flight gets the
+    // same Promise back, so we never have two `/api/plans` requests racing
+    // each other (audit §4: previously WS-triggered refetches could overlap
+    // App.tsx's bootstrap fetch and the slower one would clobber the faster).
+    if (inFlightPlansFetch) return inFlightPlansFetch;
+
     // Only flicker the global loading flag on the first load — refetches
     // (ws-driven, visibility-change, etc.) update silently to avoid
     // unmounting the active view while the network round-trip is in flight.
     const wasInitial = get().plans.length === 0;
     if (wasInitial) set({ loading: true });
-    try {
-      const plans = await fetchJson<PlanSummary[]>("/api/plans");
-      // Defensive: a refetch that returns an empty list while we already
-      // have populated state is almost always transient (server momentarily
-      // can't enumerate, auth blip, race with file watcher, etc.). Keep the
-      // last-known-good list and let the next event-driven refetch reconcile.
-      // The narrow legitimate case ("user deleted every plan") loses one
-      // refresh cycle, which is fine — they'll see the empty state on the
-      // next event or page reload.
-      if (plans.length === 0 && !wasInitial) {
-        console.warn(
-          "[plan-store] /api/plans returned empty during refetch; keeping current list",
-        );
-        set({ loading: false, plansFetched: true });
-        return;
+
+    const promise = (async () => {
+      try {
+        const plans = await fetchJson<PlanSummary[]>("/api/plans");
+        // Defensive: a refetch that returns an empty list while we already
+        // have populated state is almost always transient (server momentarily
+        // can't enumerate, auth blip, race with file watcher, etc.). Keep the
+        // last-known-good list and let the next event-driven refetch
+        // reconcile. The narrow legitimate case ("user deleted every plan")
+        // loses one refresh cycle, which is fine — they'll see the empty
+        // state on the next event or page reload.
+        if (plans.length === 0 && !wasInitial) {
+          console.warn(
+            "[plan-store] /api/plans returned empty during refetch; keeping current list",
+          );
+          set({
+            loading: false,
+            plansFetched: true,
+            lastPlansFetchedAt: Date.now(),
+          });
+          return;
+        }
+        set({
+          plans,
+          loading: false,
+          plansFetched: true,
+          lastPlansFetchedAt: Date.now(),
+        });
+      } catch (e) {
+        // Surface the failure but ensure loading is reset, otherwise the
+        // dashboard would render the spinner indefinitely. `plansFetched`
+        // stays false so EnsurePlan can retry on the next mount; in the
+        // worst case the user sees the loading state until the network
+        // recovers, which is preferable to a misleading "plan not found".
+        set({ loading: false });
+        throw e;
       }
-      set({ plans, loading: false, plansFetched: true });
-    } catch (e) {
-      // Surface the failure but ensure loading is reset, otherwise the
-      // dashboard would render the spinner indefinitely. `plansFetched`
-      // stays false so EnsurePlan can retry on the next mount; in the
-      // worst case the user sees the loading state until the network
-      // recovers, which is preferable to a misleading "plan not found".
-      set({ loading: false });
-      throw e;
-    }
+    })();
+
+    inFlightPlansFetch = promise;
+    promise.finally(() => {
+      if (inFlightPlansFetch === promise) inFlightPlansFetch = null;
+    });
+    return promise;
   },
 
   selectPlan: async (name: string) => {
