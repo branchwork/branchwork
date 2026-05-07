@@ -220,19 +220,28 @@ describe("AdminPage default-effort buttons", () => {
 });
 
 describe("AdminPage skip-permissions toggle", () => {
+  /// Pull the skip-permissions checkbox by its label (the "On"/"Off"
+  /// span is the input's accessible name). Disambiguates from the
+  /// per-class notification checkboxes in the sibling section that
+  /// also have role=checkbox.
+  function skipPermsCheckbox(): HTMLInputElement {
+    return screen.getByRole("checkbox", {
+      name: /^O(n|ff)$/,
+    }) as HTMLInputElement;
+  }
+
   it("renders the checkbox checked when skipPermissions is true", () => {
     useSettingsStore.setState({ skipPermissions: true });
     render(<AdminPage />);
-    const cb = screen.getByRole("checkbox") as HTMLInputElement;
+    const cb = skipPermsCheckbox();
     expect(cb.checked).toBe(true);
-    // The label flips to "On" when enabled.
     expect(screen.getByText(/^On$/)).toBeTruthy();
   });
 
   it("renders the checkbox unchecked when skipPermissions is false", () => {
     useSettingsStore.setState({ skipPermissions: false });
     render(<AdminPage />);
-    const cb = screen.getByRole("checkbox") as HTMLInputElement;
+    const cb = skipPermsCheckbox();
     expect(cb.checked).toBe(false);
     expect(screen.getByText(/^Off$/)).toBeTruthy();
   });
@@ -241,7 +250,7 @@ describe("AdminPage skip-permissions toggle", () => {
     const setSkipPermissions = vi.fn().mockResolvedValue(undefined);
     useSettingsStore.setState({ skipPermissions: false, setSkipPermissions });
     render(<AdminPage />);
-    const cb = screen.getByRole("checkbox") as HTMLInputElement;
+    const cb = skipPermsCheckbox();
     fireEvent.click(cb);
     expect(setSkipPermissions).toHaveBeenCalledWith(true);
   });
@@ -323,6 +332,124 @@ describe("AdminPage notification webhook", () => {
     await waitFor(() =>
       expect(screen.getByText(/hook url rejected/i)).toBeTruthy(),
     );
+  });
+});
+
+describe("AdminPage notification preferences", () => {
+  // jsdom does not ship the Notification API, so install a stub before
+  // mounting AdminPage. Without it `getNotificationPermission()`
+  // returns "unsupported" and the Enable button is hidden — every
+  // assertion that waits for the button would time out.
+  class StubNotification {
+    static permission: NotificationPermission = "default";
+    static requestPermission = vi.fn(
+      async (): Promise<NotificationPermission> => "granted",
+    );
+    constructor(_t: string, _o?: NotificationOptions) {}
+  }
+
+  beforeEach(() => {
+    StubNotification.permission = "default";
+    StubNotification.requestPermission = vi.fn(
+      async (): Promise<NotificationPermission> => "granted",
+    );
+    vi.stubGlobal(
+      "Notification",
+      StubNotification as unknown as typeof Notification,
+    );
+    // Map-backed localStorage so per-class toggles persist across the
+    // test (the same trick org-store.test.ts uses — jsdom localStorage
+    // is unreliable in this vitest config).
+    const map = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      get length() {
+        return map.size;
+      },
+      clear: () => map.clear(),
+      getItem: (k: string) => (map.has(k) ? (map.get(k) ?? null) : null),
+      setItem: (k: string, v: string) => {
+        map.set(k, String(v));
+      },
+      removeItem: (k: string) => {
+        map.delete(k);
+      },
+      key: (i: number) => Array.from(map.keys())[i] ?? null,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("renders the not-enabled badge and the Enable button when permission is default", () => {
+    render(<AdminPage />);
+    expect(
+      screen.getByTestId("notification-permission-badge").textContent,
+    ).toMatch(/not enabled/i);
+    expect(screen.getByTestId("enable-notifications-button")).toBeTruthy();
+  });
+
+  it("hides the Enable button once permission is granted", () => {
+    StubNotification.permission = "granted";
+    render(<AdminPage />);
+    expect(
+      screen.getByTestId("notification-permission-badge").textContent,
+    ).toMatch(/enabled/i);
+    expect(
+      screen.queryByTestId("enable-notifications-button"),
+    ).toBeNull();
+  });
+
+  it("clicking Enable calls Notification.requestPermission", async () => {
+    render(<AdminPage />);
+    fireEvent.click(screen.getByTestId("enable-notifications-button"));
+    await waitFor(() =>
+      expect(StubNotification.requestPermission).toHaveBeenCalledTimes(1),
+    );
+  });
+
+  it("renders one checkbox per notification class, all enabled by default", () => {
+    render(<AdminPage />);
+    const list = screen.getByTestId("notification-class-list");
+    const checkboxes = list.querySelectorAll(
+      'input[type="checkbox"]',
+    ) as NodeListOf<HTMLInputElement>;
+    expect(checkboxes.length).toBeGreaterThanOrEqual(8);
+    for (const cb of Array.from(checkboxes)) {
+      expect(cb.checked).toBe(true);
+    }
+  });
+
+  it("toggling a class checkbox persists the disabled flag in localStorage", () => {
+    render(<AdminPage />);
+    const cb = screen.getByTestId(
+      "notify-class-agent_stopped",
+    ) as HTMLInputElement;
+    expect(cb.checked).toBe(true);
+    fireEvent.click(cb);
+    expect(cb.checked).toBe(false);
+    const raw = globalThis.localStorage.getItem(
+      "branchwork.notifications.disabledClasses",
+    );
+    expect(raw).toBe(JSON.stringify(["agent_stopped"]));
+  });
+
+  it("re-checking a class removes it from the disabled list", () => {
+    globalThis.localStorage.setItem(
+      "branchwork.notifications.disabledClasses",
+      JSON.stringify(["agent_stopped"]),
+    );
+    render(<AdminPage />);
+    const cb = screen.getByTestId(
+      "notify-class-agent_stopped",
+    ) as HTMLInputElement;
+    expect(cb.checked).toBe(false);
+    fireEvent.click(cb);
+    expect(cb.checked).toBe(true);
+    const raw = globalThis.localStorage.getItem(
+      "branchwork.notifications.disabledClasses",
+    );
+    expect(raw).toBe(JSON.stringify([]));
   });
 });
 

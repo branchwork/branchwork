@@ -13,6 +13,15 @@ import { KillSwitchTab } from "./admin/KillSwitchTab.js";
 import { UserQuotasTab } from "./admin/UserQuotasTab.js";
 import { SsoTab } from "./admin/SsoTab.js";
 import { DiagnosticsTab } from "./admin/DiagnosticsTab.js";
+import {
+  NOTIFICATION_CLASSES,
+  NOTIFICATION_CLASS_ORDER,
+  getNotificationPermission,
+  isClassEnabled,
+  requestNotificationPermission,
+  setClassEnabled,
+  type NotificationClass,
+} from "../lib/notifications.js";
 
 const EFFORT_LEVELS: { value: EffortLevel; label: string }[] = [
   { value: "low", label: "Low" },
@@ -338,6 +347,21 @@ function SettingsTab() {
       </Section>
 
       <Section
+        title="Browser notifications"
+        description={
+          <>
+            Per-event-class opt-out for desktop notifications. The
+            browser asks for permission once when you click Enable below
+            — Branchwork never prompts on its own (audit §16). All
+            classes ship enabled by default; uncheck to silence a class
+            without affecting the others.
+          </>
+        }
+      >
+        <NotificationsSubsection />
+      </Section>
+
+      <Section
         title="Retention"
         description={
           <>
@@ -383,6 +407,146 @@ function SettingsTab() {
         )}
       </Section>
     </div>
+  );
+}
+
+/// Per-user notification preferences. Persisted in localStorage —
+/// nothing reaches the server today (the brief allowed either, and
+/// localStorage avoids a new endpoint + migration). The
+/// "Enable notifications" button is the ONLY way to trigger
+/// `Notification.requestPermission()`; the WS connect path no longer
+/// prompts (audit §16).
+function NotificationsSubsection() {
+  const supported =
+    typeof window !== "undefined" && "Notification" in window;
+
+  // Track permission + the local checkbox state in component state so a
+  // toggle re-renders this subsection without forcing the parent to
+  // bookkeep prefs in zustand. localStorage is the source of truth on
+  // every read; React state is the cache that drives re-render.
+  const [permission, setPermission] = useState<
+    NotificationPermission | "unsupported"
+  >(getNotificationPermission());
+  const [enabledMap, setEnabledMap] = useState<Record<NotificationClass, boolean>>(
+    () => {
+      const map = {} as Record<NotificationClass, boolean>;
+      for (const klass of NOTIFICATION_CLASS_ORDER) {
+        map[klass] = isClassEnabled(klass);
+      }
+      return map;
+    },
+  );
+  const [requestStatus, setRequestStatus] = useState<
+    "idle" | "requesting" | "denied" | "granted"
+  >("idle");
+
+  async function handleEnable() {
+    setRequestStatus("requesting");
+    const result = await requestNotificationPermission();
+    setPermission(result);
+    if (result === "granted") setRequestStatus("granted");
+    else if (result === "denied" || result === "unsupported")
+      setRequestStatus("denied");
+    else setRequestStatus("idle");
+  }
+
+  function handleToggle(klass: NotificationClass, next: boolean) {
+    setClassEnabled(klass, next);
+    setEnabledMap((prev) => ({ ...prev, [klass]: next }));
+  }
+
+  return (
+    <div>
+      <div className="flex items-center gap-3 mb-4" data-testid="notification-permission-row">
+        <PermissionBadge permission={permission} />
+        {supported && permission === "default" && (
+          <Button
+            onClick={handleEnable}
+            loading={requestStatus === "requesting"}
+            variant="primary"
+            size="sm"
+            data-testid="enable-notifications-button"
+          >
+            {requestStatus === "requesting" ? "Requesting…" : "Enable notifications"}
+          </Button>
+        )}
+      </div>
+
+      {permission === "denied" && (
+        <Banner className="mb-3">
+          The browser blocked notifications. Re-enable them from your
+          browser's site settings, then refresh the page.
+        </Banner>
+      )}
+      {permission === "unsupported" && (
+        <Banner className="mb-3">
+          This browser does not expose the Notification API. Toggles are
+          stored locally and will take effect in a supported browser.
+        </Banner>
+      )}
+
+      <ul
+        className="space-y-2"
+        data-testid="notification-class-list"
+        aria-label="Notification event classes"
+      >
+        {NOTIFICATION_CLASS_ORDER.map((klass) => {
+          const meta = NOTIFICATION_CLASSES[klass];
+          return (
+            <li key={klass} className="flex items-start gap-3">
+              <input
+                type="checkbox"
+                id={`notify-${klass}`}
+                checked={enabledMap[klass]}
+                onChange={(e) => handleToggle(klass, e.target.checked)}
+                className="mt-0.5 accent-indigo-500 w-4 h-4"
+                data-testid={`notify-class-${klass}`}
+              />
+              <label htmlFor={`notify-${klass}`} className="cursor-pointer">
+                <span className="text-sm text-gray-200">{meta.label}</span>
+                <span className="block text-[11px] text-gray-500 leading-snug mt-0.5">
+                  {meta.description}
+                </span>
+              </label>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function PermissionBadge({
+  permission,
+}: {
+  permission: NotificationPermission | "unsupported";
+}) {
+  let label: string;
+  let cls: string;
+  switch (permission) {
+    case "granted":
+      label = "Notifications enabled";
+      cls = "border-emerald-700/50 bg-emerald-900/30 text-emerald-200";
+      break;
+    case "denied":
+      label = "Blocked by browser";
+      cls = "border-red-700/50 bg-red-900/30 text-red-200";
+      break;
+    case "unsupported":
+      label = "Unsupported browser";
+      cls = "border-amber-700/50 bg-amber-900/30 text-amber-200";
+      break;
+    default:
+      label = "Not enabled";
+      cls = "border-gray-700 bg-gray-800 text-gray-300";
+  }
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 text-[11px] px-2 py-0.5 rounded border ${cls}`}
+      data-testid="notification-permission-badge"
+    >
+      {label}
+    </span>
   );
 }
 

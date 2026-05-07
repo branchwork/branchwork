@@ -13,6 +13,7 @@ import {
   type RunnerDriverInfo,
 } from "./runner-store.js";
 import { parseWsMessage, type WsMessage } from "../schemas/ws-events.js";
+import { notify } from "../lib/notifications.js";
 
 const MAX_RECONNECT_DELAY = 30_000;
 const INITIAL_RECONNECT_DELAY = 2_000;
@@ -23,29 +24,6 @@ const INITIAL_RECONNECT_DELAY = 2_000;
 /// than typical /api/plans latency under load (~hundreds of ms) so back-
 /// to-back WS events collapse to a single fetch.
 const WS_REFETCH_DEBOUNCE_MS = 1_500;
-
-function notificationsSupported(): boolean {
-  return typeof window !== "undefined" && "Notification" in window;
-}
-
-function requestNotificationPermission() {
-  if (!notificationsSupported()) return;
-  if (Notification.permission === "default") {
-    Notification.requestPermission().catch(() => {
-      // ignore — user may dismiss or browser may block
-    });
-  }
-}
-
-function notify(title: string, body: string, tag?: string) {
-  if (!notificationsSupported()) return;
-  if (Notification.permission !== "granted") return;
-  try {
-    new Notification(title, { body, tag, icon: "/favicon.ico" });
-  } catch {
-    // some browsers (mobile Safari, etc.) throw on direct construction
-  }
-}
 
 function lookupTaskTitle(planName: string | null, taskNumber: string | null): string {
   if (!planName || !taskNumber) return taskNumber ?? "task";
@@ -144,7 +122,9 @@ export const useWsStore = create<WsStore>((set, get) => ({
     const { socket } = get();
     if (socket) return;
 
-    requestNotificationPermission();
+    // Audit §16: do NOT prompt for browser-notification permission on
+    // first connect. The user opts in via the AdminPage "Enable
+    // notifications" button — see web/src/lib/notifications.ts.
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     let ws: WebSocket;
@@ -387,7 +367,12 @@ function dispatch(msg: WsMessage) {
       const taskLabel = agent
         ? lookupTaskTitle(agent.plan_name, agent.task_id)
         : `Agent ${d.id.slice(0, 8)}`;
-      notify(`${taskLabel} — ${d.status}`, "Agent finished", `agent-${d.id}`);
+      notify(
+        "agent_stopped",
+        `${taskLabel} — ${d.status}`,
+        "Agent finished",
+        `agent-${d.id}`,
+      );
       // Defer the patch behind any in-flight fetchAgents — otherwise a slow
       // /api/agents response could clobber `status` back to running. The
       // refetch we follow with is coalesced via `getInFlightAgentsFetch`,
@@ -418,6 +403,7 @@ function dispatch(msg: WsMessage) {
       const taskLabel = lookupTaskTitle(d.plan, d.task);
       const targetSuffix = d.target ? ` → ${d.target}` : "";
       notify(
+        "auto_mode_merged",
         `Auto-merged: ${taskLabel}${targetSuffix}`,
         d.plan,
         `auto-mode-merged-${d.plan}-${d.task}`,
@@ -498,6 +484,7 @@ function dispatch(msg: WsMessage) {
       });
       const taskLabel = d.task ? lookupTaskTitle(d.plan, d.task) : "plan";
       notify(
+        "auto_mode_paused",
         `Auto-mode paused: ${d.plan}`,
         `${taskLabel} — ${d.reason}`,
         `auto-mode-paused-${d.plan}`,
@@ -539,6 +526,7 @@ function dispatch(msg: WsMessage) {
       // before the deferred patch so the user sees it without waiting on a
       // possibly-slow in-flight fetch.
       notify(
+        "plan_checked",
         `Plan check: ${d.verdict}`,
         d.reason ? `${d.plan_name} — ${d.reason}` : d.plan_name,
         `plan-checked-${d.plan_name}`,
@@ -557,9 +545,10 @@ function dispatch(msg: WsMessage) {
       const d = msg.data;
       if (d.status === "completed" || d.status === "failed") {
         notify(
+          "task_status_changed",
           `${lookupTaskTitle(d.plan_name, d.task_number)} — ${d.status}`,
           d.plan_name,
-          `task-${d.plan_name}-${d.task_number}`
+          `task-${d.plan_name}-${d.task_number}`,
         );
       }
       // Defer both the optimistic patch AND the debounced refetch behind
@@ -584,9 +573,10 @@ function dispatch(msg: WsMessage) {
       const d = msg.data;
       if (d.status === "success" || d.status === "failure") {
         notify(
+          "ci_status_changed",
           `CI ${d.status}: ${lookupTaskTitle(d.plan_name, d.task_number)}`,
           d.run_url ?? d.plan_name,
-          `ci-${d.plan_name}-${d.task_number}`
+          `ci-${d.plan_name}-${d.task_number}`,
         );
       }
       deferBehindPlansFetch(() => {
@@ -604,7 +594,12 @@ function dispatch(msg: WsMessage) {
     }
     case "plan_warning": {
       const d = msg.data;
-      notify(`Plan error: ${d.name}`, d.error, `plan-warning-${d.name}`);
+      notify(
+        "plan_warning",
+        `Plan error: ${d.name}`,
+        d.error,
+        `plan-warning-${d.name}`,
+      );
       planStore.addWarning({
         name: d.name,
         file: d.file,
@@ -632,6 +627,7 @@ function dispatch(msg: WsMessage) {
         ttlMs: 8_000,
       });
       notify(
+        "phase_advanced",
         `Phase ${d.to_phase} advanced`,
         d.plan_name,
         `phase-advanced-${d.plan_name}-${d.to_phase}`,
