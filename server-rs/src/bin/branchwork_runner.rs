@@ -938,7 +938,7 @@ async fn ws_reader(
 }
 
 /// Handle a single message from the SaaS server.
-async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
+async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
     match &envelope.message {
         WireMessage::StartAgent {
             agent_id,
@@ -1929,7 +1929,7 @@ fn extra_env_for_driver(driver: &str) -> &'static [(&'static str, &'static str)]
 
 #[allow(clippy::too_many_arguments)]
 async fn spawn_agent(
-    state: &RunnerState,
+    state: &Arc<RunnerState>,
     agent_id: &str,
     cwd: &Path,
     driver: &str,
@@ -2033,27 +2033,33 @@ async fn spawn_agent(
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Connect and start I/O forwarding.
-    let ws_tx = state.ws_tx.clone();
-    let runner_id = state.runner_id.clone();
+    let task_state = state.clone();
     let aid = agent_id.to_string();
     let sock = socket_path.clone();
     let prompt_bytes = prompt.as_bytes().to_vec();
 
     let io_task = tokio::spawn(async move {
-        if let Err(e) = forward_agent_io(&sock, &ws_tx, &runner_id, &aid, Some(&prompt_bytes)).await
+        if let Err(e) = forward_agent_io(
+            &sock,
+            &task_state.ws_tx,
+            &task_state.runner_id,
+            &aid,
+            Some(&prompt_bytes),
+        )
+        .await
         {
             log_warn!("[runner] agent {aid} I/O error: {e}");
         }
 
-        // Agent exited — report.
+        // Agent exited — report reliably so a WS flap during exit replays
+        // the event from the outbox on reconnect (Task 11.7).
         let stopped = WireMessage::AgentStopped {
             agent_id: aid.clone(),
             status: "completed".into(),
             cost_usd: None,
             stop_reason: None,
         };
-        let env = Envelope::best_effort(runner_id.clone(), stopped);
-        let _ = ws_tx.send(serde_json::to_string(&env).unwrap_or_default());
+        send_reliable(&task_state, stopped).await;
     });
 
     state.agents.lock().await.insert(
@@ -2180,24 +2186,32 @@ async fn cleanup_and_reattach_runner(state: &Arc<RunnerState>) {
                 // Live — spawn a forwarder. Drop the probe stream; the
                 // forwarder establishes its own connection (cheaper than
                 // threading a borrowed handle through `tokio::spawn`).
-                let ws_tx = state.ws_tx.clone();
-                let runner_id = state.runner_id.clone();
+                let task_state = state.clone();
                 let aid = agent_id.clone();
                 let sock = path.clone();
                 let io_task = tokio::spawn(async move {
-                    if let Err(e) = forward_agent_io(&sock, &ws_tx, &runner_id, &aid, None).await {
+                    if let Err(e) = forward_agent_io(
+                        &sock,
+                        &task_state.ws_tx,
+                        &task_state.runner_id,
+                        &aid,
+                        None,
+                    )
+                    .await
+                    {
                         log_warn!("[runner] reattached agent {aid} I/O error: {e}");
                     }
 
-                    // Daemon exited — report.
+                    // Daemon exited — report reliably so a WS flap during
+                    // exit replays the event from the outbox on reconnect
+                    // (Task 11.7).
                     let stopped = WireMessage::AgentStopped {
                         agent_id: aid.clone(),
                         status: "completed".into(),
                         cost_usd: None,
                         stop_reason: None,
                     };
-                    let env = Envelope::best_effort(runner_id.clone(), stopped);
-                    let _ = ws_tx.send(serde_json::to_string(&env).unwrap_or_default());
+                    send_reliable(&task_state, stopped).await;
                 });
 
                 // PID is unknown on reattach (the daemon is detached and
@@ -3775,5 +3789,119 @@ mod tests {
         cleanup_and_reattach_runner(&state).await;
         assert_eq!(runner_health::orphans_reaped_24h(), baseline);
         assert!(state.agents.lock().await.is_empty());
+    }
+
+    // ── Normal-exit AgentStopped reliability (Task 11.7) ───────────────────
+
+    #[tokio::test]
+    async fn normal_exit_agent_stopped_is_outboxed_for_replay() {
+        // Pre-fix this path used `Envelope::best_effort` + a direct
+        // `ws_tx.send`, so a WS drop between the agent's PTY exit and
+        // the SaaS ACK would lose the event and rot the `agents` row to
+        // `running` forever. Post-fix, the io_task closure inside
+        // `spawn_agent` / `cleanup_and_reattach_runner` calls
+        // `send_reliable`, which enqueues the frame in the runner outbox
+        // before pushing it on the WS channel. This test mirrors that
+        // exact call shape and proves the row is recoverable on
+        // reconnect via `replay_runner_events`.
+        let dir = TempDir::new().unwrap();
+        let (state, rx) = make_test_state(dir.path().to_path_buf());
+
+        // Drop the receiver before the send — this is the strict
+        // analogue of "WS down between PTY exit and ACK." The unbounded
+        // mpsc still buffers the message internally, but the writer
+        // task on the other end of a real connection would have failed
+        // to push it onto the wire. The outbox is what makes the event
+        // survive, not the mpsc buffer.
+        drop(rx);
+
+        let stopped = WireMessage::AgentStopped {
+            agent_id: "agent-x".into(),
+            status: "completed".into(),
+            cost_usd: None,
+            stop_reason: None,
+        };
+        send_reliable(&state, stopped).await;
+
+        // On reconnect the runner sends `Resume { last_seen_seq }` and
+        // the server replies with its own `last_seen_seq`; the runner
+        // then loops over `replay_runner_events` to re-send any unacked
+        // frames. So `replay_runner_events(&conn, 0)` is exactly what
+        // a fresh server (or one that had never seen this seq) would
+        // get back as the replay payload.
+        let conn = state.db.lock().await;
+        let pending = outbox::replay_runner_events(&conn, 0);
+        assert_eq!(
+            pending.len(),
+            1,
+            "AgentStopped must be in the runner outbox after a WS drop",
+        );
+        let (seq, event_type, payload) = &pending[0];
+        assert!(*seq > 0, "reliable frames must carry a non-zero seq");
+        assert_eq!(event_type, "agent_stopped");
+        // Payload is the serialized WireMessage; spot-check that the
+        // agent_id and status fields round-tripped so the SaaS handler
+        // sees the right row to flip to `completed`.
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload).expect("outbox payload is JSON");
+        assert_eq!(parsed["type"], "agent_stopped");
+        assert_eq!(parsed["agent_id"], "agent-x");
+        assert_eq!(parsed["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn outbox_replay_after_reconnect_yields_normal_exit_event() {
+        // End-to-end-ish: enqueue AgentStopped while the WS is "down"
+        // (rx dropped), then simulate reconnect by reading the outbox
+        // exactly the way the post-Resume replay loop does. The frame
+        // we get back must serialise into a fresh reliable Envelope
+        // with seq preserved — that's what the SaaS server keys ACKs
+        // off and what advances `seq_tracker` on the receiving side.
+        let dir = TempDir::new().unwrap();
+        let (state, rx) = make_test_state(dir.path().to_path_buf());
+        drop(rx);
+
+        send_reliable(
+            &state,
+            WireMessage::AgentStopped {
+                agent_id: "agent-y".into(),
+                status: "completed".into(),
+                cost_usd: Some(0.42),
+                stop_reason: None,
+            },
+        )
+        .await;
+
+        // Fresh receiver — the runner wires this on every reconnect.
+        // Replay path enqueues via `Envelope::reliable(runner_id, seq,
+        // msg)` on the same channel.
+        let pending = {
+            let conn = state.db.lock().await;
+            outbox::replay_runner_events(&conn, 0)
+        };
+        assert_eq!(pending.len(), 1);
+        let (seq, _event_type, payload) = pending.into_iter().next().unwrap();
+        let msg: WireMessage = serde_json::from_str(&payload).expect("outbox payload deserialises");
+        let env = Envelope::reliable(state.runner_id.clone(), seq, msg);
+        let wire = serde_json::to_string(&env).expect("envelope serialises");
+
+        // The replayed envelope carries the same seq (so the SaaS
+        // peer can ACK it) and round-trips back to AgentStopped.
+        let back: Envelope = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.seq, Some(seq));
+        match back.message {
+            WireMessage::AgentStopped {
+                agent_id,
+                status,
+                cost_usd,
+                stop_reason,
+            } => {
+                assert_eq!(agent_id, "agent-y");
+                assert_eq!(status, "completed");
+                assert_eq!(cost_usd, Some(0.42));
+                assert!(stop_reason.is_none());
+            }
+            other => panic!("expected AgentStopped, got {other:?}"),
+        }
     }
 }

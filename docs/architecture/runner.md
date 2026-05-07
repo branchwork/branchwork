@@ -399,17 +399,10 @@ Concretely:
 
 | Direction          | Reliable (outbox + ACK)                                         | Best-effort (no outbox, no ACK) |
 |--------------------|------------------------------------------------------------------|--------------------------------|
-| Runner → SaaS      | `RunnerHello`, `AgentStarted`, `AgentStopped`†, `TaskStatusChanged`, `DriverAuthReport`, `Resume`, `Ack` | `AgentOutput`, `Ping`, `Pong`, `FoldersListed`, `FolderCreated`, `DefaultBranchResolved`, `BranchesListed`, `MergeResult`, `PushResult`, `GhRunListed`, `GhFailureLogFetched` |
-| SaaS → Runner      | `StartAgent`, `KillAgent`, `TerminalReplay`, `Resume`, `Ack`     | `AgentInput`, `Ping`, `Pong`, `ResizeTerminal`‡, `ListFolders`, `CreateFolder`, `GetDefaultBranch`, `ListBranches`, `MergeBranch`, `PushBranch`, `GhRunList`, `GhFailureLog` |
+| Runner → SaaS      | `RunnerHello`, `AgentStarted`, `AgentStopped`, `TaskStatusChanged`, `DriverAuthReport`, `Resume`, `Ack` | `AgentOutput`, `Ping`, `Pong`, `FoldersListed`, `FolderCreated`, `DefaultBranchResolved`, `BranchesListed`, `MergeResult`, `PushResult`, `GhRunListed`, `GhFailureLogFetched` |
+| SaaS → Runner      | `StartAgent`, `KillAgent`, `TerminalReplay`, `Resume`, `Ack`     | `AgentInput`, `Ping`, `Pong`, `ResizeTerminal`†, `ListFolders`, `CreateFolder`, `GetDefaultBranch`, `ListBranches`, `MergeBranch`, `PushBranch`, `GhRunList`, `GhFailureLog` |
 
-> † See [Failure modes](#failure-modes) — the *normal-exit* `AgentStopped`
-> in `forward_agent_io` is currently sent best-effort, while the
-> *spawn-failure* and `KillAgent` paths use `send_reliable`. This is a
-> known wart, not a design choice; treat the wire protocol's "anything
-> not best-effort is reliable" rule as the contract and assume the
-> normal-exit path will be tightened.
-
-> ‡ `ResizeTerminal` is technically reliable per the wire protocol but
+> † `ResizeTerminal` is technically reliable per the wire protocol but
 > is sent through the same channel as `AgentInput` from the dashboard
 > side; small terminal resizes that get lost across a reconnect are
 > harmless because the dashboard re-emits them on the next render.
@@ -600,18 +593,12 @@ A bestiary of how things break and what the dashboard sees:
   externally. The session daemon detects EOF on the PTY, writes the
   exit status into the on-disk log, and exits.
 - **Effect on runner:** `forward_agent_io` returns from its `read_frame`
-  loop and the spawned task fires the (currently best-effort) normal-exit
-  `AgentStopped`. If the WS is up, the dashboard sees the stop in
-  near-real-time; if the WS is down, the stop event is **lost** because
-  it was sent best-effort, and the dashboard will continue showing the
-  agent as "running" until the next event for that agent (which never
-  comes) or until the runner is restarted and the underlying agent
-  re-cleanup logic on the server kicks in. This is the wart called out
-  in the [reliable/best-effort table](#whats-reliable-whats-best-effort).
-- **Mitigation today:** spawn-failure and explicit `KillAgent` paths
-  *do* use `send_reliable`, so the most common stop scenarios
-  (immediate spawn failure, dashboard kill button) survive a reconnect
-  fine.
+  loop and the spawned task fires `AgentStopped` via `send_reliable`.
+  If the WS is up, the dashboard sees the stop in near-real-time; if
+  the WS is down, the event is held in the runner outbox and replays on
+  reconnect, so the `agents` row eventually flips to `completed` even
+  across a transient WS flap during agent exit. The spawn-failure and
+  explicit `KillAgent` paths follow the same reliable-delivery contract.
 
 ### Runner crash / SIGKILL
 

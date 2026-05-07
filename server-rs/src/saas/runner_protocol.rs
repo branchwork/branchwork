@@ -862,6 +862,23 @@ mod tests {
     }
 
     #[test]
+    fn agent_stopped_is_reliable() {
+        // Task 11.7 pin: `AgentStopped` must stay out of the best-effort
+        // set so the runner-side outbox replay survives a WS flap during
+        // agent exit. If anyone re-adds it to `is_best_effort`, this
+        // trips and the corresponding sender (`send_reliable` in
+        // `branchwork_runner.rs`) will need to flip too.
+        let msg = WireMessage::AgentStopped {
+            agent_id: "a".into(),
+            status: "completed".into(),
+            cost_usd: None,
+            stop_reason: None,
+        };
+        assert!(!msg.is_best_effort(), "AgentStopped must be reliable");
+        assert_eq!(msg.event_type(), "agent_stopped");
+    }
+
+    #[test]
     fn list_folders_round_trip() {
         let msg = WireMessage::ListFolders {
             req_id: "req-1".into(),
