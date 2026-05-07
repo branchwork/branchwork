@@ -1080,4 +1080,325 @@ mod tests {
         let res = create_worktree(project_dir, "0000000000000000000000000000000000000000");
         assert!(res.is_err(), "non-existent SHA must produce Err");
     }
+
+    // ── Task 2.3 — no-op fallback when no verification is configured ─────
+    //
+    // The listener must return early WITHOUT spawning a Check agent and
+    // WITHOUT broadcasting any `phase_verify_*` event whenever
+    // `resolve_phase_verification` returns `None` (or the listener bails
+    // on an earlier guard like missing plan / missing phase / missing
+    // `phase_sha`). These tests pin every early-return branch so a
+    // future refactor can't accidentally make the listener spawn an
+    // empty-prompt Check agent against a non-existent worktree.
+    //
+    // Two complementary signals are checked:
+    // - `count_phase_verify_agents` — `spawn_and_await_check_agent`
+    //   inserts an `agents` row with `task_id LIKE 'phase-%-verify'`
+    //   BEFORE attempting to exec `claude`, so any spawn attempt (even
+    //   one that fails because the binary is missing in CI) shows up.
+    // - `has_verify_event` — `run_verification` always reports its
+    //   outcome via `phase_verify_passed` or `phase_verify_failed`
+    //   broadcast events; even worktree-create failures emit
+    //   `phase_verify_failed`. So if the listener falls through past the
+    //   verification-resolution gate at all, this assertion fires.
+
+    use crate::config::Effort;
+    use crate::db::Db;
+    use crate::saas::runner_ws::new_runner_registry;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tempfile::TempDir;
+
+    fn fresh_listener_db() -> (Db, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("branchwork.db");
+        (crate::db::init(&path), dir)
+    }
+
+    /// Minimal `AppState` for listener tests. Mirrors the patterns in
+    /// `hooks::tests::test_app_state` and `agents::tests::test_registry`:
+    /// `server_exe = /nonexistent/branchwork-server` (we never spawn the
+    /// server from these tests) and `port = 0` (the listener doesn't
+    /// dispatch on the port).
+    fn listener_test_state(db: Db, plans_dir: PathBuf) -> (AppState, broadcast::Receiver<String>) {
+        let (broadcast_tx, rx) = broadcast::channel::<String>(64);
+        let registry = AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            plans_dir.clone(),
+            PathBuf::from("/nonexistent/branchwork-server"),
+            0,
+            true,
+        );
+        let state = AppState {
+            db,
+            plans_dir,
+            port: 0,
+            effort: Arc::new(StdMutex::new(Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners: new_runner_registry(),
+            settings_path: PathBuf::from("/tmp/branchwork-test-phase-check-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(HashSet::new())),
+            started_at: std::time::Instant::now(),
+        };
+        (state, rx)
+    }
+
+    /// Write a YAML plan to disk under `plans_dir` whose `project` field
+    /// resolves to a non-existent path under `$HOME` (so any accidental
+    /// downstream worktree create would fail loudly, not pollute the
+    /// dev's repo).
+    fn write_listener_plan(plans_dir: &Path, plan_name: &str, body: &str) {
+        let path = plans_dir.join(format!("{plan_name}.yaml"));
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn count_phase_verify_agents(db: &Db, plan_name: &str) -> usize {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM agents \
+             WHERE plan_name = ?1 AND task_id LIKE 'phase-%-verify'",
+            params![plan_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .unwrap_or(0)
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    fn has_verify_event(events: &[String]) -> bool {
+        events.iter().any(|e| {
+            e.contains("\"type\":\"phase_verify_passed\"")
+                || e.contains("\"type\":\"phase_verify_failed\"")
+        })
+    }
+
+    /// Primary T2.3 assertion: a plan with no `phase_verification`
+    /// configured at any layer (plan / phase / repo) makes the listener
+    /// return early at `resolve_phase_verification`. No agents row, no
+    /// `phase_verify_*` event.
+    #[tokio::test]
+    async fn handle_phase_completed_no_ops_when_no_verification_configured() {
+        let (db, dir) = fresh_listener_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan = "no-verify";
+        write_listener_plan(
+            &plans_dir,
+            plan,
+            "title: no-verify title\n\
+             project: branchwork-no-such-dir-no-verify\n\
+             phases:\n  \
+               - number: 1\n    \
+                 title: P1\n    \
+                 tasks:\n      \
+                   - number: \"1.1\"\n        \
+                     title: T11\n",
+        );
+        let (state, mut rx) = listener_test_state(db.clone(), plans_dir);
+
+        handle_phase_completed(
+            &state,
+            PhaseCompletedPayload {
+                plan_name: plan.into(),
+                phase_number: 1,
+                phase_sha: Some("abc123".into()),
+            },
+        )
+        .await;
+
+        let events = drain(&mut rx);
+        assert!(
+            !has_verify_event(&events),
+            "no phase_verify_* event should fire on no-op path: {events:?}",
+        );
+        assert_eq!(
+            count_phase_verify_agents(&db, plan),
+            0,
+            "no Check agent row should be inserted on no-op path",
+        );
+    }
+
+    /// `phase_sha = None` (manual completion path) is the earliest
+    /// no-op gate — the listener returns immediately, before loading
+    /// the plan. Even a plan WITH `phase_verification` configured must
+    /// not trigger a spawn under this branch.
+    #[tokio::test]
+    async fn handle_phase_completed_no_ops_when_phase_sha_is_none() {
+        let (db, dir) = fresh_listener_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan = "manual-completion";
+        write_listener_plan(
+            &plans_dir,
+            plan,
+            "title: manual title\n\
+             project: branchwork-no-such-dir-manual\n\
+             phases:\n  \
+               - number: 1\n    \
+                 title: P1\n    \
+                 phase_verification: \"true\"\n    \
+                 tasks:\n      \
+                   - number: \"1.1\"\n        \
+                     title: T11\n",
+        );
+        let (state, mut rx) = listener_test_state(db.clone(), plans_dir);
+
+        handle_phase_completed(
+            &state,
+            PhaseCompletedPayload {
+                plan_name: plan.into(),
+                phase_number: 1,
+                phase_sha: None,
+            },
+        )
+        .await;
+
+        let events = drain(&mut rx);
+        assert!(
+            !has_verify_event(&events),
+            "no phase_verify_* event should fire when phase_sha is None: {events:?}",
+        );
+        assert_eq!(
+            count_phase_verify_agents(&db, plan),
+            0,
+            "no Check agent row should be inserted when phase_sha is None",
+        );
+    }
+
+    /// Unknown plan name: listener bails at `find_plan_file`. No row,
+    /// no events.
+    #[tokio::test]
+    async fn handle_phase_completed_no_ops_when_plan_missing() {
+        let (db, dir) = fresh_listener_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, mut rx) = listener_test_state(db.clone(), plans_dir);
+
+        handle_phase_completed(
+            &state,
+            PhaseCompletedPayload {
+                plan_name: "unknown-plan".into(),
+                phase_number: 1,
+                phase_sha: Some("sha".into()),
+            },
+        )
+        .await;
+
+        let events = drain(&mut rx);
+        assert!(!has_verify_event(&events));
+        assert_eq!(count_phase_verify_agents(&db, "unknown-plan"), 0);
+    }
+
+    /// Unknown phase number for a real plan: listener bails at the
+    /// phase index lookup. Even though phase 1 has verification
+    /// configured, phase 99 doesn't exist so no spawn happens.
+    #[tokio::test]
+    async fn handle_phase_completed_no_ops_when_phase_number_unknown() {
+        let (db, dir) = fresh_listener_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan = "phase-not-found";
+        write_listener_plan(
+            &plans_dir,
+            plan,
+            "title: pnf title\n\
+             project: branchwork-no-such-dir-phase-not-found\n\
+             phases:\n  \
+               - number: 1\n    \
+                 title: P1\n    \
+                 phase_verification: \"true\"\n    \
+                 tasks:\n      \
+                   - number: \"1.1\"\n        \
+                     title: T11\n",
+        );
+        let (state, mut rx) = listener_test_state(db.clone(), plans_dir);
+
+        handle_phase_completed(
+            &state,
+            PhaseCompletedPayload {
+                plan_name: plan.into(),
+                phase_number: 99,
+                phase_sha: Some("sha".into()),
+            },
+        )
+        .await;
+
+        let events = drain(&mut rx);
+        assert!(!has_verify_event(&events));
+        assert_eq!(count_phase_verify_agents(&db, plan), 0);
+    }
+
+    /// Acceptance criterion (T2.3): a plan with no verification
+    /// config completes phases without ever spawning a Check agent.
+    /// Drives 3 `phase_completed` events through `handle_phase_completed`
+    /// (one per phase, each with a non-null `phase_sha`) and asserts
+    /// zero agents rows AND zero `phase_verify_*` events over the
+    /// whole run. This is the regression guard that pins T2.3 — a
+    /// future refactor that accidentally lifts the resolution gate
+    /// would surface here as `phase_verify_failed` events from
+    /// `run_verification` failing to find the (non-existent) project.
+    #[tokio::test]
+    async fn three_phase_plan_with_no_verification_zero_check_spawns() {
+        let (db, dir) = fresh_listener_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan = "three-phase-noverify";
+        write_listener_plan(
+            &plans_dir,
+            plan,
+            "title: three-phase title\n\
+             project: branchwork-no-such-dir-three-phase\n\
+             phases:\n  \
+               - number: 1\n    \
+                 title: P1\n    \
+                 tasks:\n      \
+                   - number: \"1.1\"\n        \
+                     title: T11\n  \
+               - number: 2\n    \
+                 title: P2\n    \
+                 tasks:\n      \
+                   - number: \"2.1\"\n        \
+                     title: T21\n  \
+               - number: 3\n    \
+                 title: P3\n    \
+                 tasks:\n      \
+                   - number: \"3.1\"\n        \
+                     title: T31\n",
+        );
+        let (state, mut rx) = listener_test_state(db.clone(), plans_dir);
+
+        for phase_number in 1..=3u32 {
+            handle_phase_completed(
+                &state,
+                PhaseCompletedPayload {
+                    plan_name: plan.into(),
+                    phase_number,
+                    phase_sha: Some(format!("sha-{phase_number}")),
+                },
+            )
+            .await;
+        }
+
+        let events = drain(&mut rx);
+        assert!(
+            !has_verify_event(&events),
+            "no phase_verify_* event should fire over a 3-phase no-verify run: {events:?}",
+        );
+        assert_eq!(
+            count_phase_verify_agents(&db, plan),
+            0,
+            "zero Check agent rows expected over a 3-phase no-verify run",
+        );
+    }
 }
