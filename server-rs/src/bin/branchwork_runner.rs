@@ -2588,9 +2588,18 @@ mod tests {
 
     #[test]
     fn resolve_runner_path_passes_absolute_through() {
+        // Use the platform's temp dir (absolute on every OS) so the
+        // assertion works on Windows too — `/tmp/...` looks rooted but is
+        // NOT absolute on Windows (no drive prefix), and would otherwise
+        // fall through to the bare-name branch.
+        let absolute = std::env::temp_dir().join("branchwork-test");
+        assert!(
+            absolute.is_absolute(),
+            "temp_dir() must yield an absolute path on this OS: {absolute:?}"
+        );
         assert_eq!(
-            resolve_runner_path("/tmp/branchwork-test"),
-            PathBuf::from("/tmp/branchwork-test")
+            resolve_runner_path(&absolute.display().to_string()),
+            absolute
         );
     }
 
