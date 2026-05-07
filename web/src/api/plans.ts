@@ -40,6 +40,61 @@ export function putPlanSettings(planName: string, body: PlanSettingsBody): Promi
   return putJson<PlanSettings>(`/api/plans/${encodeURIComponent(planName)}/settings`, body);
 }
 
+/// Mirrors the Rust `PhaseSettings` returned by GET
+/// `/api/plans/:name/phases/:number/settings`. `phaseVerification` is
+/// the phase-level override (`null` when unset → inherits from plan →
+/// repo). `planVerification` and `repoVerification` are the inherited
+/// values surfaced verbatim so the UI can show the chain without a
+/// separate fetch.
+export interface PhaseSettings {
+  phaseNumber: number;
+  phaseVerification: string | null;
+  planVerification: string | null;
+  repoVerification: string | null;
+}
+
+export interface PhaseSettingsBody {
+  phaseVerification?: Tristate<string>;
+}
+
+export function getPhaseSettings(
+  planName: string,
+  phaseNumber: number,
+): Promise<PhaseSettings> {
+  return fetchJson<PhaseSettings>(
+    `/api/plans/${encodeURIComponent(planName)}/phases/${phaseNumber}/settings`,
+  );
+}
+
+export function putPhaseSettings(
+  planName: string,
+  phaseNumber: number,
+  body: PhaseSettingsBody,
+): Promise<PhaseSettings> {
+  return putJson<PhaseSettings>(
+    `/api/plans/${encodeURIComponent(planName)}/phases/${phaseNumber}/settings`,
+    body,
+  );
+}
+
+/// Resolve which level of the inheritance chain provides the active
+/// verification command for a phase. Mirrors the server-side
+/// `resolve_phase_verification` precedence used by the phase-check
+/// listener in `agents::phase_check`. When the phase has its own
+/// override, the source is `phase`; otherwise plan, then repo, then
+/// none.
+export type PhaseVerificationSource = "phase" | "plan" | "repo" | "none";
+
+export function resolvePhaseVerification(s: PhaseSettings): {
+  value: string | null;
+  source: PhaseVerificationSource;
+} {
+  if (s.phaseVerification !== null) return { value: s.phaseVerification, source: "phase" };
+  if (s.planVerification !== null) return { value: s.planVerification, source: "plan" };
+  if (s.repoVerification !== null) return { value: s.repoVerification, source: "repo" };
+  return { value: null, source: "none" };
+}
+
 /// Mirror of the server-side smart classifier
 /// (`server-rs/src/ci/aggregate.rs::is_workflow_blocking_by_default`).
 /// Returns `true` when a workflow is treated as blocking by default —

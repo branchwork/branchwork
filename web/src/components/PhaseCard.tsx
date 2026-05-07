@@ -3,6 +3,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import type { PlanPhase, PlanTask } from "../stores/plan-store.js";
 import { postJson } from "../api.js";
 import { TaskCard } from "./TaskCard.js";
+import { PhaseHeader } from "./PhaseHeader.js";
 import { Button } from "./ui/Button.js";
 import { Modal } from "./ui/Modal.js";
 import { toastError } from "../lib/toast.js";
@@ -270,6 +271,14 @@ function PhaseCardInner({ phase, planName, statusFilter }: Props) {
           </div>
         </div>
       </div>
+
+      {/* Phase-scoped override accordion (Task 3.3). Rendered between
+          the phase title row and the tasks grid. The override panel
+          owns its own open/closed state — independent of `expanded`,
+          which controls the tasks grid below. */}
+      {expanded && (
+        <PhaseHeader planName={planName} phaseNumber={phase.number} forceCollapsed={!expanded} />
+      )}
 
       {/* Expanded: show tasks. Audit §10 major: plans with 100+ tasks
           per phase used to render every card; TaskGrid switches to a

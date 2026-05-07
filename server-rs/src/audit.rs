@@ -39,6 +39,12 @@ pub mod actions {
     /// YAML. Diff carries the post-update fields (camelCase) — explicit
     /// `null` is preserved so a remove shows up in the trail.
     pub const CONFIG_PLAN_SETTINGS: &str = "config.plan_settings";
+    /// PUT /api/plans/:name/phases/:number/settings wrote a phase-level
+    /// override for `phase_verification` (and/or, in the future, other
+    /// phase-scoped fields) into the plan YAML. Diff carries
+    /// `{phaseNumber, ...post-update fields}` (camelCase) — explicit
+    /// `null` preserved so a remove (Inherit) shows up in the trail.
+    pub const CONFIG_PHASE_SETTINGS: &str = "config.phase_settings";
     /// User clicked Resume on the auto-mode pill: clear `paused_reason` and
     /// re-evaluate auto-advance from the most recently completed task. Audit
     /// payload carries `last_completed_task` so the trail captures which task

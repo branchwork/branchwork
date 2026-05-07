@@ -39,6 +39,13 @@ export interface PlanPhase {
   title: string;
   description: string;
   tasks: PlanTask[];
+  /// Phase-scoped `phase_verification` override (Task 3.3). `null`
+  /// means the phase inherits from plan → repo → none. `undefined`
+  /// when the field is absent on the wire (older server builds).
+  phaseVerification?: string | null;
+  /// Phase-scoped `ci_blocking_workflows` override (schema-only today;
+  /// phase-level CI override UI was deferred per the Task 3.3 brief).
+  ciBlockingWorkflows?: string[] | null;
 }
 
 export interface PlanVerdict {

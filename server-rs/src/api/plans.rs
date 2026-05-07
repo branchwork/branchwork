@@ -1533,6 +1533,578 @@ fn line_terminates_key_range(line: &str) -> bool {
     true
 }
 
+// ── GET/PUT /api/plans/:name/phases/:number/settings ─────────────────────────
+//
+// Per-phase override surface (Task 3.3). Today this is `phase_verification`
+// only — CI workflow-filter overrides at phase scope are deferred until
+// explicitly requested. The PUT body uses the same three-state shim as the
+// plan-level endpoint so the UI can promote (override), edit, and clear
+// (inherit) without touching unrelated keys.
+//
+// The line-based YAML editor is phase-aware: it locates the
+// `  - number: <N>` list-item under `phases:` and edits the chosen key
+// at indent 4 (the conventional phase-mapping indent in plan YAML). We
+// keep `update_yaml_top_level_key` for plan-level edits and add
+// `update_yaml_phase_key` for nested phase-mapping edits — comments,
+// blank lines, and unrelated keys outside the touched range survive
+// byte-for-byte, same contract as the plan-level editor.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PhaseSettings {
+    /// Phase number this response describes; echoed back so the UI can
+    /// match responses to in-flight requests when several phases are
+    /// being edited concurrently.
+    phase_number: u32,
+    /// Phase-level `phase_verification` override from the YAML; `None`
+    /// when unset (resolution falls through to plan → repo → none).
+    phase_verification: Option<String>,
+    /// Plan-level `phase_verification` (the value the phase inherits
+    /// when its own override is unset). `None` when unset.
+    plan_verification: Option<String>,
+    /// Repo-level `phase_verification` from `branchwork.toml` (next
+    /// fallback after plan-level). `None` when unset.
+    repo_verification: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseSettingsBody {
+    /// Three-state field: `Absent` (None) leaves the YAML key untouched,
+    /// `ExplicitNull` (Some(None)) removes the key entirely, `ExplicitValue`
+    /// (Some(Some(v))) writes/replaces. Same shim used elsewhere.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    phase_verification: Option<Option<String>>,
+}
+
+fn build_phase_settings(
+    plan: &plan_parser::ParsedPlan,
+    phase_number: u32,
+) -> Option<PhaseSettings> {
+    let phase = plan.phases.iter().find(|p| p.number == phase_number)?;
+    Some(PhaseSettings {
+        phase_number,
+        phase_verification: phase.phase_verification.clone(),
+        plan_verification: plan.phase_verification.clone(),
+        repo_verification: None,
+    })
+}
+
+pub async fn get_phase_settings(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path((name, phase_number)): Path<(String, u32)>,
+) -> axum::response::Response {
+    {
+        let conn = state.db.lock().unwrap();
+        if !orgs::plan_belongs_to_org(&conn, &name, auth.org_id()) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    }
+
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "parse_error",
+                    "message": format!("Failed to parse plan: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut body = match build_phase_settings(&plan, phase_number) {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "phase_not_found",
+                    "message": format!("Phase {phase_number} not found in plan {name}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let project_dir = crate::ci::project_dir_for(&state.plans_dir, &state.db, &name);
+    body.repo_verification = repo_defaults_for(project_dir.as_deref()).phase_verification;
+
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+pub async fn put_phase_settings(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path((name, phase_number)): Path<(String, u32)>,
+    Json(body): Json<PhaseSettingsBody>,
+) -> axum::response::Response {
+    {
+        let conn = state.db.lock().unwrap();
+        if !orgs::plan_belongs_to_org(&conn, &name, auth.org_id()) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    }
+
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    if !matches!(
+        plan_path.extension().and_then(|e| e.to_str()),
+        Some("yaml") | Some("yml")
+    ) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "unsupported_format",
+                "message": "Phase settings can only be edited on YAML plans. Convert the plan first.",
+            })),
+        )
+            .into_response();
+    }
+
+    let raw = match std::fs::read_to_string(&plan_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "read_failed",
+                    "message": format!("Failed to read plan file: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&raw) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "parse_error",
+                "message": format!("Failed to parse plan YAML: {e}"),
+            })),
+        )
+            .into_response();
+    }
+
+    // Confirm the phase exists BEFORE we touch the file, so unknown
+    // phases 404 cleanly rather than silently no-op'ing.
+    {
+        let pre_plan = match plan_parser::parse_plan_file(&plan_path) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "parse_error",
+                        "message": format!("Failed to parse plan: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        if !pre_plan.phases.iter().any(|p| p.number == phase_number) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "phase_not_found",
+                    "message": format!("Phase {phase_number} not found in plan {name}"),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let mut updated = raw.clone();
+
+    if let Some(opt) = body.phase_verification.as_ref() {
+        let new_value = opt.as_ref().map(|s| serde_yaml::Value::String(s.clone()));
+        match update_yaml_phase_key(
+            &updated,
+            phase_number,
+            "phase_verification",
+            new_value.as_ref(),
+        ) {
+            Ok(s) => updated = s,
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "edit_failed",
+                        "message": format!("Failed to edit phase_verification: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&updated) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "edit_invalidated_yaml",
+                "message": format!("Edit produced invalid YAML: {e}"),
+            })),
+        )
+            .into_response();
+    }
+
+    if updated != raw
+        && let Err(e) = atomic_write(&plan_path, &updated)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "write_failed",
+                "message": format!("Failed to write plan file: {e}"),
+            })),
+        )
+            .into_response();
+    }
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("phaseNumber".into(), serde_json::json!(phase_number));
+    if let Some(opt) = body.phase_verification.as_ref() {
+        payload.insert(
+            "phaseVerification".into(),
+            match opt {
+                Some(v) => serde_json::json!(v),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    if payload.len() > 1 {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::CONFIG_PHASE_SETTINGS,
+            crate::audit::resources::PLAN,
+            Some(&name),
+            Some(&serde_json::Value::Object(payload).to_string()),
+        );
+    }
+
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "parse_error",
+                    "message": format!("Failed to parse plan after edit: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut response = match build_phase_settings(&plan, phase_number) {
+        Some(r) => r,
+        None => {
+            // Should be impossible (we checked pre-write) but cover the
+            // race where the file was edited externally between our
+            // checks. Treat as 404 rather than 5xx so the UI can refresh.
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "phase_not_found",
+                    "message": format!("Phase {phase_number} disappeared from plan {name} during edit"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let project_dir = crate::ci::project_dir_for(&state.plans_dir, &state.db, &name);
+    response.repo_verification = repo_defaults_for(project_dir.as_deref()).phase_verification;
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Update a single key inside a phase mapping while preserving every
+/// comment, blank line, and indentation outside the modified key's
+/// range. `phase_number` matches the `- number: N` list item under
+/// `phases:`. Edits land at indent 4 (the conventional phase-mapping
+/// indent in plan YAML).
+///
+/// - `Some(v)` replaces the existing key+value, or inserts a new entry
+///   immediately before the phase's `tasks:` line (the conventional
+///   trailing key in `YamlPlanPhase`); falls back to end-of-block when
+///   `tasks:` is absent.
+/// - `None` removes the key+value entirely (no-op when absent).
+fn update_yaml_phase_key(
+    yaml: &str,
+    phase_number: u32,
+    key: &str,
+    value: Option<&serde_yaml::Value>,
+) -> Result<String, String> {
+    const PHASE_INDENT: usize = 4;
+    let lines: Vec<&str> = yaml.split('\n').collect();
+    let phase_range = find_phase_block_range(&lines, phase_number)
+        .ok_or_else(|| format!("phase {phase_number} not found"))?;
+    let key_range = find_phase_key_range(&lines, phase_range, key, PHASE_INDENT);
+
+    let replacement_block: Option<String> = match value {
+        Some(v) => Some(serialize_phase_kv(key, v, PHASE_INDENT)?),
+        None => None,
+    };
+    let rep_lines: Option<Vec<String>> = replacement_block.map(|block| {
+        let trimmed = block.strip_suffix('\n').unwrap_or(&block);
+        trimmed.split('\n').map(|s| s.to_string()).collect()
+    });
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 4);
+
+    if let Some((start, end)) = key_range {
+        for line in &lines[..start] {
+            out.push((*line).to_string());
+        }
+        if let Some(rep) = rep_lines.as_ref() {
+            for l in rep {
+                out.push(l.clone());
+            }
+        }
+        for line in &lines[end..] {
+            out.push((*line).to_string());
+        }
+    } else {
+        match rep_lines.as_ref() {
+            None => return Ok(yaml.to_string()),
+            Some(rep) => {
+                let (phase_start, phase_end) = phase_range;
+                let insert_at =
+                    find_phase_inner_key_line(&lines, phase_range, "tasks", PHASE_INDENT)
+                        .unwrap_or(phase_end);
+                // Defensive: `insert_at` must lie strictly inside the
+                // phase block. find_phase_inner_key_line already
+                // constrains its search to (start, end) so this is
+                // always true; the assertion is just to catch a future
+                // refactor that loosens the constraint.
+                debug_assert!(insert_at > phase_start && insert_at <= phase_end);
+
+                for line in &lines[..insert_at] {
+                    out.push((*line).to_string());
+                }
+                for l in rep {
+                    out.push(l.clone());
+                }
+                for line in &lines[insert_at..] {
+                    out.push((*line).to_string());
+                }
+            }
+        }
+    }
+
+    Ok(out.join("\n"))
+}
+
+/// Serialize `key: value` at `indent` spaces, suitable to splice into
+/// a phase mapping. Reuses serde_yaml::to_string and re-indents each
+/// emitted line.
+fn serialize_phase_kv(
+    key: &str,
+    value: &serde_yaml::Value,
+    indent: usize,
+) -> Result<String, String> {
+    let mut map = serde_yaml::Mapping::new();
+    map.insert(serde_yaml::Value::String(key.to_string()), value.clone());
+    let raw = serde_yaml::to_string(&serde_yaml::Value::Mapping(map))
+        .map_err(|e| format!("yaml emit: {e}"))?;
+    let pad = " ".repeat(indent);
+    let mut out = String::with_capacity(raw.len() + 16);
+    for (i, line) in raw.split('\n').enumerate() {
+        let is_last = i + 1 == raw.split('\n').count();
+        if is_last && line.is_empty() {
+            // Drop the trailing newline produced by serde_yaml so the
+            // splice doesn't introduce a blank line.
+            break;
+        }
+        out.push_str(&pad);
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Returns `(start, end)` line indices for the phase-N block under
+/// `phases:`. `start` is the `  - number: N` list-item line; `end` is
+/// the index of the first line that is NOT part of the phase (next
+/// phase's list item, end of phases section, or EOF).
+fn find_phase_block_range(lines: &[&str], phase_number: u32) -> Option<(usize, usize)> {
+    let phases_idx = lines
+        .iter()
+        .position(|l| line_starts_with_top_level_key(l, "phases"))?;
+
+    // Walk forward from `phases:` looking for the matching list item.
+    // A phase block ends at (a) the next `  - number:` list item, or
+    // (b) any line at column 0 that isn't blank (the phases section
+    // itself ended).
+    let mut phase_start: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate().skip(phases_idx + 1) {
+        if let Some(n) = parse_phase_list_item_number(line) {
+            if let Some(start) = phase_start {
+                return Some((start, i));
+            }
+            if n == phase_number {
+                phase_start = Some(i);
+            }
+            continue;
+        }
+        if phase_start.is_some()
+            && !line.is_empty()
+            && let Some(b) = line.as_bytes().first()
+            && *b != b' '
+            && *b != b'\t'
+        {
+            // Hit a column-0 non-continuation: phases section over.
+            return Some((phase_start.unwrap(), i));
+        }
+    }
+    phase_start.map(|s| (s, lines.len()))
+}
+
+/// `Some(N)` when `line` is a `  - number: N` list-item line under
+/// `phases:`. Tolerates flexible whitespace before the `-` and around
+/// `number:`. Returns None for any other line.
+fn parse_phase_list_item_number(line: &str) -> Option<u32> {
+    let after_indent = line.trim_start_matches(' ');
+    if after_indent.len() == line.len() {
+        return None; // no leading indent → not a list item under phases
+    }
+    let stripped = after_indent.strip_prefix("- ")?;
+    let after_kv = stripped.trim_start();
+    let val_part = after_kv.strip_prefix("number:")?.trim_start();
+    // Number can be inline (`number: 1`) or quoted; the YAML schema for
+    // YamlPlanPhase declares `number: u32`, so quoting is rare. Accept
+    // either form. Strip any trailing comment / whitespace.
+    let n_part = val_part
+        .split(|c: char| c == '#' || c.is_whitespace())
+        .next()?
+        .trim_matches(|c| c == '\'' || c == '"');
+    n_part.parse().ok()
+}
+
+/// Find the line range for `<key>:` at `indent` inside a phase block
+/// `(phase_start, phase_end)`. Mirrors `find_top_level_key_range` but
+/// constrained to the phase's lines and at the phase-mapping indent.
+fn find_phase_key_range(
+    lines: &[&str],
+    phase_range: (usize, usize),
+    key: &str,
+    indent: usize,
+) -> Option<(usize, usize)> {
+    let (phase_start, phase_end) = phase_range;
+    let key_line_idx = find_phase_inner_key_line(lines, phase_range, key, indent)?;
+    let mut end = phase_end;
+    for (i, line) in lines
+        .iter()
+        .enumerate()
+        .skip(key_line_idx + 1)
+        .take_while(|(i, _)| *i < phase_end)
+    {
+        if line_terminates_indented_key_range(line, indent) {
+            end = i;
+            break;
+        }
+    }
+    debug_assert!(end > key_line_idx && end <= phase_end);
+    debug_assert!(key_line_idx >= phase_start);
+    Some((key_line_idx, end))
+}
+
+fn find_phase_inner_key_line(
+    lines: &[&str],
+    phase_range: (usize, usize),
+    key: &str,
+    indent: usize,
+) -> Option<usize> {
+    let (phase_start, phase_end) = phase_range;
+    (phase_start + 1..phase_end).find(|&i| line_starts_with_indented_key(lines[i], indent, key))
+}
+
+/// `true` iff `line` is `<indent-spaces><key>:` (with optional inline
+/// value or comment). Rejects deeper indents (different scope) and
+/// lines that are list items at this indent.
+fn line_starts_with_indented_key(line: &str, indent: usize, key: &str) -> bool {
+    if line.len() < indent {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    if !bytes[..indent].iter().all(|&b| b == b' ') {
+        return false;
+    }
+    let after_indent = &bytes[indent..];
+    if after_indent.is_empty() {
+        return false;
+    }
+    // Reject deeper indent (the line belongs to a child scope).
+    if after_indent[0] == b' ' || after_indent[0] == b'\t' {
+        return false;
+    }
+    // Reject list items.
+    if after_indent[0] == b'-' && (after_indent.len() == 1 || after_indent[1] == b' ') {
+        return false;
+    }
+    let kbytes = key.as_bytes();
+    if !after_indent.starts_with(kbytes) {
+        return false;
+    }
+    let after = &after_indent[kbytes.len()..];
+    if after.is_empty() || after[0] != b':' {
+        return false;
+    }
+    after.len() == 1 || matches!(after[1], b' ' | b'\t' | b'#')
+}
+
+/// `true` iff `line` ends an indented key's value range. A blank line
+/// is part of the value (block scalars can include blanks). Anything
+/// at indent <= `indent` (and non-blank) terminates: a sibling key,
+/// the next phase's list item (`  - number:` is at indent 2), or a
+/// column-0 line.
+fn line_terminates_indented_key_range(line: &str, indent: usize) -> bool {
+    if line.is_empty() {
+        return false;
+    }
+    let leading = line.bytes().take_while(|&b| b == b' ').count();
+    if leading == line.len() {
+        // Whitespace-only line — treat as blank (don't terminate).
+        return false;
+    }
+    leading <= indent
+}
+
 // ── PUT /api/plans/:name/tasks/:num/status ───────────────────────────────────
 
 #[derive(Deserialize)]
@@ -5209,5 +5781,218 @@ phases:
         assert!(out.contains("- docs"));
         // Round-trips through serde_yaml.
         let _: serde_yaml::Value = serde_yaml::from_str(&out).expect("must parse");
+    }
+}
+
+#[cfg(test)]
+mod phase_settings_yaml_edit_tests {
+    //! Unit tests for the phase-scoped YAML editor used by
+    //! PUT /api/plans/:name/phases/:number/settings (Task 3.3).
+    use super::{
+        find_phase_block_range, find_phase_inner_key_line, line_starts_with_indented_key,
+        line_terminates_indented_key_range, parse_phase_list_item_number, update_yaml_phase_key,
+    };
+
+    fn lines_of(s: &str) -> Vec<&str> {
+        s.split('\n').collect()
+    }
+
+    const FIXTURE: &str = "title: Demo\ncontext: ''\nphases:\n  - number: 1\n    title: P1\n    description: ''\n    tasks:\n      - number: '1.1'\n        title: T11\n        acceptance: ''\n  - number: 2\n    title: P2\n    description: ''\n    tasks:\n      - number: '2.1'\n        title: T21\n        acceptance: ''\n";
+
+    #[test]
+    fn parse_phase_list_item_number_recognises_basic_forms() {
+        assert_eq!(parse_phase_list_item_number("  - number: 1"), Some(1));
+        assert_eq!(parse_phase_list_item_number("  - number: 12"), Some(12));
+        assert_eq!(
+            parse_phase_list_item_number("  - number: 1 # comment"),
+            Some(1)
+        );
+        assert_eq!(parse_phase_list_item_number("  - number: '1'"), Some(1));
+        // Not a phase list item.
+        assert_eq!(parse_phase_list_item_number("number: 1"), None);
+        assert_eq!(parse_phase_list_item_number("    title: P1"), None);
+        assert_eq!(parse_phase_list_item_number("  - title: P1"), None);
+        assert_eq!(parse_phase_list_item_number(""), None);
+    }
+
+    #[test]
+    fn line_starts_with_indented_key_matches_basic_forms() {
+        assert!(line_starts_with_indented_key("    title: P1", 4, "title"));
+        assert!(line_starts_with_indented_key("    title:", 4, "title"));
+        assert!(line_starts_with_indented_key(
+            "    title: # inline",
+            4,
+            "title"
+        ));
+        // Wrong indent.
+        assert!(!line_starts_with_indented_key("  title: P1", 4, "title"));
+        assert!(!line_starts_with_indented_key(
+            "      title: P1",
+            4,
+            "title"
+        ));
+        // List item, not a key.
+        assert!(!line_starts_with_indented_key("    - title: x", 4, "title"));
+        // Comment only.
+        assert!(!line_starts_with_indented_key("    # title: x", 4, "title"));
+    }
+
+    #[test]
+    fn line_terminates_indented_key_range_treats_blanks_as_continuations() {
+        // Blanks (and whitespace-only lines) are continuations.
+        assert!(!line_terminates_indented_key_range("", 4));
+        assert!(!line_terminates_indented_key_range("    ", 4));
+        // Deeper indent → continuation (block scalar / list item content).
+        assert!(!line_terminates_indented_key_range("      child: x", 4));
+        // Same indent or shallower → terminates.
+        assert!(line_terminates_indented_key_range("    sibling: x", 4));
+        assert!(line_terminates_indented_key_range("  - number: 2", 4));
+        assert!(line_terminates_indented_key_range("phases:", 4));
+    }
+
+    #[test]
+    fn find_phase_block_range_locates_first_and_last_phase() {
+        let lines = lines_of(FIXTURE);
+        let r1 = find_phase_block_range(&lines, 1).expect("phase 1");
+        // Phase 1 starts at the `  - number: 1` line and ends at phase 2's list item.
+        assert_eq!(lines[r1.0], "  - number: 1");
+        assert_eq!(lines[r1.1], "  - number: 2");
+        let r2 = find_phase_block_range(&lines, 2).expect("phase 2");
+        assert_eq!(lines[r2.0], "  - number: 2");
+        // Phase 2 has no successor → end is EOF (last line is empty after trailing \n).
+        assert!(r2.1 >= lines.len() - 1);
+    }
+
+    #[test]
+    fn find_phase_block_range_returns_none_for_unknown_phase() {
+        let lines = lines_of(FIXTURE);
+        assert!(find_phase_block_range(&lines, 99).is_none());
+    }
+
+    #[test]
+    fn find_phase_inner_key_line_locates_tasks() {
+        let lines = lines_of(FIXTURE);
+        let phase_range = find_phase_block_range(&lines, 1).unwrap();
+        let tasks_idx = find_phase_inner_key_line(&lines, phase_range, "tasks", 4).unwrap();
+        assert_eq!(lines[tasks_idx], "    tasks:");
+    }
+
+    #[test]
+    fn insert_phase_verification_lands_before_tasks() {
+        let new = serde_yaml::Value::String("bash scripts/verify.sh".into());
+        let out = update_yaml_phase_key(FIXTURE, 1, "phase_verification", Some(&new)).unwrap();
+        let pv_idx = out.find("phase_verification:").expect("must contain key");
+        let tasks_idx = out
+            .find("    tasks:")
+            .expect("must still contain phase 1's tasks key");
+        assert!(
+            pv_idx < tasks_idx,
+            "phase_verification must be inserted before tasks (pv={pv_idx} tasks={tasks_idx})\n{out}"
+        );
+        // Phase 2 untouched: still has the same shape.
+        assert!(out.contains("  - number: 2\n    title: P2"));
+        // Round-trips through serde_yaml.
+        let v: serde_yaml::Value = serde_yaml::from_str(&out).expect("must parse");
+        let phases = v
+            .as_mapping()
+            .and_then(|m| m.get(serde_yaml::Value::String("phases".into())))
+            .and_then(|p| p.as_sequence())
+            .expect("phases sequence");
+        let phase_one = phases.iter().find(|p| {
+            p.as_mapping()
+                .and_then(|m| m.get(serde_yaml::Value::String("number".into())))
+                .and_then(|v| v.as_u64())
+                == Some(1)
+        });
+        assert_eq!(
+            phase_one
+                .and_then(|p| p.as_mapping())
+                .and_then(|m| m.get(serde_yaml::Value::String("phase_verification".into())))
+                .and_then(|v| v.as_str()),
+            Some("bash scripts/verify.sh")
+        );
+    }
+
+    #[test]
+    fn replace_phase_verification_only_touches_target_phase() {
+        // Seed phase 1 with an explicit override so we can replace it.
+        let seeded = update_yaml_phase_key(
+            FIXTURE,
+            1,
+            "phase_verification",
+            Some(&serde_yaml::Value::String("old".into())),
+        )
+        .unwrap();
+        let new = serde_yaml::Value::String("new value".into());
+        let out = update_yaml_phase_key(&seeded, 1, "phase_verification", Some(&new)).unwrap();
+        assert!(out.contains("phase_verification: new value"));
+        assert!(!out.contains("phase_verification: old"));
+        // Phase 2 still has no override.
+        let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        let phases = v
+            .as_mapping()
+            .and_then(|m| m.get(serde_yaml::Value::String("phases".into())))
+            .and_then(|p| p.as_sequence())
+            .unwrap();
+        let phase_two = phases
+            .iter()
+            .find(|p| {
+                p.as_mapping()
+                    .and_then(|m| m.get(serde_yaml::Value::String("number".into())))
+                    .and_then(|v| v.as_u64())
+                    == Some(2)
+            })
+            .unwrap();
+        assert!(
+            phase_two
+                .as_mapping()
+                .and_then(|m| m.get(serde_yaml::Value::String("phase_verification".into())))
+                .is_none(),
+            "phase 2 must not have inherited the edit:\n{out}"
+        );
+    }
+
+    #[test]
+    fn remove_phase_verification_drops_the_line() {
+        let seeded = update_yaml_phase_key(
+            FIXTURE,
+            2,
+            "phase_verification",
+            Some(&serde_yaml::Value::String("bash verify.sh".into())),
+        )
+        .unwrap();
+        assert!(seeded.contains("phase_verification: bash verify.sh"));
+        let cleared = update_yaml_phase_key(&seeded, 2, "phase_verification", None).unwrap();
+        assert!(
+            !cleared.contains("phase_verification:"),
+            "key must be gone:\n{cleared}"
+        );
+        // Sanity: still parses.
+        let _: serde_yaml::Value = serde_yaml::from_str(&cleared).unwrap();
+    }
+
+    #[test]
+    fn remove_absent_key_is_noop() {
+        let out = update_yaml_phase_key(FIXTURE, 1, "phase_verification", None).unwrap();
+        assert_eq!(out, FIXTURE);
+    }
+
+    #[test]
+    fn unknown_phase_returns_err() {
+        let new = serde_yaml::Value::String("x".into());
+        let err = update_yaml_phase_key(FIXTURE, 99, "phase_verification", Some(&new))
+            .expect_err("must error");
+        assert!(err.contains("phase 99"));
+    }
+
+    #[test]
+    fn comment_outside_phase_block_survives() {
+        let yaml = "title: Hi\n# top-level comment\ncontext: ''\nphases:\n  - number: 1\n    # inline phase comment\n    title: P1\n    tasks:\n      - number: '1.1'\n        title: T\n        acceptance: ''\n";
+        let new = serde_yaml::Value::String("bash verify.sh".into());
+        let out = update_yaml_phase_key(yaml, 1, "phase_verification", Some(&new)).unwrap();
+        assert!(out.contains("# top-level comment"));
+        assert!(out.contains("# inline phase comment"));
+        assert!(out.contains("phase_verification: bash verify.sh"));
+        let _: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
     }
 }

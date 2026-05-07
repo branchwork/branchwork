@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { isWorkflowBlockingByDefault, resolveWorkflows, type PlanSettings } from "./plans.js";
+import {
+  isWorkflowBlockingByDefault,
+  resolvePhaseVerification,
+  resolveWorkflows,
+  type PhaseSettings,
+  type PlanSettings,
+} from "./plans.js";
 
 function settingsWith(overrides: Partial<PlanSettings>): PlanSettings {
   return {
@@ -86,5 +92,47 @@ describe("resolveWorkflows", () => {
 
   it("returns empty array when no workflows are discovered", () => {
     expect(resolveWorkflows(settingsWith({}))).toEqual([]);
+  });
+});
+
+describe("resolvePhaseVerification", () => {
+  function ps(overrides: Partial<PhaseSettings>): PhaseSettings {
+    return {
+      phaseNumber: 1,
+      phaseVerification: null,
+      planVerification: null,
+      repoVerification: null,
+      ...overrides,
+    };
+  }
+
+  it("falls through phase → plan → repo → none", () => {
+    expect(resolvePhaseVerification(ps({}))).toEqual({ value: null, source: "none" });
+    expect(resolvePhaseVerification(ps({ repoVerification: "make verify" }))).toEqual({
+      value: "make verify",
+      source: "repo",
+    });
+    expect(
+      resolvePhaseVerification(ps({ repoVerification: "make verify", planVerification: "plan.sh" })),
+    ).toEqual({ value: "plan.sh", source: "plan" });
+    expect(
+      resolvePhaseVerification(
+        ps({
+          repoVerification: "make verify",
+          planVerification: "plan.sh",
+          phaseVerification: "phase.sh",
+        }),
+      ),
+    ).toEqual({ value: "phase.sh", source: "phase" });
+  });
+
+  it("treats explicit empty string as a real phase override (not inheritance)", () => {
+    // The server stores `null` for an absent field and a string for an
+    // explicit value. An empty-string override is unusual but legal —
+    // the resolver must not silently fall through.
+    const got = resolvePhaseVerification(
+      ps({ phaseVerification: "", planVerification: "plan.sh" }),
+    );
+    expect(got).toEqual({ value: "", source: "phase" });
   });
 });
