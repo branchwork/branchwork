@@ -364,6 +364,7 @@ async fn on_ci_passed(
         task_id_owned,
         effort,
         port,
+        Some(merged_sha.to_string()),
     )
     .await;
 }
@@ -1110,6 +1111,7 @@ async fn on_fix_ci_passed(
         original_task_owned,
         effort,
         port,
+        Some(merged_sha.to_string()),
     )
     .await;
 }

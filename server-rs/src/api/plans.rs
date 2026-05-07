@@ -1013,8 +1013,10 @@ pub async fn put_plan_config(
             let effort = *state.effort.lock().unwrap();
             let port = state.config_port();
             tokio::spawn(async move {
-                crate::agents::try_auto_advance(registry, plans_dir, plan_name, task, effort, port)
-                    .await;
+                crate::agents::try_auto_advance(
+                    registry, plans_dir, plan_name, task, effort, port, None,
+                )
+                .await;
             });
         }
     }
@@ -1135,8 +1137,10 @@ pub async fn set_task_status(
         let effort = *state.effort.lock().unwrap();
         let port = state.config_port();
         tokio::spawn(async move {
-            crate::agents::try_auto_advance(registry, plans_dir, plan_name, task, effort, port)
-                .await;
+            crate::agents::try_auto_advance(
+                registry, plans_dir, plan_name, task, effort, port, None,
+            )
+            .await;
         });
     }
 

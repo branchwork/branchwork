@@ -1202,6 +1202,14 @@ fn claim_task(db: &Db, plan_name: &str, task_number: &str) -> bool {
 /// auto-advance is enabled for the plan, spawn agents for ready tasks of the
 /// next phase that has any. No-op otherwise.
 ///
+/// `merged_sha` is the merge commit produced by `merge_agent_branch_dispatch`
+/// when this completion came through the auto-mode merge pipeline. It's
+/// threaded through so the `phase_completed` broadcast (Task 2.1) can carry
+/// the phase-end SHA the Check agent (Task 2.2) verifies against. Manual
+/// completion paths (HTTP `PUT /tasks/:id/status`, MCP `update_task_status`,
+/// auto-mode resume) pass `None` — the event still fires so the UI can
+/// reflect phase progress, but `phase_sha` is `null`.
+///
 /// Runs in the background (caller `tokio::spawn`s it) so it can't block the
 /// HTTP response that triggered it.
 pub async fn try_auto_advance(
@@ -1211,6 +1219,7 @@ pub async fn try_auto_advance(
     completed_task_number: String,
     effort: Effort,
     port: u16,
+    merged_sha: Option<String>,
 ) {
     // Either auto-advance (phase-level opt-in) or auto-mode (the
     // merge-CI-advance loop's master gate, which already excludes paused
@@ -1341,6 +1350,25 @@ pub async fn try_auto_advance(
     if !phase_done {
         return;
     }
+
+    // Phase boundary just crossed: every task in `current_phase` is
+    // completed/skipped. Broadcast `phase_completed` once, BEFORE the
+    // next-phase scan, so it fires regardless of whether a next phase
+    // exists or has ready tasks (last phase of the plan still emits).
+    // `phase_sha` carries the merge commit when the trigger came from
+    // the auto-mode merge pipeline (`on_ci_passed` /
+    // `on_fix_ci_passed`); for manual completion paths it's `null`.
+    // The event powers Task 2.2's phase-end Check agent — the SHA is
+    // what the verify suite runs against.
+    broadcast_event(
+        &registry.broadcast_tx,
+        "phase_completed",
+        serde_json::json!({
+            "plan_name": plan_name,
+            "phase_number": current_phase.number,
+            "phase_sha": merged_sha,
+        }),
+    );
 
     // Find the next sequentially-numbered phase that has at least one ready
     // task. Skip phases that are already fully done.
@@ -2363,6 +2391,16 @@ mod tests {
         })
     }
 
+    fn phase_completed_events<'a>(events: &'a [String], plan_name: &str) -> Vec<&'a String> {
+        events
+            .iter()
+            .filter(|e| {
+                e.contains("\"type\":\"phase_completed\"")
+                    && e.contains(&format!("\"plan_name\":\"{plan_name}\""))
+            })
+            .collect()
+    }
+
     /// Acceptance-criteria spec: a 5-task linear chain (a→b→c→d→e)
     /// advances exactly one task per `try_auto_advance` invocation.
     /// Pre-stage `a=completed`; each tick must spawn exactly the next
@@ -2420,6 +2458,7 @@ mod tests {
                 from.to_string(),
                 Effort::Medium,
                 registry.port,
+                None,
             )
             .await;
 
@@ -2516,6 +2555,7 @@ mod tests {
             "b".to_string(),
             Effort::Medium,
             registry.port,
+            None,
         )
         .await;
 
@@ -2543,6 +2583,7 @@ mod tests {
             "d".to_string(),
             Effort::Medium,
             registry.port,
+            None,
         )
         .await;
 
@@ -2618,6 +2659,7 @@ mod tests {
             "1.2".to_string(),
             Effort::Medium,
             registry.port,
+            None,
         )
         .await;
 
@@ -2691,6 +2733,7 @@ mod tests {
             "a".to_string(),
             Effort::Medium,
             registry.port,
+            None,
         )
         .await;
 
@@ -2760,6 +2803,7 @@ mod tests {
             "a".to_string(),
             Effort::Medium,
             registry.port,
+            None,
         )
         .await;
 
@@ -2886,6 +2930,7 @@ mod tests {
             "1.1".to_string(),
             Effort::Medium,
             registry.port,
+            None,
         )
         .await;
 
@@ -2944,6 +2989,7 @@ mod tests {
                 from.to_string(),
                 Effort::Medium,
                 registry.port,
+                None,
             )
             .await;
             let total = agent_task_ids(&db, plan).len();
@@ -3075,6 +3121,7 @@ mod tests {
             "a".to_string(),
             Effort::Medium,
             registry.port,
+            None,
         )
         .await;
 
@@ -3194,6 +3241,7 @@ mod tests {
                 from.to_string(),
                 Effort::Medium,
                 registry.port,
+                None,
             )
             .await;
 
@@ -3246,6 +3294,197 @@ mod tests {
             agent_task_ids(&db, plan).len(),
             4,
             "linear chain across phase boundary: 4 claims total",
+        );
+    }
+
+    // ── Task 2.1 — phase-completed broadcast ──────────────────────────
+    //
+    // Acceptance: 3-task phase, merging tasks 1 and 2 emits no
+    // `phase_completed`; merging task 3 emits exactly one. The event
+    // payload carries `(plan_name, phase_number, phase_sha)` where
+    // `phase_sha` is the merge commit threaded in by the auto-mode
+    // pipeline (or `null` for manual completion paths). A second pin
+    // proves the event still fires on the LAST phase of a plan, where
+    // there is no `phase_advanced` follow-up.
+
+    /// 3-task phase: task 1 + task 2 completion produce zero
+    /// `phase_completed` events; the third produces exactly one with
+    /// `phase_sha` carrying the merged SHA passed by the auto-mode
+    /// caller.
+    #[tokio::test]
+    async fn phase_completed_fires_once_when_last_task_in_phase_merges() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "three-task-phase";
+        // Phase 1 has three independent tasks; phase 2 exists so the
+        // next-phase scan still has work to do (proves the
+        // `phase_completed` broadcast happens BEFORE the next-phase
+        // scan, regardless of whether a follow-up phase exists).
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"1.1\"\n\
+             \x20       title: One-One\n\
+             \x20     - number: \"1.2\"\n\
+             \x20       title: One-Two\n\
+             \x20     - number: \"1.3\"\n\
+             \x20       title: One-Three\n\
+             \x20 - number: 2\n\
+             \x20   title: P2\n\
+             \x20   tasks:\n\
+             \x20     - number: \"2.1\"\n\
+             \x20       title: Two-One\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        // Tick 1: task 1.1 completes — phase still has 1.2 and 1.3
+        // open. No `phase_completed` event.
+        set_task_status(&db, plan, "1.1", "completed");
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "1.1".to_string(),
+            Effort::Medium,
+            registry.port,
+            Some("sha-1".to_string()),
+        )
+        .await;
+        let events1 = drain_events(&mut rx);
+        assert!(
+            phase_completed_events(&events1, plan).is_empty(),
+            "phase_completed must NOT fire after 1.1: {events1:?}",
+        );
+
+        // Tick 2: task 1.2 completes — phase still has 1.3 open. No
+        // `phase_completed` event.
+        set_task_status(&db, plan, "1.2", "completed");
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "1.2".to_string(),
+            Effort::Medium,
+            registry.port,
+            Some("sha-2".to_string()),
+        )
+        .await;
+        let events2 = drain_events(&mut rx);
+        assert!(
+            phase_completed_events(&events2, plan).is_empty(),
+            "phase_completed must NOT fire after 1.2: {events2:?}",
+        );
+
+        // Tick 3: task 1.3 completes — phase 1 is fully done. Exactly
+        // one `phase_completed` event with `phase_number=1` and
+        // `phase_sha="sha-3"`.
+        set_task_status(&db, plan, "1.3", "completed");
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "1.3".to_string(),
+            Effort::Medium,
+            registry.port,
+            Some("sha-3".to_string()),
+        )
+        .await;
+        let events3 = drain_events(&mut rx);
+        let completed = phase_completed_events(&events3, plan);
+        assert_eq!(
+            completed.len(),
+            1,
+            "exactly one phase_completed expected after 1.3: {events3:?}",
+        );
+        let payload = completed[0];
+        assert!(
+            payload.contains("\"phase_number\":1"),
+            "phase_completed must carry phase_number=1: {payload}",
+        );
+        assert!(
+            payload.contains("\"phase_sha\":\"sha-3\""),
+            "phase_completed must carry the merged SHA passed by the caller: {payload}",
+        );
+        // Also pin that the next-phase scan still ran (phase_advanced
+        // fires on the same tick): proves `phase_completed` does not
+        // short-circuit the existing `phase_advanced` broadcast.
+        assert!(
+            has_phase_advanced(&events3, plan),
+            "phase_advanced should still fire alongside phase_completed: {events3:?}",
+        );
+    }
+
+    /// Manual-completion path (no merged SHA threaded through):
+    /// `phase_completed` still fires, with `phase_sha` serialised as
+    /// JSON `null`. Pins that the SHA is optional, not required.
+    #[tokio::test]
+    async fn phase_completed_carries_null_sha_for_manual_completion() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "manual-phase-end";
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"only\"\n\
+             \x20       title: Only\n",
+        );
+        enable_auto_advance(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        set_task_status(&db, plan, "only", "completed");
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "only".to_string(),
+            Effort::Medium,
+            registry.port,
+            None,
+        )
+        .await;
+
+        let events = drain_events(&mut rx);
+        let completed = phase_completed_events(&events, plan);
+        assert_eq!(
+            completed.len(),
+            1,
+            "phase_completed must fire on the last phase too: {events:?}",
+        );
+        let payload = completed[0];
+        // `Option::None` serialises to JSON `null` via serde_json.
+        assert!(
+            payload.contains("\"phase_sha\":null"),
+            "phase_sha must be JSON null when no merged SHA was passed: {payload}",
+        );
+        // No next phase exists, so no `phase_advanced` follow-up.
+        assert!(
+            !has_phase_advanced(&events, plan),
+            "phase_advanced must not fire on the last phase: {events:?}",
         );
     }
 }
