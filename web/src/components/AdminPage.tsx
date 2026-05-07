@@ -1,7 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
+import { useAuthStore } from "../stores/auth-store.js";
+import { useOrgStore } from "../stores/org-store.js";
+import { useRunnerStore } from "../stores/runner-store.js";
 import { Banner } from "./ui/Banner.js";
 import { Button } from "./ui/Button.js";
+import { Tabs } from "./ui/Tabs.js";
+import { MembersTab } from "./admin/MembersTab.js";
+import { BudgetTab } from "./admin/BudgetTab.js";
+import { KillSwitchTab } from "./admin/KillSwitchTab.js";
+import { UserQuotasTab } from "./admin/UserQuotasTab.js";
+import { SsoTab } from "./admin/SsoTab.js";
 
 const EFFORT_LEVELS: { value: EffortLevel; label: string }[] = [
   { value: "low", label: "Low" },
@@ -32,7 +42,126 @@ export function retentionPreview(days: number): string {
   return `Soft-deleted plans are kept for ${days} day${days === 1 ? "" : "s"}.`;
 }
 
+/// Org roles that may see + actuate the org-scoped admin tabs (Budget,
+/// Kill switch, Quotas, SSO). Members and viewers see only Settings +
+/// Members (read-only) on a SaaS deployment.
+export function isAdminRole(role: string | null | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+const ADMIN_TABS = [
+  "settings",
+  "members",
+  "budget",
+  "kill-switch",
+  "quotas",
+  "sso",
+] as const;
+export type AdminTab = (typeof ADMIN_TABS)[number];
+
+const TAB_LABELS: Record<AdminTab, string> = {
+  settings: "Settings",
+  members: "Members",
+  budget: "Budget",
+  "kill-switch": "Kill switch",
+  quotas: "User quotas",
+  sso: "SSO",
+};
+
 export function AdminPage() {
+  const { section } = useParams<{ section?: string }>();
+  const navigate = useNavigate();
+
+  const mode = useRunnerStore((s) => s.mode);
+  const memberships = useOrgStore((s) => s.memberships);
+  const user = useAuthStore((s) => s.user);
+
+  // Resolve the active membership the same way OrgChip does so the
+  // header chip's slug and AdminPage's tab content always agree on
+  // which org we're acting on.
+  const current = useMemo(() => {
+    if (memberships.length === 0) return null;
+    const id = user?.orgId ?? null;
+    return memberships.find((m) => m.id === id) ?? memberships[0] ?? null;
+  }, [memberships, user]);
+  const role = current?.role ?? null;
+  const isAdmin = isAdminRole(role);
+
+  // Standalone deployments have no org concept — only the existing
+  // Settings form makes sense (audit §17, mirrors OrgChip / RunnerStatus
+  // gate). Tab bar is hidden so the page looks identical to its
+  // pre-tabs shape on a single-tenant box.
+  const showOrgTabs = mode === "saas" && current !== null;
+  const showAdminTabs = showOrgTabs && isAdmin;
+
+  const allowedTabs: AdminTab[] = useMemo(() => {
+    const t: AdminTab[] = ["settings"];
+    if (showOrgTabs) t.push("members");
+    if (showAdminTabs) t.push("budget", "kill-switch", "quotas", "sso");
+    return t;
+  }, [showOrgTabs, showAdminTabs]);
+
+  const requested = (section ?? "settings") as AdminTab;
+  const activeTab: AdminTab = allowedTabs.includes(requested)
+    ? requested
+    : "settings";
+
+  // Visiting `/admin/budget` as a non-admin (or on a standalone box)
+  // bounces to /admin/settings so the URL stays in sync with the
+  // visible tab. Server enforces the same authz; this is purely a
+  // UX nicety.
+  useEffect(() => {
+    if (section && !allowedTabs.includes(section as AdminTab)) {
+      navigate("/admin/settings", { replace: true });
+    }
+  }, [section, allowedTabs, navigate]);
+
+  return (
+    <div className="max-w-3xl p-8">
+      <div className="mb-6">
+        <h1 className="text-xl font-bold text-gray-100">Admin</h1>
+        <p className="text-xs text-gray-500 mt-1">
+          Server-wide defaults and per-organization controls.
+        </p>
+      </div>
+
+      {allowedTabs.length > 1 && (
+        <Tabs<AdminTab>
+          value={activeTab}
+          onChange={(v) => navigate(`/admin/${v}`)}
+          label="Admin sections"
+          tabs={allowedTabs.map((value) => ({
+            value,
+            label: TAB_LABELS[value],
+          }))}
+          className="mb-6 border-b border-gray-800"
+        />
+      )}
+
+      {activeTab === "settings" && <SettingsTab />}
+      {activeTab === "members" && current && (
+        <MembersTab
+          orgSlug={current.slug}
+          callerRole={role}
+          callerUserId={user?.id ?? null}
+        />
+      )}
+      {activeTab === "budget" && current && <BudgetTab orgSlug={current.slug} />}
+      {activeTab === "kill-switch" && current && (
+        <KillSwitchTab orgSlug={current.slug} />
+      )}
+      {activeTab === "quotas" && current && (
+        <UserQuotasTab orgSlug={current.slug} />
+      )}
+      {activeTab === "sso" && current && <SsoTab orgSlug={current.slug} />}
+    </div>
+  );
+}
+
+/// The original server-wide settings form. Lives inline so the existing
+/// test surface (effort buttons, retention input, webhook field) keeps
+/// rendering when AdminPage mounts on `/admin` or `/admin/settings`.
+function SettingsTab() {
   const effort = useSettingsStore((s) => s.effort);
   const setEffort = useSettingsStore((s) => s.setEffort);
   const skipPermissions = useSettingsStore((s) => s.skipPermissions);
@@ -47,9 +176,9 @@ export function AdminPage() {
   );
 
   const [webhookDraft, setWebhookDraft] = useState(webhookUrl ?? "");
-  const [webhookStatus, setWebhookStatus] = useState<"idle" | "saving" | "saved" | "error">(
-    "idle"
-  );
+  const [webhookStatus, setWebhookStatus] = useState<
+    "idle" | "saving" | "saved" | "error"
+  >("idle");
   const [webhookError, setWebhookError] = useState<string | null>(null);
 
   const [retentionDraft, setRetentionDraft] = useState(
@@ -114,14 +243,7 @@ export function AdminPage() {
   }
 
   return (
-    <div className="max-w-2xl p-8">
-      <div className="mb-8">
-        <h1 className="text-xl font-bold text-gray-100">Admin</h1>
-        <p className="text-xs text-gray-500 mt-1">
-          Server-wide defaults. Changes apply to new agents and persist across restarts.
-        </p>
-      </div>
-
+    <div className="max-w-2xl">
       <Section
         title="Default effort"
         description="Reasoning level passed to new agents. Higher values cost more and take longer."
@@ -148,10 +270,15 @@ export function AdminPage() {
         title="Skip permissions"
         description={
           <>
-            Spawn Claude agents with <code className="text-gray-400">--dangerously-skip-permissions</code>.
-            Requires <code className="text-gray-400">"skipDangerousModePermissionPrompt": true</code> in
-            <code className="text-gray-400"> ~/.claude/settings.json</code> (see README), otherwise the
-            session ends on first launch.
+            Spawn Claude agents with{" "}
+            <code className="text-gray-400">--dangerously-skip-permissions</code>
+            . Requires{" "}
+            <code className="text-gray-400">
+              "skipDangerousModePermissionPrompt": true
+            </code>{" "}
+            in
+            <code className="text-gray-400"> ~/.claude/settings.json</code> (see
+            README), otherwise the session ends on first launch.
           </>
         }
       >
@@ -162,7 +289,9 @@ export function AdminPage() {
             onChange={(e) => setSkipPermissions(e.target.checked)}
             className="accent-amber-500 w-4 h-4"
           />
-          <span className={`text-sm ${skipPermissions ? "text-amber-400" : "text-gray-400"}`}>
+          <span
+            className={`text-sm ${skipPermissions ? "text-amber-400" : "text-gray-400"}`}
+          >
             {skipPermissions ? "On" : "Off"}
           </span>
         </label>
@@ -258,7 +387,9 @@ function Section({ title, description, children }: SectionProps) {
   return (
     <div className="mb-6 pb-6 border-b border-gray-800 last:border-b-0">
       <h2 className="text-sm font-semibold text-gray-200">{title}</h2>
-      <p className="text-[11px] text-gray-500 mt-1 mb-3 leading-relaxed">{description}</p>
+      <p className="text-[11px] text-gray-500 mt-1 mb-3 leading-relaxed">
+        {description}
+      </p>
       {children}
     </div>
   );

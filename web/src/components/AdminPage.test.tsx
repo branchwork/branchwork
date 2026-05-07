@@ -2,16 +2,44 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   fireEvent,
-  render,
+  render as rtlRender,
   screen,
   waitFor,
+  type RenderOptions,
 } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import type { ReactElement } from "react";
 import {
   AdminPage,
+  isAdminRole,
   clampRetentionDays,
   retentionPreview,
 } from "./AdminPage.js";
 import { useSettingsStore } from "../stores/settings-store.js";
+import { useRunnerStore } from "../stores/runner-store.js";
+import { useOrgStore } from "../stores/org-store.js";
+import { useAuthStore } from "../stores/auth-store.js";
+
+/// Test render helper that mounts AdminPage under a MemoryRouter so
+/// `useParams` / `useNavigate` resolve. Defaults to `/admin/settings`
+/// so the Settings tab is the active one — that matches the pre-tabs
+/// surface (effort/webhook/retention/skip-perms inputs always present).
+/// Pass `initialEntry: "/admin/members"` to land on a different tab.
+function render(
+  ui: ReactElement,
+  options: RenderOptions & { initialEntry?: string } = {},
+) {
+  const { initialEntry = "/admin/settings", ...rest } = options;
+  return rtlRender(
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <Routes>
+        <Route path="/admin" element={ui} />
+        <Route path="/admin/:section" element={ui} />
+      </Routes>
+    </MemoryRouter>,
+    rest,
+  );
+}
 
 beforeEach(() => {
   useSettingsStore.setState({
@@ -27,6 +55,24 @@ beforeEach(() => {
     setWebhookUrl: vi.fn().mockResolvedValue(undefined),
     setPlanArchiveRetentionDays: vi.fn().mockResolvedValue(undefined),
   });
+  // Default to standalone deployment so the existing tests see only
+  // the Settings tab (no tab bar). Each gating test below overrides
+  // mode + memberships to opt into the org-scoped tabs.
+  useRunnerStore.setState({
+    mode: "standalone",
+    runners: [],
+    loaded: true,
+    lastRunnersFetchedAt: Date.now(),
+    driversByRunnerId: {},
+    selectedRunnerId: null,
+    configByRunnerId: {},
+  });
+  useOrgStore.setState({
+    memberships: [],
+    loaded: true,
+    lastFetchedAt: Date.now(),
+  });
+  useAuthStore.setState({ user: null, loading: false, error: null });
 });
 
 afterEach(() => {
@@ -277,5 +323,121 @@ describe("AdminPage notification webhook", () => {
     await waitFor(() =>
       expect(screen.getByText(/hook url rejected/i)).toBeTruthy(),
     );
+  });
+});
+
+describe("isAdminRole", () => {
+  it("returns true for owner and admin", () => {
+    expect(isAdminRole("owner")).toBe(true);
+    expect(isAdminRole("admin")).toBe(true);
+  });
+  it("returns false for member, viewer, missing", () => {
+    expect(isAdminRole("member")).toBe(false);
+    expect(isAdminRole("viewer")).toBe(false);
+    expect(isAdminRole(null)).toBe(false);
+    expect(isAdminRole(undefined)).toBe(false);
+    expect(isAdminRole("")).toBe(false);
+  });
+});
+
+/// Tab gating — the load-bearing claim the task adds. Standalone and
+/// non-admin users see only the Settings tab; admins see all six.
+describe("AdminPage tab gating", () => {
+  function asSaasAdmin() {
+    useRunnerStore.setState({ mode: "saas", loaded: true });
+    useOrgStore.setState({
+      memberships: [
+        {
+          id: "org-1",
+          name: "Acme",
+          slug: "acme",
+          role: "owner",
+          memberCount: 3,
+        },
+      ],
+      loaded: true,
+      lastFetchedAt: Date.now(),
+    });
+    useAuthStore.setState({
+      user: { id: "user-1", email: "u@example.com", orgId: "org-1" },
+      loading: false,
+      error: null,
+    });
+  }
+
+  function asSaasMember() {
+    useRunnerStore.setState({ mode: "saas", loaded: true });
+    useOrgStore.setState({
+      memberships: [
+        {
+          id: "org-1",
+          name: "Acme",
+          slug: "acme",
+          role: "member",
+          memberCount: 3,
+        },
+      ],
+      loaded: true,
+      lastFetchedAt: Date.now(),
+    });
+    useAuthStore.setState({
+      user: { id: "user-1", email: "u@example.com", orgId: "org-1" },
+      loading: false,
+      error: null,
+    });
+  }
+
+  it("standalone deployments render no tab bar", () => {
+    // Default beforeEach already sets mode=standalone + no memberships.
+    render(<AdminPage />);
+    expect(screen.queryByRole("tablist")).toBeNull();
+    // Settings tab content still renders (effort buttons present).
+    expect(screen.getByText(/^Low$/)).toBeTruthy();
+  });
+
+  it("SaaS members see only Settings + Members tabs", () => {
+    asSaasMember();
+    render(<AdminPage />);
+    const tablist = screen.getByRole("tablist");
+    expect(tablist).toBeTruthy();
+    const tabs = screen
+      .getAllByRole("tab")
+      .map((t) => (t.textContent ?? "").trim());
+    expect(tabs).toEqual(["Settings", "Members"]);
+  });
+
+  it("SaaS owners see all six admin tabs", () => {
+    asSaasAdmin();
+    render(<AdminPage />);
+    const tabs = screen
+      .getAllByRole("tab")
+      .map((t) => (t.textContent ?? "").trim());
+    expect(tabs).toEqual([
+      "Settings",
+      "Members",
+      "Budget",
+      "Kill switch",
+      "User quotas",
+      "SSO",
+    ]);
+  });
+
+  it("requesting an admin-only URL as a non-admin renders Settings", () => {
+    asSaasMember();
+    render(<AdminPage />, { initialEntry: "/admin/budget" });
+    // Falls back to Settings: the effort buttons are visible.
+    expect(screen.getByText(/^Low$/)).toBeTruthy();
+    // Budget tab is not in the tablist for a non-admin.
+    const tabs = screen
+      .getAllByRole("tab")
+      .map((t) => (t.textContent ?? "").trim());
+    expect(tabs).not.toContain("Budget");
+  });
+
+  it("requesting an org-only URL on standalone falls back to Settings", () => {
+    // Default beforeEach is standalone.
+    render(<AdminPage />, { initialEntry: "/admin/members" });
+    expect(screen.getByText(/^Low$/)).toBeTruthy();
+    expect(screen.queryByRole("tablist")).toBeNull();
   });
 });
