@@ -83,6 +83,34 @@ pub enum WireMessage {
     /// Driver authentication status snapshot. Sent at startup and on change.
     DriverAuthReport { drivers: Vec<DriverAuthInfo> },
 
+    /// One line of the runner process's own stdout/stderr — the diagnostics
+    /// a user-on-the-host normally reads via `tail -f` or `journalctl`.
+    /// Streamed to the dashboard's `/runners/{id}` tail panel via the
+    /// `runner_log` broadcast.
+    ///
+    /// Best-effort. The runner caps emission at ~200 lines/sec (drop-newest
+    /// when the in-flight bound is hit) and prepends a synthetic
+    /// `"[truncated N lines]"` line on the next surviving emit so the
+    /// dashboard can render the gap. A reconnect mid-burst loses some
+    /// lines outright; the dashboard renders a `[reconnect — N lines may
+    /// have been missed]` marker on the next render once the WS lifts back
+    /// up. No outbox, no replay.
+    RunnerLogLine {
+        /// RFC3339 / ISO 8601 timestamp, captured at emit time on the
+        /// runner. Authoritative — the server forwards verbatim so a
+        /// late-arriving line still shows the moment it was printed.
+        ts: String,
+        /// One of `info` / `warn` / `error`. `println!` maps to `info`
+        /// and `eprintln!` maps to `warn`; the dashboard tints the
+        /// `<pre>` line accordingly. Free-form so future log levels can
+        /// flow through without a wire change.
+        level: String,
+        /// The line itself, with the trailing newline already stripped
+        /// (the runner writes one frame per line). UTF-8; non-UTF-8
+        /// bytes are lossy-replaced before emit so the wire stays JSON.
+        line: String,
+    },
+
     // ── SaaS -> Runner ──────────────────────────────────────────────────
     /// Dashboard user clicked "Start" — spawn an agent.
     ///
@@ -623,6 +651,7 @@ impl WireMessage {
                 | WireMessage::CiRunStatusResolved { .. }
                 | WireMessage::CiFailureLog { .. }
                 | WireMessage::CiFailureLogResolved { .. }
+                | WireMessage::RunnerLogLine { .. }
         )
     }
 
@@ -635,6 +664,7 @@ impl WireMessage {
             WireMessage::AgentStopped { .. } => "agent_stopped",
             WireMessage::TaskStatusChanged { .. } => "task_status_changed",
             WireMessage::DriverAuthReport { .. } => "driver_auth_report",
+            WireMessage::RunnerLogLine { .. } => "runner_log_line",
             WireMessage::StartAgent { .. } => "start_agent",
             WireMessage::KillAgent { .. } => "kill_agent",
             WireMessage::ResizeTerminal { .. } => "resize_terminal",
@@ -1854,6 +1884,51 @@ mod tests {
                 assert_eq!(req_id, "req-43");
                 assert!(log.is_none());
                 assert!(run_id_used.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_log_line_round_trip() {
+        let msg = WireMessage::RunnerLogLine {
+            ts: "2026-05-07T12:34:56.789Z".into(),
+            level: "info".into(),
+            line: "[runner] connecting to wss://app.branchwork.dev".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "runner_log_line");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        // Pin the discriminator name so a future rename can't silently break the wire.
+        assert!(json.contains("\"type\":\"runner_log_line\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::RunnerLogLine { ts, level, line } => {
+                assert_eq!(ts, "2026-05-07T12:34:56.789Z");
+                assert_eq!(level, "info");
+                assert_eq!(line, "[runner] connecting to wss://app.branchwork.dev");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_log_line_truncated_marker_round_trip() {
+        // The runner emits a synthetic "[truncated N lines]" frame when the
+        // 200 lines/sec cap kicks in. Same wire shape, level=warn.
+        let msg = WireMessage::RunnerLogLine {
+            ts: "2026-05-07T12:34:56.789Z".into(),
+            level: "warn".into(),
+            line: "[truncated 42 lines]".into(),
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::RunnerLogLine { line, level, .. } => {
+                assert_eq!(level, "warn");
+                assert_eq!(line, "[truncated 42 lines]");
             }
             other => panic!("unexpected variant: {other:?}"),
         }

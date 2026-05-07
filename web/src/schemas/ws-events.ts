@@ -285,6 +285,23 @@ const RunnerDrivers = v.object({
   }),
 });
 
+/// One line of the runner host's stdout/stderr — the `[runner] connecting…`
+/// breadcrumbs the runner prints to its own terminal, forwarded straight to
+/// the dashboard's `/runners/{id}` tail panel. Best-effort fan-out from the
+/// `RunnerLogLine` wire variant; no DB persistence on the server side.
+const RunnerLog = v.object({
+  type: v.literal("runner_log"),
+  data: v.object({
+    runner_id: v.string(),
+    /// RFC3339 / ISO 8601 timestamp captured at emit time on the runner.
+    ts: v.string(),
+    /// One of `info` / `warn` / `error`. Free-form so future levels flow
+    /// through without a wire change.
+    level: v.string(),
+    line: v.string(),
+  }),
+});
+
 /// Transport-level hello sent once by the server immediately after
 /// the WS upgrade succeeds (see `server-rs/src/ws.rs:30-42`). Not a
 /// domain event — no broadcast catalogue entry, no DB row, no UI
@@ -327,6 +344,7 @@ export const WsMessageSchema = v.variant("type", [
   RunnerConnected,
   RunnerDisconnected,
   RunnerDrivers,
+  RunnerLog,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;

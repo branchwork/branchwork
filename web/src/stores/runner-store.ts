@@ -100,6 +100,22 @@ export interface RunnerDriverInfo {
   status: RunnerDriverState;
 }
 
+/// One line of runner stdout/stderr the dashboard tails on
+/// `/runners/{id}`. Pushed by `runner_log` WS events; rendered by
+/// `RunnerLogPanel`. The local `id` field is a per-runner monotonic
+/// counter so React keys stay stable when the ring evicts.
+export interface RunnerLogEntry {
+  id: number;
+  ts: string;
+  level: string;
+  line: string;
+}
+
+/// Maximum number of lines kept in the per-runner ring. Older entries are
+/// dropped (FIFO) once the cap is hit. Matches the brief's documented
+/// "last N lines (in-memory ring, default 500)".
+export const RUNNER_LOG_RING_CAP = 500;
+
 /// Per-runner config response (`GET /api/runners/{id}/config`). `effort`
 /// and `skipPermissions` are the *effective* (resolved) values; `override`
 /// captures what was set explicitly so the UI can render "Inherit server
@@ -183,6 +199,13 @@ interface RunnerStore {
   /// optional: 4.1's call site passes only `runner_id`; 4.5+ passes the
   /// payload's `drivers` array as well.
   applyDriversTouch: (payload: { runner_id: string; drivers?: RunnerDriverInfo[] }) => void;
+  /// Per-runner log ring, keyed by `runner.id`. Pushed by the `runner_log`
+  /// WS handler in `ws-store.ts`; consumed by `RunnerLogPanel`. Capped at
+  /// `RUNNER_LOG_RING_CAP` lines per runner, FIFO eviction.
+  logsByRunnerId: Record<string, RunnerLogEntry[]>;
+  /// Push one line into the ring for `runnerId`. Drops the oldest entry
+  /// when the cap is hit. Side-effect-only — no fetch, no toast.
+  pushRunnerLog: (runnerId: string, entry: { ts: string; level: string; line: string }) => void;
   /// Per-runner config cache, keyed by `runner.id`. Populated lazily by
   /// `fetchRunnerConfig`; the Settings expander on RunnersPage subscribes
   /// here so the values survive a row re-render.
@@ -215,6 +238,7 @@ const INITIAL_STATE: Pick<
   | "driversByRunnerId"
   | "selectedRunnerId"
   | "configByRunnerId"
+  | "logsByRunnerId"
 > = {
   mode: "unknown",
   runners: [],
@@ -223,7 +247,12 @@ const INITIAL_STATE: Pick<
   driversByRunnerId: {},
   selectedRunnerId: null,
   configByRunnerId: {},
+  logsByRunnerId: {},
 };
+
+/// Per-runner monotonic id counter for `RunnerLogEntry.id`. Module-scoped
+/// so a remount of `RunnerLogPanel` doesn't reset keys mid-stream.
+const runnerLogIdSeq: Record<string, number> = {};
 
 export const useRunnerStore = create<RunnerStore>((set, get) => ({
   ...INITIAL_STATE,
@@ -391,6 +420,26 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
     });
   },
 
+  pushRunnerLog: (runnerId, entry) => {
+    const nextId = (runnerLogIdSeq[runnerId] ?? 0) + 1;
+    runnerLogIdSeq[runnerId] = nextId;
+    set((s) => {
+      const current = s.logsByRunnerId[runnerId] ?? [];
+      // Append the new line, then trim from the front so the cap is
+      // never exceeded (drops oldest, FIFO). For the common path
+      // (current.length < cap) this is a single allocation.
+      const appended = [
+        ...current,
+        { id: nextId, ts: entry.ts, level: entry.level, line: entry.line },
+      ];
+      const trimmed =
+        appended.length > RUNNER_LOG_RING_CAP
+          ? appended.slice(appended.length - RUNNER_LOG_RING_CAP)
+          : appended;
+      return { logsByRunnerId: { ...s.logsByRunnerId, [runnerId]: trimmed } };
+    });
+  },
+
   fetchRunnerConfig: async (runnerId) => {
     const cfg = await fetchJson<RunnerConfig>(
       `/api/runners/${encodeURIComponent(runnerId)}/config`,
@@ -425,6 +474,8 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
   reset: () => {
     inFlightRunnersFetch = null;
     writePersistedSelectedRunnerId(null);
+    // Clear the per-runner id counter so a fresh login starts at id=1.
+    for (const key of Object.keys(runnerLogIdSeq)) delete runnerLogIdSeq[key];
     set({ ...INITIAL_STATE });
   },
 }));

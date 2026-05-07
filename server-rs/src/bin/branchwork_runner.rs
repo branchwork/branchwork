@@ -67,6 +67,164 @@ use runner_protocol::{
     MergeOutcome, WireMessage,
 };
 
+// ── Runner log shipper ──────────────────────────────────────────────────────
+//
+// One tokio task drains a bounded channel of `LogLine`s, throttles emission
+// at ~200 lines/sec, and ships each line over the WS as
+// `WireMessage::RunnerLogLine`. The macros `log_info!`/`log_warn!` push to
+// the channel and ALSO print to the original stdout/stderr so `journalctl`
+// and tty users still see everything.
+mod runner_log {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use chrono::{SecondsFormat, Utc};
+    use tokio::sync::mpsc;
+
+    use crate::runner_protocol::{Envelope, WireMessage};
+
+    /// Per-runner emission cap. The dashboard documents this; bursts beyond
+    /// it surface as a `[truncated N lines]` synthetic line.
+    pub const MAX_LINES_PER_SECOND: usize = 200;
+    /// Bounded channel capacity. Producer `try_send` returns `Full` when this
+    /// is hit; we count the drop and the next surviving emit prepends a
+    /// `[truncated N lines]` marker.
+    pub const MAX_PENDING_LINES: usize = 256;
+
+    #[derive(Debug, Clone)]
+    pub struct LogLine {
+        pub ts: String,
+        pub level: &'static str,
+        pub line: String,
+    }
+
+    /// Routing slot for the active log shipper. Set by `install` at the top
+    /// of `connect_and_run`; cleared by `uninstall` on disconnect so emits
+    /// in the reconnect gap are dropped silently rather than counting
+    /// against the truncated tally.
+    static SENDER: Mutex<Option<mpsc::Sender<LogLine>>> = Mutex::new(None);
+
+    /// Producer-side drop count. The shipper reads-and-resets this before
+    /// each emit; if non-zero it prepends a `[truncated N lines]` line.
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// Push a line. Non-blocking; called from `log_info!`/`log_warn!`.
+    pub fn try_send(line: LogLine) {
+        // Lock is held for a single clone (Sender is cheap to clone). If the
+        // slot is being swapped right now, just drop the line — the macros
+        // never block on this path.
+        let tx = match SENDER.lock() {
+            Ok(g) => g.as_ref().cloned(),
+            Err(_) => None,
+        };
+        if let Some(tx) = tx
+            && tx.try_send(line).is_err()
+        {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Spawn the consumer task. Returns the `Sender` end so the caller can
+    /// install it via `install` for the duration of a connection.
+    pub fn spawn_shipper(
+        runner_id: String,
+        ws_tx: mpsc::UnboundedSender<String>,
+    ) -> (mpsc::Sender<LogLine>, tokio::task::JoinHandle<()>) {
+        let (tx, mut rx) = mpsc::channel::<LogLine>(MAX_PENDING_LINES);
+        let handle = tokio::spawn(async move {
+            // Token bucket: one slot every 1000/200 = 5ms.
+            let interval_ms = (1000_u64 / MAX_LINES_PER_SECOND as u64).max(1);
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First tick fires immediately — skip it so the first line has
+            // to wait for the second tick (matches the documented cadence).
+            interval.tick().await;
+            while let Some(line) = rx.recv().await {
+                interval.tick().await;
+                let dropped = DROPPED.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    let marker = WireMessage::RunnerLogLine {
+                        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                        level: "warn".into(),
+                        line: format!("[truncated {dropped} lines]"),
+                    };
+                    let env = Envelope::best_effort(runner_id.clone(), marker);
+                    let _ = ws_tx.send(serde_json::to_string(&env).unwrap_or_default());
+                    // The marker pays a token of its own so a burst of
+                    // drops can't double the visible emission rate.
+                    interval.tick().await;
+                }
+                let env = Envelope::best_effort(
+                    runner_id.clone(),
+                    WireMessage::RunnerLogLine {
+                        ts: line.ts,
+                        level: line.level.into(),
+                        line: line.line,
+                    },
+                );
+                let _ = ws_tx.send(serde_json::to_string(&env).unwrap_or_default());
+            }
+        });
+        (tx, handle)
+    }
+
+    /// Install the active shipper sender. Subsequent `try_send` calls route
+    /// through it.
+    pub fn install(tx: mpsc::Sender<LogLine>) {
+        if let Ok(mut g) = SENDER.lock() {
+            *g = Some(tx);
+        }
+    }
+
+    /// Drop the active sender. `try_send` becomes a silent no-op until the
+    /// next `install`. Pending-drop counter is also reset so the truncated
+    /// marker on the next connection reflects only that connection's drops.
+    pub fn uninstall() {
+        if let Ok(mut g) = SENDER.lock() {
+            *g = None;
+        }
+        DROPPED.store(0, Ordering::Relaxed);
+    }
+
+    /// Build a timestamped log line. Used by the macros so the timestamp
+    /// is captured at the call site (not at consume time).
+    pub fn now() -> String {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+}
+
+/// Print to stdout AND ship as `RunnerLogLine` (level=info). Mirrors the
+/// existing `[runner] ...` prefix convention; callers keep their format
+/// strings unchanged.
+macro_rules! log_info {
+    ($($arg:tt)*) => {{
+        let __line = format!($($arg)*);
+        let __ts = $crate::runner_log::now();
+        println!("{}", __line);
+        $crate::runner_log::try_send($crate::runner_log::LogLine {
+            ts: __ts,
+            level: "info",
+            line: __line,
+        });
+    }};
+}
+
+/// Print to stderr AND ship as `RunnerLogLine` (level=warn). Used for
+/// non-fatal warnings and recoverable errors.
+macro_rules! log_warn {
+    ($($arg:tt)*) => {{
+        let __line = format!($($arg)*);
+        let __ts = $crate::runner_log::now();
+        eprintln!("{}", __line);
+        $crate::runner_log::try_send($crate::runner_log::LogLine {
+            ts: __ts,
+            level: "warn",
+            line: __line,
+        });
+    }};
+}
+
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
@@ -214,6 +372,9 @@ fn main() {
         .expect("failed to build tokio runtime");
 
     if let Err(e) = rt.block_on(run(cli)) {
+        // Shipper isn't installed at this point in the lifecycle so this is
+        // a plain stderr; the caller will only see it if they're tailing
+        // the runner host directly.
         eprintln!("[runner] fatal: {e}");
         std::process::exit(1);
     }
@@ -247,6 +408,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .runner_id
         .unwrap_or_else(|| load_or_generate_runner_id(&conn));
 
+    // Shipper is per-connection (installed below in `connect_and_run`); this
+    // pre-connect line is plain stdout — there's no WS yet to ship to.
     println!(
         "[runner] id={runner_id} cwd={} db={}",
         cwd.display(),
@@ -263,6 +426,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let max_backoff = Duration::from_secs(30);
 
     loop {
+        // Pre-connect: no shipper installed yet, so these are stdout-only.
+        // Once `connect_and_run` has the WS up it installs the shipper and
+        // every subsequent `log_info!`/`log_warn!` reaches the dashboard.
         println!("[runner] connecting to {}", cli.saas_url);
 
         match connect_and_run(&ws_url, &runner_id, &cwd, &server_bin, db.clone()).await {
@@ -288,6 +454,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        // Reconnect log is also pre-shipper.
         println!("[runner] reconnecting in {}ms", jitter_ms.as_millis());
         tokio::time::sleep(jitter_ms).await;
 
@@ -308,10 +475,18 @@ async fn connect_and_run(
     let (ws_stream, _response) = tokio_tungstenite::connect_async(ws_url).await?;
     let (ws_write, ws_read) = futures_util::StreamExt::split(ws_stream);
 
-    println!("[runner] connected");
-
     // Channel for outbound WebSocket messages.
     let (ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
+
+    // Install the runner-log shipper now that we have a live ws_tx. Every
+    // `log_info!`/`log_warn!` from this point on routes through the
+    // shipper to the dashboard `/runners/{id}` tail panel; we still print
+    // to local stdout/stderr so journalctl + tty users see the same line.
+    let (log_tx, log_shipper_handle) =
+        runner_log::spawn_shipper(runner_id.to_string(), ws_tx.clone());
+    runner_log::install(log_tx);
+
+    log_info!("[runner] connected");
 
     let state = Arc::new(RunnerState {
         runner_id: runner_id.to_string(),
@@ -378,6 +553,12 @@ async fn connect_and_run(
     // ── Cleanup ─────────────────────────────────────────────────────────
     heartbeat.abort();
     writer.abort();
+    // Drop the shipper sender slot so emits in the reconnect gap don't
+    // count against the truncated tally; the consumer task ends naturally
+    // when its receiver closes (the `log_tx` clone we held above is now
+    // the only outstanding sender after `uninstall`).
+    runner_log::uninstall();
+    log_shipper_handle.abort();
 
     read_result
 }
@@ -433,7 +614,7 @@ async fn ws_reader(
         };
 
         let Ok(envelope) = serde_json::from_str::<Envelope>(&text) else {
-            eprintln!(
+            log_warn!(
                 "[runner] failed to parse envelope: {}",
                 &text[..80.min(text.len())]
             );
@@ -479,7 +660,7 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
             max_budget_usd,
             skip_permissions,
         } => {
-            println!(
+            log_info!(
                 "[runner] start_agent: {} plan={} task={} driver={}",
                 agent_id, plan_name, task_id, driver
             );
@@ -524,7 +705,7 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                     send_reliable(state, started).await;
                 }
                 Err(e) => {
-                    eprintln!("[runner] failed to spawn agent {agent_id}: {e}");
+                    log_warn!("[runner] failed to spawn agent {agent_id}: {e}");
                     // Report immediate failure.
                     let stopped = WireMessage::AgentStopped {
                         agent_id: agent_id.clone(),
@@ -538,7 +719,7 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         }
 
         WireMessage::KillAgent { agent_id } => {
-            println!("[runner] kill_agent: {agent_id}");
+            log_info!("[runner] kill_agent: {agent_id}");
             let mut agents = state.agents.lock().await;
             if let Some(handle) = agents.remove(agent_id) {
                 handle.io_task.abort();
@@ -660,7 +841,7 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[runner] get_default_branch rejected cwd: {e}");
+                    log_warn!("[runner] get_default_branch rejected cwd: {e}");
                     WireMessage::DefaultBranchResolved {
                         req_id,
                         branch: None,
@@ -682,7 +863,7 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                     WireMessage::BranchesListed { req_id, branches }
                 }
                 Err(e) => {
-                    eprintln!("[runner] list_branches rejected cwd: {e}");
+                    log_warn!("[runner] list_branches rejected cwd: {e}");
                     WireMessage::BranchesListed {
                         req_id,
                         branches: Vec::new(),
@@ -764,7 +945,7 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                 .await
                 .unwrap_or(None),
                 Err(e) => {
-                    eprintln!("[runner] gh_run_list rejected cwd: {e}");
+                    log_warn!("[runner] gh_run_list rejected cwd: {e}");
                     None
                 }
             };
@@ -785,7 +966,7 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                 .await
                 .unwrap_or(None),
                 Err(e) => {
-                    eprintln!("[runner] gh_failure_log rejected cwd: {e}");
+                    log_warn!("[runner] gh_failure_log rejected cwd: {e}");
                     None
                 }
             };
@@ -1012,6 +1193,9 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         | WireMessage::GithubActionsDetected { .. }
         | WireMessage::CiRunStatusResolved { .. }
         | WireMessage::CiFailureLogResolved { .. }
+        // The runner is the producer of `RunnerLogLine`; receiving one
+        // back from the server is a protocol violation we silently drop.
+        | WireMessage::RunnerLogLine { .. }
         // saas→runner variants the runner doesn't act on (no current handler).
         | WireMessage::TerminalReplay { .. }
         | WireMessage::Ping {} => {}
@@ -1069,7 +1253,7 @@ where
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(value)) => Some(value),
         Ok(Err(e)) => {
-            eprintln!("[runner] blocking task panicked: {e}");
+            log_warn!("[runner] blocking task panicked: {e}");
             None
         }
         Err(_) => None,
@@ -1470,7 +1654,7 @@ async fn spawn_agent(
     let child = cmd.spawn()?;
     let pid = child.id();
 
-    println!(
+    log_info!(
         "[runner] spawned session daemon pid={pid} socket={}",
         socket_path.display()
     );
@@ -1496,7 +1680,7 @@ async fn spawn_agent(
 
     let io_task = tokio::spawn(async move {
         if let Err(e) = forward_agent_io(&sock, &ws_tx, &runner_id, &aid, &prompt_bytes).await {
-            eprintln!("[runner] agent {aid} I/O error: {e}");
+            log_warn!("[runner] agent {aid} I/O error: {e}");
         }
 
         // Agent exited — report.

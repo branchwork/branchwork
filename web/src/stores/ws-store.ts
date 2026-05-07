@@ -714,6 +714,18 @@ function dispatch(msg: WsMessage) {
       useRunnerStore.getState().applyDriversTouch({ runner_id: d.runner_id, drivers });
       break;
     }
+    case "runner_log": {
+      // Live tail of one runner's stdout/stderr — pushed into the per-
+      // runner ring so `RunnerLogPanel` (on `/runners/{id}`) can render
+      // the last N lines without an extra fetch. Best-effort: lines
+      // dropped during a reconnect are NOT replayed (the runner has no
+      // outbox for this variant).
+      const d = msg.data;
+      useRunnerStore
+        .getState()
+        .pushRunnerLog(d.runner_id, { ts: d.ts, level: d.level, line: d.line });
+      break;
+    }
   }
 
   // Notify external subscribers AFTER the built-in switch so they see

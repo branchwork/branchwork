@@ -841,6 +841,25 @@ async fn handle_runner_message(
             .await;
         }
 
+        WireMessage::RunnerLogLine { ts, level, line } => {
+            // Pure fan-out: forward every line straight to the dashboard
+            // WS. No DB persistence — log lines are ephemeral; long-term
+            // retention is the runner host's job (`journalctl` or its
+            // equivalent on the host's tty). Rate limiting is the
+            // runner's responsibility, so by the time we see a line it
+            // has already passed the 200 lines/sec cap.
+            broadcast_event(
+                &state.broadcast_tx,
+                "runner_log",
+                serde_json::json!({
+                    "runner_id": runner_id,
+                    "ts": ts,
+                    "level": level,
+                    "line": line,
+                }),
+            );
+        }
+
         // Server doesn't receive these from runners — the runner sending them
         // would be a protocol violation (saas→runner direction only).
         WireMessage::Pong {}

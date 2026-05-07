@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useRunnerStore, type Runner } from "./runner-store.js";
+import { useRunnerStore, type Runner, RUNNER_LOG_RING_CAP } from "./runner-store.js";
 
 afterEach(() => {
   useRunnerStore.getState().reset();
@@ -306,5 +306,62 @@ describe("runner-store", () => {
     await useRunnerStore.getState().saveRunnerConfig("r1", { effort: "max" });
     expect(captured).toEqual({ effort: "max" });
     expect(captured).not.toHaveProperty("skip_permissions");
+  });
+
+  // ── Runner log ring (T11.1) ────────────────────────────────────────────
+
+  it("pushRunnerLog appends to the per-runner ring with monotonic ids", () => {
+    const push = useRunnerStore.getState().pushRunnerLog;
+    push("r1", { ts: "2026-05-07T00:00:00.000Z", level: "info", line: "first" });
+    push("r1", { ts: "2026-05-07T00:00:01.000Z", level: "warn", line: "second" });
+    const ring = useRunnerStore.getState().logsByRunnerId["r1"];
+    expect(ring).toHaveLength(2);
+    expect(ring.map((e) => e.line)).toEqual(["first", "second"]);
+    // Monotonic ids let React keys stay stable when the ring evicts.
+    expect(ring[0].id).toBeLessThan(ring[1].id);
+  });
+
+  it("pushRunnerLog keeps separate rings per runner", () => {
+    const push = useRunnerStore.getState().pushRunnerLog;
+    push("r1", { ts: "t", level: "info", line: "one" });
+    push("r2", { ts: "t", level: "info", line: "two" });
+    const state = useRunnerStore.getState();
+    expect(state.logsByRunnerId["r1"]?.map((e) => e.line)).toEqual(["one"]);
+    expect(state.logsByRunnerId["r2"]?.map((e) => e.line)).toEqual(["two"]);
+  });
+
+  it("pushRunnerLog drops oldest entries when the cap is hit (FIFO)", () => {
+    // Acceptance: the in-memory ring is bounded so a long-running runner
+    // can't OOM the dashboard tab. Pushes beyond the cap drop the oldest
+    // line and slide the window forward.
+    const push = useRunnerStore.getState().pushRunnerLog;
+    for (let i = 0; i < RUNNER_LOG_RING_CAP + 5; i++) {
+      push("r1", { ts: "t", level: "info", line: `line-${i}` });
+    }
+    const ring = useRunnerStore.getState().logsByRunnerId["r1"];
+    expect(ring).toHaveLength(RUNNER_LOG_RING_CAP);
+    // Oldest 5 must have been evicted; newest line is at the tail.
+    expect(ring[0].line).toBe("line-5");
+    expect(ring[ring.length - 1].line).toBe(`line-${RUNNER_LOG_RING_CAP + 4}`);
+  });
+
+  it("pushRunnerLog forwards the truncated marker line verbatim", () => {
+    // The runner emits a synthetic "[truncated N lines]" line as a real
+    // RunnerLogLine when its 200/sec cap fires; the dashboard ring stores
+    // it like any other entry so the panel renders it inline.
+    const push = useRunnerStore.getState().pushRunnerLog;
+    push("r1", { ts: "t", level: "warn", line: "[truncated 42 lines]" });
+    const ring = useRunnerStore.getState().logsByRunnerId["r1"];
+    expect(ring).toHaveLength(1);
+    expect(ring[0].line).toBe("[truncated 42 lines]");
+    expect(ring[0].level).toBe("warn");
+  });
+
+  it("reset clears every per-runner log ring", () => {
+    const push = useRunnerStore.getState().pushRunnerLog;
+    push("r1", { ts: "t", level: "info", line: "one" });
+    push("r2", { ts: "t", level: "info", line: "two" });
+    useRunnerStore.getState().reset();
+    expect(useRunnerStore.getState().logsByRunnerId).toEqual({});
   });
 });

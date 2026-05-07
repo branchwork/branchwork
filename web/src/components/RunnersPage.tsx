@@ -10,6 +10,7 @@ import { useAgentStore } from "../stores/agent-store.js";
 import { Banner } from "./ui/Banner.js";
 import { Button } from "./ui/Button.js";
 import { RunnerEnrollModal } from "./RunnerEnrollModal.js";
+import { RunnerLogPanel } from "./RunnerLogPanel.js";
 import { formatRelative } from "../lib/time.js";
 import { toastWarn } from "../lib/toast.js";
 
@@ -234,6 +235,13 @@ function RunnerRow({ runner }: { runner: Runner }) {
         )}
       </dl>
       {settingsOpen && <RunnerSettings runnerId={runner.id} />}
+      {/* Live tail of the runner's stdout/stderr (T11.1). Rendered inline
+          under the selected row instead of on a dedicated `/runners/{id}`
+          subroute — the brief mentions that URL but the dashboard's
+          existing per-runner UX is the Select toggle, and inline keeps the
+          users mental model of "this row is the runner I'm looking at"
+          intact. */}
+      {isSelected && <RunnerLogPanel runnerId={runner.id} />}
     </li>
   );
 }
