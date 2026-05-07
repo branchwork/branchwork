@@ -253,6 +253,7 @@ function SettingsTab() {
     <div className="max-w-2xl">
       <Section
         title="Default effort"
+        serverWide
         description="Reasoning level passed to new agents. Higher values cost more and take longer."
       >
         <div className="flex gap-1">
@@ -275,6 +276,7 @@ function SettingsTab() {
 
       <Section
         title="Skip permissions"
+        serverWide
         description={
           <>
             Spawn Claude agents with{" "}
@@ -388,12 +390,29 @@ interface SectionProps {
   title: string;
   description: React.ReactNode;
   children: React.ReactNode;
+  /// Render a small "Applies server-wide" chip next to the title. Used
+  /// by `effort` and `skip_permissions` after the audit §18 ownership
+  /// fix: both settings persist at `<claude-dir>/branchwork-settings.json`
+  /// and apply to every spawned agent regardless of which user clicked.
+  /// Per-runner overrides live on the Runners page (see
+  /// `PerRunnerOverrideNote`).
+  serverWide?: boolean;
 }
 
-function Section({ title, description, children }: SectionProps) {
+function Section({ title, description, children, serverWide }: SectionProps) {
   return (
     <div className="mb-6 pb-6 border-b border-gray-800 last:border-b-0">
-      <h2 className="text-sm font-semibold text-gray-200">{title}</h2>
+      <div className="flex items-center gap-2">
+        <h2 className="text-sm font-semibold text-gray-200">{title}</h2>
+        {serverWide && (
+          <span
+            className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded border border-amber-700/50 bg-amber-900/30 text-amber-300/90"
+            title="This setting persists in branchwork-settings.json and applies to every user on this server."
+          >
+            Applies server-wide
+          </span>
+        )}
+      </div>
       <p className="text-[11px] text-gray-500 mt-1 mb-3 leading-relaxed">
         {description}
       </p>

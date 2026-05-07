@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { Link, NavLink, useLocation } from "react-router-dom";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
-import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js";
+import { useSettingsStore } from "../stores/settings-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
 import { useUiStore } from "../stores/ui-store.js";
 import { postJson } from "../api.js";
@@ -195,9 +195,6 @@ export function Sidebar() {
         )}
         <NewPlanLink hasMdPlans={hasMdPlans} />
       </div>
-
-      {/* Effort level */}
-      <EffortSelector />
 
       {/* Driver auth status */}
       <DriverStatusList />
@@ -415,55 +412,6 @@ function NewPlanLink({ hasMdPlans }: { hasMdPlans: boolean }) {
     >
       + New Plan
     </NavLink>
-  );
-}
-
-const EFFORT_LEVELS: { value: EffortLevel; label: string; color: string }[] = [
-  { value: "low", label: "Low", color: "text-gray-400" },
-  { value: "medium", label: "Med", color: "text-blue-400" },
-  { value: "high", label: "High", color: "text-amber-400" },
-  { value: "max", label: "Max", color: "text-red-400" },
-];
-
-function EffortSelector() {
-  const effort = useSettingsStore((s) => s.effort);
-  const setEffort = useSettingsStore((s) => s.setEffort);
-  const skipPermissions = useSettingsStore((s) => s.skipPermissions);
-  const setSkipPermissions = useSettingsStore((s) => s.setSkipPermissions);
-
-  return (
-    <>
-      <div className="px-2 pb-2 flex items-center gap-1">
-        <span className="text-[10px] text-gray-600 mr-1">Effort</span>
-        {EFFORT_LEVELS.map((l) => (
-          <button
-            key={l.value}
-            onClick={() => setEffort(l.value)}
-            className={`px-1.5 py-0.5 text-[10px] rounded transition ${
-              effort === l.value
-                ? `${l.color} bg-gray-800 font-semibold`
-                : "text-gray-600 hover:text-gray-400"
-            }`}
-          >
-            {l.label}
-          </button>
-        ))}
-      </div>
-      <label
-        className="px-2 pb-2 flex items-center gap-1.5 text-[10px] text-gray-500 hover:text-gray-300 cursor-pointer select-none"
-        title={'Spawn agents with --dangerously-skip-permissions. Requires "skipDangerousModePermissionPrompt": true in ~/.claude/settings.json (see README).'}
-      >
-        <input
-          type="checkbox"
-          checked={skipPermissions}
-          onChange={(e) => setSkipPermissions(e.target.checked)}
-          className="accent-amber-500"
-        />
-        <span className={skipPermissions ? "text-amber-400" : ""}>
-          Skip permissions
-        </span>
-      </label>
-    </>
   );
 }
 
