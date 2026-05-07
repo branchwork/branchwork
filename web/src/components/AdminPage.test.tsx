@@ -387,15 +387,20 @@ describe("AdminPage tab gating", () => {
     });
   }
 
-  it("standalone deployments render no tab bar", () => {
+  it("standalone deployments render Settings + Diagnostics", () => {
     // Default beforeEach already sets mode=standalone + no memberships.
+    // Diagnostics is a universal triage view (added in 9.2), so the
+    // tab bar now appears on standalone too — but only those two tabs.
     render(<AdminPage />);
-    expect(screen.queryByRole("tablist")).toBeNull();
+    const tabs = screen
+      .getAllByRole("tab")
+      .map((t) => (t.textContent ?? "").trim());
+    expect(tabs).toEqual(["Settings", "Diagnostics"]);
     // Settings tab content still renders (effort buttons present).
     expect(screen.getByText(/^Low$/)).toBeTruthy();
   });
 
-  it("SaaS members see only Settings + Members tabs", () => {
+  it("SaaS members see Settings + Diagnostics + Members", () => {
     asSaasMember();
     render(<AdminPage />);
     const tablist = screen.getByRole("tablist");
@@ -403,10 +408,10 @@ describe("AdminPage tab gating", () => {
     const tabs = screen
       .getAllByRole("tab")
       .map((t) => (t.textContent ?? "").trim());
-    expect(tabs).toEqual(["Settings", "Members"]);
+    expect(tabs).toEqual(["Settings", "Diagnostics", "Members"]);
   });
 
-  it("SaaS owners see all six admin tabs", () => {
+  it("SaaS owners see all admin tabs (Diagnostics included)", () => {
     asSaasAdmin();
     render(<AdminPage />);
     const tabs = screen
@@ -414,6 +419,7 @@ describe("AdminPage tab gating", () => {
       .map((t) => (t.textContent ?? "").trim());
     expect(tabs).toEqual([
       "Settings",
+      "Diagnostics",
       "Members",
       "Budget",
       "Kill switch",
@@ -438,6 +444,10 @@ describe("AdminPage tab gating", () => {
     // Default beforeEach is standalone.
     render(<AdminPage />, { initialEntry: "/admin/members" });
     expect(screen.getByText(/^Low$/)).toBeTruthy();
-    expect(screen.queryByRole("tablist")).toBeNull();
+    // Members is not in the standalone tablist — only Settings + Diagnostics.
+    const tabs = screen
+      .getAllByRole("tab")
+      .map((t) => (t.textContent ?? "").trim());
+    expect(tabs).not.toContain("Members");
   });
 });

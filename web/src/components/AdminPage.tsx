@@ -12,6 +12,7 @@ import { BudgetTab } from "./admin/BudgetTab.js";
 import { KillSwitchTab } from "./admin/KillSwitchTab.js";
 import { UserQuotasTab } from "./admin/UserQuotasTab.js";
 import { SsoTab } from "./admin/SsoTab.js";
+import { DiagnosticsTab } from "./admin/DiagnosticsTab.js";
 
 const EFFORT_LEVELS: { value: EffortLevel; label: string }[] = [
   { value: "low", label: "Low" },
@@ -51,6 +52,7 @@ export function isAdminRole(role: string | null | undefined): boolean {
 
 const ADMIN_TABS = [
   "settings",
+  "diagnostics",
   "members",
   "budget",
   "kill-switch",
@@ -61,6 +63,7 @@ export type AdminTab = (typeof ADMIN_TABS)[number];
 
 const TAB_LABELS: Record<AdminTab, string> = {
   settings: "Settings",
+  diagnostics: "Diagnostics",
   members: "Members",
   budget: "Budget",
   "kill-switch": "Kill switch",
@@ -95,7 +98,10 @@ export function AdminPage() {
   const showAdminTabs = showOrgTabs && isAdmin;
 
   const allowedTabs: AdminTab[] = useMemo(() => {
-    const t: AdminTab[] = ["settings"];
+    // Diagnostics is read-only triage and is universally useful (server
+    // version, uptime, WS connections). Visible on both standalone and
+    // SaaS, regardless of role.
+    const t: AdminTab[] = ["settings", "diagnostics"];
     if (showOrgTabs) t.push("members");
     if (showAdminTabs) t.push("budget", "kill-switch", "quotas", "sso");
     return t;
@@ -139,6 +145,7 @@ export function AdminPage() {
       )}
 
       {activeTab === "settings" && <SettingsTab />}
+      {activeTab === "diagnostics" && <DiagnosticsTab />}
       {activeTab === "members" && current && (
         <MembersTab
           orgSlug={current.slug}

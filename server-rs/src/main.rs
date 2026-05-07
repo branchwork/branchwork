@@ -30,10 +30,25 @@ use config::{Cli, Command, Config};
 use state::AppState;
 use tower_http::cors::{Any, CorsLayer};
 
-async fn health() -> impl IntoResponse {
+/// `GET /health` and `GET /api/health`. Healthcheck (used by Docker /
+/// Helm liveness probes) AND the read side for the admin Diagnostics
+/// tab (Phase 9.2). The pre-existing `status` + `timestamp` fields are
+/// preserved verbatim so external probes don't notice; the diagnostics
+/// triage view consumes the additive `version`, `uptimeSeconds`, and
+/// `wsConnections` fields.
+///
+/// `wsConnections` is the dashboard broadcast channel's current
+/// receiver count — i.e. how many `/ws` clients are subscribed right
+/// now. Runner WS connections (`/ws/runner`) are surfaced separately
+/// via `/api/runners` so the diagnostics tab can render them as a
+/// per-runner table.
+async fn health(axum::extract::State(state): axum::extract::State<AppState>) -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptimeSeconds": state.started_at.elapsed().as_secs(),
+        "wsConnections": state.broadcast_tx.receiver_count(),
     }))
 }
 

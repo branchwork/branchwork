@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -46,6 +47,10 @@ pub struct AppState {
     /// per agent for the process lifetime, which is bounded by total
     /// agent count.
     pub auto_finish_dedupe: Arc<StdMutex<HashSet<String>>>,
+    /// Process-start instant, captured once at `AppState::new`. Used by
+    /// `/api/health` to compute `uptime_seconds` for the diagnostics tab.
+    /// Monotonic — survives wall-clock skew. Cloned cheaply via `Copy`.
+    pub started_at: Instant,
 }
 
 impl AppState {
@@ -66,6 +71,7 @@ impl AppState {
             settings_path: config.settings_path.clone(),
             cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
             auto_finish_dedupe: Arc::new(StdMutex::new(HashSet::new())),
+            started_at: Instant::now(),
         }
     }
 
