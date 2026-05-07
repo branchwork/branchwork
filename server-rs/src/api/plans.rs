@@ -2396,9 +2396,13 @@ pub async fn update_plan(
                         ci: None,
                     })
                     .collect(),
+                ci_blocking_workflows: None,
+                phase_verification: None,
             })
             .collect(),
         verification: None,
+        ci_blocking_workflows: None,
+        phase_verification: None,
         total_cost_usd: None,
         max_budget_usd: None,
     };
@@ -4008,6 +4012,8 @@ mod check_prompt_tests {
             modified_at: String::new(),
             phases: vec![],
             verification: None,
+            ci_blocking_workflows: None,
+            phase_verification: None,
             total_cost_usd: None,
             max_budget_usd: None,
         }
@@ -4054,6 +4060,8 @@ mod check_prompt_tests {
             title: "P".into(),
             description: String::new(),
             tasks: vec![sample_task("1.1", vec!["a.rs".into()])],
+            ci_blocking_workflows: None,
+            phase_verification: None,
         };
         let task = phase.tasks[0].clone();
         let project_dir = std::path::Path::new("/tmp/proj");
@@ -4077,6 +4085,8 @@ mod check_prompt_tests {
             title: "Phase One".into(),
             description: String::new(),
             tasks: vec![],
+            ci_blocking_workflows: None,
+            phase_verification: None,
         };
         let task = sample_task(
             "1.3",
@@ -4123,6 +4133,8 @@ mod check_prompt_tests {
             title: "Phase One".into(),
             description: String::new(),
             tasks: vec![],
+            ci_blocking_workflows: None,
+            phase_verification: None,
         };
         let task = sample_task(
             "1.3",
@@ -4174,12 +4186,16 @@ mod check_prompt_tests {
                 title: "P1".into(),
                 description: String::new(),
                 tasks: vec![sample_task("1.1", vec![]), sample_task("1.2", vec![])],
+                ci_blocking_workflows: None,
+                phase_verification: None,
             },
             plan_parser::PlanPhase {
                 number: 2,
                 title: "P2".into(),
                 description: String::new(),
                 tasks: vec![sample_task("2.1", vec![])],
+                ci_blocking_workflows: None,
+                phase_verification: None,
             },
         ];
 

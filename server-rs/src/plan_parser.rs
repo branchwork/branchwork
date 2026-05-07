@@ -44,6 +44,10 @@ pub struct PlanPhase {
     pub title: String,
     pub description: String,
     pub tasks: Vec<PlanTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_blocking_workflows: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_verification: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +63,10 @@ pub struct ParsedPlan {
     pub phases: Vec<PlanPhase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_blocking_workflows: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_verification: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,6 +110,10 @@ struct YamlPlanPhase {
     #[serde(default)]
     description: String,
     tasks: Vec<YamlPlanTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ci_blocking_workflows: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase_verification: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,6 +128,10 @@ struct YamlPlan {
     phases: Vec<YamlPlanPhase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     verification: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ci_blocking_workflows: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase_verification: Option<String>,
 }
 
 // ── File-path extraction ─────────────────────────────────────────────────────
@@ -333,6 +349,8 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
             title: phase_title,
             description,
             tasks,
+            ci_blocking_workflows: None,
+            phase_verification: None,
         });
     }
 
@@ -346,6 +364,8 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
         modified_at: String::new(),
         phases,
         verification,
+        ci_blocking_workflows: None,
+        phase_verification: None,
         total_cost_usd: None,
         max_budget_usd: None,
     }
@@ -485,6 +505,8 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
     let yaml: YamlPlan = serde_yaml::from_str(raw).map_err(|e| e.to_string())?;
 
     let verification = yaml.verification.clone();
+    let ci_blocking_workflows = yaml.ci_blocking_workflows.clone();
+    let phase_verification = yaml.phase_verification.clone();
     let phases = yaml
         .phases
         .into_iter()
@@ -512,6 +534,8 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
                 title: p.title,
                 description: p.description,
                 tasks,
+                ci_blocking_workflows: p.ci_blocking_workflows,
+                phase_verification: p.phase_verification,
             }
         })
         .collect();
@@ -526,6 +550,8 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
         modified_at: String::new(),
         phases,
         verification,
+        ci_blocking_workflows,
+        phase_verification,
         total_cost_usd: None,
         max_budget_usd: None,
     })
@@ -562,9 +588,13 @@ pub fn serialize_plan_yaml(plan: &ParsedPlan) -> Result<String, String> {
                         produces_commit: t.produces_commit,
                     })
                     .collect(),
+                ci_blocking_workflows: p.ci_blocking_workflows.clone(),
+                phase_verification: p.phase_verification.clone(),
             })
             .collect(),
         verification: plan.verification.clone(),
+        ci_blocking_workflows: plan.ci_blocking_workflows.clone(),
+        phase_verification: plan.phase_verification.clone(),
     };
     serde_yaml::to_string(&yaml).map_err(|e| e.to_string())
 }
@@ -1510,8 +1540,12 @@ phases:
                         ci: None,
                     },
                 ],
+                ci_blocking_workflows: None,
+                phase_verification: None,
             }],
             verification: None,
+            ci_blocking_workflows: None,
+            phase_verification: None,
             total_cost_usd: None,
             max_budget_usd: None,
         };
@@ -1541,6 +1575,248 @@ phases:
         assert!(
             reparsed.phases[0].tasks[1].produces_commit,
             "round-tripped task 0.2 should have produces_commit=true (default)"
+        );
+    }
+
+    // ── ci_blocking_workflows + phase_verification tests (Phase 0.1) ──────
+
+    #[test]
+    fn yaml_ci_blocking_workflows_plan_level_round_trip() {
+        let yaml = "\
+title: Plan
+ci_blocking_workflows:
+  - CI
+  - Lint
+phases:
+  - number: 0
+    title: P0
+    tasks:
+      - number: \"0.1\"
+        title: T
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(
+            plan.ci_blocking_workflows.as_deref(),
+            Some(&["CI".to_string(), "Lint".to_string()][..]),
+            "plan-level ci_blocking_workflows should parse"
+        );
+        assert!(
+            plan.phases[0].ci_blocking_workflows.is_none(),
+            "phase-level ci_blocking_workflows should be None when only plan-level set"
+        );
+
+        let serialized = serialize_plan_yaml(&plan).unwrap();
+        assert!(
+            serialized.contains("ci_blocking_workflows:"),
+            "serialized YAML must contain ci_blocking_workflows: {serialized}"
+        );
+        assert!(
+            serialized.contains("- CI"),
+            "serialized YAML must list CI: {serialized}"
+        );
+
+        let reparsed = parse_plan_yaml(&serialized, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(reparsed.ci_blocking_workflows, plan.ci_blocking_workflows);
+    }
+
+    #[test]
+    fn yaml_phase_verification_plan_level_round_trip() {
+        let yaml = "\
+title: Plan
+phase_verification: bash scripts/verify.sh
+phases:
+  - number: 0
+    title: P0
+    tasks:
+      - number: \"0.1\"
+        title: T
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(
+            plan.phase_verification.as_deref(),
+            Some("bash scripts/verify.sh")
+        );
+        assert!(plan.phases[0].phase_verification.is_none());
+
+        let serialized = serialize_plan_yaml(&plan).unwrap();
+        assert!(
+            serialized.contains("phase_verification:"),
+            "serialized YAML must contain phase_verification: {serialized}"
+        );
+
+        let reparsed = parse_plan_yaml(&serialized, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(reparsed.phase_verification, plan.phase_verification);
+    }
+
+    #[test]
+    fn yaml_phase_level_overrides_round_trip() {
+        let yaml = "\
+title: Plan
+ci_blocking_workflows:
+  - CI
+phase_verification: bash scripts/verify.sh
+phases:
+  - number: 0
+    title: P0
+    ci_blocking_workflows:
+      - CI
+      - Lint
+    phase_verification: bash scripts/phase0-verify.sh
+    tasks:
+      - number: \"0.1\"
+        title: T
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(
+            plan.ci_blocking_workflows.as_deref(),
+            Some(&["CI".to_string()][..])
+        );
+        assert_eq!(
+            plan.phases[0].ci_blocking_workflows.as_deref(),
+            Some(&["CI".to_string(), "Lint".to_string()][..]),
+            "phase-level override must parse and survive"
+        );
+        assert_eq!(
+            plan.phase_verification.as_deref(),
+            Some("bash scripts/verify.sh")
+        );
+        assert_eq!(
+            plan.phases[0].phase_verification.as_deref(),
+            Some("bash scripts/phase0-verify.sh")
+        );
+
+        let serialized = serialize_plan_yaml(&plan).unwrap();
+        let reparsed = parse_plan_yaml(&serialized, "test", "/tmp/test.yaml").unwrap();
+
+        assert_eq!(reparsed.ci_blocking_workflows, plan.ci_blocking_workflows);
+        assert_eq!(reparsed.phase_verification, plan.phase_verification);
+        assert_eq!(
+            reparsed.phases[0].ci_blocking_workflows,
+            plan.phases[0].ci_blocking_workflows
+        );
+        assert_eq!(
+            reparsed.phases[0].phase_verification,
+            plan.phases[0].phase_verification
+        );
+    }
+
+    #[test]
+    fn yaml_omits_new_fields_when_none() {
+        let yaml = "\
+title: Plan
+phases:
+  - number: 0
+    title: P0
+    tasks:
+      - number: \"0.1\"
+        title: T
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        // All four fields default to None on a plan that does not declare them.
+        assert!(plan.ci_blocking_workflows.is_none());
+        assert!(plan.phase_verification.is_none());
+        assert!(plan.phases[0].ci_blocking_workflows.is_none());
+        assert!(plan.phases[0].phase_verification.is_none());
+
+        // Serialization must omit both keys at both levels (skip_serializing_if).
+        let serialized = serialize_plan_yaml(&plan).unwrap();
+        assert!(
+            !serialized.contains("ci_blocking_workflows"),
+            "ci_blocking_workflows must be omitted when None: {serialized}"
+        );
+        assert!(
+            !serialized.contains("phase_verification"),
+            "phase_verification must be omitted when None: {serialized}"
+        );
+    }
+
+    #[test]
+    fn existing_plan_without_new_fields_parses_unchanged() {
+        // Mirrors yaml_basic_plan but asserts the new fields default to None
+        // on a YAML that predates this task. Acceptance criterion safety net.
+        let yaml = "\
+title: Old Plan
+context: |
+  Some background.
+phases:
+  - number: 1
+    title: Backend
+    description: Set up models
+    tasks:
+      - number: \"1.1\"
+        title: Create model
+        description: Create the model
+        file_paths:
+          - src/model.rs
+        acceptance: Model compiles
+        dependencies: []
+";
+        let plan = parse_plan_yaml(yaml, "old", "/tmp/old.yaml").unwrap();
+
+        assert_eq!(plan.title, "Old Plan");
+        assert_eq!(plan.phases.len(), 1);
+        assert_eq!(plan.phases[0].tasks.len(), 1);
+
+        // The new fields all default to None — existing semantics unchanged.
+        assert!(plan.ci_blocking_workflows.is_none());
+        assert!(plan.phase_verification.is_none());
+        assert!(plan.phases[0].ci_blocking_workflows.is_none());
+        assert!(plan.phases[0].phase_verification.is_none());
+    }
+
+    #[test]
+    fn ci_blocking_workflows_round_trip_preserves_order() {
+        // Order matters for the resolution helper (0.3) — pin it explicitly.
+        let yaml = "\
+title: Plan
+ci_blocking_workflows:
+  - CI
+  - Lint
+  - Coverage
+phases:
+  - number: 0
+    title: P0
+    tasks:
+      - number: \"0.1\"
+        title: T
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        let serialized = serialize_plan_yaml(&plan).unwrap();
+        let reparsed = parse_plan_yaml(&serialized, "test", "/tmp/test.yaml").unwrap();
+
+        assert_eq!(
+            reparsed.ci_blocking_workflows.as_deref(),
+            Some(&["CI".to_string(), "Lint".to_string(), "Coverage".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn phase_verification_block_scalar_round_trip() {
+        // Multi-line block scalar — typical "bash scripts/verify.sh" can stay
+        // a single line, but tests the multi-line case for safety.
+        let yaml = "\
+title: Plan
+phases:
+  - number: 0
+    title: P0
+    phase_verification: |-
+      cargo fmt --check
+      cargo clippy --all-targets -- -D warnings
+    tasks:
+      - number: \"0.1\"
+        title: T
+";
+        let plan = parse_plan_yaml(yaml, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(
+            plan.phases[0].phase_verification.as_deref(),
+            Some("cargo fmt --check\ncargo clippy --all-targets -- -D warnings")
+        );
+
+        let serialized = serialize_plan_yaml(&plan).unwrap();
+        let reparsed = parse_plan_yaml(&serialized, "test", "/tmp/test.yaml").unwrap();
+        assert_eq!(
+            reparsed.phases[0].phase_verification,
+            plan.phases[0].phase_verification
         );
     }
 

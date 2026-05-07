@@ -1871,6 +1871,8 @@ mod tests {
             title: "MCP Server".to_string(),
             description: String::new(),
             tasks: vec![task.clone()],
+            ci_blocking_workflows: None,
+            phase_verification: None,
         };
         let plan = ParsedPlan {
             name: "portable-agents".to_string(),
@@ -1882,6 +1884,8 @@ mod tests {
             modified_at: String::new(),
             phases: vec![phase.clone()],
             verification: None,
+            ci_blocking_workflows: None,
+            phase_verification: None,
             total_cost_usd: None,
             max_budget_usd: None,
         };
