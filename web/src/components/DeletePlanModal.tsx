@@ -1,9 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { HttpError } from "../api.js";
-import {
-  usePlanStore,
-  type DeletePlanPreview,
-} from "../stores/plan-store.js";
+import { usePlanStore, type DeletePlanPreview } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { errorMessage } from "../lib/error.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
@@ -55,9 +52,7 @@ const CASCADE_LABELS: Record<string, [string, string]> = {
 /// The cascade-table order in `wouldDelete` is unspecified at the JSON
 /// layer; we use `CASCADE_LABELS`'s declaration order so the modal copy
 /// is stable across renders and never depends on hashmap iteration order.
-export function formatCascadeSummary(
-  wouldDelete: Record<string, number>,
-): string {
+export function formatCascadeSummary(wouldDelete: Record<string, number>): string {
   const parts: string[] = [];
   for (const key of Object.keys(CASCADE_LABELS)) {
     const n = wouldDelete[key];
@@ -67,8 +62,7 @@ export function formatCascadeSummary(
   }
   if (parts.length === 0) return "No cascade rows to delete.";
   if (parts.length === 1) return `${parts[0]} will be deleted.`;
-  if (parts.length === 2)
-    return `${parts[0]} and ${parts[1]} will be deleted.`;
+  if (parts.length === 2) return `${parts[0]} and ${parts[1]} will be deleted.`;
   const last = parts.pop();
   return `${parts.join(", ")}, and ${last} will be deleted.`;
 }
@@ -94,11 +88,7 @@ export function formatCascadeSummary(
 /// lands on Cancel on mount, traps inside the dialog (Tab cycles),
 /// returns to the trigger element on unmount, ESC closes when not
 /// busy. axe-core passes (verified in `DeletePlanModal.test.tsx`).
-export function DeletePlanModal({
-  planName,
-  retentionDays,
-  onClose,
-}: DeletePlanModalProps) {
+export function DeletePlanModal({ planName, retentionDays, onClose }: DeletePlanModalProps) {
   const titleId = useId();
   const descId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -115,9 +105,7 @@ export function DeletePlanModal({
   // resolves; `undefined` if the fetch errored (we still let the user
   // try the delete — the real DELETE will surface a fresh error and
   // the cascade preview is best-effort UX, not a gate).
-  const [preview, setPreview] = useState<
-    DeletePlanPreview | null | undefined
-  >(null);
+  const [preview, setPreview] = useState<DeletePlanPreview | null | undefined>(null);
 
   const deletePlan = usePlanStore((s) => s.deletePlan);
   const previewDeletePlan = usePlanStore((s) => s.previewDeletePlan);
@@ -313,7 +301,10 @@ export function DeletePlanModal({
         </p>
         {showShiftHint && (
           <p className="mt-2 text-xs text-gray-500">
-            Hold <kbd className="px-1 py-0.5 rounded border border-gray-700 bg-gray-800 font-mono text-[10px] text-gray-300">Shift</kbd>{" "}
+            Hold{" "}
+            <kbd className="px-1 py-0.5 rounded border border-gray-700 bg-gray-800 font-mono text-[10px] text-gray-300">
+              Shift
+            </kbd>{" "}
             while clicking Delete to permanently delete (skip archive).
           </p>
         )}
@@ -325,9 +316,7 @@ export function DeletePlanModal({
           data-testid="delete-plan-cascade-preview"
         >
           {preview === null ? (
-            <span className="text-gray-500">
-              Computing cascade preview…
-            </span>
+            <span className="text-gray-500">Computing cascade preview…</span>
           ) : preview === undefined ? (
             <span className="text-gray-500">
               Cascade preview unavailable. The delete will still proceed.

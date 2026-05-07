@@ -56,9 +56,7 @@ export const useToastStore = create<ToastStore>((set, get) => ({
     set((s) => {
       const combined = [...s.toasts, next];
       const trimmed =
-        combined.length > TOAST_CAP
-          ? combined.slice(combined.length - TOAST_CAP)
-          : combined;
+        combined.length > TOAST_CAP ? combined.slice(combined.length - TOAST_CAP) : combined;
       return { toasts: trimmed };
     });
     if (effectiveTtl && effectiveTtl > 0) {

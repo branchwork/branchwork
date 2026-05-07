@@ -26,43 +26,34 @@ interface CallLog {
 
 function isReject(value: unknown): value is { reject: unknown } {
   return (
-    typeof value === "object" &&
-    value !== null &&
-    "reject" in (value as Record<string, unknown>)
+    typeof value === "object" && value !== null && "reject" in (value as Record<string, unknown>)
   );
 }
 
 function installFetchMock(handler: FetchHandler) {
   const calls: CallLog[] = [];
-  const fn = vi.fn(
-    async (input: string | URL | Request, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.pathname + input.search
-            : input.url;
-      const method = init?.method ?? "GET";
-      const rawBody = init?.body;
-      const body =
-        typeof rawBody === "string" && rawBody.length > 0
-          ? JSON.parse(rawBody)
-          : undefined;
-      calls.push({ url, method, body });
-      const result = await handler(url, method, body);
-      if (isReject(result)) {
-        throw result.reject;
-      }
-      return new Response(
-        result.body !== undefined ? JSON.stringify(result.body) : null,
-        {
-          status: result.status,
-          statusText: result.statusText,
-          headers: { "Content-Type": "application/json" },
-        },
-      );
-    },
-  );
+  const fn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.pathname + input.search
+          : input.url;
+    const method = init?.method ?? "GET";
+    const rawBody = init?.body;
+    const body =
+      typeof rawBody === "string" && rawBody.length > 0 ? JSON.parse(rawBody) : undefined;
+    calls.push({ url, method, body });
+    const result = await handler(url, method, body);
+    if (isReject(result)) {
+      throw result.reject;
+    }
+    return new Response(result.body !== undefined ? JSON.stringify(result.body) : null, {
+      status: result.status,
+      statusText: result.statusText,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
   vi.stubGlobal("fetch", fn);
   return { calls, fn };
 }

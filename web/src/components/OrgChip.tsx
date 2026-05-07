@@ -64,14 +64,12 @@ export function OrgChip({
   if (memberships.length === 0) return null;
 
   const currentOrgId = user?.orgId ?? null;
-  const current =
-    memberships.find((m) => m.id === currentOrgId) ?? memberships[0];
+  const current = memberships.find((m) => m.id === currentOrgId) ?? memberships[0];
   if (!current) return null;
 
   const others = memberships.filter((m) => m.id !== current.id);
   const canSwitch = others.length > 0;
-  const memberLabel =
-    current.memberCount === 1 ? "1 member" : `${current.memberCount} members`;
+  const memberLabel = current.memberCount === 1 ? "1 member" : `${current.memberCount} members`;
 
   const onSwitch = async (orgId: string) => {
     setOpen(false);

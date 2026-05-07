@@ -2,10 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Modal } from "./ui/Modal.js";
 import { Button } from "./ui/Button.js";
 import { Banner } from "./ui/Banner.js";
-import {
-  useRunnerStore,
-  type RunnerInstallCommand,
-} from "../stores/runner-store.js";
+import { useRunnerStore, type RunnerInstallCommand } from "../stores/runner-store.js";
 import { errorMessage } from "../lib/error.js";
 
 interface Props {
@@ -73,9 +70,7 @@ export function RunnerEnrollModal({ open, onClose }: Props) {
   useEffect(() => {
     if (!issued || connected) return;
     const target = issued.runner_name;
-    const match = runners.find(
-      (r) => r.name === target && r.status === "online",
-    );
+    const match = runners.find((r) => r.name === target && r.status === "online");
     if (match) setConnected(true);
   }, [issued, connected, runners]);
 
@@ -107,13 +102,7 @@ export function RunnerEnrollModal({ open, onClose }: Props) {
     <Modal
       open={open}
       onClose={onClose}
-      title={
-        connected
-          ? "Runner connected"
-          : issued
-            ? "Install runner"
-            : "Enrol a runner"
-      }
+      title={connected ? "Runner connected" : issued ? "Install runner" : "Enrol a runner"}
       description={
         connected
           ? `${issued?.runner_name ?? "The runner"} is online and ready to take work.`
@@ -164,44 +153,31 @@ export function RunnerEnrollModal({ open, onClose }: Props) {
   );
 }
 
-function InstallView({
-  issued,
-  onClose,
-}: {
-  issued: RunnerInstallCommand;
-  onClose: () => void;
-}) {
+function InstallView({ issued, onClose }: { issued: RunnerInstallCommand; onClose: () => void }) {
   return (
     <div className="mt-4 space-y-3">
       <div>
-        <label className="block text-xs text-gray-400 mb-1">
-          Install command
-        </label>
+        <label className="block text-xs text-gray-400 mb-1">Install command</label>
         <CopyableField value={issued.command} testId="enroll-command" multiline />
         <p className="mt-1 text-[11px] text-gray-500">
-          Paste this into a terminal on the host you want to enrol. The
-          script downloads <code>branchwork-runner</code> and starts it
-          in the background.
+          Paste this into a terminal on the host you want to enrol. The script downloads{" "}
+          <code>branchwork-runner</code> and starts it in the background.
         </p>
       </div>
       <div>
-        <label className="block text-xs text-gray-400 mb-1">
-          Token (raw)
-        </label>
+        <label className="block text-xs text-gray-400 mb-1">Token (raw)</label>
         <CopyableField value={issued.token} testId="enroll-token" />
         <p className="mt-1 text-[11px] text-gray-500">
           For manual installs (e.g. you already have the binary), run{" "}
           <code className="text-gray-400">
-            branchwork-runner --token &lsquo;{issued.token}&rsquo; --saas-url{" "}
-            {issued.saas_url}
+            branchwork-runner --token &lsquo;{issued.token}&rsquo; --saas-url {issued.saas_url}
           </code>
           .
         </p>
       </div>
       <Banner kind="warn">
-        This is the only time the dashboard will show this token. It is
-        single-use: after the first runner connects, the token is bound
-        to that runner — re-pasting on another host will fail.
+        This is the only time the dashboard will show this token. It is single-use: after the first
+        runner connects, the token is bound to that runner — re-pasting on another host will fail.
       </Banner>
       <div
         className="flex items-center gap-2 text-[11px] text-gray-500"
@@ -219,13 +195,7 @@ function InstallView({
   );
 }
 
-function ConnectedView({
-  issued,
-  onClose,
-}: {
-  issued: RunnerInstallCommand;
-  onClose: () => void;
-}) {
+function ConnectedView({ issued, onClose }: { issued: RunnerInstallCommand; onClose: () => void }) {
   // The shared `Banner` only ships `error`/`warn` kinds today; rather
   // than widen its surface for one site we render an inline success
   // panel with the same role="status" semantics screen readers expect.
@@ -235,8 +205,8 @@ function ConnectedView({
         role="status"
         className="rounded border px-3 py-2 text-xs border-emerald-700/50 bg-emerald-900/30 text-emerald-200"
       >
-        <span className="font-mono">{issued.runner_name}</span> is online.
-        The dashboard can now dispatch agents to it.
+        <span className="font-mono">{issued.runner_name}</span> is online. The dashboard can now
+        dispatch agents to it.
       </div>
       <div className="flex justify-end pt-2">
         <Button variant="primary" size="sm" onClick={onClose}>

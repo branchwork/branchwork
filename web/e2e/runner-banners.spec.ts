@@ -61,7 +61,7 @@ async function runnerExec(shell: string): Promise<{ stdout: string; code: number
   try {
     const { stdout } = await exec(
       `docker compose -p ${PROJECT()} -f ${COMPOSE_FILE()} exec -T branchwork-runner sh -c ${JSON.stringify(shell)}`,
-      { timeout: 15_000 }
+      { timeout: 15_000 },
     );
     return { stdout, code: 0 };
   } catch (e) {
@@ -73,7 +73,7 @@ async function runnerExec(shell: string): Promise<{ stdout: string; code: number
 async function waitForRunnerStatus(
   page: Page,
   want: "online" | "offline",
-  timeoutMs = 20_000
+  timeoutMs = 20_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let last = "";
@@ -215,7 +215,9 @@ test("4. runner_unavailable surfaces when runner is killed mid-flight", async ({
   await waitForRunnerStatus(page, "online");
 
   await openNewPlanForm(page);
-  await page.getByPlaceholder(/~\/my-project/).fill(`~/smoke-killmid-${randomBytes(3).toString("hex")}`);
+  await page
+    .getByPlaceholder(/~\/my-project/)
+    .fill(`~/smoke-killmid-${randomBytes(3).toString("hex")}`);
   await page
     .getByPlaceholder(/Describe the feature/)
     .fill("smoke test — runner_unavailable on mid-flight kill");
@@ -230,7 +232,7 @@ test("4. runner_unavailable surfaces when runner is killed mid-flight", async ({
   // ListFolders WS message to the (paused) runner.
   const responsePromise = page.waitForResponse(
     (r) => r.url().endsWith("/api/plans/create") && (r.status() === 504 || r.status() === 503),
-    { timeout: 30_000 }
+    { timeout: 30_000 },
   );
   await page.getByRole("button", { name: /^Create Plan$/ }).click();
 

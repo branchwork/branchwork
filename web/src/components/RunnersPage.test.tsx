@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
 import { RunnersPage } from "./RunnersPage.js";
 import { useRunnerStore, type Runner } from "../stores/runner-store.js";
@@ -141,11 +136,7 @@ describe("RunnersPage", () => {
       expect(screen.queryByText(/Loading runners/)).toBeNull();
     });
     const toasts = useToastStore.getState().toasts;
-    expect(
-      toasts.some(
-        (t) => t.kind === "warn" && t.title.includes("SaaS"),
-      ),
-    ).toBe(true);
+    expect(toasts.some((t) => t.kind === "warn" && t.title.includes("SaaS"))).toBe(true);
   });
 
   it("does not redirect or toast while mode is still `unknown`", () => {

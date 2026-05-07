@@ -96,18 +96,15 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
         protocol: form.protocol,
         name: form.name.trim(),
       };
-      if (form.emailDomains.trim() !== "")
-        body.emailDomains = form.emailDomains.trim();
+      if (form.emailDomains.trim() !== "") body.emailDomains = form.emailDomains.trim();
       if (form.protocol === "oidc") {
         body.issuerUrl = form.issuerUrl.trim();
         body.clientId = form.clientId.trim();
         body.clientSecret = form.clientSecret;
       } else {
         body.idpSsoUrl = form.idpSsoUrl.trim();
-        if (form.idpEntityId.trim() !== "")
-          body.idpEntityId = form.idpEntityId.trim();
-        if (form.idpCertificate.trim() !== "")
-          body.idpCertificate = form.idpCertificate;
+        if (form.idpEntityId.trim() !== "") body.idpEntityId = form.idpEntityId.trim();
+        if (form.idpCertificate.trim() !== "") body.idpCertificate = form.idpCertificate;
       }
       await postJson(`/api/orgs/${encodeURIComponent(orgSlug)}/sso`, body);
       setForm(EMPTY_FORM);
@@ -123,10 +120,9 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
   async function toggleEnabled(p: SsoProviderDto) {
     setBusyId(p.id);
     try {
-      await putJson(
-        `/api/orgs/${encodeURIComponent(orgSlug)}/sso/${encodeURIComponent(p.id)}`,
-        { enabled: !p.enabled },
-      );
+      await putJson(`/api/orgs/${encodeURIComponent(orgSlug)}/sso/${encodeURIComponent(p.id)}`, {
+        enabled: !p.enabled,
+      });
       await refresh();
     } catch (e) {
       toastError(e, "Update failed");
@@ -139,9 +135,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
     if (!confirmDelete(p.name)) return;
     setBusyId(p.id);
     try {
-      await deleteJson(
-        `/api/orgs/${encodeURIComponent(orgSlug)}/sso/${encodeURIComponent(p.id)}`,
-      );
+      await deleteJson(`/api/orgs/${encodeURIComponent(orgSlug)}/sso/${encodeURIComponent(p.id)}`);
       await refresh();
     } catch (e) {
       toastError(e, "Delete failed");
@@ -153,9 +147,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
   return (
     <div className="space-y-6">
       <div className="flex items-baseline justify-between">
-        <h2 className="text-sm font-semibold text-gray-200">
-          Identity providers
-        </h2>
+        <h2 className="text-sm font-semibold text-gray-200">Identity providers</h2>
         {!showForm && (
           <Button
             onClick={() => setShowForm(true)}
@@ -177,8 +169,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
 
       {!loading && !error && providers && providers.length === 0 && !showForm && (
         <p className="text-xs text-gray-500">
-          No SSO providers configured. Users sign in with email + password
-          until you add one.
+          No SSO providers configured. Users sign in with email + password until you add one.
         </p>
       )}
 
@@ -198,14 +189,10 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
                 <div className="flex-1 min-w-0">
                   <div className="text-sm text-gray-200 truncate">
                     {p.name}{" "}
-                    <span className="ml-1 text-[10px] uppercase text-gray-500">
-                      {p.protocol}
-                    </span>
+                    <span className="ml-1 text-[10px] uppercase text-gray-500">{p.protocol}</span>
                   </div>
                   <div className="text-[11px] text-gray-500 truncate">
-                    {p.protocol === "oidc"
-                      ? (p.issuerUrl ?? "—")
-                      : (p.idpSsoUrl ?? "—")}
+                    {p.protocol === "oidc" ? (p.issuerUrl ?? "—") : (p.idpSsoUrl ?? "—")}
                     {p.emailDomains && (
                       <>
                         {" · domains: "}
@@ -282,9 +269,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
             <input
               type="text"
               value={form.emailDomains}
-              onChange={(e) =>
-                setForm({ ...form, emailDomains: e.target.value })
-              }
+              onChange={(e) => setForm({ ...form, emailDomains: e.target.value })}
               placeholder="acme.com, acme.io"
               data-testid="sso-domains"
               className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-600"
@@ -297,9 +282,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
                 <input
                   type="text"
                   value={form.issuerUrl}
-                  onChange={(e) =>
-                    setForm({ ...form, issuerUrl: e.target.value })
-                  }
+                  onChange={(e) => setForm({ ...form, issuerUrl: e.target.value })}
                   placeholder="https://acme.okta.com/.well-known/openid-configuration"
                   data-testid="sso-issuer"
                   className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-600"
@@ -309,9 +292,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
                 <input
                   type="text"
                   value={form.clientId}
-                  onChange={(e) =>
-                    setForm({ ...form, clientId: e.target.value })
-                  }
+                  onChange={(e) => setForm({ ...form, clientId: e.target.value })}
                   data-testid="sso-client-id"
                   className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-600"
                 />
@@ -320,9 +301,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
                 <input
                   type="password"
                   value={form.clientSecret}
-                  onChange={(e) =>
-                    setForm({ ...form, clientSecret: e.target.value })
-                  }
+                  onChange={(e) => setForm({ ...form, clientSecret: e.target.value })}
                   data-testid="sso-client-secret"
                   className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-600"
                 />
@@ -334,9 +313,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
                 <input
                   type="text"
                   value={form.idpSsoUrl}
-                  onChange={(e) =>
-                    setForm({ ...form, idpSsoUrl: e.target.value })
-                  }
+                  onChange={(e) => setForm({ ...form, idpSsoUrl: e.target.value })}
                   data-testid="sso-idp-url"
                   className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-600"
                 />
@@ -345,9 +322,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
                 <input
                   type="text"
                   value={form.idpEntityId}
-                  onChange={(e) =>
-                    setForm({ ...form, idpEntityId: e.target.value })
-                  }
+                  onChange={(e) => setForm({ ...form, idpEntityId: e.target.value })}
                   data-testid="sso-idp-entity"
                   className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-600"
                 />
@@ -355,9 +330,7 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
               <Field label="IdP certificate (PEM, optional)">
                 <textarea
                   value={form.idpCertificate}
-                  onChange={(e) =>
-                    setForm({ ...form, idpCertificate: e.target.value })
-                  }
+                  onChange={(e) => setForm({ ...form, idpCertificate: e.target.value })}
                   rows={4}
                   placeholder="-----BEGIN CERTIFICATE-----..."
                   data-testid="sso-idp-cert"
@@ -396,18 +369,10 @@ export function SsoTab({ orgSlug }: SsoTabProps) {
   );
 }
 
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block">
-      <span className="text-[11px] uppercase tracking-wide text-gray-500">
-        {label}
-      </span>
+      <span className="text-[11px] uppercase tracking-wide text-gray-500">{label}</span>
       <div className="mt-1">{children}</div>
     </label>
   );

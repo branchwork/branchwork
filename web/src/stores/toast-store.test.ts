@@ -13,9 +13,7 @@ afterEach(() => {
 
 describe("toast-store", () => {
   it("push appends a toast and returns the assigned id", () => {
-    const id = useToastStore
-      .getState()
-      .push({ kind: "info", title: "Hello" });
+    const id = useToastStore.getState().push({ kind: "info", title: "Hello" });
     const toasts = useToastStore.getState().toasts;
     expect(toasts).toHaveLength(1);
     expect(toasts[0].id).toBe(id);
@@ -49,9 +47,7 @@ describe("toast-store", () => {
   });
 
   it("error toasts default to sticky (no TTL) — must be dismissed manually", () => {
-    const id = useToastStore
-      .getState()
-      .push({ kind: "error", title: "Boom" });
+    const id = useToastStore.getState().push({ kind: "error", title: "Boom" });
     vi.advanceTimersByTime(60_000);
     expect(useToastStore.getState().toasts).toHaveLength(1);
     useToastStore.getState().dismiss(id);
@@ -59,9 +55,7 @@ describe("toast-store", () => {
   });
 
   it("explicit ttlMs overrides the default for error toasts", () => {
-    useToastStore
-      .getState()
-      .push({ kind: "error", title: "Transient", ttlMs: 1000 });
+    useToastStore.getState().push({ kind: "error", title: "Transient", ttlMs: 1000 });
     expect(useToastStore.getState().toasts).toHaveLength(1);
     vi.advanceTimersByTime(1000);
     expect(useToastStore.getState().toasts).toHaveLength(0);
@@ -69,22 +63,16 @@ describe("toast-store", () => {
 
   it("caps queue at 5 and evicts the oldest when a 6th is pushed", () => {
     for (let i = 0; i < TOAST_CAP; i += 1) {
-      useToastStore
-        .getState()
-        .push({ kind: "info", title: `t${i}`, ttlMs: 0 });
+      useToastStore.getState().push({ kind: "info", title: `t${i}`, ttlMs: 0 });
     }
     expect(useToastStore.getState().toasts).toHaveLength(TOAST_CAP);
-    useToastStore
-      .getState()
-      .push({ kind: "info", title: "t5", ttlMs: 0 });
+    useToastStore.getState().push({ kind: "info", title: "t5", ttlMs: 0 });
     const titles = useToastStore.getState().toasts.map((t) => t.title);
     expect(titles).toEqual(["t1", "t2", "t3", "t4", "t5"]);
   });
 
   it("ttlMs=0 is treated as sticky even on info/success", () => {
-    useToastStore
-      .getState()
-      .push({ kind: "info", title: "Pinned", ttlMs: 0 });
+    useToastStore.getState().push({ kind: "info", title: "Pinned", ttlMs: 0 });
     vi.advanceTimersByTime(60_000);
     expect(useToastStore.getState().toasts).toHaveLength(1);
   });

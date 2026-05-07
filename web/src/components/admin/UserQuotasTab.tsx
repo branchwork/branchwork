@@ -43,12 +43,8 @@ export function UserQuotasTab({ orgSlug }: UserQuotasTabProps) {
     setError(null);
     try {
       const [quotasRes, usageRes] = await Promise.all([
-        fetchJson<UserQuotaRow[]>(
-          `/api/orgs/${encodeURIComponent(orgSlug)}/user-quotas`,
-        ),
-        fetchJson<{ users: UsageUser[] }>(
-          `/api/orgs/${encodeURIComponent(orgSlug)}/usage`,
-        ),
+        fetchJson<UserQuotaRow[]>(`/api/orgs/${encodeURIComponent(orgSlug)}/user-quotas`),
+        fetchJson<{ users: UsageUser[] }>(`/api/orgs/${encodeURIComponent(orgSlug)}/usage`),
       ]);
       setQuotas(quotasRes);
       setUsers(usageRes.users ?? []);
@@ -145,12 +141,10 @@ export function UserQuotasTab({ orgSlug }: UserQuotasTabProps) {
   return (
     <div className="space-y-6">
       <div className="rounded border border-gray-800 bg-gray-900/40 p-4 max-w-2xl">
-        <h2 className="text-sm font-semibold text-gray-200">
-          Set per-user quota
-        </h2>
+        <h2 className="text-sm font-semibold text-gray-200">Set per-user quota</h2>
         <p className="text-[11px] text-gray-500 mt-1 mb-3 leading-relaxed">
-          Override the org budget for individual users. Quotas apply to the
-          monthly billing period and reset when it rolls over.
+          Override the org budget for individual users. Quotas apply to the monthly billing period
+          and reset when it rolls over.
         </p>
         <div className="flex flex-wrap items-center gap-2">
           <input
@@ -187,9 +181,7 @@ export function UserQuotasTab({ orgSlug }: UserQuotasTabProps) {
       </div>
 
       <div>
-        <h2 className="text-sm font-semibold text-gray-200 mb-2">
-          Current quotas
-        </h2>
+        <h2 className="text-sm font-semibold text-gray-200 mb-2">Current quotas</h2>
         {loading && (
           <p className="text-xs text-gray-500" data-testid="quotas-loading">
             Loading…
@@ -219,9 +211,7 @@ export function UserQuotasTab({ orgSlug }: UserQuotasTabProps) {
                 >
                   <div className="flex-1 min-w-0">
                     <div className="text-sm text-gray-200 truncate">
-                      {u?.email ?? (
-                        <span className="text-gray-500">{q.userId}</span>
-                      )}
+                      {u?.email ?? <span className="text-gray-500">{q.userId}</span>}
                     </div>
                     {u && (
                       <div className="text-[11px] text-gray-500">

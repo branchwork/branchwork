@@ -114,8 +114,7 @@ export const NOTIFICATION_CLASS_ORDER: NotificationClass[] = [
 /// localStorage key that stores the JSON-encoded array of disabled
 /// classes. Mirrors `org-store.ts::ACTIVE_ORG_STORAGE_KEY` — single key,
 /// shared across tabs, cleared on logout via `resetAllStores()`.
-export const NOTIFICATION_PREFS_STORAGE_KEY =
-  "branchwork.notifications.disabledClasses";
+export const NOTIFICATION_PREFS_STORAGE_KEY = "branchwork.notifications.disabledClasses";
 
 /// localStorage key that records whether the user has *seen* (and
 /// therefore explicitly chosen to enable / dismiss) the first-visit
@@ -124,8 +123,7 @@ export const NOTIFICATION_PREFS_STORAGE_KEY =
 /// values: missing (never asked), `"asked"` (we already prompted),
 /// `"enabled"` (user clicked Enable; permission may be granted or
 /// denied at the browser layer).
-export const NOTIFICATION_PROMPT_STATE_STORAGE_KEY =
-  "branchwork.notifications.promptState";
+export const NOTIFICATION_PROMPT_STATE_STORAGE_KEY = "branchwork.notifications.promptState";
 
 export interface NotificationPrefs {
   disabledClasses: NotificationClass[];
@@ -176,9 +174,7 @@ export function notificationsSupported(): boolean {
 /// `"unsupported"` for environments without the Notification API
 /// (jsdom, mobile Safari in some embeds) so callers can branch on a
 /// single value instead of also asking `notificationsSupported()`.
-export function getNotificationPermission():
-  | NotificationPermission
-  | "unsupported" {
+export function getNotificationPermission(): NotificationPermission | "unsupported" {
   if (!notificationsSupported()) return "unsupported";
   return Notification.permission;
 }
@@ -212,9 +208,7 @@ export async function requestNotificationPermission(): Promise<
 
 function readDisabledClassesFromStorage(): NotificationClass[] {
   try {
-    const raw = globalThis.localStorage?.getItem(
-      NOTIFICATION_PREFS_STORAGE_KEY,
-    );
+    const raw = globalThis.localStorage?.getItem(NOTIFICATION_PREFS_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -222,8 +216,7 @@ function readDisabledClassesFromStorage(): NotificationClass[] {
     // old browser tab that wrote a class we no longer recognise won't
     // poison the store).
     return parsed.filter(
-      (x): x is NotificationClass =>
-        typeof x === "string" && x in NOTIFICATION_CLASSES,
+      (x): x is NotificationClass => typeof x === "string" && x in NOTIFICATION_CLASSES,
     );
   } catch {
     return [];
@@ -232,10 +225,7 @@ function readDisabledClassesFromStorage(): NotificationClass[] {
 
 function writeDisabledClassesToStorage(classes: NotificationClass[]): void {
   try {
-    globalThis.localStorage?.setItem(
-      NOTIFICATION_PREFS_STORAGE_KEY,
-      JSON.stringify(classes),
-    );
+    globalThis.localStorage?.setItem(NOTIFICATION_PREFS_STORAGE_KEY, JSON.stringify(classes));
   } catch {
     // No-op — best-effort persistence (private mode, quota exceeded).
   }
@@ -252,10 +242,7 @@ export function isClassEnabled(klass: NotificationClass): boolean {
 /// Toggle a single class. The AdminPage checkbox onChange handler
 /// calls this — keeping the merge logic here means the UI stays
 /// stateless (read on each render via `isClassEnabled`).
-export function setClassEnabled(
-  klass: NotificationClass,
-  enabled: boolean,
-): void {
+export function setClassEnabled(klass: NotificationClass, enabled: boolean): void {
   const current = readDisabledClassesFromStorage();
   const exists = current.includes(klass);
   if (enabled && exists) {
@@ -269,9 +256,7 @@ export type PromptState = "never" | "asked" | "enabled";
 
 export function readPromptState(): PromptState {
   try {
-    const raw = globalThis.localStorage?.getItem(
-      NOTIFICATION_PROMPT_STATE_STORAGE_KEY,
-    );
+    const raw = globalThis.localStorage?.getItem(NOTIFICATION_PROMPT_STATE_STORAGE_KEY);
     if (raw === "asked" || raw === "enabled") return raw;
     return "never";
   } catch {
@@ -282,14 +267,9 @@ export function readPromptState(): PromptState {
 export function writePromptState(state: PromptState): void {
   try {
     if (state === "never") {
-      globalThis.localStorage?.removeItem(
-        NOTIFICATION_PROMPT_STATE_STORAGE_KEY,
-      );
+      globalThis.localStorage?.removeItem(NOTIFICATION_PROMPT_STATE_STORAGE_KEY);
     } else {
-      globalThis.localStorage?.setItem(
-        NOTIFICATION_PROMPT_STATE_STORAGE_KEY,
-        state,
-      );
+      globalThis.localStorage?.setItem(NOTIFICATION_PROMPT_STATE_STORAGE_KEY, state);
     }
   } catch {
     // No-op.
@@ -356,12 +336,7 @@ function scheduleFlush(klass: NotificationClass): void {
 /// uses `NOTIFICATION_CLASSES[klass].aggregateTitle` and ignores the
 /// per-call body (the user is reading "5 agents finished", not the
 /// 5 individual one-line bodies).
-export function notify(
-  klass: NotificationClass,
-  title: string,
-  body: string,
-  tag?: string,
-): void {
+export function notify(klass: NotificationClass, title: string, body: string, tag?: string): void {
   // Three early no-ops below collapse to "the user won't see
   // anything regardless" — drop without buffering so we don't grow
   // memory in a backgrounded tab where permission was never granted.

@@ -41,9 +41,7 @@ function seedStore(overrides: {
 }
 
 function renderDiffView() {
-  return render(
-    <DiffView agentId={AGENT_ID} canMerge={true} sourceBranch={null} />
-  );
+  return render(<DiffView agentId={AGENT_ID} canMerge={true} sourceBranch={null} />);
 }
 
 describe("AgentPanel DiffView merge dropdown", () => {
@@ -68,9 +66,7 @@ describe("AgentPanel DiffView merge dropdown", () => {
     await screen.findByRole("button", { name: /Merge into master/ });
 
     // Chevron is the only button labeled "Choose target branch".
-    expect(
-      screen.queryByRole("button", { name: /Choose target branch/ })
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /Choose target branch/ })).toBeNull();
   });
 
   it("renders the chevron and routes a dropdown selection through to mergeAgentBranch", async () => {
@@ -131,9 +127,7 @@ describe("AgentPanel DiffView merge dropdown", () => {
     fireEvent.mouseDown(document.body);
 
     await waitFor(() => {
-      expect(
-        screen.queryByRole("menuitem", { name: "feature/x" })
-      ).toBeNull();
+      expect(screen.queryByRole("menuitem", { name: "feature/x" })).toBeNull();
     });
     expect(mergeAgentBranch).not.toHaveBeenCalled();
   });
@@ -174,7 +168,7 @@ describe("AgentPanel DiffView merge dropdown", () => {
     render(
       <MemoryRouter>
         <AgentPanel />
-      </MemoryRouter>
+      </MemoryRouter>,
     );
     // sr-only span sits next to the colour-only dot so SRs announce
     // the running state. The visible status text further along the

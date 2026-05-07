@@ -33,9 +33,7 @@ describe("runner-store", () => {
       loaded: true,
       runners: [seedRunner({ id: "r1", status: "offline", name: "stale" })],
     });
-    useRunnerStore
-      .getState()
-      .applyConnected({ runner_id: "r1", runner_name: "primary" });
+    useRunnerStore.getState().applyConnected({ runner_id: "r1", runner_name: "primary" });
     const next = useRunnerStore.getState().runners;
     expect(next).toHaveLength(1);
     expect(next[0].status).toBe("online");
@@ -46,9 +44,7 @@ describe("runner-store", () => {
     // WS event for a runner the dashboard hasn't refetched yet — the
     // indicator must still flip emerald, the missing fields fill in later.
     useRunnerStore.setState({ mode: "saas", loaded: true, runners: [] });
-    useRunnerStore
-      .getState()
-      .applyConnected({ runner_id: "fresh", runner_name: "fresh-runner" });
+    useRunnerStore.getState().applyConnected({ runner_id: "fresh", runner_name: "fresh-runner" });
     const next = useRunnerStore.getState().runners;
     expect(next).toHaveLength(1);
     expect(next[0]).toMatchObject({
@@ -67,9 +63,7 @@ describe("runner-store", () => {
       loaded: false,
       runners: [],
     });
-    useRunnerStore
-      .getState()
-      .applyConnected({ runner_id: "r1", runner_name: "primary" });
+    useRunnerStore.getState().applyConnected({ runner_id: "r1", runner_name: "primary" });
     expect(useRunnerStore.getState().mode).toBe("saas");
   });
 
@@ -106,22 +100,20 @@ describe("runner-store", () => {
         const path = typeof input === "string" ? input : (input as Request).url;
         if (path.endsWith("/api/runners/tokens")) {
           tokenPostBody = JSON.parse(String(init?.body ?? "{}"));
-          return new Response(
-            JSON.stringify({ token: "cafef00d", runner_name: "laptop" }),
-            { status: 201, headers: { "Content-Type": "application/json" } },
-          );
+          return new Response(JSON.stringify({ token: "cafef00d", runner_name: "laptop" }), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+          });
         }
         // Warmup GET /api/runners — return an empty list so the
         // refetch lands without erroring.
-        return new Response(
-          JSON.stringify({ runners: [], mode: "saas" }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
+        return new Response(JSON.stringify({ runners: [], mode: "saas" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
       }),
     );
-    const issued = await useRunnerStore
-      .getState()
-      .createRunnerToken("laptop");
+    const issued = await useRunnerStore.getState().createRunnerToken("laptop");
     expect(issued).toEqual({ token: "cafef00d", runner_name: "laptop" });
     expect(tokenPostBody).toEqual({ runner_name: "laptop" });
   });
@@ -129,16 +121,15 @@ describe("runner-store", () => {
   it("createRunnerToken propagates server errors so the modal can render them inline", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response(JSON.stringify({ error: "name_taken" }), {
-          status: 409,
-          headers: { "Content-Type": "application/json" },
-        }),
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: "name_taken" }), {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          }),
       ),
     );
-    await expect(
-      useRunnerStore.getState().createRunnerToken("dup"),
-    ).rejects.toThrow();
+    await expect(useRunnerStore.getState().createRunnerToken("dup")).rejects.toThrow();
   });
 
   it("reset returns the store to its initial shape", () => {
@@ -163,9 +154,7 @@ describe("runner-store", () => {
       runners: [],
       selectedRunnerId: null,
     });
-    useRunnerStore
-      .getState()
-      .applyConnected({ runner_id: "r1", runner_name: "primary" });
+    useRunnerStore.getState().applyConnected({ runner_id: "r1", runner_name: "primary" });
     expect(useRunnerStore.getState().selectedRunnerId).toBe("r1");
   });
 
@@ -178,9 +167,7 @@ describe("runner-store", () => {
       runners: [],
       selectedRunnerId: "r2",
     });
-    useRunnerStore
-      .getState()
-      .applyConnected({ runner_id: "r1", runner_name: "secondary" });
+    useRunnerStore.getState().applyConnected({ runner_id: "r1", runner_name: "secondary" });
     expect(useRunnerStore.getState().selectedRunnerId).toBe("r2");
   });
 
@@ -235,9 +222,7 @@ describe("runner-store", () => {
                   version: "1.0",
                   lastSeenAt: null,
                   createdAt: null,
-                  drivers: [
-                    { name: "claude", status: { state: "api_key" } },
-                  ],
+                  drivers: [{ name: "claude", status: { state: "api_key" } }],
                 },
               ],
               mode: "saas",
@@ -248,9 +233,7 @@ describe("runner-store", () => {
     );
     await useRunnerStore.getState().fetchRunners();
     const s = useRunnerStore.getState();
-    expect(s.driversByRunnerId.r1).toEqual([
-      { name: "claude", status: { state: "api_key" } },
-    ]);
+    expect(s.driversByRunnerId.r1).toEqual([{ name: "claude", status: { state: "api_key" } }]);
     // First runner becomes the default selection.
     expect(s.selectedRunnerId).toBe("r1");
   });
@@ -260,16 +243,17 @@ describe("runner-store", () => {
   it("fetchRunnerConfig caches the response under configByRunnerId", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify({
-            runnerId: "r1",
-            effort: "high",
-            skipPermissions: false,
-            override: { effort: null, skipPermissions: null },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              runnerId: "r1",
+              effort: "high",
+              skipPermissions: false,
+              override: { effort: null, skipPermissions: null },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
       ),
     );
     const cfg = await useRunnerStore.getState().fetchRunnerConfig("r1");
@@ -295,9 +279,7 @@ describe("runner-store", () => {
         );
       }),
     );
-    await useRunnerStore
-      .getState()
-      .saveRunnerConfig("r1", { effort: null, skipPermissions: null });
+    await useRunnerStore.getState().saveRunnerConfig("r1", { effort: null, skipPermissions: null });
     expect(captured).toEqual({ effort: null, skip_permissions: null });
   });
 
@@ -321,9 +303,7 @@ describe("runner-store", () => {
         );
       }),
     );
-    await useRunnerStore
-      .getState()
-      .saveRunnerConfig("r1", { effort: "max" });
+    await useRunnerStore.getState().saveRunnerConfig("r1", { effort: "max" });
     expect(captured).toEqual({ effort: "max" });
     expect(captured).not.toHaveProperty("skip_permissions");
   });

@@ -75,9 +75,7 @@ describe("StaleDataChip", () => {
       </>,
     );
     expect(container.querySelector('[data-testid="stale-chip-plans"]')).toBeNull();
-    expect(
-      container.querySelector('[data-testid="stale-chip-agents"]'),
-    ).toBeTruthy();
+    expect(container.querySelector('[data-testid="stale-chip-agents"]')).toBeTruthy();
   });
 
   it("includes a relative-age label in the tooltip", () => {

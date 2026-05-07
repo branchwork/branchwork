@@ -1,12 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { RunnerEnrollModal, buildInstallCommand } from "./RunnerEnrollModal.js";
 import { useRunnerStore, type Runner } from "../stores/runner-store.js";
 
@@ -34,17 +27,14 @@ afterEach(() => {
 
 const sampleIssue = {
   token: "deadbeef",
-  command:
-    "curl -fsSL https://branchwork.dev/install-runner.sh | sh -s -- 'deadbeef'",
+  command: "curl -fsSL https://branchwork.dev/install-runner.sh | sh -s -- 'deadbeef'",
   runner_name: "laptop",
   saas_url: "https://branchwork.dev",
 };
 
 describe("buildInstallCommand", () => {
   it("single-quotes the token so a future token format with shell metacharacters wouldn't break", () => {
-    expect(buildInstallCommand("abc123")).toBe(
-      "branchwork-runner --token 'abc123'",
-    );
+    expect(buildInstallCommand("abc123")).toBe("branchwork-runner --token 'abc123'");
   });
 });
 
@@ -77,9 +67,7 @@ describe("RunnerEnrollModal", () => {
       expect(fetchInstallCommand).toHaveBeenCalledWith("laptop");
     });
 
-    const cmdField = (await screen.findByTestId(
-      "enroll-command",
-    )) as HTMLTextAreaElement;
+    const cmdField = (await screen.findByTestId("enroll-command")) as HTMLTextAreaElement;
     expect(cmdField.value).toBe(sampleIssue.command);
     // Raw token still surfaced for manual installs.
     const tokenField = screen.getByTestId("enroll-token") as HTMLInputElement;
@@ -185,18 +173,14 @@ describe("RunnerEnrollModal", () => {
       name: /Copy command/i,
     });
     fireEvent.click(copyButton);
-    await waitFor(() =>
-      expect(writeText).toHaveBeenCalledWith(sampleIssue.command),
-    );
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(sampleIssue.command));
   });
 
   it("resets state every time the modal reopens", async () => {
     const fetchInstallCommand = vi.fn().mockResolvedValueOnce(sampleIssue);
     useRunnerStore.setState({ fetchInstallCommand });
 
-    const { rerender } = render(
-      <RunnerEnrollModal open={true} onClose={() => {}} />,
-    );
+    const { rerender } = render(<RunnerEnrollModal open={true} onClose={() => {}} />);
     fireEvent.change(screen.getByTestId("runner-name-input"), {
       target: { value: "laptop" },
     });

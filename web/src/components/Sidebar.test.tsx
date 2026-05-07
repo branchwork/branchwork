@@ -1,11 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import axe from "axe-core";
 import { Sidebar } from "./Sidebar.js";
@@ -180,10 +174,7 @@ describe("Sidebar", () => {
     function Harness() {
       const navigate = useNavigate();
       return (
-        <button
-          data-testid="navigate-to-agents"
-          onClick={() => navigate("/agents")}
-        >
+        <button data-testid="navigate-to-agents" onClick={() => navigate("/agents")}>
           go
         </button>
       );

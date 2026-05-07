@@ -1,12 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { LoginPage } from "./LoginPage.js";
 import { useAuthStore } from "../stores/auth-store.js";
 
@@ -265,9 +258,7 @@ describe("LoginPage SSO discovery fallback", () => {
     });
     render(<LoginPage />);
 
-    const emailInput = screen.getByPlaceholderText(
-      "you@example.com",
-    ) as HTMLInputElement;
+    const emailInput = screen.getByPlaceholderText("you@example.com") as HTMLInputElement;
     fireEvent.change(emailInput, {
       target: { value: "person@personal.com" },
     });
@@ -349,9 +340,7 @@ describe("LoginPage email/password submit", () => {
 
   it("does not crash when login throws; the form stays mounted", async () => {
     installFetchMock(() => ({ status: 200, body: [] }));
-    const loginSpy = vi
-      .fn()
-      .mockRejectedValue(new Error("invalid_credentials"));
+    const loginSpy = vi.fn().mockRejectedValue(new Error("invalid_credentials"));
     seedAuthStore({ login: loginSpy });
     render(<LoginPage />);
 

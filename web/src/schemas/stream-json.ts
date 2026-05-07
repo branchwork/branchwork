@@ -60,9 +60,7 @@ const KnownEnvelopeSchema = v.variant("type", [
 
 export type StreamJsonEnvelope = v.InferOutput<typeof KnownEnvelopeSchema>;
 
-export type ParsedStreamJsonLine =
-  | StreamJsonEnvelope
-  | { type: "raw"; raw: string };
+export type ParsedStreamJsonLine = StreamJsonEnvelope | { type: "raw"; raw: string };
 
 /// Best-effort parse of one stream-JSON content line. Never throws:
 /// non-JSON, or a JSON value that doesn't fit any known envelope,

@@ -1,9 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import {
-  usePlanStore,
-  type ParsedPlan,
-  type PlanSummary,
-} from "./plan-store.js";
+import { usePlanStore, type ParsedPlan, type PlanSummary } from "./plan-store.js";
 
 // Inlined copy of the gate used by Sidebar/ProjectDashboard. The sole signal
 // for "plan is done" is doneCount >= taskCount, so any upward drift on

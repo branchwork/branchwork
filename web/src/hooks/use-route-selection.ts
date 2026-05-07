@@ -1,9 +1,5 @@
 import { useCallback } from "react";
-import {
-  useLocation,
-  useNavigate,
-  useSearchParams,
-} from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 
 /// Pulls "what is selected" out of the URL — the source of truth after
 /// the routing migration in 1.1. Plan name is a path param on

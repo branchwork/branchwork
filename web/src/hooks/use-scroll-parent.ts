@@ -10,9 +10,7 @@ import { useLayoutEffect, useState } from "react";
 /// In jsdom (vitest), `getComputedStyle` works but `getBoundingClientRect`
 /// returns zeros, so callers that depend on viewport size should also
 /// pass `initialRect` to seed the virtualiser.
-export function useScrollParent(
-  ref: React.RefObject<HTMLElement | null>,
-): HTMLElement | null {
+export function useScrollParent(ref: React.RefObject<HTMLElement | null>): HTMLElement | null {
   const [scrollEl, setScrollEl] = useState<HTMLElement | null>(null);
 
   useLayoutEffect(() => {

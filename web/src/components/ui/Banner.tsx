@@ -20,11 +20,7 @@ const KIND_CLASSES: Record<BannerKind, string> = {
 /// `role="alert"` so screen readers announce the message immediately,
 /// matching the toast primitive for `error`/`warn` kinds.
 export function Banner({ kind = "error", children, className }: BannerProps) {
-  const classes = [
-    "rounded border px-3 py-2 text-xs",
-    KIND_CLASSES[kind],
-    className,
-  ]
+  const classes = ["rounded border px-3 py-2 text-xs", KIND_CLASSES[kind], className]
     .filter(Boolean)
     .join(" ");
   return (

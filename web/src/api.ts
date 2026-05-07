@@ -18,7 +18,11 @@ function defaultHeaders(): Record<string, string> {
 }
 
 export class HttpError extends Error {
-  constructor(public status: number, public statusText: string, public body?: unknown) {
+  constructor(
+    public status: number,
+    public statusText: string,
+    public body?: unknown,
+  ) {
     super(`${status} ${statusText}`);
   }
 }

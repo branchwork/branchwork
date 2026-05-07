@@ -151,7 +151,7 @@ describe("NewPlanForm /api/plans/create error mapping", () => {
   async function fillFormAndSubmit() {
     const folderInput = screen.getByPlaceholderText(/~\/my-project/) as HTMLInputElement;
     const descriptionInput = screen.getByPlaceholderText(
-      /Describe the feature/i
+      /Describe the feature/i,
     ) as HTMLTextAreaElement;
     fireEvent.change(folderInput, { target: { value: "~/missing" } });
     fireEvent.change(descriptionInput, { target: { value: "build a thing" } });
@@ -199,7 +199,11 @@ describe("NewPlanForm /api/plans/create error mapping", () => {
 
     await waitFor(() => {
       const toasts = useToastStore.getState().toasts;
-      expect(toasts.some((t) => t.title === "Runner did not respond in time. Try again." && t.kind === "error")).toBe(true);
+      expect(
+        toasts.some(
+          (t) => t.title === "Runner did not respond in time. Try again." && t.kind === "error",
+        ),
+      ).toBe(true);
     });
     // The 504 path does NOT route into the runner-offline banner — that
     // branch only fires from the /api/folders mount fetch.
@@ -232,7 +236,9 @@ describe("NewPlanForm /api/plans/create error mapping", () => {
 
     await waitFor(() => {
       const toasts = useToastStore.getState().toasts;
-      expect(toasts.some((t) => t.title === "Permission denied (os error 13)" && t.kind === "error")).toBe(true);
+      expect(
+        toasts.some((t) => t.title === "Permission denied (os error 13)" && t.kind === "error"),
+      ).toBe(true);
     });
   });
 

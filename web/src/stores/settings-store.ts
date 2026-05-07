@@ -58,12 +58,7 @@ const DEFAULT_CAPABILITIES: DriverCapabilities = {
 ///                    report (newly enrolled, never connected, …).
 /// - `local`:         standalone deployment — server's compiled
 ///                    DriverRegistry is authoritative.
-export type DriverRunnerStatus =
-  | "online"
-  | "offline"
-  | "missing"
-  | "never_reported"
-  | "local";
+export type DriverRunnerStatus = "online" | "offline" | "missing" | "never_reported" | "local";
 
 interface SettingsStore {
   effort: EffortLevel;
@@ -178,10 +173,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     // Coalesce only when the in-flight fetch is for the same runner. A
     // call with a different runner id supersedes the previous fetch so
     // the sidebar reflects the runner the user just switched to.
-    if (
-      inFlightDriversFetch &&
-      inFlightDriversFetchRunnerId === targetRunnerId
-    ) {
+    if (inFlightDriversFetch && inFlightDriversFetchRunnerId === targetRunnerId) {
       return inFlightDriversFetch;
     }
     const path = targetRunnerId

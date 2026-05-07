@@ -9,12 +9,7 @@ import {
 } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import type { ReactElement } from "react";
-import {
-  AdminPage,
-  isAdminRole,
-  clampRetentionDays,
-  retentionPreview,
-} from "./AdminPage.js";
+import { AdminPage, isAdminRole, clampRetentionDays, retentionPreview } from "./AdminPage.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
 import { useOrgStore } from "../stores/org-store.js";
@@ -25,10 +20,7 @@ import { useAuthStore } from "../stores/auth-store.js";
 /// so the Settings tab is the active one — that matches the pre-tabs
 /// surface (effort/webhook/retention/skip-perms inputs always present).
 /// Pass `initialEntry: "/admin/members"` to land on a different tab.
-function render(
-  ui: ReactElement,
-  options: RenderOptions & { initialEntry?: string } = {},
-) {
+function render(ui: ReactElement, options: RenderOptions & { initialEntry?: string } = {}) {
   const { initialEntry = "/admin/settings", ...rest } = options;
   return rtlRender(
     <MemoryRouter initialEntries={[initialEntry]}>
@@ -107,15 +99,11 @@ describe("retentionPreview", () => {
   });
 
   it("renders singular at 1", () => {
-    expect(retentionPreview(1)).toBe(
-      "Soft-deleted plans are kept for 1 day.",
-    );
+    expect(retentionPreview(1)).toBe("Soft-deleted plans are kept for 1 day.");
   });
 
   it("renders plural at 30", () => {
-    expect(retentionPreview(30)).toBe(
-      "Soft-deleted plans are kept for 30 days.",
-    );
+    expect(retentionPreview(30)).toBe("Soft-deleted plans are kept for 30 days.");
   });
 });
 
@@ -124,22 +112,16 @@ describe("AdminPage retention input", () => {
     render(<AdminPage />);
     const input = screen.getByTestId("retention-input") as HTMLInputElement;
     expect(input.value).toBe("30");
-    expect(screen.getByTestId("retention-preview").textContent).toMatch(
-      /kept for 30 days/i,
-    );
+    expect(screen.getByTestId("retention-preview").textContent).toMatch(/kept for 30 days/i);
   });
 
   it("updates the live preview chip as the user types", () => {
     render(<AdminPage />);
     const input = screen.getByTestId("retention-input") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "0" } });
-    expect(screen.getByTestId("retention-preview").textContent).toMatch(
-      /permanent/i,
-    );
+    expect(screen.getByTestId("retention-preview").textContent).toMatch(/permanent/i);
     fireEvent.change(input, { target: { value: "7" } });
-    expect(screen.getByTestId("retention-preview").textContent).toMatch(
-      /kept for 7 days/i,
-    );
+    expect(screen.getByTestId("retention-preview").textContent).toMatch(/kept for 7 days/i);
   });
 
   it("clamps 9999 to 365 on blur and saves", async () => {
@@ -177,17 +159,13 @@ describe("AdminPage retention input", () => {
   });
 
   it("surfaces an error message when the store action throws", async () => {
-    const setRetention = vi
-      .fn()
-      .mockRejectedValue(new Error("network down"));
+    const setRetention = vi.fn().mockRejectedValue(new Error("network down"));
     useSettingsStore.setState({ setPlanArchiveRetentionDays: setRetention });
     render(<AdminPage />);
     const input = screen.getByTestId("retention-input") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "60" } });
     fireEvent.blur(input);
-    await waitFor(() =>
-      expect(screen.getByText(/network down/i)).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/network down/i)).toBeTruthy());
   });
 });
 
@@ -262,9 +240,7 @@ describe("AdminPage notification webhook", () => {
       webhookUrl: "https://hooks.slack.com/services/AAA",
     });
     render(<AdminPage />);
-    const input = screen.getByPlaceholderText(
-      /hooks\.slack\.com/i,
-    ) as HTMLInputElement;
+    const input = screen.getByPlaceholderText(/hooks\.slack\.com/i) as HTMLInputElement;
     expect(input.value).toBe("https://hooks.slack.com/services/AAA");
   });
 
@@ -273,9 +249,7 @@ describe("AdminPage notification webhook", () => {
     render(<AdminPage />);
     const save = screen.getByText(/^Save$/) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
-    const input = screen.getByPlaceholderText(
-      /hooks\.slack\.com/i,
-    ) as HTMLInputElement;
+    const input = screen.getByPlaceholderText(/hooks\.slack\.com/i) as HTMLInputElement;
     fireEvent.change(input, {
       target: { value: "https://hooks.slack.com/services/abc" },
     });
@@ -286,17 +260,13 @@ describe("AdminPage notification webhook", () => {
     const setWebhookUrl = vi.fn().mockResolvedValue(undefined);
     useSettingsStore.setState({ webhookUrl: null, setWebhookUrl });
     render(<AdminPage />);
-    const input = screen.getByPlaceholderText(
-      /hooks\.slack\.com/i,
-    ) as HTMLInputElement;
+    const input = screen.getByPlaceholderText(/hooks\.slack\.com/i) as HTMLInputElement;
     fireEvent.change(input, {
       target: { value: "  https://hooks.slack.com/services/xyz  " },
     });
     fireEvent.click(screen.getByText(/^Save$/));
     await waitFor(() =>
-      expect(setWebhookUrl).toHaveBeenCalledWith(
-        "https://hooks.slack.com/services/xyz",
-      ),
+      expect(setWebhookUrl).toHaveBeenCalledWith("https://hooks.slack.com/services/xyz"),
     );
     await waitFor(() => expect(screen.getByText(/^Saved\.$/)).toBeTruthy());
   });
@@ -308,30 +278,22 @@ describe("AdminPage notification webhook", () => {
       setWebhookUrl,
     });
     render(<AdminPage />);
-    const input = screen.getByPlaceholderText(
-      /hooks\.slack\.com/i,
-    ) as HTMLInputElement;
+    const input = screen.getByPlaceholderText(/hooks\.slack\.com/i) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "" } });
     fireEvent.click(screen.getByText(/^Save$/));
     await waitFor(() => expect(setWebhookUrl).toHaveBeenCalledWith(null));
   });
 
   it("surfaces an error when the webhook save throws", async () => {
-    const setWebhookUrl = vi
-      .fn()
-      .mockRejectedValue(new Error("hook url rejected"));
+    const setWebhookUrl = vi.fn().mockRejectedValue(new Error("hook url rejected"));
     useSettingsStore.setState({ webhookUrl: null, setWebhookUrl });
     render(<AdminPage />);
-    const input = screen.getByPlaceholderText(
-      /hooks\.slack\.com/i,
-    ) as HTMLInputElement;
+    const input = screen.getByPlaceholderText(/hooks\.slack\.com/i) as HTMLInputElement;
     fireEvent.change(input, {
       target: { value: "https://example.invalid/hook" },
     });
     fireEvent.click(screen.getByText(/^Save$/));
-    await waitFor(() =>
-      expect(screen.getByText(/hook url rejected/i)).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/hook url rejected/i)).toBeTruthy());
   });
 });
 
@@ -342,9 +304,7 @@ describe("AdminPage notification preferences", () => {
   // assertion that waits for the button would time out.
   class StubNotification {
     static permission: NotificationPermission = "default";
-    static requestPermission = vi.fn(
-      async (): Promise<NotificationPermission> => "granted",
-    );
+    static requestPermission = vi.fn(async (): Promise<NotificationPermission> => "granted");
     constructor(_t: string, _o?: NotificationOptions) {}
   }
 
@@ -353,10 +313,7 @@ describe("AdminPage notification preferences", () => {
     StubNotification.requestPermission = vi.fn(
       async (): Promise<NotificationPermission> => "granted",
     );
-    vi.stubGlobal(
-      "Notification",
-      StubNotification as unknown as typeof Notification,
-    );
+    vi.stubGlobal("Notification", StubNotification as unknown as typeof Notification);
     // Map-backed localStorage so per-class toggles persist across the
     // test (the same trick org-store.test.ts uses — jsdom localStorage
     // is unreliable in this vitest config).
@@ -383,29 +340,21 @@ describe("AdminPage notification preferences", () => {
 
   it("renders the not-enabled badge and the Enable button when permission is default", () => {
     render(<AdminPage />);
-    expect(
-      screen.getByTestId("notification-permission-badge").textContent,
-    ).toMatch(/not enabled/i);
+    expect(screen.getByTestId("notification-permission-badge").textContent).toMatch(/not enabled/i);
     expect(screen.getByTestId("enable-notifications-button")).toBeTruthy();
   });
 
   it("hides the Enable button once permission is granted", () => {
     StubNotification.permission = "granted";
     render(<AdminPage />);
-    expect(
-      screen.getByTestId("notification-permission-badge").textContent,
-    ).toMatch(/enabled/i);
-    expect(
-      screen.queryByTestId("enable-notifications-button"),
-    ).toBeNull();
+    expect(screen.getByTestId("notification-permission-badge").textContent).toMatch(/enabled/i);
+    expect(screen.queryByTestId("enable-notifications-button")).toBeNull();
   });
 
   it("clicking Enable calls Notification.requestPermission", async () => {
     render(<AdminPage />);
     fireEvent.click(screen.getByTestId("enable-notifications-button"));
-    await waitFor(() =>
-      expect(StubNotification.requestPermission).toHaveBeenCalledTimes(1),
-    );
+    await waitFor(() => expect(StubNotification.requestPermission).toHaveBeenCalledTimes(1));
   });
 
   it("renders one checkbox per notification class, all enabled by default", () => {
@@ -422,15 +371,11 @@ describe("AdminPage notification preferences", () => {
 
   it("toggling a class checkbox persists the disabled flag in localStorage", () => {
     render(<AdminPage />);
-    const cb = screen.getByTestId(
-      "notify-class-agent_stopped",
-    ) as HTMLInputElement;
+    const cb = screen.getByTestId("notify-class-agent_stopped") as HTMLInputElement;
     expect(cb.checked).toBe(true);
     fireEvent.click(cb);
     expect(cb.checked).toBe(false);
-    const raw = globalThis.localStorage.getItem(
-      "branchwork.notifications.disabledClasses",
-    );
+    const raw = globalThis.localStorage.getItem("branchwork.notifications.disabledClasses");
     expect(raw).toBe(JSON.stringify(["agent_stopped"]));
   });
 
@@ -440,15 +385,11 @@ describe("AdminPage notification preferences", () => {
       JSON.stringify(["agent_stopped"]),
     );
     render(<AdminPage />);
-    const cb = screen.getByTestId(
-      "notify-class-agent_stopped",
-    ) as HTMLInputElement;
+    const cb = screen.getByTestId("notify-class-agent_stopped") as HTMLInputElement;
     expect(cb.checked).toBe(false);
     fireEvent.click(cb);
     expect(cb.checked).toBe(true);
-    const raw = globalThis.localStorage.getItem(
-      "branchwork.notifications.disabledClasses",
-    );
+    const raw = globalThis.localStorage.getItem("branchwork.notifications.disabledClasses");
     expect(raw).toBe(JSON.stringify([]));
   });
 });
@@ -519,9 +460,7 @@ describe("AdminPage tab gating", () => {
     // Diagnostics is a universal triage view (added in 9.2), so the
     // tab bar now appears on standalone too — but only those two tabs.
     render(<AdminPage />);
-    const tabs = screen
-      .getAllByRole("tab")
-      .map((t) => (t.textContent ?? "").trim());
+    const tabs = screen.getAllByRole("tab").map((t) => (t.textContent ?? "").trim());
     expect(tabs).toEqual(["Settings", "Diagnostics"]);
     // Settings tab content still renders (effort buttons present).
     expect(screen.getByText(/^Low$/)).toBeTruthy();
@@ -532,18 +471,14 @@ describe("AdminPage tab gating", () => {
     render(<AdminPage />);
     const tablist = screen.getByRole("tablist");
     expect(tablist).toBeTruthy();
-    const tabs = screen
-      .getAllByRole("tab")
-      .map((t) => (t.textContent ?? "").trim());
+    const tabs = screen.getAllByRole("tab").map((t) => (t.textContent ?? "").trim());
     expect(tabs).toEqual(["Settings", "Diagnostics", "Members"]);
   });
 
   it("SaaS owners see all admin tabs (Diagnostics included)", () => {
     asSaasAdmin();
     render(<AdminPage />);
-    const tabs = screen
-      .getAllByRole("tab")
-      .map((t) => (t.textContent ?? "").trim());
+    const tabs = screen.getAllByRole("tab").map((t) => (t.textContent ?? "").trim());
     expect(tabs).toEqual([
       "Settings",
       "Diagnostics",
@@ -561,9 +496,7 @@ describe("AdminPage tab gating", () => {
     // Falls back to Settings: the effort buttons are visible.
     expect(screen.getByText(/^Low$/)).toBeTruthy();
     // Budget tab is not in the tablist for a non-admin.
-    const tabs = screen
-      .getAllByRole("tab")
-      .map((t) => (t.textContent ?? "").trim());
+    const tabs = screen.getAllByRole("tab").map((t) => (t.textContent ?? "").trim());
     expect(tabs).not.toContain("Budget");
   });
 
@@ -572,9 +505,7 @@ describe("AdminPage tab gating", () => {
     render(<AdminPage />, { initialEntry: "/admin/members" });
     expect(screen.getByText(/^Low$/)).toBeTruthy();
     // Members is not in the standalone tablist — only Settings + Diagnostics.
-    const tabs = screen
-      .getAllByRole("tab")
-      .map((t) => (t.textContent ?? "").trim());
+    const tabs = screen.getAllByRole("tab").map((t) => (t.textContent ?? "").trim());
     expect(tabs).not.toContain("Members");
   });
 });

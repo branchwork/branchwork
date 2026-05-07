@@ -55,9 +55,7 @@ describe("org-store storage helpers", () => {
   it("write + read round-trips an org id", () => {
     writeActiveOrgToStorage("org-123");
     expect(readActiveOrgFromStorage()).toBe("org-123");
-    expect(globalThis.localStorage?.getItem(ACTIVE_ORG_STORAGE_KEY)).toBe(
-      "org-123",
-    );
+    expect(globalThis.localStorage?.getItem(ACTIVE_ORG_STORAGE_KEY)).toBe("org-123");
   });
 
   it("write(null) clears the pin", () => {
@@ -98,11 +96,12 @@ describe("org-store fetchOrgs", () => {
     ];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response(JSON.stringify(memberships), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        }),
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(memberships), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
       ),
     );
 
@@ -121,13 +120,12 @@ describe("org-store fetchOrgs", () => {
     // backend catches up.
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify([
-            { id: "org-1", name: "Acme", slug: "acme", role: "owner" },
-          ]),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify([{ id: "org-1", name: "Acme", slug: "acme", role: "owner" }]),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
       ),
     );
 
@@ -141,19 +139,20 @@ describe("org-store fetchOrgs", () => {
     writeActiveOrgToStorage("org-deleted");
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify([
-            {
-              id: "org-1",
-              name: "Acme",
-              slug: "acme",
-              role: "owner",
-              memberCount: 1,
-            },
-          ]),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify([
+              {
+                id: "org-1",
+                name: "Acme",
+                slug: "acme",
+                role: "owner",
+                memberCount: 1,
+              },
+            ]),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
       ),
     );
 
@@ -165,26 +164,27 @@ describe("org-store fetchOrgs", () => {
     writeActiveOrgToStorage("org-1");
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify([
-            {
-              id: "org-1",
-              name: "Acme",
-              slug: "acme",
-              role: "owner",
-              memberCount: 1,
-            },
-            {
-              id: "org-2",
-              name: "Beta",
-              slug: "beta",
-              role: "member",
-              memberCount: 2,
-            },
-          ]),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify([
+              {
+                id: "org-1",
+                name: "Acme",
+                slug: "acme",
+                role: "owner",
+                memberCount: 1,
+              },
+              {
+                id: "org-2",
+                name: "Beta",
+                slug: "beta",
+                role: "member",
+                memberCount: 2,
+              },
+            ]),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
       ),
     );
 
@@ -195,9 +195,7 @@ describe("org-store fetchOrgs", () => {
   it("leaves `loaded` false on fetch error so the chip stays hidden", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response("server error", { status: 500, statusText: "Internal" }),
-      ),
+      vi.fn(async () => new Response("server error", { status: 500, statusText: "Internal" })),
     );
 
     await useOrgStore.getState().fetchOrgs();
@@ -206,11 +204,12 @@ describe("org-store fetchOrgs", () => {
   });
 
   it("coalesces concurrent callers onto a single in-flight fetch", async () => {
-    const fetchSpy = vi.fn(async () =>
-      new Response("[]", {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
+    const fetchSpy = vi.fn(
+      async () =>
+        new Response("[]", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
     );
     vi.stubGlobal("fetch", fetchSpy);
 
@@ -277,94 +276,85 @@ describe("org-store switchOrg", () => {
     expect(readActiveOrgFromStorage()).toBeNull();
   });
 
-  it(
-    "writes the localStorage pin, resets cross-org stores, and re-fetches /api/auth/me",
-    async () => {
-      seedTwoOrgs();
-      useAuthStore.setState({
-        user: { id: "u-1", email: "u@x.com", orgId: "org-1" },
-      });
-      // Seed plan-store + agent-store with org-1 data we expect to be
-      // wiped by resetAllStores.
-      usePlanStore.setState({
-        plans: [
-          {
-            name: "p-1",
-            title: "P 1",
-            project: null,
-            phaseCount: 0,
-            taskCount: 0,
-            doneCount: 0,
-            createdAt: "",
-            modifiedAt: "",
-          },
-        ],
-      });
-      useAgentStore.setState({
-        agents: [
-          {
-            id: "a-1",
-            session_id: "",
-            pid: null,
-            parent_agent_id: null,
-            plan_name: "p-1",
-            task_id: null,
-            cwd: "",
-            status: "running",
-            mode: "pty",
-            prompt: null,
-            started_at: "",
-            finished_at: null,
-            last_tool: null,
-            last_activity_at: null,
-            base_commit: null,
-            branch: null,
-            source_branch: null,
-            cost_usd: null,
-            driver: null,
-          },
-        ],
-      });
+  it("writes the localStorage pin, resets cross-org stores, and re-fetches /api/auth/me", async () => {
+    seedTwoOrgs();
+    useAuthStore.setState({
+      user: { id: "u-1", email: "u@x.com", orgId: "org-1" },
+    });
+    // Seed plan-store + agent-store with org-1 data we expect to be
+    // wiped by resetAllStores.
+    usePlanStore.setState({
+      plans: [
+        {
+          name: "p-1",
+          title: "P 1",
+          project: null,
+          phaseCount: 0,
+          taskCount: 0,
+          doneCount: 0,
+          createdAt: "",
+          modifiedAt: "",
+        },
+      ],
+    });
+    useAgentStore.setState({
+      agents: [
+        {
+          id: "a-1",
+          session_id: "",
+          pid: null,
+          parent_agent_id: null,
+          plan_name: "p-1",
+          task_id: null,
+          cwd: "",
+          status: "running",
+          mode: "pty",
+          prompt: null,
+          started_at: "",
+          finished_at: null,
+          last_tool: null,
+          last_activity_at: null,
+          base_commit: null,
+          branch: null,
+          source_branch: null,
+          cost_usd: null,
+          driver: null,
+        },
+      ],
+    });
 
-      // /api/auth/me is the only request switchOrg makes; org-store does
-      // NOT call /api/auth/switch-org in the localStorage approach (the
-      // pin alone tells the server which org to resolve).
-      const fetchSpy = vi.fn(async (url: string) => {
-        if (url === "/api/auth/me") {
-          return new Response(
-            JSON.stringify({ id: "u-1", email: "u@x.com", orgId: "org-2" }),
-            {
-              status: 200,
-              headers: { "Content-Type": "application/json" },
-            },
-          );
-        }
-        return new Response("not found", { status: 404 });
-      });
-      vi.stubGlobal("fetch", fetchSpy);
+    // /api/auth/me is the only request switchOrg makes; org-store does
+    // NOT call /api/auth/switch-org in the localStorage approach (the
+    // pin alone tells the server which org to resolve).
+    const fetchSpy = vi.fn(async (url: string) => {
+      if (url === "/api/auth/me") {
+        return new Response(JSON.stringify({ id: "u-1", email: "u@x.com", orgId: "org-2" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
 
-      await useOrgStore.getState().switchOrg("org-2");
+    await useOrgStore.getState().switchOrg("org-2");
 
-      // localStorage now pins org-2 — every future fetchJson() rides X-Org-Id.
-      expect(readActiveOrgFromStorage()).toBe("org-2");
-      // Cross-org slices are wiped (resetAllStores ran).
-      expect(usePlanStore.getState().plans).toEqual([]);
-      expect(useAgentStore.getState().agents).toEqual([]);
-      // org-store itself is wiped — App.tsx bootstrap on user-change
-      // re-runs fetchOrgs; we don't assert that here since the post-reset
-      // refetch lives in App.tsx, not in switchOrg.
-      expect(useOrgStore.getState().memberships).toEqual([]);
-      // /api/auth/me was called as part of switchOrg (the recovery path
-      // for `user.orgId`). The X-Org-Id header is built from localStorage
-      // by api.ts at fetch time.
-      expect(fetchSpy).toHaveBeenCalledWith(
-        "/api/auth/me",
-        expect.objectContaining({}),
-      );
-      // Auth-store reflects the new active org.
-      expect(useAuthStore.getState().user?.orgId).toBe("org-2");
-    },
-  );
+    // localStorage now pins org-2 — every future fetchJson() rides X-Org-Id.
+    expect(readActiveOrgFromStorage()).toBe("org-2");
+    // Cross-org slices are wiped (resetAllStores ran).
+    expect(usePlanStore.getState().plans).toEqual([]);
+    expect(useAgentStore.getState().agents).toEqual([]);
+    // org-store itself is wiped — App.tsx bootstrap on user-change
+    // re-runs fetchOrgs; we don't assert that here since the post-reset
+    // refetch lives in App.tsx, not in switchOrg.
+    expect(useOrgStore.getState().memberships).toEqual([]);
+    // /api/auth/me was called as part of switchOrg (the recovery path
+    // for `user.orgId`). The X-Org-Id header is built from localStorage
+    // by api.ts at fetch time.
+    expect(fetchSpy).toHaveBeenCalledWith("/api/auth/me", expect.objectContaining({}));
+    // Auth-store reflects the new active org.
+    expect(useAuthStore.getState().user?.orgId).toBe("org-2");
+  });
 });
 
 describe("org-store reset", () => {

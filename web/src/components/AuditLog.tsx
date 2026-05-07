@@ -236,8 +236,7 @@ function DiffSummary({ diff, action }: { diff: string | null; action: string }) 
     const parts: string[] = [];
     if (parsed.plan) parts.push(String(parsed.plan));
     if (parsed.task) parts.push(`T${parsed.task}`);
-    if (parsed.driver && parsed.driver !== "claude")
-      parts.push(String(parsed.driver));
+    if (parsed.driver && parsed.driver !== "claude") parts.push(String(parsed.driver));
     return <span className="text-gray-500 truncate">{parts.join(" / ")}</span>;
   }
   if (action === "org.member_add") {
@@ -248,18 +247,10 @@ function DiffSummary({ diff, action }: { diff: string | null; action: string }) 
     );
   }
   if (action === "org.member_role_change") {
-    return (
-      <span className="text-gray-500 truncate">
-        &rarr; {String(parsed.newRole || "?")}
-      </span>
-    );
+    return <span className="text-gray-500 truncate">&rarr; {String(parsed.newRole || "?")}</span>;
   }
   if (action === "config.auto_advance") {
-    return (
-      <span className="text-gray-500">
-        {parsed.enabled ? "enabled" : "disabled"}
-      </span>
-    );
+    return <span className="text-gray-500">{parsed.enabled ? "enabled" : "disabled"}</span>;
   }
   if (action === "config.kill_switch") {
     return (
@@ -312,8 +303,7 @@ function DiffSummary({ diff, action }: { diff: string | null; action: string }) 
     const outcome = parsed.outcome ? String(parsed.outcome) : "green";
     return (
       <span className="text-gray-500 truncate">
-        T{String(parsed.task ?? "?")} {sha && <span className="font-mono">{sha}</span>}{" "}
-        ({outcome})
+        T{String(parsed.task ?? "?")} {sha && <span className="font-mono">{sha}</span>} ({outcome})
       </span>
     );
   }
@@ -321,8 +311,7 @@ function DiffSummary({ diff, action }: { diff: string | null; action: string }) 
     const sha = typeof parsed.sha === "string" ? parsed.sha.slice(0, 7) : "";
     return (
       <span className="text-gray-500 truncate">
-        T{String(parsed.task ?? "?")}{" "}
-        {sha && <span className="font-mono">{sha}</span>}
+        T{String(parsed.task ?? "?")} {sha && <span className="font-mono">{sha}</span>}
         {parsed.ci_run_id ? ` — run ${String(parsed.ci_run_id)}` : ""}
       </span>
     );
@@ -366,11 +355,7 @@ function UndoCell({
     );
   }
   if (entry.snapshotId == null || !entry.recoverable) {
-    return (
-      <span className="text-gray-600 text-[11px] italic">
-        no longer recoverable
-      </span>
-    );
+    return <span className="text-gray-600 text-[11px] italic">no longer recoverable</span>;
   }
   return (
     <span className="inline-flex items-center gap-2">
@@ -381,9 +366,7 @@ function UndoCell({
       >
         {busy ? "Restoring..." : "Undo"}
       </button>
-      {diagnostic && (
-        <span className="text-[11px] text-amber-400">{diagnostic}</span>
-      )}
+      {diagnostic && <span className="text-[11px] text-amber-400">{diagnostic}</span>}
     </span>
   );
 }
@@ -434,10 +417,7 @@ export function AuditLog() {
   }, [setSearchParams]);
 
   const hasActiveFilter =
-    actionFilter !== "" ||
-    resourceFilter !== "" ||
-    planFilter !== "" ||
-    search !== "";
+    actionFilter !== "" || resourceFilter !== "" || planFilter !== "" || search !== "";
 
   const [exporting, setExporting] = useState(false);
   /// Per-entry state for in-flight Undo POSTs and any diagnostic the
@@ -468,9 +448,7 @@ export function AuditLog() {
         // (or a future audit_log broadcast) will surface separately.
         setEntries((prev) =>
           prev.map((p) =>
-            p.id === entryId
-              ? { ...p, recoverable: false, restoredAt: res.restoredAt }
-              : p,
+            p.id === entryId ? { ...p, recoverable: false, restoredAt: res.restoredAt } : p,
           ),
         );
         pushToast({
@@ -491,11 +469,7 @@ export function AuditLog() {
             };
             const restoredAt = body.restored_at ?? null;
             setEntries((prev) =>
-              prev.map((p) =>
-                p.id === entryId
-                  ? { ...p, recoverable: false, restoredAt }
-                  : p,
-              ),
+              prev.map((p) => (p.id === entryId ? { ...p, recoverable: false, restoredAt } : p)),
             );
             setUndoErrors((e) => ({
               ...e,
@@ -516,9 +490,7 @@ export function AuditLog() {
               [entryId]: "snapshot expired",
             }));
             setEntries((prev) =>
-              prev.map((p) =>
-                p.id === entryId ? { ...p, recoverable: false } : p,
-              ),
+              prev.map((p) => (p.id === entryId ? { ...p, recoverable: false } : p)),
             );
           } else {
             setUndoErrors((e) => ({
@@ -534,9 +506,7 @@ export function AuditLog() {
         }
         pushToast({
           kind: "error",
-          message: planName
-            ? `Failed to restore ${planName}`
-            : "Failed to restore plan",
+          message: planName ? `Failed to restore ${planName}` : "Failed to restore plan",
           ttlMs: 5_000,
         });
       } finally {
@@ -559,9 +529,7 @@ export function AuditLog() {
         if (actionFilter) params.set("action", actionFilter);
         if (resourceFilter) params.set("resource_type", resourceFilter);
 
-        const data = await fetchJson<AuditResponse>(
-          `/api/orgs/${orgSlug}/audit-log?${params}`
-        );
+        const data = await fetchJson<AuditResponse>(`/api/orgs/${orgSlug}/audit-log?${params}`);
         setEntries(data.entries);
         setTotal(data.total);
         setOffset(newOffset);
@@ -571,7 +539,7 @@ export function AuditLog() {
         setLoading(false);
       }
     },
-    [orgSlug, actionFilter, resourceFilter]
+    [orgSlug, actionFilter, resourceFilter],
   );
 
   useEffect(() => {
@@ -597,10 +565,9 @@ export function AuditLog() {
       if (actionFilter) params.set("action", actionFilter);
       if (resourceFilter) params.set("resource_type", resourceFilter);
 
-      const res = await fetch(
-        `/api/orgs/${orgSlug}/audit-log/export?${params}`,
-        { credentials: "same-origin" }
-      );
+      const res = await fetch(`/api/orgs/${orgSlug}/audit-log/export?${params}`, {
+        credentials: "same-origin",
+      });
       if (!res.ok) throw new Error(`Export failed: ${res.status}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -633,11 +600,9 @@ export function AuditLog() {
     const lcSearch = search.toLowerCase();
     return entries.filter((e) => {
       if (planFilter) {
-        const isPlanRow =
-          e.resourceType === "plan" && e.resourceId === planFilter;
+        const isPlanRow = e.resourceType === "plan" && e.resourceId === planFilter;
         const parsed = parseDiff(e.diff);
-        const planInDiff =
-          parsed && typeof parsed.plan === "string" && parsed.plan === planFilter;
+        const planInDiff = parsed && typeof parsed.plan === "string" && parsed.plan === planFilter;
         if (!isPlanRow && !planInDiff) return false;
       }
       if (search) {
@@ -771,29 +736,17 @@ export function AuditLog() {
             </thead>
             <tbody className="divide-y divide-gray-800/50">
               {visibleEntries.map((e) => (
-                <tr
-                  key={e.id}
-                  className="hover:bg-gray-800/30 transition-colors"
-                >
+                <tr key={e.id} className="hover:bg-gray-800/30 transition-colors">
                   <td className="px-6 py-2 text-xs text-gray-500 whitespace-nowrap">
                     {formatTimestamp(e.createdAt)}
                   </td>
                   <td className="px-3 py-2 text-xs text-gray-400 truncate max-w-[160px]">
-                    {e.userEmail ?? (
-                      <span className="italic text-gray-600">system</span>
-                    )}
+                    {e.userEmail ?? <span className="italic text-gray-600">system</span>}
                   </td>
                   <td className="px-3 py-2 text-xs whitespace-nowrap">
-                    <span
-                      className={
-                        ACTION_COLORS[e.action] ?? "text-gray-400"
-                      }
-                    >
+                    <span className={ACTION_COLORS[e.action] ?? "text-gray-400"}>
                       {ACTION_ICONS[e.action] && (
-                        <span
-                          aria-hidden="true"
-                          className="inline-block w-3 mr-1 text-center"
-                        >
+                        <span aria-hidden="true" className="inline-block w-3 mr-1 text-center">
                           {ACTION_ICONS[e.action]}
                         </span>
                       )}
@@ -824,8 +777,7 @@ export function AuditLog() {
                       busy={restoring[e.id] === true}
                       diagnostic={undoErrors[e.id]}
                       onUndo={() =>
-                        e.snapshotId != null &&
-                        undoSnapshot(e.id, e.snapshotId, e.resourceId)
+                        e.snapshotId != null && undoSnapshot(e.id, e.snapshotId, e.resourceId)
                       }
                     />
                   </td>

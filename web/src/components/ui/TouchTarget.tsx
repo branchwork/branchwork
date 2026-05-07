@@ -56,8 +56,6 @@ export function TouchTarget<P extends { className?: string }>({
     // string className.
     return children;
   }
-  const merged = [existing, PSEUDO_BASE, PSEUDO_MIN[min]]
-    .filter(Boolean)
-    .join(" ");
+  const merged = [existing, PSEUDO_BASE, PSEUDO_MIN[min]].filter(Boolean).join(" ");
   return cloneElement(children, { className: merged } as Partial<P>);
 }

@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
 import { ArchivePanel } from "./ArchivePanel.js";
 import { useAuthStore } from "../stores/auth-store.js";
@@ -27,9 +22,7 @@ function snap(overrides: Partial<MockSnapshot> = {}): MockSnapshot {
     planName: "demo-plan",
     kind: "delete",
     createdAt: new Date(Date.now() - 60_000).toISOString().slice(0, 19),
-    expiresAt: new Date(Date.now() + 4 * 86_400_000)
-      .toISOString()
-      .slice(0, 19),
+    expiresAt: new Date(Date.now() + 4 * 86_400_000).toISOString().slice(0, 19),
     archivePath: "/plans/archive/demo-plan.20260505T030000Z.yaml",
     restoredAt: null,
     ...overrides,
@@ -50,57 +43,52 @@ function installFetchMock(
 ): { calls: CallLog[]; fn: ReturnType<typeof vi.fn> } {
   const calls: CallLog[] = [];
   const deleteStatuses = options.deleteStatuses ?? [200];
-  const fn = vi.fn(
-    async (input: string | URL | Request, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.pathname + input.search
-            : input.url;
-      const method = init?.method ?? "GET";
-      calls.push({ url, method });
-      if (url === "/api/snapshots" && method === "GET") {
-        return new Response(
-          JSON.stringify({ snapshots: initial }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
+  const fn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.pathname + input.search
+          : input.url;
+    const method = init?.method ?? "GET";
+    calls.push({ url, method });
+    if (url === "/api/snapshots" && method === "GET") {
+      return new Response(JSON.stringify({ snapshots: initial }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const purgeMatch = url.match(/^\/api\/snapshots\/(\d+)$/);
+    if (purgeMatch && method === "DELETE") {
+      const id = Number(purgeMatch[1]);
+      const status = deleteStatuses.shift() ?? 200;
+      if (status === 200) {
+        return new Response(JSON.stringify({ ok: true, snapshotId: id, plan: "demo-plan" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
       }
-      const purgeMatch = url.match(/^\/api\/snapshots\/(\d+)$/);
-      if (purgeMatch && method === "DELETE") {
-        const id = Number(purgeMatch[1]);
-        const status = deleteStatuses.shift() ?? 200;
-        if (status === 200) {
-          return new Response(
-            JSON.stringify({ ok: true, snapshotId: id, plan: "demo-plan" }),
-            { status: 200, headers: { "Content-Type": "application/json" } },
-          );
-        }
-        return new Response(
-          JSON.stringify({ error: "snapshot_not_found" }),
-          {
-            status,
-            statusText: status === 404 ? "Not Found" : "Forbidden",
-            headers: { "Content-Type": "application/json" },
-          },
-        );
-      }
-      const restoreMatch = url.match(/^\/api\/snapshots\/(\d+)\/restore$/);
-      if (restoreMatch && method === "POST") {
-        const id = Number(restoreMatch[1]);
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            plan: "demo-plan",
-            snapshotId: id,
-            restoredAt: "2026-05-05 03:00:00",
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      return new Response(JSON.stringify({}), { status: 404 });
-    },
-  );
+      return new Response(JSON.stringify({ error: "snapshot_not_found" }), {
+        status,
+        statusText: status === 404 ? "Not Found" : "Forbidden",
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const restoreMatch = url.match(/^\/api\/snapshots\/(\d+)\/restore$/);
+    if (restoreMatch && method === "POST") {
+      const id = Number(restoreMatch[1]);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          plan: "demo-plan",
+          snapshotId: id,
+          restoredAt: "2026-05-05 03:00:00",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({}), { status: 404 });
+  });
   vi.stubGlobal("fetch", fn);
   return { calls, fn };
 }
@@ -142,9 +130,7 @@ describe("ArchivePanel", () => {
     installFetchMock([]);
     render(<ArchivePanel />);
     expect(
-      await screen.findByText(
-        "No snapshots in retention. Soft-deleted plans show up here.",
-      ),
+      await screen.findByText("No snapshots in retention. Soft-deleted plans show up here."),
     ).toBeTruthy();
   });
 
@@ -182,9 +168,7 @@ describe("ArchivePanel", () => {
     fireEvent.click(screen.getByText("Purge now"));
 
     // Modal copy is the gate — no DELETE has fired yet.
-    expect(
-      screen.getByText("Purge snapshot for demo?"),
-    ).toBeTruthy();
+    expect(screen.getByText("Purge snapshot for demo?")).toBeTruthy();
     expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(0);
 
     // Cancel returns to the list with no DELETE.

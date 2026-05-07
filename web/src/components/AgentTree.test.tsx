@@ -56,7 +56,7 @@ describe("AgentTree accessibility", () => {
     render(
       <MemoryRouter>
         <AgentTree />
-      </MemoryRouter>
+      </MemoryRouter>,
     );
 
     expect(screen.getByText(/Status:\s*running/i)).toBeTruthy();
@@ -73,7 +73,7 @@ describe("AgentTree accessibility", () => {
     const { container } = render(
       <MemoryRouter>
         <AgentTree />
-      </MemoryRouter>
+      </MemoryRouter>,
     );
 
     const results = await axe.run(container, {
@@ -95,7 +95,7 @@ describe("AgentTree accessibility", () => {
     const { container } = render(
       <MemoryRouter>
         <AgentTree />
-      </MemoryRouter>
+      </MemoryRouter>,
     );
 
     const results = await axe.run(container, {
@@ -119,9 +119,7 @@ describe("AgentTree empty state", () => {
 
     expect(screen.getByText("No agents yet")).toBeTruthy();
     expect(
-      screen.getByText(
-        /Start a task from the Plan Board or wait for hook events/i,
-      ),
+      screen.getByText(/Start a task from the Plan Board or wait for hook events/i),
     ).toBeTruthy();
     // Filter strip is hidden in the empty state — there's nothing to filter.
     expect(screen.queryByText("Status")).toBeNull();
@@ -183,9 +181,7 @@ describe("AgentTree depth indentation", () => {
     useAgentStore.setState({
       // Child references a parent_agent_id that does not appear in the
       // visible filtered set — the tree treats it as a fresh root.
-      agents: [
-        agent({ id: "orphan", task_id: "9.9", parent_agent_id: "missing" }),
-      ],
+      agents: [agent({ id: "orphan", task_id: "9.9", parent_agent_id: "missing" })],
       fetchAgents: vi.fn().mockResolvedValue(undefined),
     });
     usePlanStore.setState({ plans: [] });

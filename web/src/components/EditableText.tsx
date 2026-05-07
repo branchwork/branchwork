@@ -70,9 +70,7 @@ export function EditableText({
     commit();
   }
 
-  function handleKeyDown(
-    e: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
-  ) {
+  function handleKeyDown(e: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) {
     if (e.key === "Escape") {
       e.preventDefault();
       cancel();
@@ -86,9 +84,7 @@ export function EditableText({
     // Multi-line Enter (no modifier) inserts a newline (default).
   }
 
-  function handleBlur(
-    e: ReactFocusEvent<HTMLInputElement | HTMLTextAreaElement>,
-  ) {
+  function handleBlur(e: ReactFocusEvent<HTMLInputElement | HTMLTextAreaElement>) {
     // If focus is moving to another control inside the same form (e.g.
     // the sr-only Save button via Shift+Tab), don't save yet — the
     // explicit submit handler will run.
@@ -116,8 +112,7 @@ export function EditableText({
 
   const sharedProps = {
     value: draft,
-    onChange: (e: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
-      setDraft(e.target.value),
+    onChange: (e: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => setDraft(e.target.value),
     onBlur: handleBlur,
     onKeyDown: handleKeyDown,
     "aria-label": label,
@@ -125,11 +120,7 @@ export function EditableText({
   };
 
   return (
-    <form
-      onSubmit={handleSubmit}
-      aria-label={`Edit ${label}`}
-      className="contents"
-    >
+    <form onSubmit={handleSubmit} aria-label={`Edit ${label}`} className="contents">
       {multiline ? (
         <textarea
           ref={inputRef as React.RefObject<HTMLTextAreaElement>}
@@ -137,11 +128,7 @@ export function EditableText({
           {...sharedProps}
         />
       ) : (
-        <input
-          ref={inputRef as React.RefObject<HTMLInputElement>}
-          type="text"
-          {...sharedProps}
-        />
+        <input ref={inputRef as React.RefObject<HTMLInputElement>} type="text" {...sharedProps} />
       )}
       {/* Hidden submit/cancel for screen readers and as the canonical
           form-submit affordance. Sighted users use Enter (single-line),
@@ -150,12 +137,7 @@ export function EditableText({
       <button type="submit" className="sr-only" tabIndex={-1}>
         Save {label}
       </button>
-      <button
-        type="button"
-        onClick={cancel}
-        className="sr-only"
-        tabIndex={-1}
-      >
+      <button type="button" onClick={cancel} className="sr-only" tabIndex={-1}>
         Cancel editing {label}
       </button>
     </form>

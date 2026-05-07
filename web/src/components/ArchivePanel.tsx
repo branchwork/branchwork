@@ -49,13 +49,7 @@ const KIND_LABELS: Record<string, string> = {
 /// Ordered for the kind filter dropdown. Includes every kind written
 /// by `plan_curate::SnapshotKind` so future primitives surface here
 /// without code changes.
-const KIND_OPTIONS: string[] = [
-  "delete",
-  "merge",
-  "rename",
-  "archive",
-  "rewrite_context",
-];
+const KIND_OPTIONS: string[] = ["delete", "merge", "rename", "archive", "rewrite_context"];
 
 /// Render an `expires_at` UTC timestamp ("YYYY-MM-DD HH:MM:SS") as a
 /// short countdown chip. Returns `expired` when the deadline has
@@ -155,17 +149,14 @@ export function ArchivePanel() {
     async (entry: SnapshotEntry) => {
       setRestoring((r) => ({ ...r, [entry.id]: true }));
       try {
-        const res = await fetchJson<SnapshotRestoreResponse>(
-          `/api/snapshots/${entry.id}/restore`,
-          { method: "POST" },
-        );
+        const res = await fetchJson<SnapshotRestoreResponse>(`/api/snapshots/${entry.id}/restore`, {
+          method: "POST",
+        });
         // Optimistically mark the row restored so the Restore button
         // hides without waiting for the next refetch. The next
         // plan_restored / WS refetch will reconcile authoritatively.
         setEntries((prev) =>
-          prev.map((p) =>
-            p.id === entry.id ? { ...p, restoredAt: res.restoredAt } : p,
-          ),
+          prev.map((p) => (p.id === entry.id ? { ...p, restoredAt: res.restoredAt } : p)),
         );
         // Resurrect the plan in the active list so navigating back to
         // Plans surfaces it without a manual reload.
@@ -182,11 +173,7 @@ export function ArchivePanel() {
             message = "snapshot already restored";
             const body = (err.body ?? {}) as { restored_at?: string | null };
             const restoredAt = body.restored_at ?? null;
-            setEntries((prev) =>
-              prev.map((p) =>
-                p.id === entry.id ? { ...p, restoredAt } : p,
-              ),
-            );
+            setEntries((prev) => prev.map((p) => (p.id === entry.id ? { ...p, restoredAt } : p)));
           } else if (err.status === 409) {
             const body = (err.body ?? {}) as { current?: string };
             message = `name in use${body.current ? ` (${body.current})` : ""}`;
@@ -214,10 +201,9 @@ export function ArchivePanel() {
     async (entry: SnapshotEntry) => {
       setPurging((p) => ({ ...p, [entry.id]: true }));
       try {
-        const res = await fetchJson<SnapshotPurgeResponse>(
-          `/api/snapshots/${entry.id}`,
-          { method: "DELETE" },
-        );
+        const res = await fetchJson<SnapshotPurgeResponse>(`/api/snapshots/${entry.id}`, {
+          method: "DELETE",
+        });
         // Optimistic removal — the snapshot_purged WS broadcast will
         // refetch authoritatively, but this keeps the row from
         // lingering with a stuck spinner during the round-trip.
@@ -259,9 +245,7 @@ export function ArchivePanel() {
           const { [entry.id]: _omit, ...rest } = p;
           return rest;
         });
-        setConfirmPurge((current) =>
-          current?.id === entry.id ? null : current,
-        );
+        setConfirmPurge((current) => (current?.id === entry.id ? null : current));
       }
     },
     [pushToast, removePlan],
@@ -274,11 +258,10 @@ export function ArchivePanel() {
         <div>
           <h2 className="text-lg font-semibold text-gray-100">Archive</h2>
           <p className="text-xs text-gray-500 mt-0.5">
-            {entries.length} snapshot{entries.length !== 1 ? "s" : ""} pending
-            retention.{" "}
+            {entries.length} snapshot{entries.length !== 1 ? "s" : ""} pending retention.{" "}
             <span className="text-gray-600">
-              Restore brings a plan back; Purge removes the snapshot
-              immediately and cannot be undone.
+              Restore brings a plan back; Purge removes the snapshot immediately and cannot be
+              undone.
             </span>
           </p>
         </div>
@@ -316,10 +299,7 @@ export function ArchivePanel() {
       {error && (
         <div className="px-6 py-2 bg-red-900/20 border-b border-red-800/30 text-xs text-red-400 flex items-center justify-between">
           <span>{error}</span>
-          <button
-            onClick={() => setError(null)}
-            className="text-red-600 hover:text-red-400"
-          >
+          <button onClick={() => setError(null)} className="text-red-600 hover:text-red-400">
             x
           </button>
         </div>
@@ -358,9 +338,7 @@ export function ArchivePanel() {
                   <tr
                     key={entry.id}
                     className={`transition-colors ${
-                      restored
-                        ? "bg-gray-900/50 text-gray-600"
-                        : "hover:bg-gray-800/30"
+                      restored ? "bg-gray-900/50 text-gray-600" : "hover:bg-gray-800/30"
                     }`}
                   >
                     <td className="px-6 py-2 text-xs">
@@ -392,9 +370,7 @@ export function ArchivePanel() {
                           Restored {formatTimestamp(entry.restoredAt!)}
                         </span>
                       ) : (
-                        <span className={countdown.tone}>
-                          {countdown.label}
-                        </span>
+                        <span className={countdown.tone}>{countdown.label}</span>
                       )}
                     </td>
                     <td className="px-3 py-2 text-xs whitespace-nowrap text-right">
@@ -440,12 +416,7 @@ interface ConfirmPurgeModalProps {
   onConfirm: () => void;
 }
 
-function ConfirmPurgeModal({
-  entry,
-  busy,
-  onCancel,
-  onConfirm,
-}: ConfirmPurgeModalProps) {
+function ConfirmPurgeModal({ entry, busy, onCancel, onConfirm }: ConfirmPurgeModalProps) {
   return (
     <Modal
       open={entry !== null}
@@ -456,26 +427,13 @@ function ConfirmPurgeModal({
       description="This will immediately remove the snapshot row and its archived YAML. The plan cannot be restored after this. Use this only to clean up scratch plans you do not want to wait out the retention window for."
     >
       {entry?.archivePath && (
-        <p className="mt-2 text-[10px] text-gray-600 font-mono break-all">
-          {entry.archivePath}
-        </p>
+        <p className="mt-2 text-[10px] text-gray-600 font-mono break-all">{entry.archivePath}</p>
       )}
       <div className="mt-4 flex items-center justify-end gap-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={onCancel}
-          disabled={busy}
-        >
+        <Button variant="ghost" size="sm" onClick={onCancel} disabled={busy}>
           Cancel
         </Button>
-        <Button
-          variant="danger"
-          size="sm"
-          onClick={onConfirm}
-          disabled={busy}
-          loading={busy}
-        >
+        <Button variant="danger" size="sm" onClick={onConfirm} disabled={busy} loading={busy}>
           {busy ? "Purging…" : "Purge permanently"}
         </Button>
       </div>

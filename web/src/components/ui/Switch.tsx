@@ -1,7 +1,9 @@
 import { forwardRef, type ButtonHTMLAttributes } from "react";
 
-interface SwitchProps
-  extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "onChange" | "children"> {
+interface SwitchProps extends Omit<
+  ButtonHTMLAttributes<HTMLButtonElement>,
+  "onChange" | "children"
+> {
   /// Visible label rendered next to the toggle. Also serves as the
   /// accessible name (the `<button role="switch">` wraps both pieces).
   label: string;
@@ -51,9 +53,7 @@ export const Switch = forwardRef<HTMLButtonElement, SwitchProps>(function Switch
       </span>
       <span
         className={
-          checked
-            ? "text-gray-200 font-medium"
-            : "text-gray-400 group-hover:text-gray-300"
+          checked ? "text-gray-200 font-medium" : "text-gray-400 group-hover:text-gray-300"
         }
       >
         {label}

@@ -69,7 +69,7 @@ export function Sidebar() {
           (p) =>
             p.title.toLowerCase().includes(q) ||
             p.name.toLowerCase().includes(q) ||
-            (p.project ?? "").toLowerCase().includes(q)
+            (p.project ?? "").toLowerCase().includes(q),
         )
       : plans;
 
@@ -93,14 +93,7 @@ export function Sidebar() {
 
   function renderPlanItem(p: PlanSummary, dimmed = false) {
     const isSelected = selectedPlanName === p.name;
-    return (
-      <PlanItem
-        key={p.name}
-        plan={p}
-        isSelected={isSelected}
-        dimmed={dimmed}
-      />
-    );
+    return <PlanItem key={p.name} plan={p} isSelected={isSelected} dimmed={dimmed} />;
   }
 
   return (
@@ -124,190 +117,178 @@ export function Sidebar() {
         }`}
       >
         {/* Logo — click to return to project dashboard */}
-      <Link
-        to="/"
-        className="p-4 border-b border-gray-800 text-left hover:bg-gray-800/30 transition block"
-        title="Back to project dashboard"
-      >
-        <h1 className="text-lg font-bold tracking-tight">
-          Branch<span className="text-indigo-400">work</span>
-        </h1>
-        <p className="text-xs text-gray-500 mt-0.5">Claude Code Dashboard</p>
-      </Link>
+        <Link
+          to="/"
+          className="p-4 border-b border-gray-800 text-left hover:bg-gray-800/30 transition block"
+          title="Back to project dashboard"
+        >
+          <h1 className="text-lg font-bold tracking-tight">
+            Branch<span className="text-indigo-400">work</span>
+          </h1>
+          <p className="text-xs text-gray-500 mt-0.5">Claude Code Dashboard</p>
+        </Link>
 
-      {/* Nav */}
-      <nav className="p-2 flex gap-1">
-        <PlansNavLink />
-        <NavLink
-          to="/agents"
-          className={({ isActive }) =>
-            `flex-1 px-2 py-1.5 rounded text-xs font-medium transition relative text-center ${
-              isActive
-                ? "bg-indigo-600 text-white"
-                : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
-            }`
-          }
-        >
-          Agents
-          {activeCount > 0 && (
-            <span className="absolute -top-1 -right-1 bg-emerald-500 text-white text-[10px] w-4 h-4 rounded-full flex items-center justify-center">
-              {activeCount}
-            </span>
-          )}
-        </NavLink>
-        <NavLink
-          to="/audit"
-          className={({ isActive }) =>
-            `flex-1 px-2 py-1.5 rounded text-xs font-medium transition text-center ${
-              isActive
-                ? "bg-indigo-600 text-white"
-                : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
-            }`
-          }
-        >
-          Activity
-        </NavLink>
-        <NavLink
-          to="/archive"
-          title="Soft-deleted plans pending retention"
-          className={({ isActive }) =>
-            `flex-1 px-2 py-1.5 rounded text-xs font-medium transition text-center ${
-              isActive
-                ? "bg-indigo-600 text-white"
-                : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
-            }`
-          }
-        >
-          Archive
-        </NavLink>
-      </nav>
-
-      {/* Global actions */}
-      <div className="px-2 pb-2">
-        {hasMdPlans && (
-          <button
-            onClick={handleConvertAll}
-            disabled={convertingAll}
-            className="w-full px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-amber-600 hover:text-amber-400 disabled:opacity-50 text-gray-400 rounded transition"
+        {/* Nav */}
+        <nav className="p-2 flex gap-1">
+          <PlansNavLink />
+          <NavLink
+            to="/agents"
+            className={({ isActive }) =>
+              `flex-1 px-2 py-1.5 rounded text-xs font-medium transition relative text-center ${
+                isActive
+                  ? "bg-indigo-600 text-white"
+                  : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+              }`
+            }
           >
-            {convertingAll ? "Converting..." : "Convert All to YAML"}
-          </button>
-        )}
-        <NewPlanLink hasMdPlans={hasMdPlans} />
-      </div>
+            Agents
+            {activeCount > 0 && (
+              <span className="absolute -top-1 -right-1 bg-emerald-500 text-white text-[10px] w-4 h-4 rounded-full flex items-center justify-center">
+                {activeCount}
+              </span>
+            )}
+          </NavLink>
+          <NavLink
+            to="/audit"
+            className={({ isActive }) =>
+              `flex-1 px-2 py-1.5 rounded text-xs font-medium transition text-center ${
+                isActive
+                  ? "bg-indigo-600 text-white"
+                  : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+              }`
+            }
+          >
+            Activity
+          </NavLink>
+          <NavLink
+            to="/archive"
+            title="Soft-deleted plans pending retention"
+            className={({ isActive }) =>
+              `flex-1 px-2 py-1.5 rounded text-xs font-medium transition text-center ${
+                isActive
+                  ? "bg-indigo-600 text-white"
+                  : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
+              }`
+            }
+          >
+            Archive
+          </NavLink>
+        </nav>
 
-      {/* Driver auth status */}
-      <DriverStatusList />
+        {/* Global actions */}
+        <div className="px-2 pb-2">
+          {hasMdPlans && (
+            <button
+              onClick={handleConvertAll}
+              disabled={convertingAll}
+              className="w-full px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-amber-600 hover:text-amber-400 disabled:opacity-50 text-gray-400 rounded transition"
+            >
+              {convertingAll ? "Converting..." : "Convert All to YAML"}
+            </button>
+          )}
+          <NewPlanLink hasMdPlans={hasMdPlans} />
+        </div>
 
-      {/* Admin link */}
-      <div className="px-2 pb-2">
-        <NavLink
-          to="/admin"
-          className={({ isActive }) =>
-            `block w-full text-left px-2 py-1 text-[10px] rounded transition ${
-              isActive
-                ? "bg-gray-800 text-indigo-400"
-                : "text-gray-600 hover:text-gray-300 hover:bg-gray-800/50"
-            }`
-          }
-        >
-          <span aria-hidden="true">⚙ </span>Admin
-        </NavLink>
-      </div>
+        {/* Driver auth status */}
+        <DriverStatusList />
 
-      {/* Search */}
-      <div className="px-2 pb-2">
-        <input
-          type="text"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search plans..."
-          className="w-full px-2 py-1 text-xs bg-gray-800 border border-gray-700 rounded text-gray-300 placeholder-gray-600 outline-none focus:border-indigo-600 transition"
-        />
-      </div>
+        {/* Admin link */}
+        <div className="px-2 pb-2">
+          <NavLink
+            to="/admin"
+            className={({ isActive }) =>
+              `block w-full text-left px-2 py-1 text-[10px] rounded transition ${
+                isActive
+                  ? "bg-gray-800 text-indigo-400"
+                  : "text-gray-600 hover:text-gray-300 hover:bg-gray-800/50"
+              }`
+            }
+          >
+            <span aria-hidden="true">⚙ </span>Admin
+          </NavLink>
+        </div>
 
-      {/* Plan list grouped by project */}
-      <div className="flex-1 overflow-auto p-2">
-        {/* Stale-data marker for the whole plan list. Self-gates: only
+        {/* Search */}
+        <div className="px-2 pb-2">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search plans..."
+            className="w-full px-2 py-1 text-xs bg-gray-800 border border-gray-700 rounded text-gray-300 placeholder-gray-600 outline-none focus:border-indigo-600 transition"
+          />
+        </div>
+
+        {/* Plan list grouped by project */}
+        <div className="flex-1 overflow-auto p-2">
+          {/* Stale-data marker for the whole plan list. Self-gates: only
             appears when WS is disconnected AND lastPlansFetchedAt is
             >60s old. Sits at the top of the list because the plan rows
             below all share the same fetch lifecycle. */}
-        <div className="px-2 mb-1.5 empty:hidden">
-          <StaleDataChip slice="plans" />
-        </div>
-        {warnings.length > 0 && (
-          <div className="mb-3 space-y-1">
-            {warnings.map((w) => (
-              <div
-                key={w.name}
-                className="bg-amber-900/30 border border-amber-700/50 rounded px-2 py-1.5 text-xs"
-              >
-                <div className="flex items-start justify-between gap-1">
-                  <span className="text-amber-400 font-medium truncate">
-                    {w.name}.yaml
-                  </span>
-                  <button
-                    onClick={() => dismissWarning(w.name)}
-                    aria-label={`Dismiss ${w.name}.yaml warning`}
-                    className="text-gray-600 hover:text-gray-400 flex-shrink-0"
-                  >
-                    <span aria-hidden="true">x</span>
-                  </button>
-                </div>
-                <p className="text-amber-500/70 text-[10px] mt-0.5 line-clamp-2">
-                  {w.error}
-                </p>
-              </div>
-            ))}
+          <div className="px-2 mb-1.5 empty:hidden">
+            <StaleDataChip slice="plans" />
           </div>
-        )}
-        {grouped.map(([project, { active, done }]) => (
-          <div key={project} className="mb-3">
-            <h3 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider px-2 mb-1 flex items-center gap-1.5">
-              <span
-                aria-hidden="true"
-                className={`w-1.5 h-1.5 rounded-full ${
-                  project === "Unassigned" ? "bg-gray-600" : "bg-indigo-500"
-                }`}
-              />
-              {project}
-              <span className="text-gray-600 font-normal">
-                ({active.length + done.length})
-              </span>
-            </h3>
-
-            {/* Active plans */}
-            <ul className="space-y-0.5">
-              {active.map((p) => renderPlanItem(p))}
-            </ul>
-
-            {/* Completed plans — folded */}
-            {done.length > 0 && (
-              <div className="mt-1">
-                <button
-                  onClick={() =>
-                    setShowDone((prev) => ({ ...prev, [project]: !prev[project] }))
-                  }
-                  className="w-full text-left px-2 py-1 text-[10px] text-gray-600 hover:text-gray-400 transition flex items-center gap-1"
+          {warnings.length > 0 && (
+            <div className="mb-3 space-y-1">
+              {warnings.map((w) => (
+                <div
+                  key={w.name}
+                  className="bg-amber-900/30 border border-amber-700/50 rounded px-2 py-1.5 text-xs"
                 >
-                  <span aria-hidden="true" className="text-[8px]">
-                    {showDone[project] ? "▼" : "▶"}
-                  </span>
-                  <span aria-hidden="true" className="text-emerald-700">
-                    &#10003;
-                  </span>
-                  {done.length} completed plan{done.length !== 1 ? "s" : ""}
-                </button>
-                {showDone[project] && (
-                  <ul className="space-y-0.5">
-                    {done.map((p) => renderPlanItem(p, true))}
-                  </ul>
-                )}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
+                  <div className="flex items-start justify-between gap-1">
+                    <span className="text-amber-400 font-medium truncate">{w.name}.yaml</span>
+                    <button
+                      onClick={() => dismissWarning(w.name)}
+                      aria-label={`Dismiss ${w.name}.yaml warning`}
+                      className="text-gray-600 hover:text-gray-400 flex-shrink-0"
+                    >
+                      <span aria-hidden="true">x</span>
+                    </button>
+                  </div>
+                  <p className="text-amber-500/70 text-[10px] mt-0.5 line-clamp-2">{w.error}</p>
+                </div>
+              ))}
+            </div>
+          )}
+          {grouped.map(([project, { active, done }]) => (
+            <div key={project} className="mb-3">
+              <h3 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider px-2 mb-1 flex items-center gap-1.5">
+                <span
+                  aria-hidden="true"
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    project === "Unassigned" ? "bg-gray-600" : "bg-indigo-500"
+                  }`}
+                />
+                {project}
+                <span className="text-gray-600 font-normal">({active.length + done.length})</span>
+              </h3>
+
+              {/* Active plans */}
+              <ul className="space-y-0.5">{active.map((p) => renderPlanItem(p))}</ul>
+
+              {/* Completed plans — folded */}
+              {done.length > 0 && (
+                <div className="mt-1">
+                  <button
+                    onClick={() => setShowDone((prev) => ({ ...prev, [project]: !prev[project] }))}
+                    className="w-full text-left px-2 py-1 text-[10px] text-gray-600 hover:text-gray-400 transition flex items-center gap-1"
+                  >
+                    <span aria-hidden="true" className="text-[8px]">
+                      {showDone[project] ? "▼" : "▶"}
+                    </span>
+                    <span aria-hidden="true" className="text-emerald-700">
+                      &#10003;
+                    </span>
+                    {done.length} completed plan{done.length !== 1 ? "s" : ""}
+                  </button>
+                  {showDone[project] && (
+                    <ul className="space-y-0.5">{done.map((p) => renderPlanItem(p, true))}</ul>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
       </aside>
     </>
   );
@@ -325,13 +306,8 @@ interface PlanItemProps {
   dimmed: boolean;
 }
 
-const PlanItem = memo(function PlanItem({
-  plan: p,
-  isSelected,
-  dimmed,
-}: PlanItemProps) {
-  const pct =
-    p.taskCount > 0 ? Math.round((p.doneCount / p.taskCount) * 100) : 0;
+const PlanItem = memo(function PlanItem({ plan: p, isSelected, dimmed }: PlanItemProps) {
+  const pct = p.taskCount > 0 ? Math.round((p.doneCount / p.taskCount) * 100) : 0;
   return (
     <li>
       <TouchTarget>
@@ -354,9 +330,7 @@ const PlanItem = memo(function PlanItem({
             )}
             <span className="truncate">{p.title}</span>
           </div>
-          <div className="text-[9px] font-mono text-gray-700 truncate">
-            {p.name}
-          </div>
+          <div className="text-[9px] font-mono text-gray-700 truncate">{p.name}</div>
           <div className="text-[10px] text-gray-600 flex items-center gap-1">
             {p.taskCount > 0 && (
               <>
@@ -367,9 +341,7 @@ const PlanItem = memo(function PlanItem({
               </>
             )}
             {p.taskCount === 0 && <span>{p.phaseCount} phases</span>}
-            <span className="text-gray-700 ml-auto">
-              {formatRelative(p.modifiedAt)}
-            </span>
+            <span className="text-gray-700 ml-auto">{formatRelative(p.modifiedAt)}</span>
           </div>
         </Link>
       </TouchTarget>
@@ -382,8 +354,7 @@ const PlanItem = memo(function PlanItem({
 /// lit across the whole plans subtree.
 function PlansNavLink() {
   const location = useLocation();
-  const isActive =
-    location.pathname === "/" || location.pathname.startsWith("/plans");
+  const isActive = location.pathname === "/" || location.pathname.startsWith("/plans");
   return (
     <Link
       to="/"
@@ -460,16 +431,13 @@ function DriverStatusList() {
 
   const runnerLabel =
     mode === "saas" && selectedRunnerId
-      ? (runners.find((r) => r.id === selectedRunnerId)?.name ??
-        selectedRunnerId.slice(0, 8))
+      ? (runners.find((r) => r.id === selectedRunnerId)?.name ?? selectedRunnerId.slice(0, 8))
       : null;
 
   return (
     <div className="px-2 pb-2">
       <div className="flex items-baseline justify-between mb-0.5 px-1">
-        <div className="text-[9px] uppercase tracking-wider text-gray-600">
-          Drivers
-        </div>
+        <div className="text-[9px] uppercase tracking-wider text-gray-600">Drivers</div>
         {runnerLabel && (
           <div
             className="text-[9px] text-gray-600 truncate max-w-[60%]"
@@ -511,8 +479,7 @@ function DriverStatusList() {
                       ? auth.provider
                       : "cloud"
                     : "unknown";
-        const canExpand =
-          auth?.kind === "unauthenticated" || auth?.kind === "not_installed";
+        const canExpand = auth?.kind === "unauthenticated" || auth?.kind === "not_installed";
         const isExpanded = expanded === d.name;
         const help =
           auth?.kind === "unauthenticated"

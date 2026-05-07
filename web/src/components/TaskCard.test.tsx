@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
 import { TaskCard } from "./TaskCard.js";
 import {
@@ -110,9 +105,7 @@ describe("TaskCard CI badge — via_fix_attempt marker", () => {
     expect(screen.getByText(/CI/i)).toBeTruthy();
     // Tooltip is on the badge wrapper. No runUrl so the badge is a <span>;
     // querying by title attribute pulls the wrapper directly.
-    const badge = document.querySelector(
-      '[title="passed via fix attempt 1"]',
-    );
+    const badge = document.querySelector('[title="passed via fix attempt 1"]');
     expect(badge).not.toBeNull();
   });
 
@@ -128,9 +121,7 @@ describe("TaskCard CI badge — via_fix_attempt marker", () => {
     expect(badge).not.toBeNull();
     // And the "passed via fix attempt" wording must NOT leak into a no-fix
     // run's tooltip.
-    expect(
-      document.querySelector('[title*="passed via fix attempt"]'),
-    ).toBeNull();
+    expect(document.querySelector('[title*="passed via fix attempt"]')).toBeNull();
   });
 
   it("appends ' — open run' to the fix tooltip when runUrl is present", () => {
@@ -144,9 +135,7 @@ describe("TaskCard CI badge — via_fix_attempt marker", () => {
     render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
 
     expect(screen.getByText(/fix #2/i)).toBeTruthy();
-    const link = document.querySelector(
-      '[title="passed via fix attempt 2 — open run"]',
-    );
+    const link = document.querySelector('[title="passed via fix attempt 2 — open run"]');
     expect(link).not.toBeNull();
     expect(link?.tagName).toBe("A");
   });
@@ -161,44 +150,38 @@ interface LearningCall {
 function installLearningsFetch(initial: { id: number; learning: string; createdAt: string }[]) {
   const calls: LearningCall[] = [];
   const store = [...initial];
-  const fn = vi.fn(
-    async (input: string | URL | Request, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.pathname + input.search
-            : input.url;
-      const method = init?.method ?? "GET";
-      const body = init?.body
-        ? JSON.parse(init.body as string)
-        : undefined;
-      calls.push({ url, method, body });
-      const match = url.match(
-        /^\/api\/plans\/([^/]+)\/tasks\/([^/]+)\/learnings$/,
-      );
-      if (match && method === "GET") {
-        return new Response(JSON.stringify(store), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      if (match && method === "POST") {
-        const next = {
-          id: store.length + 1,
-          learning: (body as { learning: string }).learning,
-          createdAt: new Date().toISOString(),
-        };
-        // Server returns most-recent-first on subsequent GETs.
-        store.unshift(next);
-        return new Response(
-          JSON.stringify({ ok: true, id: next.id, learning: next.learning }),
-          { status: 201, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      return new Response("not found", { status: 404 });
-    },
-  );
+  const fn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.pathname + input.search
+          : input.url;
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(init.body as string) : undefined;
+    calls.push({ url, method, body });
+    const match = url.match(/^\/api\/plans\/([^/]+)\/tasks\/([^/]+)\/learnings$/);
+    if (match && method === "GET") {
+      return new Response(JSON.stringify(store), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (match && method === "POST") {
+      const next = {
+        id: store.length + 1,
+        learning: (body as { learning: string }).learning,
+        createdAt: new Date().toISOString(),
+      };
+      // Server returns most-recent-first on subsequent GETs.
+      store.unshift(next);
+      return new Response(JSON.stringify({ ok: true, id: next.id, learning: next.learning }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("not found", { status: 404 });
+  });
   vi.stubGlobal("fetch", fn);
   return { calls };
 }
@@ -220,18 +203,15 @@ describe("TaskCard learnings", () => {
     render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
 
     // No fetch fired yet.
-    expect(
-      calls.filter((c) => c.url.includes("/learnings")).length,
-    ).toBe(0);
+    expect(calls.filter((c) => c.url.includes("/learnings")).length).toBe(0);
 
     const toggle = screen.getByRole("button", { name: /^Learnings/ });
     fireEvent.click(toggle);
 
     await waitFor(() => {
-      expect(
-        calls.filter((c) => c.url.endsWith("/learnings") && c.method === "GET")
-          .length,
-      ).toBe(1);
+      expect(calls.filter((c) => c.url.endsWith("/learnings") && c.method === "GET").length).toBe(
+        1,
+      );
     });
     // Empty-state copy renders.
     expect(screen.getByText(/No learnings recorded yet/i)).toBeTruthy();
@@ -269,13 +249,9 @@ describe("TaskCard learnings", () => {
     fireEvent.blur(input);
 
     await waitFor(() => {
-      const post = calls.find(
-        (c) => c.url.endsWith("/learnings") && c.method === "POST",
-      );
+      const post = calls.find((c) => c.url.endsWith("/learnings") && c.method === "POST");
       expect(post).toBeTruthy();
-      expect((post?.body as { learning: string } | undefined)?.learning).toBe(
-        "brand new learning",
-      );
+      expect((post?.body as { learning: string } | undefined)?.learning).toBe("brand new learning");
     });
 
     // After the POST, load() refetches and the new entry shows.

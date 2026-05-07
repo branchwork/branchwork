@@ -151,10 +151,7 @@ export function LoginPage() {
 
   const displayError = ssoError || error;
   const showSsoFallback =
-    mode === "login" &&
-    email.includes("@") &&
-    ssoDiscovered &&
-    ssoProviders.length === 0;
+    mode === "login" && email.includes("@") && ssoDiscovered && ssoProviders.length === 0;
 
   return (
     <div className="flex h-screen items-center justify-center bg-gray-950 text-gray-100">
@@ -212,9 +209,7 @@ export function LoginPage() {
           </Banner>
         )}
 
-        {displayError && (
-          <Banner className="mb-3">{humanize(displayError)}</Banner>
-        )}
+        {displayError && <Banner className="mb-3">{humanize(displayError)}</Banner>}
 
         <Button
           type="submit"

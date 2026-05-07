@@ -25,9 +25,7 @@ interface RunnersResponse {
   runners: Array<{ lastSeenAt?: string | null }>;
 }
 
-type RunnerStatus =
-  | { kind: "no_runner" }
-  | { kind: "unavailable"; lastSeen: string | null };
+type RunnerStatus = { kind: "no_runner" } | { kind: "unavailable"; lastSeen: string | null };
 
 interface Props {
   onClose: () => void;
@@ -57,7 +55,9 @@ export function NewPlanForm({ onClose }: Props) {
         if (!cancelled) await applyRunnerErrorIfAny(e, setRunnerStatus);
       }
     })();
-    fetchJson<Template[]>("/api/templates").then(setTemplates).catch(() => {});
+    fetchJson<Template[]>("/api/templates")
+      .then(setTemplates)
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -77,22 +77,19 @@ export function NewPlanForm({ onClose }: Props) {
     ? folders.filter(
         (f) =>
           f.name.toLowerCase().includes(folder.toLowerCase()) ||
-          f.path.toLowerCase().includes(folder.toLowerCase())
+          f.path.toLowerCase().includes(folder.toLowerCase()),
       )
     : folders;
 
   async function handleSubmit() {
     setCreating(true);
     try {
-      const res = await postJson<{ agentId: string; folder: string }>(
-        "/api/plans/create",
-        {
-          description,
-          folder,
-          createFolder: !!confirmCreate,
-          templateId: templateId || undefined,
-        }
-      );
+      const res = await postJson<{ agentId: string; folder: string }>("/api/plans/create", {
+        description,
+        folder,
+        createFolder: !!confirmCreate,
+        templateId: templateId || undefined,
+      });
 
       selectAgent(res.agentId);
       goToAgent(res.agentId);
@@ -147,19 +144,14 @@ export function NewPlanForm({ onClose }: Props) {
     <div className="p-6 max-w-2xl">
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-xl font-bold">New Plan</h2>
-        <button
-          onClick={onClose}
-          className="text-gray-500 hover:text-gray-300 text-sm"
-        >
+        <button onClick={onClose} className="text-gray-500 hover:text-gray-300 text-sm">
           Cancel
         </button>
       </div>
 
       {/* Folder */}
       <div className="mb-4">
-        <label className="block text-sm font-medium text-gray-400 mb-1.5">
-          Project folder
-        </label>
+        <label className="block text-sm font-medium text-gray-400 mb-1.5">Project folder</label>
         {runnerStatus && <RunnerBanner status={runnerStatus} />}
         <div className="relative">
           <input
@@ -283,7 +275,7 @@ export function NewPlanForm({ onClose }: Props) {
 
 async function applyRunnerErrorIfAny(
   e: unknown,
-  setRunnerStatus: (s: RunnerStatus) => void
+  setRunnerStatus: (s: RunnerStatus) => void,
 ): Promise<boolean> {
   if (!(e instanceof HttpError)) return false;
   const errorKey = httpErrorBody<{ error?: string }>(e)?.error;

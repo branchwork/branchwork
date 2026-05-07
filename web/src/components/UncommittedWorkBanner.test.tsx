@@ -76,45 +76,35 @@ describe("UncommittedWorkBanner", () => {
   });
 
   it("renders the banner copy when pausedReason is agent_left_uncommitted_work", () => {
-    seed(
-      defaultConfig({ pausedReason: "agent_left_uncommitted_work" }),
-      [agent({ id: "running-agent-1" })],
-    );
+    seed(defaultConfig({ pausedReason: "agent_left_uncommitted_work" }), [
+      agent({ id: "running-agent-1" }),
+    ]);
     render(<UncommittedWorkBanner planName={PLAN} />);
-    expect(
-      screen.getByText(/Auto-mode paused: agent left uncommitted work\./i),
-    ).toBeTruthy();
-    expect(
-      screen.getByText(
-        /Inspect and either commit, discard, or click Resume\./i,
-      ),
-    ).toBeTruthy();
+    expect(screen.getByText(/Auto-mode paused: agent left uncommitted work\./i)).toBeTruthy();
+    expect(screen.getByText(/Inspect and either commit, discard, or click Resume\./i)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Inspect agent/i })).toBeTruthy();
   });
 
   it("clicking Inspect agent selects the still-running task agent for this plan", () => {
     const selectAgentSpy = vi.fn();
     useAgentStore.setState({ selectAgent: selectAgentSpy });
-    seed(
-      defaultConfig({ pausedReason: "agent_left_uncommitted_work" }),
-      [
-        agent({
-          id: "other-plan-running",
-          plan_name: "p2",
-          status: "running",
-        }),
-        agent({
-          id: "this-plan-completed",
-          plan_name: PLAN,
-          status: "completed",
-        }),
-        agent({
-          id: "this-plan-running",
-          plan_name: PLAN,
-          status: "running",
-        }),
-      ],
-    );
+    seed(defaultConfig({ pausedReason: "agent_left_uncommitted_work" }), [
+      agent({
+        id: "other-plan-running",
+        plan_name: "p2",
+        status: "running",
+      }),
+      agent({
+        id: "this-plan-completed",
+        plan_name: PLAN,
+        status: "completed",
+      }),
+      agent({
+        id: "this-plan-running",
+        plan_name: PLAN,
+        status: "running",
+      }),
+    ]);
 
     render(<UncommittedWorkBanner planName={PLAN} />);
     fireEvent.click(screen.getByRole("button", { name: /Inspect agent/i }));
@@ -126,17 +116,14 @@ describe("UncommittedWorkBanner", () => {
   it("disables Inspect agent when no running agent exists for this plan", () => {
     const selectAgentSpy = vi.fn();
     useAgentStore.setState({ selectAgent: selectAgentSpy });
-    seed(
-      defaultConfig({ pausedReason: "agent_left_uncommitted_work" }),
-      [
-        agent({ id: "completed-1", status: "completed" }),
-        agent({
-          id: "other-plan",
-          plan_name: "p2",
-          status: "running",
-        }),
-      ],
-    );
+    seed(defaultConfig({ pausedReason: "agent_left_uncommitted_work" }), [
+      agent({ id: "completed-1", status: "completed" }),
+      agent({
+        id: "other-plan",
+        plan_name: "p2",
+        status: "running",
+      }),
+    ]);
 
     render(<UncommittedWorkBanner planName={PLAN} />);
     const button = screen.getByRole("button", {
@@ -151,21 +138,18 @@ describe("UncommittedWorkBanner", () => {
   it("ignores non-task (check-plan) agents when picking the inspect target", () => {
     const selectAgentSpy = vi.fn();
     useAgentStore.setState({ selectAgent: selectAgentSpy });
-    seed(
-      defaultConfig({ pausedReason: "agent_left_uncommitted_work" }),
-      [
-        agent({
-          id: "check-plan-agent",
-          task_id: null,
-          status: "running",
-        }),
-        agent({
-          id: "task-agent",
-          task_id: "2.1",
-          status: "running",
-        }),
-      ],
-    );
+    seed(defaultConfig({ pausedReason: "agent_left_uncommitted_work" }), [
+      agent({
+        id: "check-plan-agent",
+        task_id: null,
+        status: "running",
+      }),
+      agent({
+        id: "task-agent",
+        task_id: "2.1",
+        status: "running",
+      }),
+    ]);
 
     render(<UncommittedWorkBanner planName={PLAN} />);
     fireEvent.click(screen.getByRole("button", { name: /Inspect agent/i }));

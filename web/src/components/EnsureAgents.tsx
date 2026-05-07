@@ -48,10 +48,8 @@ function AgentNotFound({ agentId }: { agentId: string }) {
         <h2 className="text-sm font-semibold text-red-100">Agent not found</h2>
         <p className="mt-1 text-xs text-red-200/80">
           No agent matches{" "}
-          <span className="font-mono text-red-100">
-            {agentId ? agentId.slice(0, 8) : "—"}
-          </span>
-          . It may have already exited and been cleaned up.
+          <span className="font-mono text-red-100">{agentId ? agentId.slice(0, 8) : "—"}</span>. It
+          may have already exited and been cleaned up.
         </p>
       </div>
     </div>

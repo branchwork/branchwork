@@ -7,8 +7,7 @@ import { createContext, useContext } from "react";
 /// per plan the per-card O(N) Set build dominated re-renders.
 const EMPTY_COMPLETED_SET: ReadonlySet<string> = new Set<string>();
 
-export const CompletedTasksContext =
-  createContext<ReadonlySet<string>>(EMPTY_COMPLETED_SET);
+export const CompletedTasksContext = createContext<ReadonlySet<string>>(EMPTY_COMPLETED_SET);
 
 export function useCompletedTasks(): ReadonlySet<string> {
   return useContext(CompletedTasksContext);

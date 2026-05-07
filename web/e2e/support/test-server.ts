@@ -85,7 +85,7 @@ export async function bootstrap(): Promise<Bootstrap> {
   for (const bin of [SERVER_BIN, RUNNER_BIN]) {
     if (!(await fileExists(bin))) {
       throw new Error(
-        `${bin} missing — run \`cargo build --release -p branchwork-server\` from server-rs/ first`
+        `${bin} missing — run \`cargo build --release -p branchwork-server\` from server-rs/ first`,
       );
     }
   }
@@ -117,11 +117,10 @@ export async function bootstrap(): Promise<Bootstrap> {
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "e2e-stub-key",
   };
 
-  const rust = spawn(
-    SERVER_BIN,
-    ["--port", String(rustPort), "--claude-dir", claudeDir],
-    { env, stdio: ["ignore", "pipe", "pipe"] }
-  );
+  const rust = spawn(SERVER_BIN, ["--port", String(rustPort), "--claude-dir", claudeDir], {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   pipeOutput(rust, "[rust]");
 
   await waitFor(`${apiBase}/api/health`, "rust server");
@@ -136,7 +135,7 @@ export async function bootstrap(): Promise<Bootstrap> {
         BRANCHWORK_BACKEND_PORT: String(rustPort),
       },
       stdio: ["ignore", "pipe", "pipe"],
-    }
+    },
   );
   pipeOutput(vite, "[vite]");
 

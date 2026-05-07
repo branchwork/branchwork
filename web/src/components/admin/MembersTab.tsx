@@ -1,11 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  HttpError,
-  deleteJson,
-  fetchJson,
-  postJson,
-  putJson,
-} from "../../api.js";
+import { HttpError, deleteJson, fetchJson, postJson, putJson } from "../../api.js";
 import { errorMessage } from "../../lib/error.js";
 import { toastError } from "../../lib/toast.js";
 import { Banner } from "../ui/Banner.js";
@@ -49,11 +43,7 @@ interface MembersTabProps {
   callerUserId: string | null;
 }
 
-export function MembersTab({
-  orgSlug,
-  callerRole,
-  callerUserId,
-}: MembersTabProps) {
+export function MembersTab({ orgSlug, callerRole, callerUserId }: MembersTabProps) {
   const [members, setMembers] = useState<OrgMember[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -73,9 +63,7 @@ export function MembersTab({
     setLoading(true);
     setError(null);
     try {
-      const detail = await fetchJson<OrgDetail>(
-        `/api/orgs/${encodeURIComponent(orgSlug)}`,
-      );
+      const detail = await fetchJson<OrgDetail>(`/api/orgs/${encodeURIComponent(orgSlug)}`);
       setMembers(detail.members);
     } catch (e) {
       // Surface inline so the operator can retry without leaving the
@@ -158,8 +146,8 @@ export function MembersTab({
         <div className="rounded border border-gray-800 bg-gray-900/40 p-4">
           <h2 className="text-sm font-semibold text-gray-200">Invite member</h2>
           <p className="text-[11px] text-gray-500 mt-1 mb-3 leading-relaxed">
-            The user must already have an account on this server. We do not
-            email invitations — share the dashboard URL out-of-band.
+            The user must already have an account on this server. We do not email invitations —
+            share the dashboard URL out-of-band.
           </p>
           <div className="flex flex-wrap gap-2">
             <input
@@ -223,10 +211,8 @@ export function MembersTab({
             {sorted.map((m) => {
               const isSelf = m.userId === callerUserId;
               const isOnlyOwner =
-                m.role === "owner" &&
-                sorted.filter((x) => x.role === "owner").length <= 1;
-              const canRemove =
-                (canInviteOrRemove || isSelf) && !isOnlyOwner;
+                m.role === "owner" && sorted.filter((x) => x.role === "owner").length <= 1;
+              const canRemove = (canInviteOrRemove || isSelf) && !isOnlyOwner;
               const showRolePicker = canChangeRole && !isOnlyOwner;
               const busy = busyUserId === m.userId;
               return (
@@ -239,9 +225,7 @@ export function MembersTab({
                     <div className="text-sm text-gray-200 truncate">
                       {m.email}
                       {isSelf && (
-                        <span className="ml-2 text-[10px] uppercase text-gray-500">
-                          you
-                        </span>
+                        <span className="ml-2 text-[10px] uppercase text-gray-500">you</span>
                       )}
                     </div>
                     <div className="text-[11px] text-gray-500">
@@ -257,10 +241,7 @@ export function MembersTab({
                       data-testid={`role-${m.userId}`}
                       className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 focus:outline-none focus:border-indigo-600 disabled:opacity-60"
                     >
-                      {[
-                        { value: "owner", label: "Owner" },
-                        ...ASSIGNABLE_ROLES,
-                      ].map((r) => (
+                      {[{ value: "owner", label: "Owner" }, ...ASSIGNABLE_ROLES].map((r) => (
                         <option key={r.value} value={r.value}>
                           {r.label}
                         </option>

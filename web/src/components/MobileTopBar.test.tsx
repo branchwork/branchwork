@@ -86,28 +86,20 @@ describe("MobileTopBar", () => {
     };
     usePlanStore.setState({ selectedPlan: plan });
     renderTopBar("/plans/my-plan");
-    expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe(
-      "My nice plan",
-    );
+    expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe("My nice plan");
   });
 
   it("falls back to the URL slug when /plans/:planName has no selected plan loaded", () => {
     renderTopBar("/plans/some-slug");
-    expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe(
-      "some-slug",
-    );
+    expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe("some-slug");
   });
 
   it("renders 'Agents' on /agents and /agents/:id", () => {
     const { unmount } = renderTopBar("/agents");
-    expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe(
-      "Agents",
-    );
+    expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe("Agents");
     unmount();
     renderTopBar("/agents/abc-123");
-    expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe(
-      "Agents",
-    );
+    expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe("Agents");
   });
 
   it("renders 'Activity', 'Archive', 'Admin', 'Runners', 'New Plan' for their respective routes", () => {
@@ -121,9 +113,7 @@ describe("MobileTopBar", () => {
     ];
     for (const [path, expected] of cases) {
       const { unmount } = renderTopBar(path);
-      expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe(
-        expected,
-      );
+      expect(screen.getByTestId("mobile-top-bar-title").textContent).toBe(expected);
       unmount();
     }
   });

@@ -1,13 +1,7 @@
 import { create } from "zustand";
 import { fetchJson, putJson } from "../api.js";
 
-export type CiStatusValue =
-  | "pending"
-  | "running"
-  | "success"
-  | "failure"
-  | "cancelled"
-  | "unknown";
+export type CiStatusValue = "pending" | "running" | "success" | "failure" | "cancelled" | "unknown";
 
 export interface CiStatus {
   /// Row id in the server's `ci_runs` table — passed to the fix-CI endpoint
@@ -120,13 +114,7 @@ export interface PlanConfigPatch {
 /// info (which task is mid-merge, which fix attempt is in flight); the
 /// config fills in *persistent* info (paused or not, and why).
 export interface AutoModeRuntime {
-  state:
-    | "auto_finishing"
-    | "merging"
-    | "awaiting_ci"
-    | "fixing_ci"
-    | "advancing"
-    | "paused";
+  state: "auto_finishing" | "merging" | "awaiting_ci" | "fixing_ci" | "advancing" | "paused";
   task?: string | null;
   sha?: string | null;
   reason?: string | null;
@@ -268,10 +256,7 @@ interface PlanStore {
   /// from the local list — that is driven by the `plan_deleted` WS
   /// event (see ws-store.ts) so the sidebar converges identically
   /// whether the delete was triggered from this tab or another.
-  deletePlan: (
-    name: string,
-    opts?: { hard?: boolean },
-  ) => Promise<DeletePlanResponse>;
+  deletePlan: (name: string, opts?: { hard?: boolean }) => Promise<DeletePlanResponse>;
   /// DELETE /api/plans/:name?dry_run=true — read-only cascade preview.
   /// Used by `DeletePlanModal` on open so the user sees how many rows
   /// will be cleared and whether the plan is currently blocked. Throws
@@ -396,8 +381,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   removePlan: (planName: string) => {
     set((s) => ({
       plans: s.plans.filter((p) => p.name !== planName),
-      selectedPlan:
-        s.selectedPlan?.name === planName ? null : s.selectedPlan,
+      selectedPlan: s.selectedPlan?.name === planName ? null : s.selectedPlan,
     }));
   },
 
@@ -408,9 +392,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       ...selectedPlan,
       phases: selectedPlan.phases.map((p) => ({
         ...p,
-        tasks: p.tasks.map((t) =>
-          t.number === taskNumber ? { ...t, ci } : t
-        ),
+        tasks: p.tasks.map((t) => (t.number === taskNumber ? { ...t, ci } : t)),
       })),
     };
     set({ selectedPlan: patched });
@@ -429,9 +411,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       ...selectedPlan,
       phases: selectedPlan.phases.map((p) => ({
         ...p,
-        tasks: p.tasks.map((t) =>
-          t.number === taskNumber ? { ...t, ci: null } : t
-        ),
+        tasks: p.tasks.map((t) => (t.number === taskNumber ? { ...t, ci: null } : t)),
       })),
     };
     set({ selectedPlan: patched });
@@ -467,9 +447,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     // debounced fetchPlans on `task_status_changed` reconciles drift.
     const delta = touched ? amountUsd - (prevCost ?? 0) : amountUsd;
     const updatedPlans = plans.map((p) =>
-      p.name === planName
-        ? { ...p, totalCostUsd: (p.totalCostUsd ?? 0) + delta }
-        : p
+      p.name === planName ? { ...p, totalCostUsd: (p.totalCostUsd ?? 0) + delta } : p,
     );
     set({ plans: updatedPlans });
   },
@@ -502,7 +480,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
           tasks: p.tasks.map((t) =>
             t.number === taskNumber
               ? { ...t, status, statusUpdatedAt: new Date().toISOString() }
-              : t
+              : t,
           ),
         })),
       };
@@ -518,8 +496,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
         // Signed delta handles all 4 transitions: pending→done (+1),
         // done→pending/in_progress/failed (-1), completed↔skipped (0),
         // repeated done→done (0).
-        const wasDone =
-          prevStatus === "completed" || prevStatus === "skipped";
+        const wasDone = prevStatus === "completed" || prevStatus === "skipped";
         delta = (isDone ? 1 : 0) - (wasDone ? 1 : 0);
       } else {
         // Non-selected plan: store has no per-task data, so fall back to the
@@ -557,10 +534,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
 
   addWarning: (w: PlanWarning) => {
     set((s) => ({
-      warnings: [
-        ...s.warnings.filter((x) => x.name !== w.name),
-        w,
-      ],
+      warnings: [...s.warnings.filter((x) => x.name !== w.name), w],
     }));
   },
 
@@ -597,13 +571,9 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   },
 
   pushToast: ({ id, kind, message, action, ttlMs }) => {
-    const toastId =
-      id ?? `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const toastId = id ?? `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     set((s) => ({
-      toasts: [
-        ...s.toasts.filter((t) => t.id !== toastId),
-        { id: toastId, kind, message, action },
-      ],
+      toasts: [...s.toasts.filter((t) => t.id !== toastId), { id: toastId, kind, message, action }],
     }));
     if (ttlMs && ttlMs > 0) {
       // Auto-dismiss. If the user already dismissed manually (or the
@@ -628,10 +598,9 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   },
 
   previewDeletePlan: async (name: string) => {
-    return await fetchJson<DeletePlanPreview>(
-      `/api/plans/${name}?dry_run=true`,
-      { method: "DELETE" },
-    );
+    return await fetchJson<DeletePlanPreview>(`/api/plans/${name}?dry_run=true`, {
+      method: "DELETE",
+    });
   },
 
   reset: () => {

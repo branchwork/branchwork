@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
 import axe from "axe-core";
 import { BulkDeleteModal } from "./BulkDeleteModal.js";
@@ -26,9 +21,7 @@ function okResponse(name: string) {
 
 beforeEach(() => {
   usePlanStore.setState({
-    deletePlan: vi.fn().mockImplementation((name: string) =>
-      Promise.resolve(okResponse(name)),
-    ),
+    deletePlan: vi.fn().mockImplementation((name: string) => Promise.resolve(okResponse(name))),
   });
   useAgentStore.setState({ selectAgent: vi.fn() });
 });
@@ -47,9 +40,7 @@ describe("BulkDeleteModal", () => {
         onPlanDeleted={() => {}}
       />,
     );
-    expect(
-      screen.getByRole("heading", { name: /Delete 3 plans\?/i }),
-    ).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /Delete 3 plans\?/i })).toBeTruthy();
     const list = screen.getByTestId("bulk-delete-plan-list");
     expect(list.textContent).toContain("alpha-plan");
     expect(list.textContent).toContain("beta-plan");
@@ -65,12 +56,8 @@ describe("BulkDeleteModal", () => {
         onPlanDeleted={() => {}}
       />,
     );
-    expect(
-      screen.getByRole("heading", { name: /Delete 1 plan\?/i }),
-    ).toBeTruthy();
-    expect(
-      screen.getByRole("button", { name: /^Delete 1$/ }),
-    ).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /Delete 1 plan\?/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Delete 1$/ })).toBeTruthy();
   });
 
   it("opens directly in hard-confirm mode when retentionDays is 0", () => {
@@ -82,13 +69,9 @@ describe("BulkDeleteModal", () => {
         onPlanDeleted={() => {}}
       />,
     );
-    expect(
-      screen.getByRole("heading", { name: /Permanently delete 3 plans\?/i }),
-    ).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /Permanently delete 3 plans\?/i })).toBeTruthy();
     expect(screen.queryByText(/Hold/)).toBeNull();
-    expect(
-      screen.getByRole("button", { name: /Permanently delete 3/i }),
-    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Permanently delete 3/i })).toBeTruthy();
   });
 
   it("Cancel does not call deletePlan and invokes onClose", () => {
@@ -111,9 +94,9 @@ describe("BulkDeleteModal", () => {
   it("happy path: deletes all 3 plans serially and closes the modal", async () => {
     const onClose = vi.fn();
     const onPlanDeleted = vi.fn();
-    const deletePlan = vi.fn().mockImplementation((name: string) =>
-      Promise.resolve(okResponse(name)),
-    );
+    const deletePlan = vi
+      .fn()
+      .mockImplementation((name: string) => Promise.resolve(okResponse(name)));
     usePlanStore.setState({ deletePlan });
     render(
       <BulkDeleteModal
@@ -141,9 +124,9 @@ describe("BulkDeleteModal", () => {
   });
 
   it("Shift+click flips to hard-confirm without deleting; second click commits hard", async () => {
-    const deletePlan = vi.fn().mockImplementation((name: string) =>
-      Promise.resolve({ ...okResponse(name), hard: true }),
-    );
+    const deletePlan = vi
+      .fn()
+      .mockImplementation((name: string) => Promise.resolve({ ...okResponse(name), hard: true }));
     usePlanStore.setState({ deletePlan });
     render(
       <BulkDeleteModal
@@ -158,13 +141,9 @@ describe("BulkDeleteModal", () => {
     });
     expect(deletePlan).not.toHaveBeenCalled();
     await waitFor(() =>
-      expect(
-        screen.getByRole("heading", { name: /Permanently delete 3 plans\?/i }),
-      ).toBeTruthy(),
+      expect(screen.getByRole("heading", { name: /Permanently delete 3 plans\?/i })).toBeTruthy(),
     );
-    fireEvent.click(
-      screen.getByRole("button", { name: /Permanently delete 3/i }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: /Permanently delete 3/i }));
     await waitFor(() => expect(deletePlan).toHaveBeenCalledTimes(3));
     expect(deletePlan.mock.calls[0]).toEqual(["alpha-plan", { hard: true }]);
     expect(deletePlan.mock.calls[2]).toEqual(["gamma-plan", { hard: true }]);
@@ -194,11 +173,7 @@ describe("BulkDeleteModal", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /^Delete 3$/ }));
-    await waitFor(() =>
-      expect(
-        screen.getByText(/Cannot delete "beta-plan"/i),
-      ).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/Cannot delete "beta-plan"/i)).toBeTruthy());
     // Two attempts (alpha succeeded, beta blocked); gamma is NEVER
     // attempted — that is the load-bearing serial-halt invariant.
     expect(deletePlan).toHaveBeenCalledTimes(2);
@@ -236,18 +211,16 @@ describe("BulkDeleteModal", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /^Delete 1$/ }));
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "agent-zzz" })).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "agent-zzz" })).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "agent-zzz" }));
     expect(selectAgent).toHaveBeenCalledWith("agent-zzz");
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it("409 auto_mode_in_flight surfaces an explanatory banner without agent list", async () => {
-    const deletePlan = vi.fn().mockRejectedValue(
-      new HttpError(409, "Conflict", { error: "auto_mode_in_flight" }),
-    );
+    const deletePlan = vi
+      .fn()
+      .mockRejectedValue(new HttpError(409, "Conflict", { error: "auto_mode_in_flight" }));
     usePlanStore.setState({ deletePlan });
     render(
       <BulkDeleteModal
@@ -258,11 +231,7 @@ describe("BulkDeleteModal", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /^Delete 1$/ }));
-    await waitFor(() =>
-      expect(
-        screen.getByText(/auto-mode is mid-flight/i),
-      ).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/auto-mode is mid-flight/i)).toBeTruthy());
   });
 
   it("404 mid-stream is treated as success (raced delete) and the loop continues", async () => {
@@ -270,9 +239,7 @@ describe("BulkDeleteModal", () => {
     const onClose = vi.fn();
     const deletePlan = vi.fn().mockImplementation((name: string) => {
       if (name === "beta-plan") {
-        return Promise.reject(
-          new HttpError(404, "Not Found", { error: "plan_not_found" }),
-        );
+        return Promise.reject(new HttpError(404, "Not Found", { error: "plan_not_found" }));
       }
       return Promise.resolve(okResponse(name));
     });
@@ -297,9 +264,7 @@ describe("BulkDeleteModal", () => {
     const onClose = vi.fn();
     const deletePlan = vi.fn().mockImplementation((name: string) => {
       if (name === "beta-plan") {
-        return Promise.reject(
-          new HttpError(500, "Server Error", { error: "boom" }),
-        );
+        return Promise.reject(new HttpError(500, "Server Error", { error: "boom" }));
       }
       return Promise.resolve(okResponse(name));
     });
@@ -313,9 +278,7 @@ describe("BulkDeleteModal", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /^Delete 3$/ }));
-    await waitFor(() =>
-      expect(screen.getByText(/Delete failed on "beta-plan"/i)).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/Delete failed on "beta-plan"/i)).toBeTruthy());
     // Exactly two attempts: alpha succeeded, beta blew up. Gamma was
     // never attempted because the serial loop halted.
     expect(deletePlan).toHaveBeenCalledTimes(2);
@@ -365,9 +328,7 @@ describe("BulkDeleteModal", () => {
       />,
     );
     const dialog = screen.getByRole("dialog");
-    const focusables = Array.from(
-      dialog.querySelectorAll<HTMLElement>("button:not([disabled])"),
-    );
+    const focusables = Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled])"));
     expect(focusables.length).toBeGreaterThan(0);
     const last = focusables[focusables.length - 1];
     last.focus();

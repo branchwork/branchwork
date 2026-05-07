@@ -15,11 +15,7 @@ interface FetchResult {
   statusText?: string;
 }
 
-type FetchHandler = (
-  url: string,
-  method: string,
-  body: unknown,
-) => FetchResult;
+type FetchHandler = (url: string, method: string, body: unknown) => FetchResult;
 
 interface CallLog {
   url: string;
@@ -32,32 +28,25 @@ interface CallLog {
 // `vi.unstubAllGlobals` in afterEach.
 function installFetchMock(handler: FetchHandler) {
   const calls: CallLog[] = [];
-  const fn = vi.fn(
-    async (input: string | URL | Request, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.pathname + input.search
-            : input.url;
-      const method = init?.method ?? "GET";
-      const rawBody = init?.body;
-      const body =
-        typeof rawBody === "string" && rawBody.length > 0
-          ? JSON.parse(rawBody)
-          : undefined;
-      calls.push({ url, method, body });
-      const result = handler(url, method, body);
-      return new Response(
-        result.body !== undefined ? JSON.stringify(result.body) : null,
-        {
-          status: result.status,
-          statusText: result.statusText,
-          headers: { "Content-Type": "application/json" },
-        },
-      );
-    },
-  );
+  const fn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.pathname + input.search
+          : input.url;
+    const method = init?.method ?? "GET";
+    const rawBody = init?.body;
+    const body =
+      typeof rawBody === "string" && rawBody.length > 0 ? JSON.parse(rawBody) : undefined;
+    calls.push({ url, method, body });
+    const result = handler(url, method, body);
+    return new Response(result.body !== undefined ? JSON.stringify(result.body) : null, {
+      status: result.status,
+      statusText: result.statusText,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
   vi.stubGlobal("fetch", fn);
   return { calls, fn };
 }
@@ -179,9 +168,7 @@ describe("agent-store mutations", () => {
         makeAgent({ id: "c", branch: "branchwork/p/2.1" }),
       ],
     });
-    useAgentStore
-      .getState()
-      .clearAgentBranch({ branch: "branchwork/p/1.1" });
+    useAgentStore.getState().clearAgentBranch({ branch: "branchwork/p/1.1" });
     const rows = useAgentStore.getState().agents;
     expect(rows.find((r) => r.id === "a")?.branch).toBeNull();
     expect(rows.find((r) => r.id === "b")?.branch).toBeNull();
@@ -193,9 +180,7 @@ describe("agent-store mutations", () => {
     const seed = [makeAgent({ id: "a", branch: "branchwork/p/1.1" })];
     useAgentStore.setState({ agents: seed });
     useAgentStore.getState().clearAgentBranch({ agentId: "nope" });
-    expect(useAgentStore.getState().agents[0].branch).toBe(
-      "branchwork/p/1.1",
-    );
+    expect(useAgentStore.getState().agents[0].branch).toBe("branchwork/p/1.1");
   });
 });
 
@@ -315,9 +300,7 @@ describe("agent-store fetchers (stubbed fetch)", () => {
 
     await useAgentStore.getState().killAgent("a1");
 
-    expect(calls).toEqual([
-      { url: "/api/agents/a1", method: "DELETE", body: undefined },
-    ]);
+    expect(calls).toEqual([{ url: "/api/agents/a1", method: "DELETE", body: undefined }]);
   });
 
   it("finishAgent POSTs /api/agents/{id}/finish", async () => {
@@ -325,9 +308,7 @@ describe("agent-store fetchers (stubbed fetch)", () => {
 
     await useAgentStore.getState().finishAgent("a1");
 
-    expect(calls).toEqual([
-      { url: "/api/agents/a1/finish", method: "POST", body: {} },
-    ]);
+    expect(calls).toEqual([{ url: "/api/agents/a1/finish", method: "POST", body: {} }]);
   });
 
   it("mergeAgentBranch (success) clears branch locally and returns ok:true", async () => {
@@ -339,9 +320,7 @@ describe("agent-store fetchers (stubbed fetch)", () => {
       body: { ok: true },
     }));
 
-    const result = await useAgentStore
-      .getState()
-      .mergeAgentBranch("a1", "main");
+    const result = await useAgentStore.getState().mergeAgentBranch("a1", "main");
 
     expect(result).toEqual({ ok: true });
     expect(useAgentStore.getState().agents[0].branch).toBeNull();
@@ -366,9 +345,7 @@ describe("agent-store fetchers (stubbed fetch)", () => {
 
     expect(result).toEqual({ error: "merge_conflict" });
     // Branch is NOT cleared on failure — only success clears it.
-    expect(useAgentStore.getState().agents[0].branch).toBe(
-      "branchwork/p/1.1",
-    );
+    expect(useAgentStore.getState().agents[0].branch).toBe("branchwork/p/1.1");
   });
 
   it("fetchMergeTargets returns the server's {default, available} response", async () => {

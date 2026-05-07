@@ -1,10 +1,5 @@
 import { IconButton } from "./ui/IconButton.js";
-import {
-  useToastStore,
-  toastRole,
-  type Toast,
-  type ToastKind,
-} from "../stores/toast-store.js";
+import { useToastStore, toastRole, type Toast, type ToastKind } from "../stores/toast-store.js";
 
 /// Tailwind palette per kind. Mirrors the soft-surface tokens used by
 /// `Badge`/`AutoModeStatusPill` (info=indigo, success=emerald,
@@ -52,11 +47,7 @@ function ToastCard({ toast, onDismiss }: ToastCardProps) {
     >
       <div className="flex-1 min-w-0">
         <div className="font-medium break-words">{toast.title}</div>
-        {toast.body && (
-          <div className="mt-0.5 text-xs opacity-80 break-words">
-            {toast.body}
-          </div>
-        )}
+        {toast.body && <div className="mt-0.5 text-xs opacity-80 break-words">{toast.body}</div>}
       </div>
       <IconButton
         aria-label="Dismiss notification"

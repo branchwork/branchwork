@@ -138,8 +138,8 @@ export function DiagnosticsTab({ refreshMs = REFRESH_MS }: DiagnosticsTabProps =
   return (
     <div className="max-w-3xl">
       <p className="text-[11px] text-gray-500 mb-4 leading-relaxed">
-        Read-only triage view. Refreshes every 10 seconds while this tab is
-        visible; pauses when the browser backgrounds it.
+        Read-only triage view. Refreshes every 10 seconds while this tab is visible; pauses when the
+        browser backgrounds it.
       </p>
 
       {error && <Banner className="mb-4">{error}</Banner>}
@@ -148,10 +148,7 @@ export function DiagnosticsTab({ refreshMs = REFRESH_MS }: DiagnosticsTabProps =
         className="rounded border border-gray-800 bg-gray-900/40 p-4 mb-4"
         aria-labelledby="diagnostics-server-heading"
       >
-        <h2
-          id="diagnostics-server-heading"
-          className="text-sm font-semibold text-gray-200 mb-3"
-        >
+        <h2 id="diagnostics-server-heading" className="text-sm font-semibold text-gray-200 mb-3">
           Server
         </h2>
 
@@ -162,36 +159,24 @@ export function DiagnosticsTab({ refreshMs = REFRESH_MS }: DiagnosticsTabProps =
         ) : (
           <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-xs">
             <dt className="text-gray-500">Version</dt>
-            <dd
-              className="text-gray-200 font-mono"
-              data-testid="diagnostics-version"
-            >
+            <dd className="text-gray-200 font-mono" data-testid="diagnostics-version">
               {health?.version ?? "unknown"}
             </dd>
 
             <dt className="text-gray-500">Uptime</dt>
-            <dd
-              className="text-gray-200 font-mono"
-              data-testid="diagnostics-uptime"
-            >
+            <dd className="text-gray-200 font-mono" data-testid="diagnostics-uptime">
               {formatUptime(health?.uptimeSeconds ?? Number.NaN)}
             </dd>
 
             <dt className="text-gray-500">WS connections</dt>
-            <dd
-              className="text-gray-200 font-mono"
-              data-testid="diagnostics-ws-connections"
-            >
+            <dd className="text-gray-200 font-mono" data-testid="diagnostics-ws-connections">
               {health?.wsConnections ?? 0}
             </dd>
 
             {mode && (
               <>
                 <dt className="text-gray-500">Deployment</dt>
-                <dd
-                  className="text-gray-200 font-mono"
-                  data-testid="diagnostics-mode"
-                >
+                <dd className="text-gray-200 font-mono" data-testid="diagnostics-mode">
                   {mode}
                 </dd>
               </>
@@ -204,29 +189,20 @@ export function DiagnosticsTab({ refreshMs = REFRESH_MS }: DiagnosticsTabProps =
         className="rounded border border-gray-800 bg-gray-900/40 p-4"
         aria-labelledby="diagnostics-runners-heading"
       >
-        <h2
-          id="diagnostics-runners-heading"
-          className="text-sm font-semibold text-gray-200 mb-3"
-        >
+        <h2 id="diagnostics-runners-heading" className="text-sm font-semibold text-gray-200 mb-3">
           Runners
         </h2>
 
         {runners === null ? (
           <p className="text-xs text-gray-500">Loading…</p>
         ) : runners.length === 0 ? (
-          <p
-            className="text-xs text-gray-500"
-            data-testid="diagnostics-no-runners"
-          >
+          <p className="text-xs text-gray-500" data-testid="diagnostics-no-runners">
             {mode === "standalone"
               ? "Standalone deployment — agents run on this server. No remote runners are registered."
               : "No runners registered yet."}
           </p>
         ) : (
-          <table
-            className="w-full text-xs"
-            data-testid="diagnostics-runners-table"
-          >
+          <table className="w-full text-xs" data-testid="diagnostics-runners-table">
             <thead>
               <tr className="text-left text-gray-500 border-b border-gray-800">
                 <th className="font-medium pb-1.5 pr-3">Name</th>
@@ -243,18 +219,12 @@ export function DiagnosticsTab({ refreshMs = REFRESH_MS }: DiagnosticsTabProps =
                   className="border-b border-gray-900 last:border-b-0"
                   data-testid={`diagnostics-runner-row-${r.id}`}
                 >
-                  <td className="py-1.5 pr-3 text-gray-200 font-mono">
-                    {r.name ?? r.id}
-                  </td>
+                  <td className="py-1.5 pr-3 text-gray-200 font-mono">{r.name ?? r.id}</td>
                   <td className="py-1.5 pr-3">
                     <RunnerStatusBadge status={r.status} />
                   </td>
-                  <td className="py-1.5 pr-3 text-gray-300 font-mono">
-                    {r.hostname ?? "—"}
-                  </td>
-                  <td className="py-1.5 pr-3 text-gray-300 font-mono">
-                    {r.version ?? "—"}
-                  </td>
+                  <td className="py-1.5 pr-3 text-gray-300 font-mono">{r.hostname ?? "—"}</td>
+                  <td className="py-1.5 pr-3 text-gray-300 font-mono">{r.version ?? "—"}</td>
                   <td className="py-1.5 text-gray-400">
                     {r.lastSeenAt ? formatRelative(r.lastSeenAt) : "never"}
                   </td>
@@ -274,8 +244,7 @@ export function DiagnosticsTab({ refreshMs = REFRESH_MS }: DiagnosticsTabProps =
 /// amber so the operator can spot it.
 function RunnerStatusBadge({ status }: { status: string | null }) {
   const s = (status ?? "unknown").toLowerCase();
-  let cls =
-    "inline-flex items-center gap-1.5 text-[11px] px-2 py-0.5 rounded border";
+  let cls = "inline-flex items-center gap-1.5 text-[11px] px-2 py-0.5 rounded border";
   if (s === "online") {
     cls += " border-emerald-700/50 bg-emerald-900/30 text-emerald-200";
   } else if (s === "offline") {
@@ -287,11 +256,7 @@ function RunnerStatusBadge({ status }: { status: string | null }) {
     <span className={cls}>
       <span
         className={`inline-block w-1.5 h-1.5 rounded-full ${
-          s === "online"
-            ? "bg-emerald-400"
-            : s === "offline"
-              ? "bg-gray-500"
-              : "bg-amber-400"
+          s === "online" ? "bg-emerald-400" : s === "offline" ? "bg-gray-500" : "bg-amber-400"
         }`}
         aria-hidden="true"
       />

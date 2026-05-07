@@ -3,18 +3,11 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
-import {
-  MAX_OUTPUT_LINES,
-  useAgentStore,
-  type AgentOutputLine,
-} from "../stores/agent-store.js";
+import { MAX_OUTPUT_LINES, useAgentStore, type AgentOutputLine } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { toastError } from "../lib/toast.js";
-import {
-  parseStreamJsonLine,
-  parseVerdictJson,
-} from "../schemas/stream-json.js";
+import { parseStreamJsonLine, parseVerdictJson } from "../schemas/stream-json.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
 import { Dropdown, DropdownItem } from "./ui/Dropdown.js";
 import { Tabs } from "./ui/Tabs.js";
@@ -34,9 +27,7 @@ export function AgentPanel() {
   const [activeTab, setActiveTab] = useState<Tab>("output");
 
   const agent = agents.find((a) => a.id === selectedAgentId);
-  const planTitle = agent?.plan_name
-    ? plans.find((p) => p.name === agent.plan_name)?.title
-    : null;
+  const planTitle = agent?.plan_name ? plans.find((p) => p.name === agent.plan_name)?.title : null;
 
   const isPty = agent?.mode === "pty";
   const isActive = agent?.status === "running" || agent?.status === "starting";
@@ -46,8 +37,8 @@ export function AgentPanel() {
   // at MAX_OUTPUT_LINES (audit §10). Surface the cap once the user is
   // actually looking at a truncated buffer so they know the older transcript
   // is on disk, not lost.
-  const outputCount = useAgentStore(
-    (s) => (selectedAgentId ? s.agentOutput[selectedAgentId]?.length ?? 0 : 0),
+  const outputCount = useAgentStore((s) =>
+    selectedAgentId ? (s.agentOutput[selectedAgentId]?.length ?? 0) : 0,
   );
   const bufferAtCap = !isPty && outputCount >= MAX_OUTPUT_LINES;
 
@@ -67,7 +58,11 @@ export function AgentPanel() {
             <span
               aria-hidden="true"
               className={`w-2 h-2 rounded-full flex-shrink-0 ${
-                isActive ? "bg-emerald-500 animate-pulse" : agent.status === "completed" ? "bg-emerald-500" : "bg-red-500"
+                isActive
+                  ? "bg-emerald-500 animate-pulse"
+                  : agent.status === "completed"
+                    ? "bg-emerald-500"
+                    : "bg-red-500"
               }`}
             />
             <span className="sr-only">Status: {agent.status}</span>
@@ -89,9 +84,7 @@ export function AgentPanel() {
             </div>
           )}
           {agent.branch && (
-            <div className="text-[10px] text-indigo-500/70 font-mono truncate">
-              {agent.branch}
-            </div>
+            <div className="text-[10px] text-indigo-500/70 font-mono truncate">{agent.branch}</div>
           )}
           {bufferAtCap && (
             <div
@@ -146,9 +139,7 @@ export function AgentPanel() {
             value: "diff",
             label: "Diff",
             disabled: !hasBaseCommit,
-            title: hasBaseCommit
-              ? undefined
-              : "Diff unavailable — agent has no base commit yet",
+            title: hasBaseCommit ? undefined : "Diff unavailable — agent has no base commit yet",
           },
         ]}
       />
@@ -216,9 +207,7 @@ function PtyTerminal({ agentId }: { agentId: string }) {
 
     // Connect WebSocket
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(
-      `${protocol}//${window.location.host}/terminal?agent=${agentId}`
-    );
+    const ws = new WebSocket(`${protocol}//${window.location.host}/terminal?agent=${agentId}`);
 
     ws.onopen = () => {
       // Fit after WS opens so we can send correct size
@@ -352,26 +341,17 @@ function StreamJsonView({ agentId, isActive }: { agentId: string; isActive: bool
             </div>
           )}
           {texts.length > 0 && (
-            <div className="text-xs text-gray-200 py-1 whitespace-pre-wrap">
-              {texts.join("\n")}
-            </div>
+            <div className="text-xs text-gray-200 py-1 whitespace-pre-wrap">{texts.join("\n")}</div>
           )}
         </div>
       );
     }
     if (env.type === "result") {
-      const dur = env.duration_ms
-        ? `${(env.duration_ms / 1000).toFixed(1)}s`
-        : "";
+      const dur = env.duration_ms ? `${(env.duration_ms / 1000).toFixed(1)}s` : "";
       const cost =
-        typeof env.total_cost_usd === "number"
-          ? `$${env.total_cost_usd.toFixed(4)}`
-          : null;
+        typeof env.total_cost_usd === "number" ? `$${env.total_cost_usd.toFixed(4)}` : null;
       return (
-        <div
-          key={line.id}
-          className="text-[10px] text-gray-600 py-1 border-t border-gray-800 mt-1"
-        >
+        <div key={line.id} className="text-[10px] text-gray-600 py-1 border-t border-gray-800 mt-1">
           Finished in {dur} ({env.num_turns ?? 0} turns)
           {cost && <span className="text-amber-500/80 ml-2">{cost}</span>}
         </div>
@@ -399,8 +379,14 @@ function StreamJsonView({ agentId, isActive }: { agentId: string; isActive: bool
       {/* Verdict banner */}
       {verdict && !isActive && (
         <div className="mx-3 mt-3 p-3 rounded border bg-gray-800/50 border-gray-700 flex-shrink-0">
-          <span className={`text-sm font-semibold ${verdictColors[verdict.status] ?? "text-gray-300"}`}>
-            {verdict.status === "completed" ? "Done" : verdict.status === "in_progress" ? "In Progress" : "Pending"}
+          <span
+            className={`text-sm font-semibold ${verdictColors[verdict.status] ?? "text-gray-300"}`}
+          >
+            {verdict.status === "completed"
+              ? "Done"
+              : verdict.status === "in_progress"
+                ? "In Progress"
+                : "Pending"}
           </span>
           <p className="text-xs text-gray-400 mt-1">{verdict.reason}</p>
         </div>
@@ -411,9 +397,7 @@ function StreamJsonView({ agentId, isActive }: { agentId: string; isActive: bool
         {rendered.length === 0 && isActive && (
           <p className="text-xs text-gray-600">Agent is working...</p>
         )}
-        {rendered.length === 0 && !isActive && (
-          <p className="text-xs text-gray-600">No output.</p>
-        )}
+        {rendered.length === 0 && !isActive && <p className="text-xs text-gray-600">No output.</p>}
         {rendered}
       </div>
     </div>
@@ -437,9 +421,16 @@ export function DiffView({
   const fetchMergeTargets = useAgentStore((s) => s.fetchMergeTargets);
   const discardAgentBranch = useAgentStore((s) => s.discardAgentBranch);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
-  const [mergeState, setMergeState] = useState<"idle" | "confirming" | "merging" | "merged" | "error">("idle");
-  const [discardState, setDiscardState] = useState<"idle" | "confirming" | "discarding" | "discarded" | "error">("idle");
-  const [mergeTargets, setMergeTargets] = useState<{ default: string | null; available: string[] } | null>(null);
+  const [mergeState, setMergeState] = useState<
+    "idle" | "confirming" | "merging" | "merged" | "error"
+  >("idle");
+  const [discardState, setDiscardState] = useState<
+    "idle" | "confirming" | "discarding" | "discarded" | "error"
+  >("idle");
+  const [mergeTargets, setMergeTargets] = useState<{
+    default: string | null;
+    available: string[];
+  } | null>(null);
   const [targetsLoading, setTargetsLoading] = useState(true);
   const [targetsError, setTargetsError] = useState(false);
   const [selectedTarget, setSelectedTarget] = useState<string | null>(null);
@@ -506,14 +497,11 @@ export function DiffView({
 
   // Parse unified diff into per-file hunks
   const fileDiffs = parseDiff(diffData.diff);
-  const displayed = selectedFile
-    ? fileDiffs.filter((f) => f.path === selectedFile)
-    : fileDiffs;
+  const displayed = selectedFile ? fileDiffs.filter((f) => f.path === selectedFile) : fileDiffs;
 
   const defaultTarget = mergeTargets?.default ?? sourceBranch ?? "main";
   const resolvedTarget = selectedTarget ?? defaultTarget;
-  const showChevron =
-    !targetsLoading && !targetsError && (mergeTargets?.available.length ?? 0) > 0;
+  const showChevron = !targetsLoading && !targetsError && (mergeTargets?.available.length ?? 0) > 0;
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -625,16 +613,11 @@ export function DiffView({
               {/* Merge button (split: main + chevron dropdown) */}
               {mergeState === "confirming" ? (
                 <div className="flex items-center gap-1">
-                  <span className="text-[10px] text-amber-400">
-                    Merge into {resolvedTarget}?
-                  </span>
+                  <span className="text-[10px] text-amber-400">Merge into {resolvedTarget}?</span>
                   <button
                     onClick={async () => {
                       setMergeState("merging");
-                      const result = await mergeAgentBranch(
-                        agentId,
-                        selectedTarget ?? undefined
-                      );
+                      const result = await mergeAgentBranch(agentId, selectedTarget ?? undefined);
                       if (result.ok) {
                         setMergeState("merged");
                       } else {
@@ -687,25 +670,16 @@ export function DiffView({
                       {mergeTargets?.default && (
                         <DropdownItem
                           onSelect={() => setSelectedTarget(null)}
-                          className={
-                            selectedTarget === null
-                              ? "text-emerald-400"
-                              : ""
-                          }
+                          className={selectedTarget === null ? "text-emerald-400" : ""}
                         >
-                          {mergeTargets.default}{" "}
-                          <span className="text-gray-600">(default)</span>
+                          {mergeTargets.default} <span className="text-gray-600">(default)</span>
                         </DropdownItem>
                       )}
                       {mergeTargets?.available.map((branch) => (
                         <DropdownItem
                           key={branch}
                           onSelect={() => setSelectedTarget(branch)}
-                          className={
-                            selectedTarget === branch
-                              ? "text-emerald-400"
-                              : ""
-                          }
+                          className={selectedTarget === branch ? "text-emerald-400" : ""}
                         >
                           {branch}
                         </DropdownItem>
@@ -743,19 +717,11 @@ interface DiffLineData {
 
 function DiffLine({ line }: { line: DiffLineData }) {
   if (line.type === "noNewline") {
-    return (
-      <div className="px-3 text-gray-600 italic select-none">
-        \ No newline at end of file
-      </div>
-    );
+    return <div className="px-3 text-gray-600 italic select-none">\ No newline at end of file</div>;
   }
 
   const bgClass =
-    line.type === "add"
-      ? "bg-emerald-950/30"
-      : line.type === "del"
-        ? "bg-red-950/30"
-        : "";
+    line.type === "add" ? "bg-emerald-950/30" : line.type === "del" ? "bg-red-950/30" : "";
 
   const textClass =
     line.type === "add"
@@ -779,14 +745,14 @@ function DiffLine({ line }: { line: DiffLineData }) {
       <span className={`w-10 text-right px-1 select-none flex-shrink-0 ${gutterClass}`}>
         {line.oldNum ?? ""}
       </span>
-      <span className={`w-10 text-right px-1 select-none flex-shrink-0 border-r border-gray-800/50 ${gutterClass}`}>
+      <span
+        className={`w-10 text-right px-1 select-none flex-shrink-0 border-r border-gray-800/50 ${gutterClass}`}
+      >
         {line.newNum ?? ""}
       </span>
       {/* Prefix and content */}
       <span className={`px-1 select-none flex-shrink-0 ${textClass}`}>{prefix}</span>
-      <span className={`flex-1 whitespace-pre ${textClass}`}>
-        {line.content}
-      </span>
+      <span className={`flex-1 whitespace-pre ${textClass}`}>{line.content}</span>
     </div>
   );
 }

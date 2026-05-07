@@ -58,9 +58,7 @@ export function ProjectDashboard() {
   const loading = usePlanStore((s) => s.loading);
   const selectPlan = usePlanStore((s) => s.selectPlan);
   const agents = useAgentStore((s) => s.agents);
-  const planArchiveRetentionDays = useSettingsStore(
-    (s) => s.planArchiveRetentionDays,
-  );
+  const planArchiveRetentionDays = useSettingsStore((s) => s.planArchiveRetentionDays);
 
   // Multi-select + bulk-delete state. selectionMode toggles the
   // checkboxes on every plan row; selected holds the picked plan
@@ -106,9 +104,7 @@ export function ProjectDashboard() {
 
   const projectStats: ProjectStats[] = useMemo(() => {
     const nowMs = Date.now();
-    const visiblePlans = showStale
-      ? plans.filter((p) => isStalePlan(p, nowMs))
-      : plans;
+    const visiblePlans = showStale ? plans.filter((p) => isStalePlan(p, nowMs)) : plans;
 
     const byProject = new Map<string, PlanSummary[]>();
     for (const p of visiblePlans) {
@@ -128,21 +124,14 @@ export function ProjectDashboard() {
     for (const [name, projectPlans] of byProject) {
       const totalTasks = projectPlans.reduce((s, p) => s + p.taskCount, 0);
       const doneTasks = projectPlans.reduce((s, p) => s + p.doneCount, 0);
-      const totalCost = projectPlans.reduce(
-        (s, p) => s + (p.totalCostUsd ?? 0),
-        0
-      );
-      const activeAgents = projectPlans.reduce(
-        (s, p) => s + (activeByPlan.get(p.name) ?? 0),
-        0
-      );
+      const totalCost = projectPlans.reduce((s, p) => s + (p.totalCostUsd ?? 0), 0);
+      const activeAgents = projectPlans.reduce((s, p) => s + (activeByPlan.get(p.name) ?? 0), 0);
       const lastActivity =
-        [...projectPlans].sort((a, b) =>
-          b.modifiedAt.localeCompare(a.modifiedAt)
-        )[0]?.modifiedAt ?? "";
+        [...projectPlans].sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt))[0]?.modifiedAt ??
+        "";
 
       const sortedPlans = [...projectPlans].sort((a, b) =>
-        b.modifiedAt.localeCompare(a.modifiedAt)
+        b.modifiedAt.localeCompare(a.modifiedAt),
       );
       stats.push({
         name,
@@ -167,9 +156,7 @@ export function ProjectDashboard() {
     });
   }, [plans, agents, showStale]);
 
-  const visibleStaleCount = showStale
-    ? projectStats.reduce((s, ps) => s + ps.plans.length, 0)
-    : 0;
+  const visibleStaleCount = showStale ? projectStats.reduce((s, ps) => s + ps.plans.length, 0) : 0;
 
   const selectAllStale = useCallback(() => {
     const nowMs = Date.now();
@@ -186,7 +173,7 @@ export function ProjectDashboard() {
   const totalProjects = projectStats.length;
   const totalPlans = plans.length;
   const totalActiveAgents = agents.filter(
-    (a) => a.status === "running" || a.status === "starting"
+    (a) => a.status === "running" || a.status === "starting",
   ).length;
   const totalCost = plans.reduce((s, p) => s + (p.totalCostUsd ?? 0), 0);
 
@@ -209,11 +196,7 @@ export function ProjectDashboard() {
   }, [projectStats, selected]);
 
   if (loading && plans.length === 0) {
-    return (
-      <div className="flex items-center justify-center h-full text-gray-500">
-        Loading...
-      </div>
-    );
+    return <div className="flex items-center justify-center h-full text-gray-500">Loading...</div>;
   }
 
   if (plans.length === 0) {
@@ -222,9 +205,7 @@ export function ProjectDashboard() {
         <div className="text-center">
           <div className="text-4xl mb-3 text-gray-700">&#9776;</div>
           <p className="text-gray-500">No plans yet</p>
-          <p className="text-xs text-gray-600 mt-1">
-            Plans are loaded from ~/.claude/plans/
-          </p>
+          <p className="text-xs text-gray-600 mt-1">Plans are loaded from ~/.claude/plans/</p>
         </div>
       </div>
     );
@@ -261,9 +242,7 @@ export function ProjectDashboard() {
             {totalCost > 0 && (
               <>
                 <span className="text-gray-700">/</span>
-                <span className="text-amber-400">
-                  Total cost ${totalCost.toFixed(2)}
-                </span>
+                <span className="text-amber-400">Total cost ${totalCost.toFixed(2)}</span>
               </>
             )}
           </div>
@@ -285,9 +264,7 @@ export function ProjectDashboard() {
           </button>
           <button
             type="button"
-            onClick={() =>
-              selectionMode ? exitSelectionMode() : setSelectionMode(true)
-            }
+            onClick={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
             aria-pressed={selectionMode}
             className={`px-3 py-1.5 text-xs rounded border transition ${
               selectionMode
@@ -295,9 +272,7 @@ export function ProjectDashboard() {
                 : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600 hover:text-gray-100"
             }`}
             title={
-              selectionMode
-                ? "Exit selection mode"
-                : "Pick multiple plans to delete in one batch"
+              selectionMode ? "Exit selection mode" : "Pick multiple plans to delete in one batch"
             }
           >
             {selectionMode ? "Cancel selection" : "Select"}
@@ -315,9 +290,9 @@ export function ProjectDashboard() {
               <>No stale plans &mdash; your dashboard is clean.</>
             ) : (
               <>
-                Showing <span className="font-mono">{visibleStaleCount}</span>{" "}
-                plan{visibleStaleCount !== 1 ? "s" : ""} that look retireable
-                (completed, auto-named, &gt; 30 days old).
+                Showing <span className="font-mono">{visibleStaleCount}</span> plan
+                {visibleStaleCount !== 1 ? "s" : ""} that look retireable (completed, auto-named,
+                &gt; 30 days old).
               </>
             )}
           </div>
@@ -409,10 +384,7 @@ function ProjectCard({
   onToggleSelect,
   forceExpandDone = false,
 }: ProjectCardProps) {
-  const pct =
-    stats.totalTasks > 0
-      ? Math.round((stats.doneTasks / stats.totalTasks) * 100)
-      : 0;
+  const pct = stats.totalTasks > 0 ? Math.round((stats.doneTasks / stats.totalTasks) * 100) : 0;
   const isUnassigned = stats.name === "Unassigned";
   const allDone = stats.totalTasks > 0 && stats.doneTasks === stats.totalTasks;
 
@@ -442,25 +414,15 @@ function ProjectCard({
           <Stat
             label="Plans"
             value={stats.plans.length}
-            sub={
-              stats.donePlans.length > 0
-                ? `${stats.donePlans.length} done`
-                : undefined
-            }
+            sub={stats.donePlans.length > 0 ? `${stats.donePlans.length} done` : undefined}
           />
           <Stat
             label="Tasks"
-            value={
-              stats.totalTasks > 0
-                ? `${stats.doneTasks}/${stats.totalTasks}`
-                : "-"
-            }
+            value={stats.totalTasks > 0 ? `${stats.doneTasks}/${stats.totalTasks}` : "-"}
           />
           <Stat
             label="Cost"
-            value={
-              stats.totalCost > 0 ? `$${stats.totalCost.toFixed(2)}` : "-"
-            }
+            value={stats.totalCost > 0 ? `$${stats.totalCost.toFixed(2)}` : "-"}
             valueClass={stats.totalCost > 0 ? "text-amber-400" : undefined}
           />
           <Stat label="Updated" value={formatRelative(stats.lastActivity) || "-"} />
@@ -500,9 +462,7 @@ function ProjectCard({
           ))
         ) : (
           <div className="px-4 py-3 text-xs text-gray-600">
-            {stats.donePlans.length > 0
-              ? "All plans completed"
-              : "No plans yet"}
+            {stats.donePlans.length > 0 ? "All plans completed" : "No plans yet"}
           </div>
         )}
 
@@ -534,14 +494,8 @@ function Stat({
 }) {
   return (
     <div>
-      <div className="text-[10px] uppercase tracking-wider text-gray-600">
-        {label}
-      </div>
-      <div
-        className={`text-sm font-mono font-medium truncate ${
-          valueClass ?? "text-gray-200"
-        }`}
-      >
+      <div className="text-[10px] uppercase tracking-wider text-gray-600">{label}</div>
+      <div className={`text-sm font-mono font-medium truncate ${valueClass ?? "text-gray-200"}`}>
         {value}
       </div>
       {sub && <div className="text-[10px] text-gray-600">{sub}</div>}
@@ -566,13 +520,10 @@ function PlanRow({
   selected,
   onToggleSelect,
 }: PlanRowProps) {
-  const pct =
-    plan.taskCount > 0 ? Math.round((plan.doneCount / plan.taskCount) * 100) : 0;
+  const pct = plan.taskCount > 0 ? Math.round((plan.doneCount / plan.taskCount) * 100) : 0;
   const agents = useAgentStore((s) => s.agents);
   const planActive = agents.filter(
-    (a) =>
-      a.plan_name === plan.name &&
-      (a.status === "running" || a.status === "starting")
+    (a) => a.plan_name === plan.name && (a.status === "running" || a.status === "starting"),
   ).length;
 
   // Selection mode: render the row as a <label> wrapping the
@@ -589,9 +540,7 @@ function PlanRow({
     <>
       <div className="flex-1 min-w-0">
         <div className="text-sm text-gray-200 truncate flex items-center gap-1.5">
-          {dimmed && (
-            <span className="text-emerald-600 text-[10px]">&#10003;</span>
-          )}
+          {dimmed && <span className="text-emerald-600 text-[10px]">&#10003;</span>}
           <span className="truncate">{plan.title}</span>
           {planActive > 0 && (
             <span className="flex-shrink-0 inline-flex items-center gap-1 text-[10px] text-emerald-400">
@@ -602,13 +551,9 @@ function PlanRow({
         </div>
         <div className="text-[10px] font-mono text-gray-600 truncate flex items-center gap-2">
           <span className="truncate">{plan.name}</span>
-          <span className="flex-shrink-0 text-gray-700">
-            {formatRelative(plan.modifiedAt)}
-          </span>
+          <span className="flex-shrink-0 text-gray-700">{formatRelative(plan.modifiedAt)}</span>
           {plan.totalCostUsd != null && plan.totalCostUsd > 0 && (
-            <span className="flex-shrink-0 text-amber-500/80">
-              ${plan.totalCostUsd.toFixed(2)}
-            </span>
+            <span className="flex-shrink-0 text-amber-500/80">${plan.totalCostUsd.toFixed(2)}</span>
           )}
         </div>
       </div>
@@ -619,15 +564,11 @@ function PlanRow({
               {plan.doneCount}/{plan.taskCount}
             </span>
           )}
-          <span className="font-mono text-gray-400 w-8 text-right">
-            {pct}%
-          </span>
+          <span className="font-mono text-gray-400 w-8 text-right">{pct}%</span>
         </div>
         <div className="w-24 h-1 bg-gray-800 rounded-full overflow-hidden mt-1">
           <div
-            className={`h-full rounded-full ${
-              pct === 100 ? "bg-emerald-500" : "bg-indigo-500"
-            }`}
+            className={`h-full rounded-full ${pct === 100 ? "bg-emerald-500" : "bg-indigo-500"}`}
             style={{ width: `${pct}%` }}
           />
         </div>
@@ -638,9 +579,7 @@ function PlanRow({
   if (selectionMode) {
     return (
       <label
-        className={`${rowBase} ${dimmedClass} cursor-pointer ${
-          selected ? "bg-indigo-900/20" : ""
-        }`}
+        className={`${rowBase} ${dimmedClass} cursor-pointer ${selected ? "bg-indigo-900/20" : ""}`}
       >
         <input
           type="checkbox"

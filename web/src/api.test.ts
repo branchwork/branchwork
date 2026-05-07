@@ -21,27 +21,22 @@ interface CallLog {
 
 function installFetchMock(handler: FetchHandler) {
   const calls: CallLog[] = [];
-  const fn = vi.fn(
-    async (input: string | URL | Request, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.pathname + input.search
-            : input.url;
-      const method = init?.method ?? "GET";
-      calls.push({ url, method });
-      const { status, body, statusText } = handler(url, method);
-      return new Response(
-        body !== undefined ? JSON.stringify(body) : null,
-        {
-          status,
-          statusText,
-          headers: { "Content-Type": "application/json" },
-        },
-      );
-    },
-  );
+  const fn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.pathname + input.search
+          : input.url;
+    const method = init?.method ?? "GET";
+    calls.push({ url, method });
+    const { status, body, statusText } = handler(url, method);
+    return new Response(body !== undefined ? JSON.stringify(body) : null, {
+      status,
+      statusText,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
   vi.stubGlobal("fetch", fn);
   return { calls, fn };
 }
@@ -91,10 +86,7 @@ describe("fetchJson session-expiry interceptor", () => {
     // re-treated as session-expiry. Both fetches happen exactly once;
     // the inner one falls through to plain HttpError (which logout's
     // try/catch swallows) rather than re-entering the 401 branch.
-    expect(calls.map((c) => c.url)).toEqual([
-      "/api/plans",
-      "/api/auth/logout",
-    ]);
+    expect(calls.map((c) => c.url)).toEqual(["/api/plans", "/api/auth/logout"]);
   });
 
   it("does not fire the session-expired toast on a 401 from the bootstrap probe (user is null)", async () => {

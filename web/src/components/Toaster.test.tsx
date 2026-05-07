@@ -18,9 +18,7 @@ describe("Toaster", () => {
   it("renders a pushed toast title and body", () => {
     render(<Toaster />);
     act(() => {
-      useToastStore
-        .getState()
-        .push({ kind: "info", title: "Hello", body: "world" });
+      useToastStore.getState().push({ kind: "info", title: "Hello", body: "world" });
     });
     expect(screen.getByText("Hello")).toBeTruthy();
     expect(screen.getByText("world")).toBeTruthy();

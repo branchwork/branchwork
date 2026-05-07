@@ -85,9 +85,7 @@ export function Dropdown({
     const root = menuRef.current;
     if (!root) return [];
     return Array.from(
-      root.querySelectorAll<HTMLElement>(
-        '[role="menuitem"]:not([data-disabled="true"])',
-      ),
+      root.querySelectorAll<HTMLElement>('[role="menuitem"]:not([data-disabled="true"])'),
     );
   }, []);
 
@@ -139,10 +137,7 @@ export function Dropdown({
         }
         case "ArrowUp": {
           e.preventDefault();
-          const next =
-            current < 0
-              ? items.length - 1
-              : (current - 1 + items.length) % items.length;
+          const next = current < 0 ? items.length - 1 : (current - 1 + items.length) % items.length;
           items[next]?.focus();
           break;
         }
@@ -217,8 +212,10 @@ export function Dropdown({
   );
 }
 
-interface DropdownItemProps
-  extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "onSelect" | "role"> {
+interface DropdownItemProps extends Omit<
+  ButtonHTMLAttributes<HTMLButtonElement>,
+  "onSelect" | "role"
+> {
   /// Called when the item is activated (click or Enter/Space). The
   /// containing `Dropdown` does not auto-close — call the consumer's
   /// close hook (or just rely on the next state change to unmount the

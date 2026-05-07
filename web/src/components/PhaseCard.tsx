@@ -53,11 +53,7 @@ export const VIRTUALIZATION_THRESHOLD = 30;
 // (1/2/3 to mirror the Tailwind grid), each row is a virtual item.
 // Dynamic measurement via `virtualizer.measureElement` lets variable
 // TaskCard heights compose without a fixed estimate.
-function VirtualizedTaskGrid({
-  tasks,
-  planName,
-  phaseNumber,
-}: VirtualizedTaskGridProps) {
+function VirtualizedTaskGrid({ tasks, planName, phaseNumber }: VirtualizedTaskGridProps) {
   const cols = useResponsiveColumns();
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollEl = useScrollParent(containerRef);
@@ -82,12 +78,7 @@ function VirtualizedTaskGrid({
   });
 
   const items = virtualizer.getVirtualItems();
-  const colsClass =
-    cols === 3
-      ? "grid-cols-3"
-      : cols === 2
-        ? "grid-cols-2"
-        : "grid-cols-1";
+  const colsClass = cols === 3 ? "grid-cols-3" : cols === 2 ? "grid-cols-2" : "grid-cols-1";
 
   return (
     <div ref={containerRef} className="px-3 pb-3">
@@ -130,20 +121,11 @@ function VirtualizedTaskGrid({
   );
 }
 
-function StaticTaskGrid({
-  tasks,
-  planName,
-  phaseNumber,
-}: VirtualizedTaskGridProps) {
+function StaticTaskGrid({ tasks, planName, phaseNumber }: VirtualizedTaskGridProps) {
   return (
     <div className="px-3 pb-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
       {tasks.map((task) => (
-        <TaskCard
-          key={task.number}
-          task={task}
-          planName={planName}
-          phaseNumber={phaseNumber}
-        />
+        <TaskCard key={task.number} task={task} planName={planName} phaseNumber={phaseNumber} />
       ))}
     </div>
   );
@@ -159,12 +141,8 @@ function TaskGrid(props: VirtualizedTaskGridProps) {
 
 function PhaseCardInner({ phase, planName, statusFilter }: Props) {
   const total = phase.tasks.length;
-  const done = phase.tasks.filter(
-    (t) => t.status === "completed" || t.status === "skipped"
-  ).length;
-  const inProgress = phase.tasks.filter(
-    (t) => t.status === "in_progress"
-  ).length;
+  const done = phase.tasks.filter((t) => t.status === "completed" || t.status === "skipped").length;
+  const inProgress = phase.tasks.filter((t) => t.status === "in_progress").length;
   const pending = total - done - inProgress;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   const allDone = total > 0 && done === total;
@@ -179,7 +157,7 @@ function PhaseCardInner({ phase, planName, statusFilter }: Props) {
     : phase.tasks;
 
   const eligibleCount = phase.tasks.filter(
-    (t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending")
+    (t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending"),
   ).length;
 
   function openConfirm(e: React.MouseEvent) {
@@ -203,15 +181,13 @@ function PhaseCardInner({ phase, planName, statusFilter }: Props) {
   return (
     <div
       className={`rounded-lg border transition ${
-        allDone
-          ? "border-gray-800/50 bg-gray-900/50"
-          : "border-gray-800 bg-gray-900"
+        allDone ? "border-gray-800/50 bg-gray-900/50" : "border-gray-800 bg-gray-900"
       }`}
     >
       {/* Phase header — always visible, clickable. Uses a div instead of a
-        * button so the nested "Check" <button> below stays HTML-valid (a
-        * <button> cannot legally contain another <button>; React flags it
-        * as a hydration error in dev). */}
+       * button so the nested "Check" <button> below stays HTML-valid (a
+       * <button> cannot legally contain another <button>; React flags it
+       * as a hydration error in dev). */}
       <div
         role="button"
         tabIndex={0}
@@ -226,7 +202,9 @@ function PhaseCardInner({ phase, planName, statusFilter }: Props) {
       >
         <div className="flex items-center gap-3">
           {/* Expand arrow */}
-          <span className={`text-[10px] text-gray-600 transition-transform ${expanded ? "rotate-90" : ""}`}>
+          <span
+            className={`text-[10px] text-gray-600 transition-transform ${expanded ? "rotate-90" : ""}`}
+          >
             &#9654;
           </span>
 
@@ -236,15 +214,17 @@ function PhaseCardInner({ phase, planName, statusFilter }: Props) {
               allDone
                 ? "bg-emerald-600/20 text-emerald-400"
                 : inProgress > 0
-                ? "bg-amber-600/20 text-amber-400"
-                : "bg-indigo-600/20 text-indigo-400"
+                  ? "bg-amber-600/20 text-amber-400"
+                  : "bg-indigo-600/20 text-indigo-400"
             }`}
           >
             Phase {phase.number}
           </span>
 
           {/* Title */}
-          <span className={`text-sm font-semibold truncate ${allDone ? "text-gray-500" : "text-gray-200"}`}>
+          <span
+            className={`text-sm font-semibold truncate ${allDone ? "text-gray-500" : "text-gray-200"}`}
+          >
             {phase.title}
           </span>
 
@@ -252,15 +232,9 @@ function PhaseCardInner({ phase, planName, statusFilter }: Props) {
           <div className="ml-auto flex items-center gap-3 flex-shrink-0">
             {/* Status counts */}
             <div className="flex items-center gap-2 text-[10px]">
-              {done > 0 && (
-                <span className="text-emerald-400">{done} done</span>
-              )}
-              {inProgress > 0 && (
-                <span className="text-amber-400">{inProgress} active</span>
-              )}
-              {pending > 0 && (
-                <span className="text-gray-500">{pending} pending</span>
-              )}
+              {done > 0 && <span className="text-emerald-400">{done} done</span>}
+              {inProgress > 0 && <span className="text-amber-400">{inProgress} active</span>}
+              {pending > 0 && <span className="text-gray-500">{pending} pending</span>}
             </div>
 
             {/* Progress bar */}
@@ -288,7 +262,9 @@ function PhaseCardInner({ phase, planName, statusFilter }: Props) {
             )}
 
             {/* Percentage */}
-            <span className={`text-xs font-mono w-8 text-right ${allDone ? "text-emerald-400" : "text-gray-500"}`}>
+            <span
+              className={`text-xs font-mono w-8 text-right ${allDone ? "text-emerald-400" : "text-gray-500"}`}
+            >
               {pct}%
             </span>
           </div>
@@ -302,11 +278,7 @@ function PhaseCardInner({ phase, planName, statusFilter }: Props) {
           with fewer tasks render the full grid for simpler keyboard
           navigation and zero virtualiser overhead. */}
       {expanded && filteredTasks.length > 0 && (
-        <TaskGrid
-          tasks={filteredTasks}
-          planName={planName}
-          phaseNumber={phase.number}
-        />
+        <TaskGrid tasks={filteredTasks} planName={planName} phaseNumber={phase.number} />
       )}
 
       {expanded && filteredTasks.length === 0 && phase.tasks.length > 0 && (

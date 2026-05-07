@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { DiagnosticsTab, formatUptime } from "./DiagnosticsTab.js";
 
 interface FetchCall {
@@ -86,30 +81,18 @@ describe("formatUptime", () => {
 describe("DiagnosticsTab", () => {
   it("fetches /api/health and /api/runners on mount and renders the values", async () => {
     render(<DiagnosticsTab refreshMs={60_000} />);
-    await waitFor(() =>
-      expect(screen.queryByTestId("diagnostics-version")).toBeTruthy(),
-    );
-    expect(screen.getByTestId("diagnostics-version").textContent).toBe(
-      "0.3.0",
-    );
-    expect(screen.getByTestId("diagnostics-uptime").textContent).toBe(
-      "1d 1h 1m",
-    );
-    expect(screen.getByTestId("diagnostics-ws-connections").textContent).toBe(
-      "3",
-    );
-    expect(screen.getByTestId("diagnostics-mode").textContent).toBe(
-      "standalone",
-    );
+    await waitFor(() => expect(screen.queryByTestId("diagnostics-version")).toBeTruthy());
+    expect(screen.getByTestId("diagnostics-version").textContent).toBe("0.3.0");
+    expect(screen.getByTestId("diagnostics-uptime").textContent).toBe("1d 1h 1m");
+    expect(screen.getByTestId("diagnostics-ws-connections").textContent).toBe("3");
+    expect(screen.getByTestId("diagnostics-mode").textContent).toBe("standalone");
     expect(calls.some((c) => c.url === "/api/health")).toBe(true);
     expect(calls.some((c) => c.url === "/api/runners")).toBe(true);
   });
 
   it("renders the standalone empty-state copy when there are no runners", async () => {
     render(<DiagnosticsTab refreshMs={60_000} />);
-    await waitFor(() =>
-      expect(screen.queryByTestId("diagnostics-no-runners")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.queryByTestId("diagnostics-no-runners")).toBeTruthy());
     expect(screen.getByTestId("diagnostics-no-runners").textContent).toMatch(
       /Standalone deployment/i,
     );
@@ -131,9 +114,7 @@ describe("DiagnosticsTab", () => {
       ],
     };
     render(<DiagnosticsTab refreshMs={60_000} />);
-    await waitFor(() =>
-      expect(screen.queryByTestId("diagnostics-runners-table")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.queryByTestId("diagnostics-runners-table")).toBeTruthy());
     expect(screen.getByText("edge-runner")).toBeTruthy();
     expect(screen.getByText("host-1")).toBeTruthy();
     // Status badge contains the literal "online" text.
@@ -180,8 +161,6 @@ describe("DiagnosticsTab", () => {
     healthStatus = 500;
     healthBody = { error: "kaboom" };
     render(<DiagnosticsTab refreshMs={60_000} />);
-    await waitFor(() =>
-      expect(screen.queryByText(/kaboom|http 500|server error/i)).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.queryByText(/kaboom|http 500|server error/i)).toBeTruthy());
   });
 });

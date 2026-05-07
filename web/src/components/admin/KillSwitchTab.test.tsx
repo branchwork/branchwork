@@ -1,11 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { KillSwitchTab } from "./KillSwitchTab.js";
 
 interface Call {
@@ -31,10 +25,9 @@ beforeEach(() => {
     }
     calls.push({ url, method, body });
     if (url === "/api/orgs/acme/budget" && method === "GET") {
-      return new Response(
-        JSON.stringify({ budget: null, killSwitchActive: killState }),
-        { status: 200 },
-      );
+      return new Response(JSON.stringify({ budget: null, killSwitchActive: killState }), {
+        status: 200,
+      });
     }
     if (url === "/api/orgs/acme/kill-switch" && method === "PUT") {
       killState = (body as { active: boolean }).active;
@@ -61,18 +54,14 @@ describe("KillSwitchTab", () => {
     });
     fireEvent.click(screen.getByTestId("kill-activate"));
     await waitFor(() => {
-      const put = calls.find(
-        (c) => c.url === "/api/orgs/acme/kill-switch" && c.method === "PUT",
-      );
+      const put = calls.find((c) => c.url === "/api/orgs/acme/kill-switch" && c.method === "PUT");
       expect(put).toBeTruthy();
       expect(put?.body).toEqual({
         active: true,
         reason: "PoC blew the budget",
       });
     });
-    await waitFor(() =>
-      expect(screen.getByTestId("kill-state").textContent).toMatch(/Active/),
-    );
+    await waitFor(() => expect(screen.getByTestId("kill-state").textContent).toMatch(/Active/));
   });
 
   it("activate with empty reason sends reason: null (no empty-string)", async () => {
@@ -80,9 +69,7 @@ describe("KillSwitchTab", () => {
     await waitFor(() => expect(screen.getByTestId("kill-state")).toBeTruthy());
     fireEvent.click(screen.getByTestId("kill-activate"));
     await waitFor(() => {
-      const put = calls.find(
-        (c) => c.url === "/api/orgs/acme/kill-switch" && c.method === "PUT",
-      );
+      const put = calls.find((c) => c.url === "/api/orgs/acme/kill-switch" && c.method === "PUT");
       expect(put).toBeTruthy();
       expect(put?.body).toEqual({ active: true, reason: null });
     });
@@ -94,9 +81,7 @@ describe("KillSwitchTab", () => {
     await waitFor(() => expect(screen.getByTestId("kill-state")).toBeTruthy());
     fireEvent.click(screen.getByTestId("kill-deactivate"));
     await waitFor(() => {
-      const put = calls.find(
-        (c) => c.url === "/api/orgs/acme/kill-switch" && c.method === "PUT",
-      );
+      const put = calls.find((c) => c.url === "/api/orgs/acme/kill-switch" && c.method === "PUT");
       expect(put).toBeTruthy();
       expect(put?.body).toEqual({ active: false, reason: null });
     });

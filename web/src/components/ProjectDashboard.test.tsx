@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  screen,
-  within,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
 import {
   ProjectDashboard,
@@ -49,14 +44,13 @@ describe("STALE_PLAN_NAME_RE", () => {
   // Acceptance examples are pinned by the plan task brief; loosening the
   // regex risks flagging hand-named plans as stale and silently deleting
   // active work, so any change here MUST keep these green.
-  it.each([
-    "enumerated-crafting-puffin",
-    "cosmic-toasting-lagoon",
-    "steady-prancing-squid",
-  ])("matches CLI auto-named slug %s", (name) => {
-    expect(STALE_PLAN_NAME_RE.test(name)).toBe(true);
-    expect(isAutoNamedPlan(name)).toBe(true);
-  });
+  it.each(["enumerated-crafting-puffin", "cosmic-toasting-lagoon", "steady-prancing-squid"])(
+    "matches CLI auto-named slug %s",
+    (name) => {
+      expect(STALE_PLAN_NAME_RE.test(name)).toBe(true);
+      expect(isAutoNamedPlan(name)).toBe(true);
+    },
+  );
 
   it.each([
     "unify-check-prompts",
@@ -282,20 +276,12 @@ describe("ProjectDashboard stale filter", () => {
     expect(footer.textContent).toMatch(/2\s+plans selected/);
     // Both stale rows are now checked. Each plan title sits inside a
     // <label> wrapping the checkbox once selection mode kicks in.
-    const cosmicLabel = screen
-      .getByText("Cosmic Toasting Lagoon")
-      .closest("label");
+    const cosmicLabel = screen.getByText("Cosmic Toasting Lagoon").closest("label");
     expect(cosmicLabel).not.toBeNull();
-    const cosmicBox = within(cosmicLabel as HTMLElement).getByRole(
-      "checkbox",
-    ) as HTMLInputElement;
+    const cosmicBox = within(cosmicLabel as HTMLElement).getByRole("checkbox") as HTMLInputElement;
     expect(cosmicBox.checked).toBe(true);
-    const squidLabel = screen
-      .getByText("Steady Prancing Squid")
-      .closest("label");
-    const squidBox = within(squidLabel as HTMLElement).getByRole(
-      "checkbox",
-    ) as HTMLInputElement;
+    const squidLabel = screen.getByText("Steady Prancing Squid").closest("label");
+    const squidBox = within(squidLabel as HTMLElement).getByRole("checkbox") as HTMLInputElement;
     expect(squidBox.checked).toBe(true);
   });
 });
@@ -358,9 +344,7 @@ describe("ProjectDashboard render with plans", () => {
     usePlanStore.setState({ plans: [], loading: false });
     render(<ProjectDashboard />);
     expect(screen.getByText("No plans yet")).toBeTruthy();
-    expect(
-      screen.getByText(/Plans are loaded from ~\/.claude\/plans\//i),
-    ).toBeTruthy();
+    expect(screen.getByText(/Plans are loaded from ~\/.claude\/plans\//i)).toBeTruthy();
   });
 });
 

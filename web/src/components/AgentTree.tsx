@@ -53,9 +53,7 @@ export function AgentTree() {
   // we keep the visual tree shape via per-row paddingLeft.
   const flatRows = useMemo(() => {
     const filteredIds = new Set(filtered.map((a) => a.id));
-    const roots = filtered.filter(
-      (a) => !a.parent_agent_id || !filteredIds.has(a.parent_agent_id),
-    );
+    const roots = filtered.filter((a) => !a.parent_agent_id || !filteredIds.has(a.parent_agent_id));
     const byParent = new Map<string, Agent[]>();
     for (const a of filtered) {
       if (!a.parent_agent_id) continue;
@@ -117,18 +115,14 @@ export function AgentTree() {
             />
             <span className="sr-only">Status: {agent.status}</span>
             <span className="text-sm font-medium truncate">
-              {agent.plan_name
-                ? `Task ${agent.task_id}`
-                : `Agent ${agent.id.slice(0, 8)}`}
+              {agent.plan_name ? `Task ${agent.task_id}` : `Agent ${agent.id.slice(0, 8)}`}
             </span>
             {driverCapabilities(agent.driver).supports_cost && agent.cost_usd != null && (
               <span className="text-[10px] text-amber-500/80 font-mono flex-shrink-0">
                 ${agent.cost_usd.toFixed(4)}
               </span>
             )}
-            <span className="text-[10px] text-gray-500 ml-auto flex-shrink-0">
-              {agent.status}
-            </span>
+            <span className="text-[10px] text-gray-500 ml-auto flex-shrink-0">{agent.status}</span>
           </div>
 
           <div className="mt-1 text-[11px] text-gray-500 space-y-0.5">
@@ -157,8 +151,8 @@ export function AgentTree() {
       <h2 className="text-xl font-bold mb-2 flex items-center gap-2 flex-wrap">
         <span>Agents</span>
         <span className="text-sm font-normal text-gray-500">
-          {agents.filter((a) => a.status === "running" || a.status === "starting").length} active
-          / {agents.length} total
+          {agents.filter((a) => a.status === "running" || a.status === "starting").length} active /{" "}
+          {agents.length} total
         </span>
         {/* Stale marker for the agent rows below. Self-gates on
             WS-disconnect + 60s of cache age. */}

@@ -80,16 +80,10 @@ export function RunnersPage() {
   // Avoids flashing "no runners yet" on a SaaS deployment that's only
   // briefly empty.
   if (!loaded) {
-    return (
-      <div className="p-6 max-w-4xl mx-auto text-sm text-gray-500">
-        Loading runners…
-      </div>
-    );
+    return <div className="p-6 max-w-4xl mx-auto text-sm text-gray-500">Loading runners…</div>;
   }
 
-  const inFlight = agents.filter(
-    (a) => a.status === "running" || a.status === "starting",
-  ).length;
+  const inFlight = agents.filter((a) => a.status === "running" || a.status === "starting").length;
 
   return (
     <div className="p-6 max-w-4xl mx-auto">
@@ -97,9 +91,9 @@ export function RunnersPage() {
         <div>
           <h1 className="text-xl font-bold text-gray-100">Runners</h1>
           <p className="text-xs text-gray-500 mt-1">
-            Remote runners execute agents on your hosts so the SaaS
-            dashboard never touches your filesystem. Enrol one, copy the
-            install command, and start the runner on the target machine.
+            Remote runners execute agents on your hosts so the SaaS dashboard never touches your
+            filesystem. Enrol one, copy the install command, and start the runner on the target
+            machine.
           </p>
         </div>
         <Button
@@ -118,10 +112,7 @@ export function RunnersPage() {
         <RunnerList runners={runners} inFlightAgents={inFlight} />
       )}
 
-      <RunnerEnrollModal
-        open={enrollOpen}
-        onClose={() => setEnrollOpen(false)}
-      />
+      <RunnerEnrollModal open={enrollOpen} onClose={() => setEnrollOpen(false)} />
     </div>
   );
 }
@@ -145,18 +136,12 @@ function EmptyState({ onEnroll }: { onEnroll: () => void }) {
   );
 }
 
-function RunnerList({
-  runners,
-  inFlightAgents,
-}: {
-  runners: Runner[];
-  inFlightAgents: number;
-}) {
+function RunnerList({ runners, inFlightAgents }: { runners: Runner[]; inFlightAgents: number }) {
   return (
     <div data-testid="runners-list">
       <p className="text-[11px] text-gray-500 mb-2">
-        {runners.length} runner{runners.length === 1 ? "" : "s"} ·{" "}
-        {inFlightAgents} agent{inFlightAgents === 1 ? "" : "s"} in flight
+        {runners.length} runner{runners.length === 1 ? "" : "s"} · {inFlightAgents} agent
+        {inFlightAgents === 1 ? "" : "s"} in flight
       </p>
       <ul className="divide-y divide-gray-800 border border-gray-800 rounded">
         {runners.map((r) => (
@@ -172,20 +157,14 @@ const EMPTY_DRIVERS: RunnerDriverInfo[] = [];
 function RunnerRow({ runner }: { runner: Runner }) {
   const status = runner.status ?? "unknown";
   const statusClass =
-    status === "online"
-      ? "bg-emerald-500"
-      : status === "offline"
-        ? "bg-red-500"
-        : "bg-gray-500";
+    status === "online" ? "bg-emerald-500" : status === "offline" ? "bg-red-500" : "bg-gray-500";
   const label = runner.name?.trim() || runner.id.slice(0, 8);
   // Subscribe via stable references only — returning a fresh `[]` from
   // the selector tripped React's getSnapshot warning and caused an
   // infinite re-render loop. We pull the map slot directly and fall
   // back to the row's persisted `runner.drivers` (or a hoisted empty
   // array) outside the selector.
-  const driversFromStore = useRunnerStore(
-    (s) => s.driversByRunnerId[runner.id],
-  );
+  const driversFromStore = useRunnerStore((s) => s.driversByRunnerId[runner.id]);
   const drivers = driversFromStore ?? runner.drivers ?? EMPTY_DRIVERS;
   const selectedRunnerId = useRunnerStore((s) => s.selectedRunnerId);
   const setSelectedRunnerId = useRunnerStore((s) => s.setSelectedRunnerId);
@@ -196,14 +175,9 @@ function RunnerRow({ runner }: { runner: Runner }) {
     <li className="px-4 py-3" data-testid="runner-row">
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
-          <span
-            aria-hidden="true"
-            className={`inline-block w-2 h-2 rounded-full ${statusClass}`}
-          />
+          <span aria-hidden="true" className={`inline-block w-2 h-2 rounded-full ${statusClass}`} />
           <div className="min-w-0">
-            <div className="text-sm text-gray-100 font-mono truncate">
-              {label}
-            </div>
+            <div className="text-sm text-gray-100 font-mono truncate">{label}</div>
             <div className="text-[11px] text-gray-500 capitalize">{status}</div>
           </div>
         </div>
@@ -215,9 +189,7 @@ function RunnerRow({ runner }: { runner: Runner }) {
             ) : (
               <div>Never seen</div>
             )}
-            {runner.createdAt && (
-              <div>Enrolled {formatRelative(runner.createdAt)}</div>
-            )}
+            {runner.createdAt && <div>Enrolled {formatRelative(runner.createdAt)}</div>}
           </div>
           <button
             type="button"
@@ -251,9 +223,7 @@ function RunnerRow({ runner }: { runner: Runner }) {
         {runner.hostname && (
           <div>
             <dt className="inline text-gray-600">Host: </dt>
-            <dd className="inline font-mono text-gray-400">
-              {runner.hostname}
-            </dd>
+            <dd className="inline font-mono text-gray-400">{runner.hostname}</dd>
           </div>
         )}
         {runner.version && (
@@ -293,10 +263,7 @@ function RunnerSettings({ runnerId }: { runnerId: string }) {
       .finally(() => setLoading(false));
   }, [runnerId, config, fetchRunnerConfig]);
 
-  async function commit(patch: {
-    effort?: string | null;
-    skipPermissions?: boolean | null;
-  }) {
+  async function commit(patch: { effort?: string | null; skipPermissions?: boolean | null }) {
     setSaving(true);
     setError(null);
     try {
@@ -311,9 +278,7 @@ function RunnerSettings({ runnerId }: { runnerId: string }) {
   }
 
   if (loading && !config) {
-    return (
-      <div className="mt-3 text-[11px] text-gray-500">Loading settings…</div>
-    );
+    return <div className="mt-3 text-[11px] text-gray-500">Loading settings…</div>;
   }
   if (!config) {
     return (
@@ -328,8 +293,7 @@ function RunnerSettings({ runnerId }: { runnerId: string }) {
   // Server default is the *effective* value when the override is null —
   // the absence of an override means the resolved value IS the server
   // default. Cache it so the dropdown can show "Inherit (high)".
-  const inheritedEffort =
-    effortOverride === null ? config.effort : null;
+  const inheritedEffort = effortOverride === null ? config.effort : null;
 
   return (
     <div
@@ -341,10 +305,7 @@ function RunnerSettings({ runnerId }: { runnerId: string }) {
       </h3>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <SettingRow
-          label="Effort"
-          description="Reasoning level passed to agents on this runner."
-        >
+        <SettingRow label="Effort" description="Reasoning level passed to agents on this runner.">
           <select
             value={effortOverride ?? INHERIT_VALUE}
             onChange={(e) => {
@@ -371,8 +332,8 @@ function RunnerSettings({ runnerId }: { runnerId: string }) {
           label="Skip permissions"
           description={
             <>
-              Pass <code className="text-gray-400">--dangerously-skip-permissions</code>{" "}
-              for Claude agents on this runner.
+              Pass <code className="text-gray-400">--dangerously-skip-permissions</code> for Claude
+              agents on this runner.
             </>
           }
         >
@@ -388,9 +349,7 @@ function RunnerSettings({ runnerId }: { runnerId: string }) {
 
       <div className="mt-2 flex items-center gap-2 text-[11px]">
         {saving && <span className="text-gray-500">Saving…</span>}
-        {!saving && savedAt && (
-          <span className="text-emerald-400">Saved.</span>
-        )}
+        {!saving && savedAt && <span className="text-emerald-400">Saved.</span>}
         {error && <Banner className="grow">{error}</Banner>}
       </div>
     </div>
@@ -409,9 +368,7 @@ function SettingRow({
   return (
     <div>
       <div className="text-xs font-medium text-gray-300">{label}</div>
-      <p className="text-[11px] text-gray-500 mt-0.5 mb-1.5 leading-relaxed">
-        {description}
-      </p>
+      <p className="text-[11px] text-gray-500 mt-0.5 mb-1.5 leading-relaxed">{description}</p>
       {children}
     </div>
   );
@@ -430,8 +387,7 @@ function SkipTriState({
   onChange: (next: boolean | null) => void;
   testId: string;
 }) {
-  const value =
-    override === null ? INHERIT_VALUE : override ? "on" : "off";
+  const value = override === null ? INHERIT_VALUE : override ? "on" : "off";
   // When no override is set, the effective value IS the server default,
   // so showing "(on)/(off)" next to "Inherit" is the closest hint.
   const inheritedHint = override === null ? (effective ? "on" : "off") : null;
@@ -455,7 +411,6 @@ function SkipTriState({
     </select>
   );
 }
-
 
 /// "N drivers · M ready" chip that expands on hover/click into per-driver
 /// auth state. `ready` counts every driver whose state isn't
@@ -494,16 +449,9 @@ function DriverInventoryChip({ drivers }: { drivers: RunnerDriverInfo[] }) {
             {drivers.map((d) => {
               const ok = isDriverStateReady(d.status);
               return (
-                <li
-                  key={d.name}
-                  className="flex items-center justify-between px-3 py-1"
-                >
+                <li key={d.name} className="flex items-center justify-between px-3 py-1">
                   <span className="font-mono text-gray-200">{d.name}</span>
-                  <span
-                    className={`font-mono ${
-                      ok ? "text-emerald-400" : "text-red-400"
-                    }`}
-                  >
+                  <span className={`font-mono ${ok ? "text-emerald-400" : "text-red-400"}`}>
                     {driverStateLabel(d.status)}
                   </span>
                 </li>

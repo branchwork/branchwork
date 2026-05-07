@@ -32,9 +32,7 @@ export function PlanBoard() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmCheckAll, setConfirmCheckAll] = useState(false);
-  const planArchiveRetentionDays = useSettingsStore(
-    (s) => s.planArchiveRetentionDays,
-  );
+  const planArchiveRetentionDays = useSettingsStore((s) => s.planArchiveRetentionDays);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const savePlan = usePlanStore((s) => s.savePlan);
   const driverCapabilities = useSettingsStore((s) => s.driverCapabilities);
@@ -61,11 +59,7 @@ export function PlanBoard() {
   }, [plan]);
 
   if (loading) {
-    return (
-      <div className="flex items-center justify-center h-full text-gray-500">
-        Loading...
-      </div>
-    );
+    return <div className="flex items-center justify-center h-full text-gray-500">Loading...</div>;
   }
 
   if (!plan) return null;
@@ -73,9 +67,7 @@ export function PlanBoard() {
   // Aggregate stats
   const allTasks = plan.phases.flatMap((p) => p.tasks);
   const total = allTasks.length;
-  const done = allTasks.filter(
-    (t) => t.status === "completed" || t.status === "skipped"
-  ).length;
+  const done = allTasks.filter((t) => t.status === "completed" || t.status === "skipped").length;
   const inProgress = allTasks.filter((t) => t.status === "in_progress").length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
@@ -110,10 +102,7 @@ export function PlanBoard() {
     if (!plan) return;
     setCheckingPlan(true);
     try {
-      const res = await postJson<{ agentId: string }>(
-        `/api/plans/${plan.name}/check`,
-        {},
-      );
+      const res = await postJson<{ agentId: string }>(`/api/plans/${plan.name}/check`, {});
       selectAgent(res.agentId);
       goToAgent(res.agentId);
     } catch (e) {
@@ -149,8 +138,7 @@ export function PlanBoard() {
 
   const pendingCheckCount = plan.phases
     .flatMap((p) => p.tasks)
-    .filter((t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending"))
-    .length;
+    .filter((t) => !["completed", "skipped", "checking"].includes(t.status ?? "pending")).length;
 
   return (
     <div className="p-6">
@@ -164,14 +152,25 @@ export function PlanBoard() {
             </span>
           )}
           <span className="text-gray-600">
-            Created {new Date(plan.createdAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+            Created{" "}
+            {new Date(plan.createdAt).toLocaleDateString("en-US", {
+              month: "short",
+              day: "numeric",
+              year: "numeric",
+            })}
             {plan.modifiedAt !== plan.createdAt && (
-              <> / Modified {new Date(plan.modifiedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</>
+              <>
+                {" "}
+                / Modified{" "}
+                {new Date(plan.modifiedAt).toLocaleDateString("en-US", {
+                  month: "short",
+                  day: "numeric",
+                  year: "numeric",
+                })}
+              </>
             )}
           </span>
-          {isMd && (
-            <span className="text-amber-500/60 font-mono">.md</span>
-          )}
+          {isMd && <span className="text-amber-500/60 font-mono">.md</span>}
           {/* Stale-data marker. Self-gates on WS-disconnect + 60s of
               cache age — surfaces "this plan view may be out of date"
               right alongside the displayed Modified timestamp. */}
@@ -195,14 +194,15 @@ export function PlanBoard() {
             )}
           </span>
           {driverCapabilities((plan as ParsedPlan & { driver?: string }).driver).supports_cost &&
-            plan.totalCostUsd != null && plan.totalCostUsd > 0 && (
-            <span
-              className="text-xs text-amber-400 bg-amber-900/20 border border-amber-800/30 px-2 py-0.5 rounded"
-              title="Total agent cost for this plan"
-            >
-              Total cost: ${plan.totalCostUsd.toFixed(2)}
-            </span>
-          )}
+            plan.totalCostUsd != null &&
+            plan.totalCostUsd > 0 && (
+              <span
+                className="text-xs text-amber-400 bg-amber-900/20 border border-amber-800/30 px-2 py-0.5 rounded"
+                title="Total agent cost for this plan"
+              >
+                Total cost: ${plan.totalCostUsd.toFixed(2)}
+              </span>
+            )}
           <BudgetBadge plan={plan} />
           <AutoModeStatusPill planName={plan.name} />
         </div>
@@ -340,7 +340,12 @@ export function PlanBoard() {
       <CompletedTasksContext.Provider value={completedSet}>
         <div className="space-y-3 pb-4">
           {plan.phases.map((phase) => (
-            <PhaseCard key={phase.number} phase={phase} planName={plan.name} statusFilter={statusFilter} />
+            <PhaseCard
+              key={phase.number}
+              phase={phase}
+              planName={plan.name}
+              statusFilter={statusFilter}
+            />
           ))}
         </div>
       </CompletedTasksContext.Provider>
@@ -479,7 +484,9 @@ function VerificationSection({ verification }: { verification: string | null }) 
         onClick={() => setExpanded((v) => !v)}
         className="w-full flex items-center gap-2 text-left text-xs text-gray-500 hover:text-gray-300 transition"
       >
-        <span className={`text-[10px] text-gray-600 transition-transform ${expanded ? "rotate-90" : ""}`}>
+        <span
+          className={`text-[10px] text-gray-600 transition-transform ${expanded ? "rotate-90" : ""}`}
+        >
           &#9654;
         </span>
         <span className="uppercase tracking-wide font-semibold">Verification</span>
@@ -497,9 +504,7 @@ function BudgetBadge({ plan }: { plan: ParsedPlan }) {
   const selectPlan = usePlanStore((s) => s.selectPlan);
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(
-    plan.maxBudgetUsd != null ? String(plan.maxBudgetUsd) : ""
-  );
+  const [draft, setDraft] = useState(plan.maxBudgetUsd != null ? String(plan.maxBudgetUsd) : "");
   const [saving, setSaving] = useState(false);
 
   const spent = plan.totalCostUsd ?? 0;
@@ -583,8 +588,8 @@ function BudgetBadge({ plan }: { plan: ParsedPlan }) {
   const classes = exceeded
     ? "text-red-400 bg-red-900/20 border-red-800/40"
     : approaching
-    ? "text-amber-300 bg-amber-900/30 border-amber-700/50"
-    : "text-emerald-400 bg-emerald-900/20 border-emerald-800/30";
+      ? "text-amber-300 bg-amber-900/30 border-amber-700/50"
+      : "text-emerald-400 bg-emerald-900/20 border-emerald-800/30";
 
   return (
     <button
@@ -597,8 +602,8 @@ function BudgetBadge({ plan }: { plan: ParsedPlan }) {
         exceeded
           ? "Budget exceeded -- new agents are blocked"
           : approaching
-          ? `Approaching budget limit (${pct.toFixed(0)}%)`
-          : `Under budget (${pct.toFixed(0)}%)`
+            ? `Approaching budget limit (${pct.toFixed(0)}%)`
+            : `Under budget (${pct.toFixed(0)}%)`
       }
     >
       {exceeded
@@ -643,9 +648,7 @@ function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
       );
       setBranches(data.branches);
       // Default selection: safe-only (no unique commits).
-      setSelected(
-        new Set(data.branches.filter((b) => !b.hasUniqueCommits).map((b) => b.name)),
-      );
+      setSelected(new Set(data.branches.filter((b) => !b.hasUniqueCommits).map((b) => b.name)));
     } catch (e) {
       toastError(e, "Load branches failed");
       setOpen(false);
@@ -664,8 +667,7 @@ function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
       const failed = results.filter((r) => !r.ok);
       if (failed.length > 0) {
         toastError(
-          `${failed.length} failed: ` +
-            failed.map((f) => `${f.branch} (${f.error})`).join(", "),
+          `${failed.length} failed: ` + failed.map((f) => `${f.branch} (${f.error})`).join(", "),
         );
       }
       setOpen(false);
@@ -733,17 +735,11 @@ function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
                           />
                         </td>
                         <td className="py-1 pr-2 font-mono text-gray-300">{b.name}</td>
-                        <td
-                          className={`py-1 pr-2 ${
-                            risky ? "text-amber-400" : "text-gray-500"
-                          }`}
-                        >
+                        <td className={`py-1 pr-2 ${risky ? "text-amber-400" : "text-gray-500"}`}>
                           {b.commitsAheadOfTrunk ?? "?"}
                         </td>
                         <td className="py-1 pr-2 text-gray-500">
-                          {b.lastCommitAgeSecs != null
-                            ? formatAge(b.lastCommitAgeSecs)
-                            : "?"}
+                          {b.lastCommitAgeSecs != null ? formatAge(b.lastCommitAgeSecs) : "?"}
                         </td>
                         <td className="py-1 pr-2 font-mono text-gray-600">
                           {b.agentId ? b.agentId.slice(0, 8) : "-"}
@@ -764,12 +760,7 @@ function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
             </>
           )}
           <div className="flex justify-end gap-2 mt-4">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setOpen(false)}
-              disabled={busy}
-            >
+            <Button variant="ghost" size="sm" onClick={() => setOpen(false)} disabled={busy}>
               Cancel
             </Button>
             <Button
@@ -956,9 +947,7 @@ export function UncommittedWorkBanner({ planName }: { planName: string }) {
         !
       </span>
       <div className="flex-1 text-red-100">
-        <div className="font-medium">
-          Auto-mode paused: agent left uncommitted work.
-        </div>
+        <div className="font-medium">Auto-mode paused: agent left uncommitted work.</div>
         <div className="mt-0.5 text-red-200/80">
           Inspect and either commit, discard, or click Resume.
         </div>
@@ -973,9 +962,7 @@ export function UncommittedWorkBanner({ planName }: { planName: string }) {
         disabled={!runningAgent}
         className="flex-shrink-0 self-center rounded border border-red-700/60 bg-red-900/40 px-3 py-1 text-xs text-red-100 transition hover:bg-red-800/50 hover:text-white disabled:opacity-50 disabled:hover:bg-red-900/40 disabled:hover:text-red-100"
         title={
-          runningAgent
-            ? "Open the agent's terminal panel"
-            : "No running agent found for this plan"
+          runningAgent ? "Open the agent's terminal panel" : "No running agent found for this plan"
         }
       >
         Inspect agent
@@ -1198,12 +1185,7 @@ function ConfirmDialog({
         <Button variant="ghost" size="sm" onClick={onCancel} disabled={confirmDisabled}>
           Cancel
         </Button>
-        <Button
-          variant={confirmVariant}
-          size="sm"
-          onClick={onConfirm}
-          disabled={confirmDisabled}
-        >
+        <Button variant={confirmVariant} size="sm" onClick={onConfirm} disabled={confirmDisabled}>
           {confirmLabel}
         </Button>
       </div>

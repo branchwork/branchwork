@@ -168,8 +168,7 @@ export function BulkDeleteModal({
               | GenericErrorBody
               | undefined;
             if (body && body.error === "plan_has_running_agents") {
-              const agents =
-                (body as PlanHasRunningAgentsBody).agents ?? [];
+              const agents = (body as PlanHasRunningAgentsBody).agents ?? [];
               setBlocked({
                 planName: name,
                 message: `Cannot delete "${name}": this plan has running agents.`,
@@ -285,20 +284,8 @@ export function BulkDeleteModal({
             return (
               <li
                 key={name}
-                className={
-                  done
-                    ? "line-through text-gray-600"
-                    : isBlocker
-                      ? "text-red-300"
-                      : ""
-                }
-                title={
-                  done
-                    ? "Deleted"
-                    : isBlocker
-                      ? "Blocked — see banner below"
-                      : undefined
-                }
+                className={done ? "line-through text-gray-600" : isBlocker ? "text-red-300" : ""}
+                title={done ? "Deleted" : isBlocker ? "Blocked — see banner below" : undefined}
               >
                 {name}
               </li>

@@ -281,5 +281,4 @@ describe("first-visit prompt state", () => {
     await requestNotificationPermission();
     expect(readPromptState()).toBe("asked");
   });
-
 });

@@ -1,11 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  render,
-  screen,
-  waitFor,
-  type RenderResult,
-} from "@testing-library/react";
+import { cleanup, render, screen, waitFor, type RenderResult } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { EnsurePlan } from "./EnsurePlan.js";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";

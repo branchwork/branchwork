@@ -73,13 +73,8 @@ interface AgentStore {
   sendMessage: (agentId: string, message: string) => Promise<void>;
   killAgent: (agentId: string) => Promise<void>;
   finishAgent: (agentId: string) => Promise<void>;
-  mergeAgentBranch: (
-    agentId: string,
-    target?: string
-  ) => Promise<{ ok?: boolean; error?: string }>;
-  fetchMergeTargets: (
-    agentId: string
-  ) => Promise<{ default: string | null; available: string[] }>;
+  mergeAgentBranch: (agentId: string, target?: string) => Promise<{ ok?: boolean; error?: string }>;
+  fetchMergeTargets: (agentId: string) => Promise<{ default: string | null; available: string[] }>;
   discardAgentBranch: (agentId: string) => Promise<{ ok?: boolean; error?: string }>;
   addAgent: (agent: Agent) => void;
   updateAgentStatus: (agentId: string, status: string) => void;
@@ -134,9 +129,7 @@ export const useAgentStore = create<AgentStore>((set) => ({
   },
 
   fetchAgentOutput: async (agentId: string) => {
-    const output = await fetchJson<AgentOutputLine[]>(
-      `/api/agents/${agentId}/output`
-    );
+    const output = await fetchJson<AgentOutputLine[]>(`/api/agents/${agentId}/output`);
     set((s) => ({
       agentOutput: { ...s.agentOutput, [agentId]: output },
     }));
@@ -168,14 +161,12 @@ export const useAgentStore = create<AgentStore>((set) => ({
       const body = target ? { into: target } : {};
       const result = await postJson<{ ok?: boolean; error?: string }>(
         `/api/agents/${agentId}/merge`,
-        body
+        body,
       );
       if (result.ok) {
         // Clear branch from local state after merge
         set((s) => ({
-          agents: s.agents.map((a) =>
-            a.id === agentId ? { ...a, branch: null } : a
-          ),
+          agents: s.agents.map((a) => (a.id === agentId ? { ...a, branch: null } : a)),
         }));
       }
       return result;
@@ -190,7 +181,7 @@ export const useAgentStore = create<AgentStore>((set) => ({
 
   fetchMergeTargets: async (agentId) => {
     return fetchJson<{ default: string | null; available: string[] }>(
-      `/api/agents/${agentId}/merge-targets`
+      `/api/agents/${agentId}/merge-targets`,
     );
   },
 
@@ -198,13 +189,11 @@ export const useAgentStore = create<AgentStore>((set) => ({
     try {
       const result = await postJson<{ ok?: boolean; error?: string }>(
         `/api/agents/${agentId}/discard`,
-        {}
+        {},
       );
       if (result.ok) {
         set((s) => ({
-          agents: s.agents.map((a) =>
-            a.id === agentId ? { ...a, branch: null } : a
-          ),
+          agents: s.agents.map((a) => (a.id === agentId ? { ...a, branch: null } : a)),
         }));
       }
       return result;
@@ -213,14 +202,11 @@ export const useAgentStore = create<AgentStore>((set) => ({
     }
   },
 
-  addAgent: (agent) =>
-    set((s) => ({ agents: [agent, ...s.agents] })),
+  addAgent: (agent) => set((s) => ({ agents: [agent, ...s.agents] })),
 
   updateAgentStatus: (agentId, status) =>
     set((s) => ({
-      agents: s.agents.map((a) =>
-        a.id === agentId ? { ...a, status } : a
-      ),
+      agents: s.agents.map((a) => (a.id === agentId ? { ...a, status } : a)),
     })),
 
   clearAgentBranch: ({ agentId, branch }) =>
@@ -243,10 +229,7 @@ export const useAgentStore = create<AgentStore>((set) => ({
       const next =
         existing.length < MAX_OUTPUT_LINES
           ? [...existing, line]
-          : [
-              ...existing.slice(existing.length - MAX_OUTPUT_LINES + 1),
-              line,
-            ];
+          : [...existing.slice(existing.length - MAX_OUTPUT_LINES + 1), line];
       return {
         agentOutput: { ...s.agentOutput, [agentId]: next },
       };

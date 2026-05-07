@@ -1,17 +1,8 @@
 import { create } from "zustand";
-import {
-  getInFlightPlansFetch,
-  usePlanStore,
-} from "./plan-store.js";
-import {
-  getInFlightAgentsFetch,
-  useAgentStore,
-} from "./agent-store.js";
+import { getInFlightPlansFetch, usePlanStore } from "./plan-store.js";
+import { getInFlightAgentsFetch, useAgentStore } from "./agent-store.js";
 import { useSettingsStore } from "./settings-store.js";
-import {
-  useRunnerStore,
-  type RunnerDriverInfo,
-} from "./runner-store.js";
+import { useRunnerStore, type RunnerDriverInfo } from "./runner-store.js";
 import { parseWsMessage, type WsMessage } from "../schemas/ws-events.js";
 import { notify } from "../lib/notifications.js";
 
@@ -153,13 +144,19 @@ export const useWsStore = create<WsStore>((set, get) => ({
         const planStore = usePlanStore.getState();
         const settingsStore = useSettingsStore.getState();
         planStore.fetchPlans().catch(() => {});
-        useAgentStore.getState().fetchAgents().catch(() => {});
+        useAgentStore
+          .getState()
+          .fetchAgents()
+          .catch(() => {});
         settingsStore.fetchSettings().catch(() => {});
         settingsStore.fetchDrivers().catch(() => {});
         // Runner inventory: any `runner_connected/_disconnected` events that
         // fired during the disconnect were lost, so the cached `online/offline`
         // status could be wrong. Refetching gives us a clean baseline.
-        useRunnerStore.getState().fetchRunners().catch(() => {});
+        useRunnerStore
+          .getState()
+          .fetchRunners()
+          .catch(() => {});
         // Per-plan auto-mode-config: only refetch the plans we already
         // know about (planConfigs is keyed by plans the user has opened
         // in this session). New plans surface via plan_updated /
@@ -238,10 +235,7 @@ export const useWsStore = create<WsStore>((set, get) => ({
 
 function scheduleReconnect(get: () => WsStore) {
   const attempt = get().reconnectAttempt;
-  const delay = Math.min(
-    INITIAL_RECONNECT_DELAY * Math.pow(2, attempt),
-    MAX_RECONNECT_DELAY
-  );
+  const delay = Math.min(INITIAL_RECONNECT_DELAY * Math.pow(2, attempt), MAX_RECONNECT_DELAY);
   useWsStore.setState({ reconnectAttempt: attempt + 1 });
   setTimeout(() => get().connect(), delay);
 }
@@ -290,7 +284,10 @@ function schedulePlansRefetch(): void {
     if (getInFlightPlansFetch()) return;
     const last = usePlanStore.getState().lastPlansFetchedAt;
     if (last !== null && Date.now() - last < WS_REFETCH_DEBOUNCE_MS) return;
-    usePlanStore.getState().fetchPlans().catch(() => {});
+    usePlanStore
+      .getState()
+      .fetchPlans()
+      .catch(() => {});
   }, 2000);
 }
 
@@ -317,9 +314,7 @@ function dispatch(msg: WsMessage) {
       deferBehindPlansFetch(() => {
         const planStoreNow = usePlanStore.getState();
         if (plan) {
-          planStoreNow.updatePlan(
-            plan as Parameters<typeof planStoreNow.updatePlan>[0],
-          );
+          planStoreNow.updatePlan(plan as Parameters<typeof planStoreNow.updatePlan>[0]);
         }
         schedulePlansRefetch();
       });
@@ -339,9 +334,7 @@ function dispatch(msg: WsMessage) {
       planStore.pushToast({
         kind: "info",
         message: `Deleted plan ${d.plan}`,
-        action: snapshotId
-          ? { label: "Undo", snapshotId }
-          : undefined,
+        action: snapshotId ? { label: "Undo", snapshotId } : undefined,
         ttlMs: 30_000,
       });
       break;
@@ -367,12 +360,7 @@ function dispatch(msg: WsMessage) {
       const taskLabel = agent
         ? lookupTaskTitle(agent.plan_name, agent.task_id)
         : `Agent ${d.id.slice(0, 8)}`;
-      notify(
-        "agent_stopped",
-        `${taskLabel} — ${d.status}`,
-        "Agent finished",
-        `agent-${d.id}`,
-      );
+      notify("agent_stopped", `${taskLabel} — ${d.status}`, "Agent finished", `agent-${d.id}`);
       // Defer the patch behind any in-flight fetchAgents — otherwise a slow
       // /api/agents response could clobber `status` back to running. The
       // refetch we follow with is coalesced via `getInFlightAgentsFetch`,
@@ -514,9 +502,7 @@ function dispatch(msg: WsMessage) {
     case "task_checked": {
       const d = msg.data;
       deferBehindPlansFetch(() => {
-        usePlanStore
-          .getState()
-          .patchTaskStatus(d.plan_name, d.task_number, d.status);
+        usePlanStore.getState().patchTaskStatus(d.plan_name, d.task_number, d.status);
       });
       break;
     }
@@ -557,9 +543,7 @@ function dispatch(msg: WsMessage) {
       // and `selectedPlan.task.status` with the pre-event server snapshot.
       // See the audit-§4 acceptance test in ws-store.test.ts.
       deferBehindPlansFetch(() => {
-        usePlanStore
-          .getState()
-          .patchTaskStatus(d.plan_name, d.task_number, d.status);
+        usePlanStore.getState().patchTaskStatus(d.plan_name, d.task_number, d.status);
         // Authoritative refetch — guarantees convergence to server truth
         // (doneCount drift on non-selected plans, MCP/agent-driven
         // transitions) even when the signed-delta in patchTaskStatus
@@ -583,7 +567,12 @@ function dispatch(msg: WsMessage) {
         usePlanStore.getState().patchTaskCi(d.plan_name, d.task_number, {
           id: d.id,
           status: d.status as
-            | "pending" | "running" | "success" | "failure" | "cancelled" | "unknown",
+            | "pending"
+            | "running"
+            | "success"
+            | "failure"
+            | "cancelled"
+            | "unknown",
           conclusion: d.conclusion ?? null,
           runUrl: d.run_url ?? null,
           commitSha: d.commit_sha ?? null,
@@ -594,12 +583,7 @@ function dispatch(msg: WsMessage) {
     }
     case "plan_warning": {
       const d = msg.data;
-      notify(
-        "plan_warning",
-        `Plan error: ${d.name}`,
-        d.error,
-        `plan-warning-${d.name}`,
-      );
+      notify("plan_warning", `Plan error: ${d.name}`, d.error, `plan-warning-${d.name}`);
       planStore.addWarning({
         name: d.name,
         file: d.file,
@@ -640,9 +624,7 @@ function dispatch(msg: WsMessage) {
       // ProjectDashboard aggregate in sync without a refetch.
       const d = msg.data;
       deferBehindPlansFetch(() => {
-        usePlanStore
-          .getState()
-          .patchTaskCost(d.plan_name, d.task_number, d.amount_usd);
+        usePlanStore.getState().patchTaskCost(d.plan_name, d.task_number, d.amount_usd);
       });
       break;
     }
@@ -728,12 +710,8 @@ function dispatch(msg: WsMessage) {
       // schema-typed as `unknown` (4.1) — cast at the boundary; the
       // store handler tolerates `undefined` and unfamiliar variants.
       const d = msg.data;
-      const drivers = Array.isArray(d.drivers)
-        ? (d.drivers as RunnerDriverInfo[])
-        : undefined;
-      useRunnerStore
-        .getState()
-        .applyDriversTouch({ runner_id: d.runner_id, drivers });
+      const drivers = Array.isArray(d.drivers) ? (d.drivers as RunnerDriverInfo[]) : undefined;
+      useRunnerStore.getState().applyDriversTouch({ runner_id: d.runner_id, drivers });
       break;
     }
   }

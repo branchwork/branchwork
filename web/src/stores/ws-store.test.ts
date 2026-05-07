@@ -1,15 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAgentStore, type Agent } from "./agent-store.js";
-import {
-  usePlanStore,
-  type ParsedPlan,
-  type PlanSummary,
-} from "./plan-store.js";
-import {
-  handleWsMessage,
-  subscribeToWsEvents,
-  useWsStore,
-} from "./ws-store.js";
+import { usePlanStore, type ParsedPlan, type PlanSummary } from "./plan-store.js";
+import { handleWsMessage, subscribeToWsEvents, useWsStore } from "./ws-store.js";
 
 afterEach(() => {
   // Reset zustand stores so seeded state and spies don't leak between
@@ -106,8 +98,7 @@ describe("ws-store handleWsMessage", () => {
       },
     });
 
-    const runtime = usePlanStore.getState()
-      .autoModeRuntimes["unattended-auto-mode"];
+    const runtime = usePlanStore.getState().autoModeRuntimes["unattended-auto-mode"];
     expect(runtime).toEqual({
       state: "auto_finishing",
       task: "6.1",
@@ -117,108 +108,97 @@ describe("ws-store handleWsMessage", () => {
     expect(fetchAgents).toHaveBeenCalledTimes(1);
   });
 
-  it(
-    "soft plan_deleted drops the plan, clears selectedPlan, " +
-      "and pushes an Undo toast",
-    () => {
-      const summary: PlanSummary = {
-        name: "doomed",
-        title: "Doomed",
-        project: null,
-        phaseCount: 1,
-        taskCount: 1,
-        doneCount: 0,
-        createdAt: "2026-04-12T00:00:00Z",
-        modifiedAt: "2026-04-12T00:00:00Z",
-      };
-      const selected: ParsedPlan = {
-        name: "doomed",
-        filePath: "doomed.yaml",
-        title: "Doomed",
-        context: "",
-        project: null,
-        createdAt: "2026-04-12T00:00:00Z",
-        modifiedAt: "2026-04-12T00:00:00Z",
-        phases: [],
-      };
-      usePlanStore.setState({ plans: [summary], selectedPlan: selected });
+  it("soft plan_deleted drops the plan, clears selectedPlan, " + "and pushes an Undo toast", () => {
+    const summary: PlanSummary = {
+      name: "doomed",
+      title: "Doomed",
+      project: null,
+      phaseCount: 1,
+      taskCount: 1,
+      doneCount: 0,
+      createdAt: "2026-04-12T00:00:00Z",
+      modifiedAt: "2026-04-12T00:00:00Z",
+    };
+    const selected: ParsedPlan = {
+      name: "doomed",
+      filePath: "doomed.yaml",
+      title: "Doomed",
+      context: "",
+      project: null,
+      createdAt: "2026-04-12T00:00:00Z",
+      modifiedAt: "2026-04-12T00:00:00Z",
+      phases: [],
+    };
+    usePlanStore.setState({ plans: [summary], selectedPlan: selected });
 
-      handleWsMessage({
-        type: "plan_deleted",
-        data: { plan: "doomed", snapshot_id: "snap-123", hard: false },
-      });
+    handleWsMessage({
+      type: "plan_deleted",
+      data: { plan: "doomed", snapshot_id: "snap-123", hard: false },
+    });
 
-      const state = usePlanStore.getState();
-      expect(state.plans.find((p) => p.name === "doomed")).toBeUndefined();
-      // App.tsx routes back to ProjectDashboard when selectedPlan is null.
-      expect(state.selectedPlan).toBeNull();
-      expect(state.toasts).toHaveLength(1);
-      expect(state.toasts[0]).toMatchObject({
-        kind: "info",
-        message: "Deleted plan doomed",
-        action: { label: "Undo", snapshotId: "snap-123" },
-      });
-    },
-  );
+    const state = usePlanStore.getState();
+    expect(state.plans.find((p) => p.name === "doomed")).toBeUndefined();
+    // App.tsx routes back to ProjectDashboard when selectedPlan is null.
+    expect(state.selectedPlan).toBeNull();
+    expect(state.toasts).toHaveLength(1);
+    expect(state.toasts[0]).toMatchObject({
+      kind: "info",
+      message: "Deleted plan doomed",
+      action: { label: "Undo", snapshotId: "snap-123" },
+    });
+  });
 
-  it(
-    "hard plan_deleted (no snapshot_id) pushes a toast without an Undo action",
-    () => {
-      const summary: PlanSummary = {
-        name: "obsolete",
-        title: "Obsolete",
-        project: null,
-        phaseCount: 0,
-        taskCount: 0,
-        doneCount: 0,
-        createdAt: "2026-04-12T00:00:00Z",
-        modifiedAt: "2026-04-12T00:00:00Z",
-      };
-      usePlanStore.setState({ plans: [summary], selectedPlan: null });
+  it("hard plan_deleted (no snapshot_id) pushes a toast without an Undo action", () => {
+    const summary: PlanSummary = {
+      name: "obsolete",
+      title: "Obsolete",
+      project: null,
+      phaseCount: 0,
+      taskCount: 0,
+      doneCount: 0,
+      createdAt: "2026-04-12T00:00:00Z",
+      modifiedAt: "2026-04-12T00:00:00Z",
+    };
+    usePlanStore.setState({ plans: [summary], selectedPlan: null });
 
-      handleWsMessage({
-        type: "plan_deleted",
-        data: { plan: "obsolete", snapshot_id: null, hard: true },
-      });
+    handleWsMessage({
+      type: "plan_deleted",
+      data: { plan: "obsolete", snapshot_id: null, hard: true },
+    });
 
-      const state = usePlanStore.getState();
-      expect(state.plans.find((p) => p.name === "obsolete")).toBeUndefined();
-      expect(state.toasts).toHaveLength(1);
-      expect(state.toasts[0].action).toBeUndefined();
-      expect(state.toasts[0]).toMatchObject({
-        kind: "info",
-        message: "Deleted plan obsolete",
-      });
-    },
-  );
+    const state = usePlanStore.getState();
+    expect(state.plans.find((p) => p.name === "obsolete")).toBeUndefined();
+    expect(state.toasts).toHaveLength(1);
+    expect(state.toasts[0].action).toBeUndefined();
+    expect(state.toasts[0]).toMatchObject({
+      kind: "info",
+      message: "Deleted plan obsolete",
+    });
+  });
 
-  it(
-    "plan_deleted leaves selectedPlan alone when the user is viewing a different plan",
-    () => {
-      const other: ParsedPlan = {
-        name: "still-here",
-        filePath: "still-here.yaml",
-        title: "Still here",
-        context: "",
-        project: null,
-        createdAt: "2026-04-12T00:00:00Z",
-        modifiedAt: "2026-04-12T00:00:00Z",
-        phases: [],
-      };
-      usePlanStore.setState({ plans: [], selectedPlan: other });
+  it("plan_deleted leaves selectedPlan alone when the user is viewing a different plan", () => {
+    const other: ParsedPlan = {
+      name: "still-here",
+      filePath: "still-here.yaml",
+      title: "Still here",
+      context: "",
+      project: null,
+      createdAt: "2026-04-12T00:00:00Z",
+      modifiedAt: "2026-04-12T00:00:00Z",
+      phases: [],
+    };
+    usePlanStore.setState({ plans: [], selectedPlan: other });
 
-      handleWsMessage({
-        type: "plan_deleted",
-        data: { plan: "doomed", snapshot_id: "snap-1", hard: false },
-      });
+    handleWsMessage({
+      type: "plan_deleted",
+      data: { plan: "doomed", snapshot_id: "snap-1", hard: false },
+    });
 
-      expect(usePlanStore.getState().selectedPlan).toEqual(other);
-    },
-  );
+    expect(usePlanStore.getState().selectedPlan).toEqual(other);
+  });
 
   it(
-    "drops a malformed task_status_changed: warns, does not throw, " +
-      "does not partially apply",
+    "drops a malformed task_status_changed: warns, does not throw, " + "does not partially apply",
     () => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const patchTaskStatus = vi.fn();
@@ -244,29 +224,24 @@ describe("ws-store handleWsMessage", () => {
     },
   );
 
-  it(
-    "drops a JSON string that fails the discriminator: warns and ignores",
-    () => {
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      const fetchAgents = vi.fn().mockResolvedValue(undefined);
-      useAgentStore.setState({ fetchAgents });
+  it("drops a JSON string that fails the discriminator: warns and ignores", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchAgents = vi.fn().mockResolvedValue(undefined);
+    useAgentStore.setState({ fetchAgents });
 
-      // Unknown event types fall outside the discriminated union and the
-      // listener silently drops them. The on-the-wire shape is a string
-      // (this is what `ws.onmessage` hands to `handleWsMessage`), so we
-      // exercise the JSON-string branch here too.
-      expect(() =>
-        handleWsMessage(
-          JSON.stringify({ type: "completely_unknown_event", data: {} }),
-        ),
-      ).not.toThrow();
+    // Unknown event types fall outside the discriminated union and the
+    // listener silently drops them. The on-the-wire shape is a string
+    // (this is what `ws.onmessage` hands to `handleWsMessage`), so we
+    // exercise the JSON-string branch here too.
+    expect(() =>
+      handleWsMessage(JSON.stringify({ type: "completely_unknown_event", data: {} })),
+    ).not.toThrow();
 
-      expect(fetchAgents).not.toHaveBeenCalled();
-      expect(warn).toHaveBeenCalled();
+    expect(fetchAgents).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
 
-      warn.mockRestore();
-    },
-  );
+    warn.mockRestore();
+  });
 
   it("drops non-JSON garbage from ws.onmessage without throwing", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -278,28 +253,24 @@ describe("ws-store handleWsMessage", () => {
     warn.mockRestore();
   });
 
-  it(
-    "phase_advanced refetches the selected plan and pushes a toast",
-    () => {
-      const selected = makePlan({ name: "alpha", title: "Alpha" });
-      const selectPlan = vi.fn().mockResolvedValue(undefined);
-      usePlanStore.setState({ selectedPlan: selected, selectPlan });
+  it("phase_advanced refetches the selected plan and pushes a toast", () => {
+    const selected = makePlan({ name: "alpha", title: "Alpha" });
+    const selectPlan = vi.fn().mockResolvedValue(undefined);
+    usePlanStore.setState({ selectedPlan: selected, selectPlan });
 
-      handleWsMessage({
-        type: "phase_advanced",
-        data: { plan_name: "alpha", from_phase: 1, to_phase: 2 },
-      });
+    handleWsMessage({
+      type: "phase_advanced",
+      data: { plan_name: "alpha", from_phase: 1, to_phase: 2 },
+    });
 
-      expect(selectPlan).toHaveBeenCalledWith("alpha");
-      const toasts = usePlanStore.getState().toasts;
-      expect(toasts).toHaveLength(1);
-      expect(toasts[0].message).toMatch(/alpha.*Phase 2/);
-    },
-  );
+    expect(selectPlan).toHaveBeenCalledWith("alpha");
+    const toasts = usePlanStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].message).toMatch(/alpha.*Phase 2/);
+  });
 
   it(
-    "phase_advanced for a non-selected plan still pushes a toast " +
-      "but does not refetch",
+    "phase_advanced for a non-selected plan still pushes a toast " + "but does not refetch",
     () => {
       const other = makePlan({ name: "beta" });
       const selectPlan = vi.fn().mockResolvedValue(undefined);
@@ -455,53 +426,47 @@ describe("ws-store handleWsMessage", () => {
     expect(ci).toBeNull();
   });
 
-  it(
-    "agent_branch_cleared with agent_id patches branch on the matching agent",
-    () => {
-      useAgentStore.setState({
-        agents: [
-          makeAgent({ id: "a-1", branch: "feature/foo" }),
-          makeAgent({ id: "a-2", branch: "feature/bar" }),
-        ],
-      });
+  it("agent_branch_cleared with agent_id patches branch on the matching agent", () => {
+    useAgentStore.setState({
+      agents: [
+        makeAgent({ id: "a-1", branch: "feature/foo" }),
+        makeAgent({ id: "a-2", branch: "feature/bar" }),
+      ],
+    });
 
-      handleWsMessage({
-        type: "agent_branch_cleared",
-        data: {
-          agent_id: "a-1",
-          branch: "feature/foo",
-          reason: "boot_sweep: branch not present in project git",
-        },
-      });
+    handleWsMessage({
+      type: "agent_branch_cleared",
+      data: {
+        agent_id: "a-1",
+        branch: "feature/foo",
+        reason: "boot_sweep: branch not present in project git",
+      },
+    });
 
-      const agents = useAgentStore.getState().agents;
-      expect(agents.find((a) => a.id === "a-1")!.branch).toBeNull();
-      expect(agents.find((a) => a.id === "a-2")!.branch).toBe("feature/bar");
-    },
-  );
+    const agents = useAgentStore.getState().agents;
+    expect(agents.find((a) => a.id === "a-1")!.branch).toBeNull();
+    expect(agents.find((a) => a.id === "a-2")!.branch).toBe("feature/bar");
+  });
 
-  it(
-    "agent_branch_cleared without agent_id falls back to matching by branch",
-    () => {
-      useAgentStore.setState({
-        agents: [
-          makeAgent({ id: "a-1", branch: "feature/foo" }),
-          makeAgent({ id: "a-2", branch: "feature/foo" }),
-          makeAgent({ id: "a-3", branch: "feature/bar" }),
-        ],
-      });
+  it("agent_branch_cleared without agent_id falls back to matching by branch", () => {
+    useAgentStore.setState({
+      agents: [
+        makeAgent({ id: "a-1", branch: "feature/foo" }),
+        makeAgent({ id: "a-2", branch: "feature/foo" }),
+        makeAgent({ id: "a-3", branch: "feature/bar" }),
+      ],
+    });
 
-      handleWsMessage({
-        type: "agent_branch_cleared",
-        data: { branch: "feature/foo" },
-      });
+    handleWsMessage({
+      type: "agent_branch_cleared",
+      data: { branch: "feature/foo" },
+    });
 
-      const agents = useAgentStore.getState().agents;
-      expect(agents.find((a) => a.id === "a-1")!.branch).toBeNull();
-      expect(agents.find((a) => a.id === "a-2")!.branch).toBeNull();
-      expect(agents.find((a) => a.id === "a-3")!.branch).toBe("feature/bar");
-    },
-  );
+    const agents = useAgentStore.getState().agents;
+    expect(agents.find((a) => a.id === "a-1")!.branch).toBeNull();
+    expect(agents.find((a) => a.id === "a-2")!.branch).toBeNull();
+    expect(agents.find((a) => a.id === "a-3")!.branch).toBe("feature/bar");
+  });
 
   it("hook_event is logged via the validator instead of swallowed", () => {
     const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
@@ -616,9 +581,7 @@ describe("ws-store handleWsMessage", () => {
       // Mid-state assertion: patch has NOT been applied yet because the
       // fetch is still in flight. (If the patch had run synchronously the
       // fetch's response would clobber it on resolve.)
-      expect(
-        usePlanStore.getState().selectedPlan!.phases[0].tasks[0].status,
-      ).toBe("pending");
+      expect(usePlanStore.getState().selectedPlan!.phases[0].tasks[0].status).toBe("pending");
 
       // Wait for fetch to resolve, then for the deferred .then() callback.
       await fetchPromise;
@@ -635,9 +598,7 @@ describe("ws-store handleWsMessage", () => {
       expect(final.plans).toHaveLength(1);
       expect(final.plans[0].name).toBe("p");
       expect(final.plans[0].doneCount).toBe(1);
-      expect(final.selectedPlan!.phases[0].tasks[0].status).toBe(
-        "completed",
-      );
+      expect(final.selectedPlan!.phases[0].tasks[0].status).toBe("completed");
 
       vi.unstubAllGlobals();
     },

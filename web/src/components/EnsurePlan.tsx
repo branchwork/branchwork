@@ -47,9 +47,8 @@ function PlanNotFound({ planName }: { planName: string }) {
       <div className="rounded border border-red-700/50 bg-red-900/20 p-6 max-w-2xl">
         <h2 className="text-lg font-semibold text-red-100">Plan not found</h2>
         <p className="mt-1 text-sm text-red-200/80">
-          No plan named{" "}
-          <span className="font-mono text-red-100">{planName || "—"}</span>{" "}
-          exists. It may have been deleted, archived, or the link is wrong.
+          No plan named <span className="font-mono text-red-100">{planName || "—"}</span> exists. It
+          may have been deleted, archived, or the link is wrong.
         </p>
         <div className="mt-4">
           <Link

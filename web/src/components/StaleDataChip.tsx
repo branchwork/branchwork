@@ -84,10 +84,7 @@ export function StaleDataChip({ slice, className }: StaleDataChipProps) {
       className={classes}
       title={`Last refreshed ${ageLabel}. Disconnected from server, so this may be out of date.`}
     >
-      <span
-        aria-hidden="true"
-        className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400"
-      />
+      <span aria-hidden="true" className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400" />
       stale
     </span>
   );

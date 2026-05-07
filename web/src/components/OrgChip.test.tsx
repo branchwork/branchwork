@@ -124,9 +124,7 @@ describe("OrgChip", () => {
       lastFetchedAt: Date.now(),
     });
     renderChip();
-    expect(screen.getByTestId("org-chip-member-count").textContent).toBe(
-      "1 member",
-    );
+    expect(screen.getByTestId("org-chip-member-count").textContent).toBe("1 member");
   });
 
   it("renders the switcher button when the user has multiple orgs", () => {

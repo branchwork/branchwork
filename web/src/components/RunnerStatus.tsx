@@ -40,15 +40,8 @@ export function RunnerStatus() {
     // enrolling one. The link target lives at /runners (the placeholder
     // ships in 1.1; full enrolment flow ships in 4.2).
     return (
-      <span
-        data-testid="runner-status"
-        data-state="no-runner"
-        className="flex items-center gap-2"
-      >
-        <span
-          aria-hidden="true"
-          className="inline-block w-2 h-2 rounded-full bg-amber-400"
-        />
+      <span data-testid="runner-status" data-state="no-runner" className="flex items-center gap-2">
+        <span aria-hidden="true" className="inline-block w-2 h-2 rounded-full bg-amber-400" />
         <Link
           to="/runners"
           className="text-amber-300 hover:text-amber-200 transition"
@@ -66,16 +59,9 @@ export function RunnerStatus() {
         data-testid="runner-status"
         data-state="offline"
         className="flex items-center gap-2"
-        title={
-          active.lastSeenAt
-            ? `Last seen ${active.lastSeenAt}`
-            : "Runner is offline"
-        }
+        title={active.lastSeenAt ? `Last seen ${active.lastSeenAt}` : "Runner is offline"}
       >
-        <span
-          aria-hidden="true"
-          className="inline-block w-2 h-2 rounded-full bg-red-500"
-        />
+        <span aria-hidden="true" className="inline-block w-2 h-2 rounded-full bg-red-500" />
         <span className="text-red-300">Runner offline</span>
       </span>
     );
@@ -98,10 +84,7 @@ export function RunnerStatus() {
       className="flex items-center gap-2"
       title={tooltip}
     >
-      <span
-        aria-hidden="true"
-        className="inline-block w-2 h-2 rounded-full bg-emerald-500"
-      />
+      <span aria-hidden="true" className="inline-block w-2 h-2 rounded-full bg-emerald-500" />
       <span className="text-gray-400">
         Runner: <span className="font-mono text-gray-300">{label}</span>
       </span>

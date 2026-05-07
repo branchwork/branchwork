@@ -2,8 +2,7 @@ import { forwardRef, type SelectHTMLAttributes } from "react";
 
 type SelectSize = "sm" | "md";
 
-interface SelectProps
-  extends Omit<SelectHTMLAttributes<HTMLSelectElement>, "size"> {
+interface SelectProps extends Omit<SelectHTMLAttributes<HTMLSelectElement>, "size"> {
   /// Visual size; `sm` matches the existing inline status filter / driver
   /// dropdown footprints, `md` matches the form fields.
   size?: SelectSize;

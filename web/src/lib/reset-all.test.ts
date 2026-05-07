@@ -1,11 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetAllStores } from "./reset-all.js";
 import { useAgentStore } from "../stores/agent-store.js";
-import {
-  usePlanStore,
-  type ParsedPlan,
-  type PlanSummary,
-} from "../stores/plan-store.js";
+import { usePlanStore, type ParsedPlan, type PlanSummary } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useToastStore } from "../stores/toast-store.js";
 import { subscribeToWsEvents, useWsStore } from "../stores/ws-store.js";
@@ -62,9 +58,7 @@ function seedAllStores() {
     },
     autoModeRuntimes: { "user-a-plan": { state: "merging", task: "1.1" } },
     toasts: [{ id: "t-1", kind: "info", message: "stale" }],
-    warnings: [
-      { name: "user-a-plan", file: "f", error: "boom", timestamp: 1 },
-    ],
+    warnings: [{ name: "user-a-plan", file: "f", error: "boom", timestamp: 1 }],
   });
   useAgentStore.setState({
     agents: [
@@ -198,26 +192,23 @@ describe("resetAllStores", () => {
     expect(() => resetAllStores()).not.toThrow();
   });
 
-  it(
-    "does NOT reset auth-store (auth is the orchestrator and owns its slice)",
-    async () => {
-      const { useAuthStore } = await import("../stores/auth-store.js");
-      useAuthStore.setState({
-        user: { id: "u-1", email: "u@example.com" },
-        error: null,
-        loading: false,
-      });
+  it("does NOT reset auth-store (auth is the orchestrator and owns its slice)", async () => {
+    const { useAuthStore } = await import("../stores/auth-store.js");
+    useAuthStore.setState({
+      user: { id: "u-1", email: "u@example.com" },
+      error: null,
+      loading: false,
+    });
 
-      resetAllStores();
+    resetAllStores();
 
-      // resetAllStores intentionally leaves auth alone — auth.logout()
-      // does its own set({user:null}) and orchestrates the rest.
-      expect(useAuthStore.getState().user).toEqual({
-        id: "u-1",
-        email: "u@example.com",
-      });
-    },
-  );
+    // resetAllStores intentionally leaves auth alone — auth.logout()
+    // does its own set({user:null}) and orchestrates the rest.
+    expect(useAuthStore.getState().user).toEqual({
+      id: "u-1",
+      email: "u@example.com",
+    });
+  });
 
   it(
     "acceptance: user A's plans/agents/settings cleared so user B's session " +
@@ -299,9 +290,7 @@ describe("resetAllStores", () => {
       expect(useOrgStore.getState().memberships).toEqual([]);
       expect(useOrgStore.getState().loaded).toBe(false);
       expect(readActiveOrgFromStorage()).toBeNull();
-      expect(
-        globalThis.localStorage?.getItem(ACTIVE_ORG_STORAGE_KEY),
-      ).toBeNull();
+      expect(globalThis.localStorage?.getItem(ACTIVE_ORG_STORAGE_KEY)).toBeNull();
     });
   });
 });

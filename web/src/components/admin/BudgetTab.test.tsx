@@ -1,11 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BudgetTab } from "./BudgetTab.js";
 
 interface Call {
@@ -93,32 +87,22 @@ afterEach(() => {
 describe("BudgetTab", () => {
   it("renders the seeded budget + usage bar at the right percentage", async () => {
     render(<BudgetTab orgSlug="acme" />);
-    await waitFor(() =>
-      expect(screen.getByTestId("budget-input")).toBeTruthy(),
-    );
-    expect(
-      (screen.getByTestId("budget-input") as HTMLInputElement).value,
-    ).toBe("100");
+    await waitFor(() => expect(screen.getByTestId("budget-input")).toBeTruthy());
+    expect((screen.getByTestId("budget-input") as HTMLInputElement).value).toBe("100");
     expect(screen.getByTestId("budget-spent").textContent).toContain("$42.00");
     expect(screen.getByTestId("budget-pct").textContent).toContain("42%");
-    expect(screen.getByTestId("budget-bar").getAttribute("aria-valuenow")).toBe(
-      "42",
-    );
+    expect(screen.getByTestId("budget-bar").getAttribute("aria-valuenow")).toBe("42");
   });
 
   it("Save PUTs camelCase maxBudgetUsd as a number", async () => {
     render(<BudgetTab orgSlug="acme" />);
-    await waitFor(() =>
-      expect(screen.getByTestId("budget-input")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByTestId("budget-input")).toBeTruthy());
     fireEvent.change(screen.getByTestId("budget-input"), {
       target: { value: "250" },
     });
     fireEvent.click(screen.getByText("Save"));
     await waitFor(() => {
-      const put = calls.find(
-        (c) => c.url === "/api/orgs/acme/budget" && c.method === "PUT",
-      );
+      const put = calls.find((c) => c.url === "/api/orgs/acme/budget" && c.method === "PUT");
       expect(put).toBeTruthy();
       expect(put?.body).toEqual({ maxBudgetUsd: 250 });
     });
@@ -126,17 +110,13 @@ describe("BudgetTab", () => {
 
   it("clearing the input PUTs maxBudgetUsd: null", async () => {
     render(<BudgetTab orgSlug="acme" />);
-    await waitFor(() =>
-      expect(screen.getByTestId("budget-input")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByTestId("budget-input")).toBeTruthy());
     fireEvent.change(screen.getByTestId("budget-input"), {
       target: { value: "" },
     });
     fireEvent.click(screen.getByText("Save"));
     await waitFor(() => {
-      const put = calls.find(
-        (c) => c.url === "/api/orgs/acme/budget" && c.method === "PUT",
-      );
+      const put = calls.find((c) => c.url === "/api/orgs/acme/budget" && c.method === "PUT");
       expect(put).toBeTruthy();
       expect(put?.body).toEqual({ maxBudgetUsd: null });
     });
@@ -144,9 +124,7 @@ describe("BudgetTab", () => {
 
   it("renders the per-user usage breakdown", async () => {
     render(<BudgetTab orgSlug="acme" />);
-    await waitFor(() =>
-      expect(screen.getByTestId("usage-by-user")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByTestId("usage-by-user")).toBeTruthy());
     expect(screen.getByText("alice@example.com")).toBeTruthy();
     expect(screen.getByText("bob@example.com")).toBeTruthy();
     expect(screen.getByText("$30.00")).toBeTruthy();
@@ -157,9 +135,7 @@ describe("BudgetTab", () => {
   it("hides the percentage badge when no budget is set", async () => {
     budgetResponse = { budget: null, killSwitchActive: false };
     render(<BudgetTab orgSlug="acme" />);
-    await waitFor(() =>
-      expect(screen.getByTestId("budget-input")).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByTestId("budget-input")).toBeTruthy());
     expect(screen.queryByTestId("budget-pct")).toBeNull();
     expect(screen.getByText(/no cap/i)).toBeTruthy();
   });

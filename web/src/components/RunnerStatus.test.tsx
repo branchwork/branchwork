@@ -99,26 +99,20 @@ describe("RunnerStatus", () => {
       loaded: true,
     });
     renderRunnerStatus();
-    expect(screen.getByTestId("runner-status").getAttribute("data-state")).toBe(
-      "online",
-    );
+    expect(screen.getByTestId("runner-status").getAttribute("data-state")).toBe("online");
     act(() => {
       handleWsMessage({
         type: "runner_disconnected",
         data: { runner_id: "r1" },
       });
     });
-    expect(screen.getByTestId("runner-status").getAttribute("data-state")).toBe(
-      "offline",
-    );
+    expect(screen.getByTestId("runner-status").getAttribute("data-state")).toBe("offline");
   });
 
   it("flips to emerald within one render after `runner_connected`", () => {
     useRunnerStore.setState({ mode: "saas", runners: [], loaded: true });
     renderRunnerStatus();
-    expect(screen.getByTestId("runner-status").getAttribute("data-state")).toBe(
-      "no-runner",
-    );
+    expect(screen.getByTestId("runner-status").getAttribute("data-state")).toBe("no-runner");
     act(() => {
       handleWsMessage({
         type: "runner_connected",

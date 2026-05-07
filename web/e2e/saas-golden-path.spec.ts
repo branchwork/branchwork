@@ -126,7 +126,11 @@ function uniqueEmail(prefix: string): string {
   return `${prefix}-${ts}-${rand}@example.test`;
 }
 
-async function waitForPlanFile(homeDir: string, planName: string, timeoutMs = 30_000): Promise<void> {
+async function waitForPlanFile(
+  homeDir: string,
+  planName: string,
+  timeoutMs = 30_000,
+): Promise<void> {
   const filePath = path.join(homeDir, ".claude", "plans", `${planName}.yaml`);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -145,7 +149,7 @@ async function expectTaskStatus(
   planName: string,
   taskNumber: string,
   expected: string,
-  timeoutMs: number
+  timeoutMs: number,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let last = "";
@@ -165,6 +169,6 @@ async function expectTaskStatus(
     await page.waitForTimeout(500);
   }
   throw new Error(
-    `task ${planName}/${taskNumber} did not reach status=${expected} within ${timeoutMs}ms (last=${last})`
+    `task ${planName}/${taskNumber} did not reach status=${expected} within ${timeoutMs}ms (last=${last})`,
   );
 }

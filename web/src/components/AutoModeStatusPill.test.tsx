@@ -1,11 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { AutoModeStatusPill } from "./PlanBoard.js";
-import {
-  usePlanStore,
-  type AutoModeRuntime,
-  type PlanConfig,
-} from "../stores/plan-store.js";
+import { usePlanStore, type AutoModeRuntime, type PlanConfig } from "../stores/plan-store.js";
 
 const PLAN = "p1";
 
@@ -20,10 +16,7 @@ function defaultConfig(overrides: Partial<PlanConfig> = {}): PlanConfig {
   };
 }
 
-function seed(
-  config: PlanConfig | null,
-  runtime: AutoModeRuntime | null,
-): void {
+function seed(config: PlanConfig | null, runtime: AutoModeRuntime | null): void {
   usePlanStore.setState({
     planConfigs: config ? { [PLAN]: config } : {},
     autoModeRuntimes: { [PLAN]: runtime },
@@ -50,28 +43,19 @@ describe("AutoModeStatusPill", () => {
   });
 
   it("renders the merging pill with the task number", () => {
-    seed(
-      defaultConfig(),
-      { state: "merging", task: "1.1" },
-    );
+    seed(defaultConfig(), { state: "merging", task: "1.1" });
     render(<AutoModeStatusPill planName={PLAN} />);
     expect(screen.getByText(/auto: merging task 1\.1/i)).toBeTruthy();
   });
 
   it("renders the awaiting-CI pill", () => {
-    seed(
-      defaultConfig(),
-      { state: "awaiting_ci", task: "1.1", sha: "abc" },
-    );
+    seed(defaultConfig(), { state: "awaiting_ci", task: "1.1", sha: "abc" });
     render(<AutoModeStatusPill planName={PLAN} />);
     expect(screen.getByText(/auto: waiting on CI/i)).toBeTruthy();
   });
 
   it("renders the fixing-CI pill with attempt/cap", () => {
-    seed(
-      defaultConfig({ maxFixAttempts: 5 }),
-      { state: "fixing_ci", task: "1.1", attempt: 2 },
-    );
+    seed(defaultConfig({ maxFixAttempts: 5 }), { state: "fixing_ci", task: "1.1", attempt: 2 });
     render(<AutoModeStatusPill planName={PLAN} />);
     expect(screen.getByText(/auto: fixing CI \(attempt 2\/5\)/i)).toBeTruthy();
   });
@@ -103,12 +87,10 @@ describe("AutoModeStatusPill", () => {
 
   it("PUTs pausedReason: null when Resume is clicked", async () => {
     const fetchSpy = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify(
-          defaultConfig({ pausedReason: null }),
-        ),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      ),
+      new Response(JSON.stringify(defaultConfig({ pausedReason: null })), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
     );
     vi.stubGlobal("fetch", fetchSpy);
 

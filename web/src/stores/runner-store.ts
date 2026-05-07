@@ -182,10 +182,7 @@ interface RunnerStore {
   /// chip reflects the latest auth state without a refetch. Drivers are
   /// optional: 4.1's call site passes only `runner_id`; 4.5+ passes the
   /// payload's `drivers` array as well.
-  applyDriversTouch: (payload: {
-    runner_id: string;
-    drivers?: RunnerDriverInfo[];
-  }) => void;
+  applyDriversTouch: (payload: { runner_id: string; drivers?: RunnerDriverInfo[] }) => void;
   /// Per-runner config cache, keyed by `runner.id`. Populated lazily by
   /// `fetchRunnerConfig`; the Settings expander on RunnersPage subscribes
   /// here so the values survive a row re-render.
@@ -197,10 +194,7 @@ interface RunnerStore {
   /// PUT `/api/runners/{id}/config`. The server returns the same shape as
   /// GET so we update `configByRunnerId` from the response — no follow-up
   /// fetch needed.
-  saveRunnerConfig: (
-    runnerId: string,
-    patch: RunnerConfigPatch,
-  ) => Promise<RunnerConfig>;
+  saveRunnerConfig: (runnerId: string, patch: RunnerConfigPatch) => Promise<RunnerConfig>;
   /// Drop everything back to its initial shape. Driven by `reset-all.ts` on
   /// logout so user A's runner inventory doesn't bleed into user B's tab.
   reset: () => void;
@@ -257,11 +251,8 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
         // wins by default.
         const currentSelected = get().selectedRunnerId;
         const selectedStillValid =
-          currentSelected !== null &&
-          runners.some((r) => r.id === currentSelected);
-        const selectedRunnerId = selectedStillValid
-          ? currentSelected
-          : (runners[0]?.id ?? null);
+          currentSelected !== null && runners.some((r) => r.id === currentSelected);
+        const selectedRunnerId = selectedStillValid ? currentSelected : (runners[0]?.id ?? null);
         if (selectedRunnerId !== currentSelected) {
           writePersistedSelectedRunnerId(selectedRunnerId);
         }
@@ -293,10 +284,9 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
   },
 
   createRunnerToken: async (runnerName) => {
-    const issued = await postJson<RunnerTokenIssued>(
-      "/api/runners/tokens",
-      { runner_name: runnerName },
-    );
+    const issued = await postJson<RunnerTokenIssued>("/api/runners/tokens", {
+      runner_name: runnerName,
+    });
     // Don't await — the modal needs the token NOW; the runner row only
     // appears once the operator runs `branchwork-runner --token` and the
     // WS handshake lands. The refetch is a best-effort warmup so a row
@@ -307,10 +297,9 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
   },
 
   fetchInstallCommand: async (runnerName) => {
-    const issued = await postJson<RunnerInstallCommand>(
-      "/api/runners/install-command",
-      { runner_name: runnerName },
-    );
+    const issued = await postJson<RunnerInstallCommand>("/api/runners/install-command", {
+      runner_name: runnerName,
+    });
     // Same warmup as createRunnerToken: prefetch /api/runners so the
     // row appears as soon as the runner connects, without waiting for
     // the next page-level refetch.
@@ -325,8 +314,7 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
       // Auto-select the freshly-connected runner if no selection is
       // active yet. This makes the dashboard's first runner the default
       // target without any extra user click.
-      const autoSelected =
-        s.selectedRunnerId === null ? payload.runner_id : s.selectedRunnerId;
+      const autoSelected = s.selectedRunnerId === null ? payload.runner_id : s.selectedRunnerId;
       if (autoSelected !== s.selectedRunnerId) {
         writePersistedSelectedRunnerId(autoSelected);
       }
@@ -391,9 +379,7 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
         // Driver report can land before the runner row exists — still
         // cache the inventory so the RunnersPage chip is ready when the
         // row arrives via fetchRunners().
-        return payload.drivers
-          ? { driversByRunnerId: nextDriversByRunnerId }
-          : {};
+        return payload.drivers ? { driversByRunnerId: nextDriversByRunnerId } : {};
       }
       const next = s.runners.slice();
       next[idx] = {

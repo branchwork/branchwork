@@ -76,10 +76,7 @@ export function getInFlightOrgsFetch(): Promise<void> | null {
   return inFlightOrgsFetch;
 }
 
-const INITIAL_STATE: Pick<
-  OrgStore,
-  "memberships" | "loaded" | "lastFetchedAt"
-> = {
+const INITIAL_STATE: Pick<OrgStore, "memberships" | "loaded" | "lastFetchedAt"> = {
   memberships: [],
   loaded: false,
   lastFetchedAt: null,

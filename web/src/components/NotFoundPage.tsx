@@ -14,15 +14,10 @@ export function NotFoundPage() {
         role="alert"
         className="max-w-lg rounded border border-gray-800 bg-gray-900/50 p-6 text-center"
       >
-        <p className="text-xs font-mono uppercase tracking-wider text-gray-600">
-          404
-        </p>
-        <h2 className="mt-1 text-lg font-semibold text-gray-100">
-          Page not found
-        </h2>
+        <p className="text-xs font-mono uppercase tracking-wider text-gray-600">404</p>
+        <h2 className="mt-1 text-lg font-semibold text-gray-100">Page not found</h2>
         <p className="mt-1 text-sm text-gray-400">
-          No route matches{" "}
-          <span className="font-mono text-gray-200">{location.pathname}</span>.
+          No route matches <span className="font-mono text-gray-200">{location.pathname}</span>.
         </p>
         <div className="mt-4">
           <Link

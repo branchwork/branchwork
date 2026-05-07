@@ -57,12 +57,8 @@ export function BudgetTab({ orgSlug }: BudgetTabProps) {
     setError(null);
     try {
       const [b, u] = await Promise.all([
-        fetchJson<BudgetResponse>(
-          `/api/orgs/${encodeURIComponent(orgSlug)}/budget`,
-        ),
-        fetchJson<UsageResponse>(
-          `/api/orgs/${encodeURIComponent(orgSlug)}/usage`,
-        ),
+        fetchJson<BudgetResponse>(`/api/orgs/${encodeURIComponent(orgSlug)}/budget`),
+        fetchJson<UsageResponse>(`/api/orgs/${encodeURIComponent(orgSlug)}/usage`),
       ]);
       setBudget(b);
       setUsage(u);
@@ -85,8 +81,7 @@ export function BudgetTab({ orgSlug }: BudgetTabProps) {
     setSaved(false);
     try {
       const trimmed = draft.trim();
-      const max =
-        trimmed === "" ? null : Number.parseFloat(trimmed);
+      const max = trimmed === "" ? null : Number.parseFloat(trimmed);
       if (max !== null && (Number.isNaN(max) || max < 0)) {
         toastError("Budget must be a non-negative number");
         setSaving(false);
@@ -125,9 +120,8 @@ export function BudgetTab({ orgSlug }: BudgetTabProps) {
       <div className="rounded border border-gray-800 bg-gray-900/40 p-4">
         <h2 className="text-sm font-semibold text-gray-200">Monthly budget</h2>
         <p className="text-[11px] text-gray-500 mt-1 mb-3 leading-relaxed">
-          Cap the total agent cost across this org for the current billing
-          period. Leave blank to remove the cap. The kill-switch flips on
-          automatically at 100% (see Kill switch tab).
+          Cap the total agent cost across this org for the current billing period. Leave blank to
+          remove the cap. The kill-switch flips on automatically at 100% (see Kill switch tab).
         </p>
         {loading && (
           <p className="text-xs text-gray-500" data-testid="budget-loading">
@@ -151,26 +145,16 @@ export function BudgetTab({ orgSlug }: BudgetTabProps) {
               className="w-32 bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-600"
             />
             <span className="text-xs text-gray-500">USD / month</span>
-            <Button
-              onClick={save}
-              loading={saving}
-              disabled={saving}
-              variant="primary"
-              size="sm"
-            >
+            <Button onClick={save} loading={saving} disabled={saving} variant="primary" size="sm">
               Save
             </Button>
-            {saved && (
-              <span className="text-[11px] text-emerald-400">Saved.</span>
-            )}
+            {saved && <span className="text-[11px] text-emerald-400">Saved.</span>}
           </div>
         )}
       </div>
 
       <div className="rounded border border-gray-800 bg-gray-900/40 p-4">
-        <h2 className="text-sm font-semibold text-gray-200">
-          Usage this period
-        </h2>
+        <h2 className="text-sm font-semibold text-gray-200">Usage this period</h2>
         {usage && (
           <p className="text-[11px] text-gray-500 mt-1 mb-3">
             Period: <span className="font-mono">{usage.summary.periodKey}</span>
@@ -179,10 +163,7 @@ export function BudgetTab({ orgSlug }: BudgetTabProps) {
         {usage && (
           <div className="mb-4">
             <div className="flex items-baseline justify-between mb-1">
-              <span
-                className="text-base font-semibold text-gray-100"
-                data-testid="budget-spent"
-              >
+              <span className="text-base font-semibold text-gray-100" data-testid="budget-spent">
                 ${totalSpent.toFixed(2)}
               </span>
               <span className="text-xs text-gray-500">
@@ -227,9 +208,7 @@ export function BudgetTab({ orgSlug }: BudgetTabProps) {
 
         {usage && usage.users.length > 0 && (
           <div data-testid="usage-by-user">
-            <h3 className="text-xs uppercase tracking-wide text-gray-500 mb-2">
-              By user
-            </h3>
+            <h3 className="text-xs uppercase tracking-wide text-gray-500 mb-2">By user</h3>
             <div className="space-y-1">
               {usage.users
                 .slice()
@@ -256,8 +235,7 @@ function UsageRow({
   // a relative reference. With neither, we just render the dollar
   // amount without a bar.
   const ref = user.quotaUsd ?? planMax;
-  const pct =
-    ref !== null && ref > 0 ? Math.min(1, user.costUsd / ref) : null;
+  const pct = ref !== null && ref > 0 ? Math.min(1, user.costUsd / ref) : null;
   const color =
     pct === null
       ? "bg-gray-700"
@@ -275,9 +253,7 @@ function UsageRow({
           style={{ width: pct !== null ? `${pct * 100}%` : "0%" }}
         />
       </div>
-      <div className="w-20 text-right text-gray-200 tabular-nums">
-        ${user.costUsd.toFixed(2)}
-      </div>
+      <div className="w-20 text-right text-gray-200 tabular-nums">${user.costUsd.toFixed(2)}</div>
       <div className="w-20 text-right text-gray-500 tabular-nums">
         {user.quotaUsd !== null
           ? `/ $${user.quotaUsd.toFixed(2)}`

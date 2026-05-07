@@ -68,7 +68,7 @@ export class StubRunner {
           ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "e2e-stub-key",
         },
         stdio: ["ignore", "pipe", "pipe"],
-      }
+      },
     );
 
     const trace = process.env.BRANCHWORK_E2E_TRACE === "1";
@@ -93,10 +93,7 @@ export class StubRunner {
         // ignore
       }
     }
-    await Promise.race([
-      this.exited,
-      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
-    ]);
+    await Promise.race([this.exited, new Promise<void>((resolve) => setTimeout(resolve, 5_000))]);
     if (this.child.exitCode === null && this.child.signalCode === null) {
       try {
         this.child.kill("SIGKILL");
@@ -116,7 +113,7 @@ export class StubRunner {
 export async function waitForRunnerOnline(
   apiBase: string,
   cookie: string,
-  timeoutMs = 20_000
+  timeoutMs = 20_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let last = "";

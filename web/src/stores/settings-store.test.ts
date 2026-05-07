@@ -29,32 +29,25 @@ interface CallLog {
 
 function installFetchMock(handler: FetchHandler) {
   const calls: CallLog[] = [];
-  const fn = vi.fn(
-    async (input: string | URL | Request, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.pathname + input.search
-            : input.url;
-      const method = init?.method ?? "GET";
-      const rawBody = init?.body;
-      const body =
-        typeof rawBody === "string" && rawBody.length > 0
-          ? JSON.parse(rawBody)
-          : undefined;
-      calls.push({ url, method, body });
-      const result = await handler(url, method, body);
-      return new Response(
-        result.body !== undefined ? JSON.stringify(result.body) : null,
-        {
-          status: result.status,
-          statusText: result.statusText,
-          headers: { "Content-Type": "application/json" },
-        },
-      );
-    },
-  );
+  const fn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.pathname + input.search
+          : input.url;
+    const method = init?.method ?? "GET";
+    const rawBody = init?.body;
+    const body =
+      typeof rawBody === "string" && rawBody.length > 0 ? JSON.parse(rawBody) : undefined;
+    calls.push({ url, method, body });
+    const result = await handler(url, method, body);
+    return new Response(result.body !== undefined ? JSON.stringify(result.body) : null, {
+      status: result.status,
+      statusText: result.statusText,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
   vi.stubGlobal("fetch", fn);
   return { calls, fn };
 }
@@ -116,9 +109,7 @@ describe("settings-store mutations (PUT setters)", () => {
     await useSettingsStore.getState().setEffort("low");
 
     expect(useSettingsStore.getState().effort).toBe("low");
-    expect(calls).toEqual([
-      { url: "/api/settings", method: "PUT", body: { effort: "low" } },
-    ]);
+    expect(calls).toEqual([{ url: "/api/settings", method: "PUT", body: { effort: "low" } }]);
   });
 
   it("setSkipPermissions PUTs /api/settings and updates the local slice", async () => {
@@ -143,9 +134,7 @@ describe("settings-store mutations (PUT setters)", () => {
     await useSettingsStore.getState().setWebhookUrl(null);
 
     expect(useSettingsStore.getState().webhookUrl).toBeNull();
-    expect(calls).toEqual([
-      { url: "/api/settings", method: "PUT", body: { webhook_url: null } },
-    ]);
+    expect(calls).toEqual([{ url: "/api/settings", method: "PUT", body: { webhook_url: null } }]);
   });
 
   it("setPlanArchiveRetentionDays PUTs /api/settings (snake_case wire field)", async () => {
@@ -377,14 +366,10 @@ describe("settings-store selectors", () => {
     expect(isDriverReady(undefined)).toBe(true);
     expect(isDriverReady({ kind: "oauth", account: null })).toBe(true);
     expect(isDriverReady({ kind: "api_key" })).toBe(true);
-    expect(
-      isDriverReady({ kind: "cloud_provider", provider: "bedrock" }),
-    ).toBe(true);
+    expect(isDriverReady({ kind: "cloud_provider", provider: "bedrock" })).toBe(true);
     expect(isDriverReady({ kind: "unknown" })).toBe(true);
     expect(isDriverReady({ kind: "not_installed" })).toBe(false);
-    expect(
-      isDriverReady({ kind: "unauthenticated", help: "log in" }),
-    ).toBe(false);
+    expect(isDriverReady({ kind: "unauthenticated", help: "log in" })).toBe(false);
   });
 });
 

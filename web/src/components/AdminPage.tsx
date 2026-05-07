@@ -117,9 +117,7 @@ export function AdminPage() {
   }, [showOrgTabs, showAdminTabs]);
 
   const requested = (section ?? "settings") as AdminTab;
-  const activeTab: AdminTab = allowedTabs.includes(requested)
-    ? requested
-    : "settings";
+  const activeTab: AdminTab = allowedTabs.includes(requested) ? requested : "settings";
 
   // Visiting `/admin/budget` as a non-admin (or on a standalone box)
   // bounces to /admin/settings so the URL stays in sync with the
@@ -156,19 +154,11 @@ export function AdminPage() {
       {activeTab === "settings" && <SettingsTab />}
       {activeTab === "diagnostics" && <DiagnosticsTab />}
       {activeTab === "members" && current && (
-        <MembersTab
-          orgSlug={current.slug}
-          callerRole={role}
-          callerUserId={user?.id ?? null}
-        />
+        <MembersTab orgSlug={current.slug} callerRole={role} callerUserId={user?.id ?? null} />
       )}
       {activeTab === "budget" && current && <BudgetTab orgSlug={current.slug} />}
-      {activeTab === "kill-switch" && current && (
-        <KillSwitchTab orgSlug={current.slug} />
-      )}
-      {activeTab === "quotas" && current && (
-        <UserQuotasTab orgSlug={current.slug} />
-      )}
+      {activeTab === "kill-switch" && current && <KillSwitchTab orgSlug={current.slug} />}
+      {activeTab === "quotas" && current && <UserQuotasTab orgSlug={current.slug} />}
       {activeTab === "sso" && current && <SsoTab orgSlug={current.slug} />}
     </div>
   );
@@ -184,25 +174,17 @@ function SettingsTab() {
   const setSkipPermissions = useSettingsStore((s) => s.setSkipPermissions);
   const webhookUrl = useSettingsStore((s) => s.webhookUrl);
   const setWebhookUrl = useSettingsStore((s) => s.setWebhookUrl);
-  const planArchiveRetentionDays = useSettingsStore(
-    (s) => s.planArchiveRetentionDays,
-  );
-  const setPlanArchiveRetentionDays = useSettingsStore(
-    (s) => s.setPlanArchiveRetentionDays,
-  );
+  const planArchiveRetentionDays = useSettingsStore((s) => s.planArchiveRetentionDays);
+  const setPlanArchiveRetentionDays = useSettingsStore((s) => s.setPlanArchiveRetentionDays);
 
   const [webhookDraft, setWebhookDraft] = useState(webhookUrl ?? "");
-  const [webhookStatus, setWebhookStatus] = useState<
-    "idle" | "saving" | "saved" | "error"
-  >("idle");
+  const [webhookStatus, setWebhookStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [webhookError, setWebhookError] = useState<string | null>(null);
 
-  const [retentionDraft, setRetentionDraft] = useState(
-    String(planArchiveRetentionDays),
+  const [retentionDraft, setRetentionDraft] = useState(String(planArchiveRetentionDays));
+  const [retentionStatus, setRetentionStatus] = useState<"idle" | "saving" | "saved" | "error">(
+    "idle",
   );
-  const [retentionStatus, setRetentionStatus] = useState<
-    "idle" | "saving" | "saved" | "error"
-  >("idle");
   const [retentionError, setRetentionError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -221,10 +203,7 @@ function SettingsTab() {
   // Preview always reflects what the *committed* value would be — i.e. the
   // clamped draft if the user blurred right now. Keeps the chip consistent
   // with the modal copy after a save.
-  const retentionPreviewDays = clampRetentionDays(
-    retentionDraft,
-    planArchiveRetentionDays,
-  );
+  const retentionPreviewDays = clampRetentionDays(retentionDraft, planArchiveRetentionDays);
 
   async function commitRetention() {
     const next = clampRetentionDays(retentionDraft, planArchiveRetentionDays);
@@ -289,14 +268,10 @@ function SettingsTab() {
         description={
           <>
             Spawn Claude agents with{" "}
-            <code className="text-gray-400">--dangerously-skip-permissions</code>
-            . Requires{" "}
-            <code className="text-gray-400">
-              "skipDangerousModePermissionPrompt": true
-            </code>{" "}
-            in
-            <code className="text-gray-400"> ~/.claude/settings.json</code> (see
-            README), otherwise the session ends on first launch.
+            <code className="text-gray-400">--dangerously-skip-permissions</code>. Requires{" "}
+            <code className="text-gray-400">"skipDangerousModePermissionPrompt": true</code> in
+            <code className="text-gray-400"> ~/.claude/settings.json</code> (see README), otherwise
+            the session ends on first launch.
           </>
         }
       >
@@ -307,9 +282,7 @@ function SettingsTab() {
             onChange={(e) => setSkipPermissions(e.target.checked)}
             className="accent-amber-500 w-4 h-4"
           />
-          <span
-            className={`text-sm ${skipPermissions ? "text-amber-400" : "text-gray-400"}`}
-          >
+          <span className={`text-sm ${skipPermissions ? "text-amber-400" : "text-gray-400"}`}>
             {skipPermissions ? "On" : "Off"}
           </span>
         </label>
@@ -338,9 +311,7 @@ function SettingsTab() {
             {webhookStatus === "saving" ? "Saving" : "Save"}
           </Button>
         </div>
-        {webhookStatus === "saved" && (
-          <p className="text-[11px] text-emerald-400 mt-1.5">Saved.</p>
-        )}
+        {webhookStatus === "saved" && <p className="text-[11px] text-emerald-400 mt-1.5">Saved.</p>}
         {webhookStatus === "error" && webhookError && (
           <Banner className="mt-1.5">{webhookError}</Banner>
         )}
@@ -350,11 +321,10 @@ function SettingsTab() {
         title="Browser notifications"
         description={
           <>
-            Per-event-class opt-out for desktop notifications. The
-            browser asks for permission once when you click Enable below
-            — Branchwork never prompts on its own (audit §16). All
-            classes ship enabled by default; uncheck to silence a class
-            without affecting the others.
+            Per-event-class opt-out for desktop notifications. The browser asks for permission once
+            when you click Enable below — Branchwork never prompts on its own (audit §16). All
+            classes ship enabled by default; uncheck to silence a class without affecting the
+            others.
           </>
         }
       >
@@ -365,10 +335,9 @@ function SettingsTab() {
         title="Retention"
         description={
           <>
-            Days a soft-deleted plan stays in the archive before purge. Set
-            to 0 to disable soft delete — Delete becomes permanent and
-            skips the archive. Range 0–365; out-of-range values clamp on
-            blur.
+            Days a soft-deleted plan stays in the archive before purge. Set to 0 to disable soft
+            delete — Delete becomes permanent and skips the archive. Range 0–365; out-of-range
+            values clamp on blur.
           </>
         }
       >
@@ -417,36 +386,32 @@ function SettingsTab() {
 /// `Notification.requestPermission()`; the WS connect path no longer
 /// prompts (audit §16).
 function NotificationsSubsection() {
-  const supported =
-    typeof window !== "undefined" && "Notification" in window;
+  const supported = typeof window !== "undefined" && "Notification" in window;
 
   // Track permission + the local checkbox state in component state so a
   // toggle re-renders this subsection without forcing the parent to
   // bookkeep prefs in zustand. localStorage is the source of truth on
   // every read; React state is the cache that drives re-render.
-  const [permission, setPermission] = useState<
-    NotificationPermission | "unsupported"
-  >(getNotificationPermission());
-  const [enabledMap, setEnabledMap] = useState<Record<NotificationClass, boolean>>(
-    () => {
-      const map = {} as Record<NotificationClass, boolean>;
-      for (const klass of NOTIFICATION_CLASS_ORDER) {
-        map[klass] = isClassEnabled(klass);
-      }
-      return map;
-    },
+  const [permission, setPermission] = useState<NotificationPermission | "unsupported">(
+    getNotificationPermission(),
   );
-  const [requestStatus, setRequestStatus] = useState<
-    "idle" | "requesting" | "denied" | "granted"
-  >("idle");
+  const [enabledMap, setEnabledMap] = useState<Record<NotificationClass, boolean>>(() => {
+    const map = {} as Record<NotificationClass, boolean>;
+    for (const klass of NOTIFICATION_CLASS_ORDER) {
+      map[klass] = isClassEnabled(klass);
+    }
+    return map;
+  });
+  const [requestStatus, setRequestStatus] = useState<"idle" | "requesting" | "denied" | "granted">(
+    "idle",
+  );
 
   async function handleEnable() {
     setRequestStatus("requesting");
     const result = await requestNotificationPermission();
     setPermission(result);
     if (result === "granted") setRequestStatus("granted");
-    else if (result === "denied" || result === "unsupported")
-      setRequestStatus("denied");
+    else if (result === "denied" || result === "unsupported") setRequestStatus("denied");
     else setRequestStatus("idle");
   }
 
@@ -474,14 +439,14 @@ function NotificationsSubsection() {
 
       {permission === "denied" && (
         <Banner className="mb-3">
-          The browser blocked notifications. Re-enable them from your
-          browser's site settings, then refresh the page.
+          The browser blocked notifications. Re-enable them from your browser's site settings, then
+          refresh the page.
         </Banner>
       )}
       {permission === "unsupported" && (
         <Banner className="mb-3">
-          This browser does not expose the Notification API. Toggles are
-          stored locally and will take effect in a supported browser.
+          This browser does not expose the Notification API. Toggles are stored locally and will
+          take effect in a supported browser.
         </Banner>
       )}
 
@@ -516,11 +481,7 @@ function NotificationsSubsection() {
   );
 }
 
-function PermissionBadge({
-  permission,
-}: {
-  permission: NotificationPermission | "unsupported";
-}) {
+function PermissionBadge({ permission }: { permission: NotificationPermission | "unsupported" }) {
   let label: string;
   let cls: string;
   switch (permission) {
@@ -577,9 +538,7 @@ function Section({ title, description, children, serverWide }: SectionProps) {
           </span>
         )}
       </div>
-      <p className="text-[11px] text-gray-500 mt-1 mb-3 leading-relaxed">
-        {description}
-      </p>
+      <p className="text-[11px] text-gray-500 mt-1 mb-3 leading-relaxed">{description}</p>
       {children}
     </div>
   );
@@ -592,10 +551,7 @@ function PerRunnerOverrideNote() {
   return (
     <p className="mt-2 text-[11px] text-gray-600">
       Runners can override this per-runner on the{" "}
-      <a
-        href="/runners"
-        className="underline decoration-dotted hover:text-gray-400"
-      >
+      <a href="/runners" className="underline decoration-dotted hover:text-gray-400">
         Runners page
       </a>
       .

@@ -77,7 +77,16 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [user, fetchPlans, fetchAgents, fetchSettings, fetchDrivers, fetchRunners, fetchOrgs, connect]);
+  }, [
+    user,
+    fetchPlans,
+    fetchAgents,
+    fetchSettings,
+    fetchDrivers,
+    fetchRunners,
+    fetchOrgs,
+    connect,
+  ]);
 
   // Refetch when the tab becomes visible again — covers events missed
   // while the browser throttled or suspended the WebSocket.
@@ -160,10 +169,7 @@ export function App() {
         </span>
         <span className="text-gray-600">·</span>
         <span className="text-gray-500">{user.email}</span>
-        <button
-          onClick={() => logout()}
-          className="text-gray-600 hover:text-gray-300 transition"
-        >
+        <button onClick={() => logout()} className="text-gray-600 hover:text-gray-300 transition">
           Sign out
         </button>
       </div>

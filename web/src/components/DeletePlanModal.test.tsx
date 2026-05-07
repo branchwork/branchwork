@@ -1,16 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
 import axe from "axe-core";
-import {
-  DeletePlanModal,
-  formatCascadeSummary,
-} from "./DeletePlanModal.js";
+import { DeletePlanModal, formatCascadeSummary } from "./DeletePlanModal.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { HttpError } from "../api.js";
@@ -75,73 +67,39 @@ afterEach(() => {
 
 describe("DeletePlanModal", () => {
   it("renders the soft-delete copy and shows the Shift hint when retention > 0", () => {
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={() => {}}
-      />,
-    );
-    expect(
-      screen.getByRole("heading", { name: /Delete plan scratch-plan\?/i }),
-    ).toBeTruthy();
-    expect(
-      screen.getByText(/Recoverable for 30 days from the Activity tab/i),
-    ).toBeTruthy();
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={() => {}} />);
+    expect(screen.getByRole("heading", { name: /Delete plan scratch-plan\?/i })).toBeTruthy();
+    expect(screen.getByText(/Recoverable for 30 days from the Activity tab/i)).toBeTruthy();
     // Shift hint mentions Shift modifier verbatim.
     expect(screen.getByText(/Hold/)).toBeTruthy();
     expect(screen.getByText("Shift")).toBeTruthy();
   });
 
   it("uses singular 'day' when retention is exactly 1", () => {
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={1}
-        onClose={() => {}}
-      />,
-    );
-    expect(
-      screen.getByText(/Recoverable for 1 day from the Activity tab/i),
-    ).toBeTruthy();
+    render(<DeletePlanModal planName={PLAN} retentionDays={1} onClose={() => {}} />);
+    expect(screen.getByText(/Recoverable for 1 day from the Activity tab/i)).toBeTruthy();
   });
 
   it("opens directly in hard-confirm mode when retentionDays is 0", () => {
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={0}
-        onClose={() => {}}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={0} onClose={() => {}} />);
     expect(
       screen.getByRole("heading", {
         name: /Permanently delete plan scratch-plan\?/i,
       }),
     ).toBeTruthy();
-    expect(
-      screen.getByText(/Permanently deletes the plan file/i),
-    ).toBeTruthy();
+    expect(screen.getByText(/Permanently deletes the plan file/i)).toBeTruthy();
     expect(screen.getByText(/This cannot be undone/i)).toBeTruthy();
     // No Shift hint — modifier is meaningless when retention is 0.
     expect(screen.queryByText(/Hold/)).toBeNull();
     // Primary button text is the permanent variant.
-    expect(
-      screen.getByRole("button", { name: /Permanently delete/i }),
-    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Permanently delete/i })).toBeTruthy();
   });
 
   it("Cancel does not call deletePlan and invokes onClose", () => {
     const onClose = vi.fn();
     const deletePlan = vi.fn();
     usePlanStore.setState({ deletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={onClose}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
     expect(deletePlan).not.toHaveBeenCalled();
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -157,13 +115,7 @@ describe("DeletePlanModal", () => {
       hard: false,
     });
     usePlanStore.setState({ deletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={onClose}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
     await waitFor(() => expect(deletePlan).toHaveBeenCalledTimes(1));
     // Soft delete: opts is undefined so the call site sends no `?hard=true`.
@@ -181,13 +133,7 @@ describe("DeletePlanModal", () => {
       hard: true,
     });
     usePlanStore.setState({ deletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={onClose}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={onClose} />);
     // First click holds Shift — should NOT issue the delete.
     fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }), {
       shiftKey: true,
@@ -202,9 +148,7 @@ describe("DeletePlanModal", () => {
       ).toBeTruthy(),
     );
     // Second click on the new "Permanently delete" button issues hard delete.
-    fireEvent.click(
-      screen.getByRole("button", { name: /Permanently delete/i }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: /Permanently delete/i }));
     await waitFor(() => expect(deletePlan).toHaveBeenCalledTimes(1));
     expect(deletePlan).toHaveBeenCalledWith(PLAN, { hard: true });
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
@@ -219,19 +163,9 @@ describe("DeletePlanModal", () => {
       }),
     );
     usePlanStore.setState({ deletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={onClose}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
-    await waitFor(() =>
-      expect(
-        screen.getByText(/this plan has running agents/i),
-      ).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/this plan has running agents/i)).toBeTruthy());
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "agent-aaa" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "agent-bbb" })).toBeTruthy();
@@ -248,17 +182,9 @@ describe("DeletePlanModal", () => {
     );
     usePlanStore.setState({ deletePlan });
     useAgentStore.setState({ selectAgent });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={onClose}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "agent-xyz" })).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "agent-xyz" })).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "agent-xyz" }));
     expect(selectAgent).toHaveBeenCalledWith("agent-xyz");
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -266,23 +192,13 @@ describe("DeletePlanModal", () => {
 
   it("409 auto_mode_in_flight surfaces an explanatory banner", async () => {
     const onClose = vi.fn();
-    const deletePlan = vi.fn().mockRejectedValue(
-      new HttpError(409, "Conflict", { error: "auto_mode_in_flight" }),
-    );
+    const deletePlan = vi
+      .fn()
+      .mockRejectedValue(new HttpError(409, "Conflict", { error: "auto_mode_in_flight" }));
     usePlanStore.setState({ deletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={onClose}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
-    await waitFor(() =>
-      expect(
-        screen.getByText(/auto-mode is mid-flight/i),
-      ).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/auto-mode is mid-flight/i)).toBeTruthy());
     expect(onClose).not.toHaveBeenCalled();
   });
 
@@ -290,30 +206,16 @@ describe("DeletePlanModal", () => {
     const onClose = vi.fn();
     const deletePlan = vi
       .fn()
-      .mockRejectedValue(
-        new HttpError(404, "Not Found", { error: "plan_not_found" }),
-      );
+      .mockRejectedValue(new HttpError(404, "Not Found", { error: "plan_not_found" }));
     usePlanStore.setState({ deletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={onClose}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
   it("ESC closes the modal", () => {
     const onClose = vi.fn();
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={onClose}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={onClose} />);
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
@@ -324,11 +226,7 @@ describe("DeletePlanModal", () => {
     document.body.appendChild(trigger);
     trigger.focus();
     const { unmount } = render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={() => {}}
-      />,
+      <DeletePlanModal planName={PLAN} retentionDays={30} onClose={() => {}} />,
     );
     // While the modal is mounted, focus should have moved off the trigger.
     expect(document.activeElement).not.toBe(trigger);
@@ -340,50 +238,28 @@ describe("DeletePlanModal", () => {
   it("renders 'Computing cascade preview…' until the dry-run fetch resolves", async () => {
     // Don't resolve the preview promise during this assertion window.
     let resolvePreview: (v: ReturnType<typeof defaultPreview>) => void = () => {};
-    const previewDeletePlan = vi
-      .fn()
-      .mockImplementation(
-        () =>
-          new Promise<ReturnType<typeof defaultPreview>>((res) => {
-            resolvePreview = res;
-          }),
-      );
+    const previewDeletePlan = vi.fn().mockImplementation(
+      () =>
+        new Promise<ReturnType<typeof defaultPreview>>((res) => {
+          resolvePreview = res;
+        }),
+    );
     usePlanStore.setState({ previewDeletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={() => {}}
-      />,
-    );
-    expect(
-      screen.getByText(/Computing cascade preview…/i),
-    ).toBeTruthy();
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={() => {}} />);
+    expect(screen.getByText(/Computing cascade preview…/i)).toBeTruthy();
     resolvePreview(defaultPreview());
-    await waitFor(() =>
-      expect(
-        screen.queryByText(/Computing cascade preview…/i),
-      ).toBeNull(),
-    );
+    await waitFor(() => expect(screen.queryByText(/Computing cascade preview…/i)).toBeNull());
   });
 
   it("renders the per-table cascade preview line from wouldDelete", async () => {
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={() => {}}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={() => {}} />);
     // Wait for the preview fetch to resolve.
     await waitFor(() =>
-      expect(
-        screen.getByTestId("delete-plan-cascade-preview").textContent,
-      ).toContain("12 task statuses"),
+      expect(screen.getByTestId("delete-plan-cascade-preview").textContent).toContain(
+        "12 task statuses",
+      ),
     );
-    const previewText = screen.getByTestId(
-      "delete-plan-cascade-preview",
-    ).textContent;
+    const previewText = screen.getByTestId("delete-plan-cascade-preview").textContent;
     expect(previewText).toContain("12 task statuses");
     expect(previewText).toContain("8 CI runs");
     expect(previewText).toContain("3 fix attempts");
@@ -403,19 +279,9 @@ describe("DeletePlanModal", () => {
     });
     const deletePlan = vi.fn();
     usePlanStore.setState({ previewDeletePlan, deletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={() => {}}
-      />,
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={() => {}} />);
     // Banner copy from the blocked branch.
-    await waitFor(() =>
-      expect(
-        screen.getByText(/this plan has running agents/i),
-      ).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/this plan has running agents/i)).toBeTruthy());
     // Agent IDs rendered as buttons (clickable to inspect).
     expect(screen.getByRole("button", { name: "agent-aaa" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "agent-bbb" })).toBeTruthy();
@@ -433,24 +299,14 @@ describe("DeletePlanModal", () => {
     });
     const deletePlan = vi.fn();
     usePlanStore.setState({ previewDeletePlan, deletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={() => {}}
-      />,
-    );
-    await waitFor(() =>
-      expect(screen.getByText(/auto-mode is mid-flight/i)).toBeTruthy(),
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={() => {}} />);
+    await waitFor(() => expect(screen.getByText(/auto-mode is mid-flight/i)).toBeTruthy());
     const deleteBtn = screen.getByRole("button", { name: /^Delete$/ });
     expect((deleteBtn as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("falls back to 'preview unavailable' if dry-run fetch errors and Delete stays clickable", async () => {
-    const previewDeletePlan = vi
-      .fn()
-      .mockRejectedValue(new HttpError(500, "boom", { error: "x" }));
+    const previewDeletePlan = vi.fn().mockRejectedValue(new HttpError(500, "boom", { error: "x" }));
     const deletePlan = vi.fn().mockResolvedValue({
       ok: true,
       name: PLAN,
@@ -459,18 +315,8 @@ describe("DeletePlanModal", () => {
       hard: false,
     });
     usePlanStore.setState({ previewDeletePlan, deletePlan });
-    render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={() => {}}
-      />,
-    );
-    await waitFor(() =>
-      expect(
-        screen.getByText(/Cascade preview unavailable/i),
-      ).toBeTruthy(),
-    );
+    render(<DeletePlanModal planName={PLAN} retentionDays={30} onClose={() => {}} />);
+    await waitFor(() => expect(screen.getByText(/Cascade preview unavailable/i)).toBeTruthy());
     // Delete button still clickable — preview is best-effort UX.
     const deleteBtn = screen.getByRole("button", { name: /^Delete$/ });
     expect((deleteBtn as HTMLButtonElement).disabled).toBe(false);
@@ -480,24 +326,20 @@ describe("DeletePlanModal", () => {
 
   describe("formatCascadeSummary", () => {
     it("returns a fallback when nothing would be deleted", () => {
-      expect(
-        formatCascadeSummary({ task_status: 0, ci_runs: 0 }),
-      ).toMatch(/No cascade rows to delete\./);
+      expect(formatCascadeSummary({ task_status: 0, ci_runs: 0 })).toMatch(
+        /No cascade rows to delete\./,
+      );
     });
 
     it("renders a single non-zero count with singular/plural", () => {
-      expect(formatCascadeSummary({ task_status: 1 })).toBe(
-        "1 task status will be deleted.",
-      );
-      expect(formatCascadeSummary({ task_status: 12 })).toBe(
-        "12 task statuses will be deleted.",
-      );
+      expect(formatCascadeSummary({ task_status: 1 })).toBe("1 task status will be deleted.");
+      expect(formatCascadeSummary({ task_status: 12 })).toBe("12 task statuses will be deleted.");
     });
 
     it("joins two entries with 'and'", () => {
-      expect(
-        formatCascadeSummary({ task_status: 12, ci_runs: 8 }),
-      ).toBe("12 task statuses and 8 CI runs will be deleted.");
+      expect(formatCascadeSummary({ task_status: 12, ci_runs: 8 })).toBe(
+        "12 task statuses and 8 CI runs will be deleted.",
+      );
     });
 
     it("joins three or more entries with commas + Oxford and", () => {
@@ -506,9 +348,7 @@ describe("DeletePlanModal", () => {
         ci_runs: 8,
         task_fix_attempts: 3,
       });
-      expect(out).toBe(
-        "12 task statuses, 8 CI runs, and 3 fix attempts will be deleted.",
-      );
+      expect(out).toBe("12 task statuses, 8 CI runs, and 3 fix attempts will be deleted.");
     });
 
     it("skips zero-count entries silently", () => {
@@ -518,19 +358,13 @@ describe("DeletePlanModal", () => {
         task_fix_attempts: 3,
       });
       expect(out).not.toContain("CI run");
-      expect(out).toBe(
-        "12 task statuses and 3 fix attempts will be deleted.",
-      );
+      expect(out).toBe("12 task statuses and 3 fix attempts will be deleted.");
     });
   });
 
   it("axe-core reports zero violations on the rendered dialog", async () => {
     const { container } = render(
-      <DeletePlanModal
-        planName={PLAN}
-        retentionDays={30}
-        onClose={() => {}}
-      />,
+      <DeletePlanModal planName={PLAN} retentionDays={30} onClose={() => {}} />,
     );
     const dialog = container.querySelector('[role="dialog"]');
     expect(dialog).toBeTruthy();

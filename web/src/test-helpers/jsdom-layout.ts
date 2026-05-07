@@ -38,9 +38,7 @@ if (typeof window !== "undefined") {
         contentRect: rect,
         borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }],
         contentBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }],
-        devicePixelContentBoxSize: [
-          { inlineSize: rect.width, blockSize: rect.height },
-        ],
+        devicePixelContentBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }],
       } as unknown as ResizeObserverEntry;
       // Fire async like the real API to give React a tick to commit.
       queueMicrotask(() => this.callback([entry], this as unknown as ResizeObserver));
@@ -48,9 +46,8 @@ if (typeof window !== "undefined") {
     unobserve() {}
     disconnect() {}
   }
-  (
-    window as unknown as { ResizeObserver: typeof ResizeObserver }
-  ).ResizeObserver = StubResizeObserver as unknown as typeof ResizeObserver;
+  (window as unknown as { ResizeObserver: typeof ResizeObserver }).ResizeObserver =
+    StubResizeObserver as unknown as typeof ResizeObserver;
 
   // getBoundingClientRect on every Element returns all zeros under jsdom;
   // override to advertise the viewport so virtualisers can compute ranges.

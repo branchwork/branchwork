@@ -69,7 +69,7 @@ describe("AgentRail", () => {
     render(
       <MemoryRouter initialEntries={["/plans/foo"]}>
         <AgentRail />
-      </MemoryRouter>
+      </MemoryRouter>,
     );
     expect(screen.queryByTestId("agent-rail")).toBeNull();
   });
@@ -79,7 +79,7 @@ describe("AgentRail", () => {
     render(
       <MemoryRouter initialEntries={[`/agents/${AGENT_ID}`]}>
         <AgentRail />
-      </MemoryRouter>
+      </MemoryRouter>,
     );
 
     const rail = screen.getByTestId("agent-rail");
@@ -102,7 +102,7 @@ describe("AgentRail", () => {
     render(
       <MemoryRouter initialEntries={[`/plans/foo?agent=${AGENT_ID}`]}>
         <AgentRail />
-      </MemoryRouter>
+      </MemoryRouter>,
     );
 
     expect(screen.getByTestId("agent-rail")).toBeTruthy();

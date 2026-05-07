@@ -29,10 +29,7 @@ interface TabsProps<V extends string> {
   tabClassName?: (cfg: TabConfig<V>, selected: boolean) => string;
 }
 
-function DEFAULT_TAB_CLASS<V extends string>(
-  cfg: TabConfig<V>,
-  selected: boolean,
-): string {
+function DEFAULT_TAB_CLASS<V extends string>(cfg: TabConfig<V>, selected: boolean): string {
   if (selected) {
     return "px-3 py-1.5 text-xs font-medium text-gray-200 border-b-2 border-indigo-500 transition";
   }
@@ -104,9 +101,7 @@ export function Tabs<V extends string>({
       case "ArrowUp": {
         e.preventDefault();
         const next =
-          current < 0
-            ? buttons.length - 1
-            : (current - 1 + buttons.length) % buttons.length;
+          current < 0 ? buttons.length - 1 : (current - 1 + buttons.length) % buttons.length;
         focusAndSelect(next);
         break;
       }
@@ -134,9 +129,7 @@ export function Tabs<V extends string>({
     >
       {tabs.map((cfg) => {
         const selected = cfg.value === value;
-        const cls = tabClassName
-          ? tabClassName(cfg, selected)
-          : DEFAULT_TAB_CLASS(cfg, selected);
+        const cls = tabClassName ? tabClassName(cfg, selected) : DEFAULT_TAB_CLASS(cfg, selected);
         return (
           <button
             key={cfg.value}

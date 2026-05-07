@@ -331,9 +331,7 @@ export const WsMessageSchema = v.variant("type", [
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;
 
-export type ParseResult<T> =
-  | { ok: true; value: T }
-  | { ok: false; error: string };
+export type ParseResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
 /// Parse a raw WS frame body into a typed `WsMessage`. Accepts either a
 /// JSON string (the on-the-wire form delivered to `ws.onmessage`) or an

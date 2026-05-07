@@ -28,9 +28,7 @@ export function KillSwitchTab({ orgSlug }: KillSwitchTabProps) {
     setLoading(true);
     setError(null);
     try {
-      const b = await fetchJson<BudgetResponse>(
-        `/api/orgs/${encodeURIComponent(orgSlug)}/budget`,
-      );
+      const b = await fetchJson<BudgetResponse>(`/api/orgs/${encodeURIComponent(orgSlug)}/budget`);
       setActive(b.killSwitchActive);
     } catch (e) {
       setError(errorMessage(e));
@@ -46,15 +44,12 @@ export function KillSwitchTab({ orgSlug }: KillSwitchTabProps) {
   async function toggle(next: boolean) {
     setBusy(true);
     try {
-      await putJson(
-        `/api/orgs/${encodeURIComponent(orgSlug)}/kill-switch`,
-        {
-          active: next,
-          // `reason` is only meaningful when activating — clearing the
-          // switch shouldn't carry a justification field.
-          reason: next ? reason.trim() || null : null,
-        },
-      );
+      await putJson(`/api/orgs/${encodeURIComponent(orgSlug)}/kill-switch`, {
+        active: next,
+        // `reason` is only meaningful when activating — clearing the
+        // switch shouldn't carry a justification field.
+        reason: next ? reason.trim() || null : null,
+      });
       setActive(next);
       if (!next) setReason("");
     } catch (e) {
@@ -68,10 +63,9 @@ export function KillSwitchTab({ orgSlug }: KillSwitchTabProps) {
     <div className="rounded border border-gray-800 bg-gray-900/40 p-4 max-w-2xl">
       <h2 className="text-sm font-semibold text-gray-200">Kill switch</h2>
       <p className="text-[11px] text-gray-500 mt-1 mb-4 leading-relaxed">
-        When active, the server refuses to spawn new agents for this org.
-        Already-running agents continue. The switch flips on automatically
-        when the org's monthly budget is exceeded; toggle here to override
-        manually.
+        When active, the server refuses to spawn new agents for this org. Already-running agents
+        continue. The switch flips on automatically when the org's monthly budget is exceeded;
+        toggle here to override manually.
       </p>
 
       {loading && (
@@ -89,10 +83,7 @@ export function KillSwitchTab({ orgSlug }: KillSwitchTabProps) {
               }`}
               aria-hidden="true"
             />
-            <span
-              className="text-sm text-gray-200"
-              data-testid="kill-state"
-            >
+            <span className="text-sm text-gray-200" data-testid="kill-state">
               {active ? "Active — new agents blocked" : "Inactive — spawning allowed"}
             </span>
           </div>

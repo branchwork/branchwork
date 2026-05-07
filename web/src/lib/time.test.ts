@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  formatAbsolute,
-  formatRelative,
-  formatShortDate,
-  formatTimestamp,
-} from "./time.js";
+import { formatAbsolute, formatRelative, formatShortDate, formatTimestamp } from "./time.js";
 
 const FIXED_NOW = new Date("2026-04-12T12:00:00Z").getTime();
 
@@ -32,9 +27,7 @@ describe("formatRelative", () => {
   });
 
   it("returns days under 30", () => {
-    expect(formatRelative(new Date(FIXED_NOW - 5 * 24 * 60 * 60_000))).toBe(
-      "5d ago",
-    );
+    expect(formatRelative(new Date(FIXED_NOW - 5 * 24 * 60 * 60_000))).toBe("5d ago");
   });
 
   it("falls back to short date past 30 days", () => {
@@ -56,9 +49,7 @@ describe("formatRelative", () => {
 
 describe("formatTimestamp", () => {
   it("matches formatRelative for the first 7 days", () => {
-    expect(formatTimestamp(new Date(FIXED_NOW - 6 * 24 * 60 * 60_000))).toBe(
-      "6d ago",
-    );
+    expect(formatTimestamp(new Date(FIXED_NOW - 6 * 24 * 60 * 60_000))).toBe("6d ago");
   });
 
   it("falls back to absolute (date + time) past 7 days", () => {
@@ -74,9 +65,7 @@ describe("locale honours navigator.language", () => {
   // it receives the navigator-reported locale.
   it("forwards navigator.language to Intl.DateTimeFormat in formatShortDate", () => {
     const spy = vi.spyOn(Intl, "DateTimeFormat");
-    const navStub = vi
-      .spyOn(navigator, "language", "get")
-      .mockReturnValue("fr-FR");
+    const navStub = vi.spyOn(navigator, "language", "get").mockReturnValue("fr-FR");
 
     formatShortDate(new Date(FIXED_NOW));
 

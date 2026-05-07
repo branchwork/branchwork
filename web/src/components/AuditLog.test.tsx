@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { AuditLog } from "./AuditLog.js";
 import { useAuthStore } from "../stores/auth-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
@@ -401,9 +396,7 @@ describe("AuditLog Undo affordance", () => {
         diff: JSON.stringify({ snapshot_id: 5 }),
         snapshotId: 5,
         recoverable: false,
-        restoredAt: new Date(Date.now() - 5 * 60_000)
-          .toISOString()
-          .slice(0, 19),
+        restoredAt: new Date(Date.now() - 5 * 60_000).toISOString().slice(0, 19),
       }),
     ]);
 
@@ -415,8 +408,7 @@ describe("AuditLog Undo affordance", () => {
     // Match the cell content (relative time follows "Restored "), which
     // disambiguates from the "Restored plan" dropdown option in the
     // action filter.
-    expect(screen.getByText(/Restored\s+(just now|\d+[mhd] ago)/i))
-      .toBeTruthy();
+    expect(screen.getByText(/Restored\s+(just now|\d+[mhd] ago)/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Undo/i })).toBeNull();
   });
 
@@ -499,27 +491,18 @@ describe("AuditLog Undo affordance", () => {
     // Restored annotation appears in place of the button — match the
     // cell's relative time so the assertion ignores the unrelated
     // "Restored plan" dropdown option.
-    expect(screen.getByText(/Restored\s+(just now|\d+[mhd] ago)/i))
-      .toBeTruthy();
+    expect(screen.getByText(/Restored\s+(just now|\d+[mhd] ago)/i)).toBeTruthy();
 
     // Verify the POST landed at the right URL.
     const calls = fetchMock.mock.calls.map((c) => {
       const input = c[0] as string | URL | Request;
-      return typeof input === "string"
-        ? input
-        : input instanceof URL
-          ? input.pathname
-          : input.url;
+      return typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
     });
-    expect(calls.some((u) => u.includes("/api/snapshots/7/restore"))).toBe(
-      true,
-    );
+    expect(calls.some((u) => u.includes("/api/snapshots/7/restore"))).toBe(true);
 
     // Toast confirms the restore.
     expect(usePlanStore.getState().toasts.length).toBeGreaterThan(0);
-    expect(
-      usePlanStore.getState().toasts.some((t) => /Restored/i.test(t.message)),
-    ).toBe(true);
+    expect(usePlanStore.getState().toasts.some((t) => /Restored/i.test(t.message))).toBe(true);
   });
 
   it("on 410 already_restored, hides Undo and shows inline diagnostic", async () => {
@@ -557,8 +540,7 @@ describe("AuditLog Undo affordance", () => {
     // Cell flips to "Restored <relative ts>" (server-supplied
     // restored_at). The dropdown option "Restored plan" is excluded by
     // the trailing time anchor.
-    expect(screen.getByText(/Restored\s+(just now|\d+[mhd] ago)/i))
-      .toBeTruthy();
+    expect(screen.getByText(/Restored\s+(just now|\d+[mhd] ago)/i)).toBeTruthy();
   });
 
   it("on 409 slug_collision, keeps Undo button and shows the collision inline", async () => {
@@ -788,9 +770,7 @@ describe("AuditLog URL-driven filter state", () => {
 
     render(<AuditLog />, { initialEntries: ["/audit"] });
 
-    const q = (await screen.findByLabelText(
-      /Search audit log/i,
-    )) as HTMLInputElement;
+    const q = (await screen.findByLabelText(/Search audit log/i)) as HTMLInputElement;
     fireEvent.change(q, { target: { value: "ag-keep" } });
 
     // The input value comes from `searchParams.get("q") ?? ""`, so it can
@@ -798,9 +778,7 @@ describe("AuditLog URL-driven filter state", () => {
     // searchParams (i.e. the URL). This proves the round-trip without
     // depending on MemoryRouter exposing window.location.
     await waitFor(() => {
-      const after = screen.getByLabelText(
-        /Search audit log/i,
-      ) as HTMLInputElement;
+      const after = screen.getByLabelText(/Search audit log/i) as HTMLInputElement;
       expect(after.value).toBe("ag-keep");
     });
     // Client-side narrowing kicks in immediately.

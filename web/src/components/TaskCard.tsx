@@ -4,11 +4,7 @@ import type { PlanTask } from "../stores/plan-store.js";
 import { fetchJson, postJson, putJson, deleteJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
-import {
-  isDriverReady,
-  useSettingsStore,
-  type AuthStatus,
-} from "../stores/settings-store.js";
+import { isDriverReady, useSettingsStore, type AuthStatus } from "../stores/settings-store.js";
 import { EditableText } from "./EditableText.js";
 import { Button } from "./ui/Button.js";
 import { Dropdown, DropdownItem, DropdownSeparator } from "./ui/Dropdown.js";
@@ -26,28 +22,60 @@ interface Props {
 
 const STATUS_ORDER = ["pending", "in_progress", "completed", "skipped"] as const;
 
-const ciConfig: Record<
-  string,
-  { label: string; bg: string; dot: string; title: string }
-> = {
-  pending:   { label: "CI",     bg: "bg-amber-600/20 text-amber-400",   dot: "bg-amber-400",                title: "CI run queued" },
-  running:   { label: "CI",     bg: "bg-amber-600/20 text-amber-400",   dot: "bg-amber-400 animate-pulse",  title: "CI run in progress" },
-  success:   { label: "CI \u2713", bg: "bg-emerald-600/20 text-emerald-400", dot: "bg-emerald-400",          title: "CI passed" },
-  failure:   { label: "CI \u2717", bg: "bg-red-600/20 text-red-400",     dot: "bg-red-400",                  title: "CI failed" },
-  cancelled: { label: "CI \u2014", bg: "bg-gray-600/20 text-gray-400",   dot: "bg-gray-400",                 title: "CI cancelled or skipped" },
-  unknown:   { label: "CI ?",   bg: "bg-gray-600/20 text-gray-500",     dot: "bg-gray-500",                 title: "No CI run found for this commit" },
+const ciConfig: Record<string, { label: string; bg: string; dot: string; title: string }> = {
+  pending: {
+    label: "CI",
+    bg: "bg-amber-600/20 text-amber-400",
+    dot: "bg-amber-400",
+    title: "CI run queued",
+  },
+  running: {
+    label: "CI",
+    bg: "bg-amber-600/20 text-amber-400",
+    dot: "bg-amber-400 animate-pulse",
+    title: "CI run in progress",
+  },
+  success: {
+    label: "CI \u2713",
+    bg: "bg-emerald-600/20 text-emerald-400",
+    dot: "bg-emerald-400",
+    title: "CI passed",
+  },
+  failure: {
+    label: "CI \u2717",
+    bg: "bg-red-600/20 text-red-400",
+    dot: "bg-red-400",
+    title: "CI failed",
+  },
+  cancelled: {
+    label: "CI \u2014",
+    bg: "bg-gray-600/20 text-gray-400",
+    dot: "bg-gray-400",
+    title: "CI cancelled or skipped",
+  },
+  unknown: {
+    label: "CI ?",
+    bg: "bg-gray-600/20 text-gray-500",
+    dot: "bg-gray-500",
+    title: "No CI run found for this commit",
+  },
 };
 
-const statusConfig: Record<
-  string,
-  { label: string; bg: string; dot: string }
-> = {
+const statusConfig: Record<string, { label: string; bg: string; dot: string }> = {
   pending: { label: "Pending", bg: "bg-gray-700 text-gray-300", dot: "bg-gray-400" },
-  in_progress: { label: "In Progress", bg: "bg-amber-600/20 text-amber-400", dot: "bg-amber-400 animate-pulse" },
+  in_progress: {
+    label: "In Progress",
+    bg: "bg-amber-600/20 text-amber-400",
+    dot: "bg-amber-400 animate-pulse",
+  },
   completed: { label: "Done", bg: "bg-emerald-600/20 text-emerald-400", dot: "bg-emerald-400" },
   failed: { label: "Failed", bg: "bg-red-600/20 text-red-400", dot: "bg-red-400" },
   skipped: { label: "Skipped", bg: "bg-gray-600/20 text-gray-500", dot: "bg-gray-500" },
-  checking: { label: "Checking...", bg: "bg-blue-600/20 text-blue-400", dot: "bg-blue-400 animate-pulse" },
+  checking: {
+    label: "Checking...",
+    bg: "bg-blue-600/20 text-blue-400",
+    dot: "bg-blue-400 animate-pulse",
+  },
 };
 
 /// Short human-readable label for the auth blocker — used as a button
@@ -128,9 +156,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
       ...plan,
       phases: plan.phases.map((p) => ({
         ...p,
-        tasks: p.tasks.map((t) =>
-          t.number === task.number ? { ...t, ...patch } : t
-        ),
+        tasks: p.tasks.map((t) => (t.number === task.number ? { ...t, ...patch } : t)),
       })),
     };
     try {
@@ -183,7 +209,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
     try {
       const res = await postJson<{ agentId: string }>(
         `/api/plans/${planName}/tasks/${task.number}/check`,
-        {}
+        {},
       );
       setAgentId(res.agentId);
       selectAgent(res.agentId);
@@ -203,15 +229,12 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
     if (!task.ci || task.ci.status !== "failure") return;
     setFixingCi(true);
     try {
-      const res = await postJson<{ agentId: string; branch: string }>(
-        "/api/actions/fix-ci",
-        {
-          planName,
-          taskNumber: task.number,
-          ciRunId: task.ci.id,
-          driver,
-        }
-      );
+      const res = await postJson<{ agentId: string; branch: string }>("/api/actions/fix-ci", {
+        planName,
+        taskNumber: task.number,
+        ciRunId: task.ci.id,
+        driver,
+      });
       setAgentId(res.agentId);
       selectAgent(res.agentId);
       goToAgent(res.agentId);
@@ -235,10 +258,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
 
   async function resetStatus() {
     try {
-      await postJson(
-        `/api/plans/${planName}/tasks/${task.number}/reset-status`,
-        {},
-      );
+      await postJson(`/api/plans/${planName}/tasks/${task.number}/reset-status`, {});
       await selectPlan(planName);
     } catch (e) {
       toastError(e, "Reset failed");
@@ -262,7 +282,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
         const target = e.target as HTMLElement;
         if (
           target.closest(
-            'button, input, textarea, select, a, [role="button"], [contenteditable="true"]'
+            'button, input, textarea, select, a, [role="button"], [contenteditable="true"]',
           )
         ) {
           return;
@@ -286,9 +306,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
       <div className="flex items-start justify-between gap-2">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 flex-wrap">
-            <span className="text-[10px] font-mono text-gray-500">
-              {task.number}
-            </span>
+            <span className="text-[10px] font-mono text-gray-500">{task.number}</span>
             {/* Status badge — left-click cycles, kebab opens the menu.
                 Right-click context menu was removed (audit §8: hidden
                 keyboard interaction). */}
@@ -356,93 +374,91 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
             )}
             {/* CI badge + dismiss button (only shown for failed/unknown
                 runs — passing or running CI shouldn't be dismissable). */}
-            {task.ci && (() => {
-              const c = ciConfig[task.ci.status] ?? ciConfig.unknown;
-              const className = `text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1 ${c.bg}`;
-              const viaFix = task.ci.viaFixAttempt ?? null;
-              const tooltip =
-                viaFix != null
-                  ? `passed via fix attempt ${viaFix}`
-                  : c.title;
-              const inner = (
-                <>
-                  <span className={`w-1.5 h-1.5 rounded-full ${c.dot}`} />
-                  {c.label}
-                  {viaFix != null && (
-                    <span className="opacity-70">fix #{viaFix}</span>
-                  )}
-                </>
-              );
-              const badge = task.ci.runUrl ? (
-                <a
-                  href={task.ci.runUrl}
-                  target="_blank"
-                  rel="noreferrer noopener"
-                  className={`${className} hover:opacity-80`}
-                  title={`${tooltip} — open run`}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  {inner}
-                </a>
-              ) : (
-                <span className={className} title={tooltip}>{inner}</span>
-              );
-              const dismissable =
-                task.ci.status === "failure" ||
-                task.ci.status === "cancelled" ||
-                task.ci.status === "unknown";
-              const ciRunId = task.ci.id;
-              const isFailed = task.ci.status === "failure";
-              return (
-                <span className="inline-flex items-center">
-                  {badge}
-                  {/* Fix CI — inline with the badge so the failure state and
+            {task.ci &&
+              (() => {
+                const c = ciConfig[task.ci.status] ?? ciConfig.unknown;
+                const className = `text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1 ${c.bg}`;
+                const viaFix = task.ci.viaFixAttempt ?? null;
+                const tooltip = viaFix != null ? `passed via fix attempt ${viaFix}` : c.title;
+                const inner = (
+                  <>
+                    <span className={`w-1.5 h-1.5 rounded-full ${c.dot}`} />
+                    {c.label}
+                    {viaFix != null && <span className="opacity-70">fix #{viaFix}</span>}
+                  </>
+                );
+                const badge = task.ci.runUrl ? (
+                  <a
+                    href={task.ci.runUrl}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className={`${className} hover:opacity-80`}
+                    title={`${tooltip} — open run`}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {inner}
+                  </a>
+                ) : (
+                  <span className={className} title={tooltip}>
+                    {inner}
+                  </span>
+                );
+                const dismissable =
+                  task.ci.status === "failure" ||
+                  task.ci.status === "cancelled" ||
+                  task.ci.status === "unknown";
+                const ciRunId = task.ci.id;
+                const isFailed = task.ci.status === "failure";
+                return (
+                  <span className="inline-flex items-center">
+                    {badge}
+                    {/* Fix CI — inline with the badge so the failure state and
                       its recovery action read as one unit. Spawns an agent on
                       a recovery branch off the failing commit with the failure
                       log baked into the prompt. */}
-                  {isFailed && !agentId && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleFixCi();
-                      }}
-                      disabled={fixingCi || taskLocked || !authReady}
-                      title={
-                        taskLocked
-                          ? "Agent running — wait for it to finish"
-                          : !authReady
-                            ? `${driver} not ready: ${authStatusLabel(auth)}`
-                            : `Spawn an agent to fix the failing CI on ${
-                                task.ci.commitSha?.slice(0, 7) ?? "the merged commit"
-                              }`
-                      }
-                      className="ml-1 text-[10px] px-1.5 py-0.5 rounded font-medium bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white transition"
-                    >
-                      {fixingCi ? "..." : "Fix CI"}
-                    </button>
-                  )}
-                  {dismissable && ciRunId != null && (
-                    <TouchTarget>
+                    {isFailed && !agentId && (
                       <button
-                        onClick={async (e) => {
+                        onClick={(e) => {
                           e.stopPropagation();
-                          try {
-                            await deleteJson(`/api/ci/${ciRunId}`);
-                            await selectPlan(planName);
-                          } catch (err) {
-                            toastError(err, "Dismiss CI failed");
-                          }
+                          handleFixCi();
                         }}
-                        className="ml-0.5 text-[10px] text-gray-500 hover:text-gray-300 hover:bg-gray-800/60 px-1 rounded transition"
-                        title="Dismiss this CI result — won't affect future runs"
+                        disabled={fixingCi || taskLocked || !authReady}
+                        title={
+                          taskLocked
+                            ? "Agent running — wait for it to finish"
+                            : !authReady
+                              ? `${driver} not ready: ${authStatusLabel(auth)}`
+                              : `Spawn an agent to fix the failing CI on ${
+                                  task.ci.commitSha?.slice(0, 7) ?? "the merged commit"
+                                }`
+                        }
+                        className="ml-1 text-[10px] px-1.5 py-0.5 rounded font-medium bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white transition"
                       >
-                        &#x2715;
+                        {fixingCi ? "..." : "Fix CI"}
                       </button>
-                    </TouchTarget>
-                  )}
-                </span>
-              );
-            })()}
+                    )}
+                    {dismissable && ciRunId != null && (
+                      <TouchTarget>
+                        <button
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            try {
+                              await deleteJson(`/api/ci/${ciRunId}`);
+                              await selectPlan(planName);
+                            } catch (err) {
+                              toastError(err, "Dismiss CI failed");
+                            }
+                          }}
+                          className="ml-0.5 text-[10px] text-gray-500 hover:text-gray-300 hover:bg-gray-800/60 px-1 rounded transition"
+                          title="Dismiss this CI result — won't affect future runs"
+                        >
+                          &#x2715;
+                        </button>
+                      </TouchTarget>
+                    )}
+                  </span>
+                );
+              })()}
           </div>
           <h4 className="text-sm font-medium mt-0.5 leading-tight">
             <EditableText
@@ -576,7 +592,6 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
               View
             </button>
           )}
-
         </div>
       </div>
 
@@ -600,15 +615,23 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
          For non-commit tasks (producesCommit === false) the Merge button is
          hidden but Discard is kept so the empty branch can be cleaned up. */}
       {branchAgent?.branch && (
-        <div className={`mt-2 flex items-center gap-2 ${canMerge ? "bg-indigo-950/40 border-indigo-800/40" : "bg-gray-900/40 border-gray-700/40"} border rounded px-2 py-1.5`}>
-          <span className={`${canMerge ? "text-indigo-400" : "text-gray-500"} text-[10px]`}>&#9739;</span>
+        <div
+          className={`mt-2 flex items-center gap-2 ${canMerge ? "bg-indigo-950/40 border-indigo-800/40" : "bg-gray-900/40 border-gray-700/40"} border rounded px-2 py-1.5`}
+        >
+          <span className={`${canMerge ? "text-indigo-400" : "text-gray-500"} text-[10px]`}>
+            &#9739;
+          </span>
           <div className="flex-1 min-w-0">
             {!canMerge && (
               <div className="text-[10px] text-gray-400 mb-0.5">
-                Agent finished — no commit expected. Discard the scratch branch when you're done reviewing.
+                Agent finished — no commit expected. Discard the scratch branch when you're done
+                reviewing.
               </div>
             )}
-            <div className="text-[10px] font-mono text-indigo-300/90 truncate" title={branchAgent.branch}>
+            <div
+              className="text-[10px] font-mono text-indigo-300/90 truncate"
+              title={branchAgent.branch}
+            >
               {branchAgent.branch}
             </div>
             <div className="text-[9px] text-gray-600">
@@ -692,9 +715,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
             </span>
           ))}
           {task.filePaths.length > 3 && (
-            <span className="text-[10px] text-gray-600">
-              +{task.filePaths.length - 3} more
-            </span>
+            <span className="text-[10px] text-gray-600">+{task.filePaths.length - 3} more</span>
           )}
         </div>
       )}
@@ -731,7 +752,6 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
           remounts (via the count-keyed key) after each save so the
           previously-typed text doesn't linger in the next edit pass. */}
       <TaskLearnings planName={planName} taskNumber={task.number} />
-
     </div>
   );
 }
@@ -812,22 +832,15 @@ function TaskLearnings({ planName, taskNumber }: TaskLearningsProps) {
             <div className="text-[10px] text-gray-600 italic">Loading…</div>
           )}
           {rows && rows.length === 0 && !loading && (
-            <div className="text-[10px] text-gray-600 italic">
-              No learnings recorded yet.
-            </div>
+            <div className="text-[10px] text-gray-600 italic">No learnings recorded yet.</div>
           )}
           {rows?.map((row) => (
             <div
               key={row.id}
               className="text-[11px] text-gray-300 bg-gray-900/40 border border-gray-800/50 rounded px-1.5 py-1"
             >
-              <div className="whitespace-pre-wrap break-words">
-                {row.learning}
-              </div>
-              <div
-                className="text-[9px] text-gray-600 mt-0.5"
-                title={row.createdAt}
-              >
+              <div className="whitespace-pre-wrap break-words">{row.learning}</div>
+              <div className="text-[9px] text-gray-600 mt-0.5" title={row.createdAt}>
                 {formatRelative(row.createdAt)}
               </div>
             </div>

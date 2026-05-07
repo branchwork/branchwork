@@ -133,11 +133,7 @@ export function Modal({
       >
         <h2
           id={titleId}
-          className={
-            titleVisuallyHidden
-              ? "sr-only"
-              : "text-base font-semibold text-gray-100"
-          }
+          className={titleVisuallyHidden ? "sr-only" : "text-base font-semibold text-gray-100"}
         >
           {title}
         </h2>
