@@ -1,7 +1,7 @@
-import { memo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import type { PlanTask } from "../stores/plan-store.js";
-import { postJson, putJson, deleteJson } from "../api.js";
+import { fetchJson, postJson, putJson, deleteJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import {
@@ -724,6 +724,127 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
         />
       </div>
 
+      {/* Learnings — collapsed by default; lazy-fetches on first expand
+          to keep large plans from firing N GETs at mount time. Backed by
+          the append-only POST /api/plans/:name/tasks/:num/learnings; the
+          EditableText acts as a single-shot "Add learning" input that
+          remounts (via the count-keyed key) after each save so the
+          previously-typed text doesn't linger in the next edit pass. */}
+      <TaskLearnings planName={planName} taskNumber={task.number} />
+
+    </div>
+  );
+}
+
+interface LearningRow {
+  id: number;
+  learning: string;
+  createdAt: string;
+}
+
+interface TaskLearningsProps {
+  planName: string;
+  taskNumber: string;
+}
+
+function TaskLearnings({ planName, taskNumber }: TaskLearningsProps) {
+  const [open, setOpen] = useState(false);
+  const [rows, setRows] = useState<LearningRow[] | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await fetchJson<LearningRow[]>(
+        `/api/plans/${encodeURIComponent(planName)}/tasks/${encodeURIComponent(
+          taskNumber,
+        )}/learnings`,
+      );
+      setRows(data);
+    } catch (e) {
+      toastError(e, "Load learnings failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (open && rows === null && !loading) {
+      load();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  async function addLearning(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    try {
+      await postJson(
+        `/api/plans/${encodeURIComponent(planName)}/tasks/${encodeURIComponent(
+          taskNumber,
+        )}/learnings`,
+        { learning: trimmed },
+      );
+      await load();
+    } catch (e) {
+      toastError(e, "Add learning failed");
+    }
+  }
+
+  const count = rows?.length ?? 0;
+  const countLabel = rows ? ` (${count})` : "";
+
+  return (
+    <div className="mt-1.5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="text-[10px] text-gray-500 hover:text-gray-300 transition flex items-center gap-1"
+        title="Show or hide task learnings"
+      >
+        <span aria-hidden="true">{open ? "▾" : "▸"}</span>
+        Learnings{countLabel}
+      </button>
+      {open && (
+        <div className="mt-1 space-y-1">
+          {loading && rows === null && (
+            <div className="text-[10px] text-gray-600 italic">Loading…</div>
+          )}
+          {rows && rows.length === 0 && !loading && (
+            <div className="text-[10px] text-gray-600 italic">
+              No learnings recorded yet.
+            </div>
+          )}
+          {rows?.map((row) => (
+            <div
+              key={row.id}
+              className="text-[11px] text-gray-300 bg-gray-900/40 border border-gray-800/50 rounded px-1.5 py-1"
+            >
+              <div className="whitespace-pre-wrap break-words">
+                {row.learning}
+              </div>
+              <div
+                className="text-[9px] text-gray-600 mt-0.5"
+                title={row.createdAt}
+              >
+                {formatRelative(row.createdAt)}
+              </div>
+            </div>
+          ))}
+          <div className="text-[11px] text-gray-400">
+            <EditableText
+              key={`add-${count}`}
+              value=""
+              onSave={addLearning}
+              label={`add learning to task ${taskNumber}`}
+              multiline
+              placeholder="+ Add learning..."
+              editClassName="text-[11px]"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
