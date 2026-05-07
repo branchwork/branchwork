@@ -217,7 +217,10 @@ pub fn plan_runner_id(db: &Db, plan_name: &str) -> Option<String> {
 
 /// Persist (or clear) the per-plan runner affinity. `runner_id = None`
 /// deletes the row (back to "any online runner"); `Some` UPSERTs it.
-/// Idempotent.
+/// Idempotent. The UPSERT path preserves any existing `runner_failover`
+/// policy (T11.5) — only the `runner_id` and `updated_at` columns are
+/// touched on conflict, so re-pinning a plan that already had
+/// failover='sibling' keeps that policy in place.
 pub fn set_plan_runner_id(db: &Db, plan_name: &str, org_id: &str, runner_id: Option<&str>) {
     let conn = db.lock().unwrap();
     match runner_id {
@@ -240,6 +243,46 @@ pub fn set_plan_runner_id(db: &Db, plan_name: &str, org_id: &str, runner_id: Opt
             .ok();
         }
     }
+}
+
+/// Read the per-plan runner failover policy (T11.5). Returns `"pause"` for
+/// plans without a `plan_runner_affinity` row (the default for unpinned
+/// plans where failover doesn't apply anyway), the column value for
+/// pinned plans, or `"pause"` on a malformed value to fail safe.
+pub fn plan_runner_failover(db: &Db, plan_name: &str) -> String {
+    let conn = db.lock().unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT runner_failover FROM plan_runner_affinity WHERE plan_name = ?1",
+            params![plan_name],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "pause".to_string());
+    match raw.as_str() {
+        "pause" | "sibling" => raw,
+        _ => "pause".to_string(),
+    }
+}
+
+/// Persist the per-plan runner failover policy (T11.5). Only valid values
+/// are `"pause"` (today's behaviour) and `"sibling"` (re-dispatch on
+/// offline). Returns `Ok(true)` when an existing pin row was updated,
+/// `Ok(false)` when no pin row existed (failover is a no-op without a
+/// pin to fail over from — caller should reject the request at the API
+/// layer), or `Err(())` when `policy` is not one of the two valid values.
+pub fn set_plan_runner_failover(db: &Db, plan_name: &str, policy: &str) -> Result<bool, ()> {
+    if policy != "pause" && policy != "sibling" {
+        return Err(());
+    }
+    let conn = db.lock().unwrap();
+    let updated = conn
+        .execute(
+            "UPDATE plan_runner_affinity SET runner_failover = ?2, updated_at = datetime('now') \
+             WHERE plan_name = ?1",
+            params![plan_name, policy],
+        )
+        .unwrap_or(0);
+    Ok(updated > 0)
 }
 
 /// Per-plan retry cap for fix agents. Mirrors the schema default (3) so
@@ -874,6 +917,23 @@ fn migrate(conn: &Connection) {
              org_id     TEXT NOT NULL DEFAULT 'default-org',
              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
          );",
+    )
+    .ok();
+
+    // Per-plan runner failover policy (T11.5). Sibling-failover opt-in for
+    // pinned plans: when the pinned runner goes offline, do we pause the
+    // plan (today's behaviour) or re-dispatch to a sibling online runner?
+    // Stored on `plan_runner_affinity` rather than `plan_project` because
+    // (a) failover is only meaningful when there IS a pin to fail over
+    // from, and (b) `plan_project.project` is NOT NULL so plans without a
+    // project override can't carry per-plan policy without the empty-
+    // string sentinel trap that T11.4 explicitly avoided. NULL row in
+    // `plan_runner_affinity` => unpinned => no failover concept (today's
+    // pick_runner_for_org behaviour stays). Pinned + 'pause' (default) =>
+    // T11.4's pause-on-offline. Pinned + 'sibling' => redirect to a
+    // sibling online runner.
+    conn.execute_batch(
+        "ALTER TABLE plan_runner_affinity ADD COLUMN runner_failover TEXT NOT NULL DEFAULT 'pause';",
     )
     .ok();
 
@@ -2039,6 +2099,95 @@ mod tests {
             pp_rows, 0,
             "setting runner pin must not touch plan_project (the project column is NOT NULL there)"
         );
+    }
+
+    // ── plan_runner_failover (T11.5) ─────────────────────────────────────
+
+    #[test]
+    fn plan_runner_failover_defaults_to_pause_for_unpinned_plan() {
+        let (db, _dir) = test_db();
+        // No `plan_runner_affinity` row inserted. The read helper must
+        // synthesize the default policy so dispatch code never has to
+        // special-case the absent-row path.
+        assert_eq!(plan_runner_failover(&db, "unpinned-plan"), "pause");
+    }
+
+    #[test]
+    fn plan_runner_failover_defaults_to_pause_on_fresh_pin() {
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-a", "default-org");
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-a"));
+        // The schema-level DEFAULT 'pause' kicks in on INSERT — pinning
+        // a plan must NOT silently opt the user into sibling failover.
+        assert_eq!(plan_runner_failover(&db, "plan-a"), "pause");
+    }
+
+    #[test]
+    fn set_plan_runner_failover_round_trips_and_validates() {
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-a", "default-org");
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-a"));
+
+        assert_eq!(
+            set_plan_runner_failover(&db, "plan-a", "sibling"),
+            Ok(true),
+            "valid policy on a pinned plan should update one row"
+        );
+        assert_eq!(plan_runner_failover(&db, "plan-a"), "sibling");
+
+        assert_eq!(
+            set_plan_runner_failover(&db, "plan-a", "pause"),
+            Ok(true),
+            "switching back to pause should also update one row"
+        );
+        assert_eq!(plan_runner_failover(&db, "plan-a"), "pause");
+
+        // Invalid policies are rejected without touching the row.
+        assert_eq!(set_plan_runner_failover(&db, "plan-a", "yolo"), Err(()));
+        assert_eq!(plan_runner_failover(&db, "plan-a"), "pause");
+    }
+
+    #[test]
+    fn set_plan_runner_failover_returns_false_for_unpinned_plan() {
+        let (db, _dir) = test_db();
+        // No pin row exists; the UPDATE matches zero rows.
+        assert_eq!(
+            set_plan_runner_failover(&db, "no-pin-plan", "sibling"),
+            Ok(false),
+            "setting failover without a pin should be a no-op so the API \
+             layer can return 409/400 instead of silently writing nothing"
+        );
+        assert_eq!(plan_runner_failover(&db, "no-pin-plan"), "pause");
+    }
+
+    #[test]
+    fn re_pinning_preserves_existing_failover_policy() {
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-a", "default-org");
+        seed_runner(&db, "runner-b", "default-org");
+
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-a"));
+        assert_eq!(set_plan_runner_failover(&db, "plan-a", "sibling"), Ok(true));
+
+        // Re-pin to a different runner — failover policy must survive.
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-b"));
+        assert_eq!(
+            plan_runner_failover(&db, "plan-a"),
+            "sibling",
+            "re-pinning must not silently revert sibling-failover to pause"
+        );
+    }
+
+    #[test]
+    fn clearing_pin_drops_failover_with_the_row() {
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-a", "default-org");
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-a"));
+        assert_eq!(set_plan_runner_failover(&db, "plan-a", "sibling"), Ok(true));
+
+        set_plan_runner_id(&db, "plan-a", "default-org", None);
+        // No row left ⇒ default 'pause' from the read helper.
+        assert_eq!(plan_runner_failover(&db, "plan-a"), "pause");
     }
 
     #[test]

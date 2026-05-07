@@ -380,6 +380,88 @@ async fn handle_runner_ws(
             serde_json::json!({ "runner_id": rid }),
         );
 
+        // T11.5 mid-task sibling failover: for plans pinned to this
+        // runner whose failover policy is 'sibling', mark in-flight
+        // agents as failed with `runner_disappeared` so auto-mode picks
+        // up the failure path and re-dispatches via
+        // `resolve_runner_for_spawn` (which now sees the pin offline +
+        // failover=sibling and routes to the sibling). Plans with
+        // failover='pause' (default) keep T11.4's existing semantics:
+        // in-flight agents are left at 'running' until either the
+        // runner returns or an explicit kill/timeout flips them.
+        //
+        // We don't gate on whether a sibling currently exists — auto-mode's
+        // fix-attempt re-dispatch will re-evaluate. If no sibling is
+        // available by then, resolve_runner_for_spawn falls back to
+        // PinnedRunnerOffline and pauses the plan with runner_offline,
+        // matching the brief's "all runners offline" edge case.
+        let plans_to_failover: Vec<String> = {
+            let conn = state.db.lock().unwrap();
+            conn.prepare(
+                "SELECT plan_name FROM plan_runner_affinity \
+                 WHERE runner_id = ?1 AND runner_failover = 'sibling'",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![rid], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default()
+        };
+
+        for plan_name in &plans_to_failover {
+            let in_flight: Vec<String> = {
+                let conn = state.db.lock().unwrap();
+                conn.prepare(
+                    "SELECT id FROM agents \
+                     WHERE plan_name = ?1 AND status IN ('running', 'starting')",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![plan_name], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap_or_default()
+            };
+
+            if in_flight.is_empty() {
+                continue;
+            }
+
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute(
+                    "UPDATE agents SET status = 'failed', stop_reason = 'runner_disappeared', \
+                     finished_at = datetime('now') \
+                     WHERE plan_name = ?1 AND status IN ('running', 'starting')",
+                    params![plan_name],
+                )
+                .ok();
+            }
+
+            for agent_id in &in_flight {
+                broadcast_event(
+                    &state.broadcast_tx,
+                    "agent_stopped",
+                    serde_json::json!({
+                        "id": agent_id,
+                        "status": "failed",
+                        "stop_reason": "runner_disappeared",
+                        "plan": plan_name,
+                    }),
+                );
+            }
+
+            broadcast_event(
+                &state.broadcast_tx,
+                "runner_failover",
+                serde_json::json!({
+                    "plan": plan_name,
+                    "from_runner_id": rid,
+                    "agents_failed": in_flight,
+                    "trigger": "runner_disconnected",
+                }),
+            );
+        }
+
         println!("[runner-ws] Runner {rid} disconnected");
     }
 

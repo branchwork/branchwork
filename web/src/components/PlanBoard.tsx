@@ -805,6 +805,17 @@ const PARALLEL_DISABLED_TOOLTIP = "Available once worktree isolation ships";
 const RUNNER_PICKER_TOOLTIP =
   "Pin every spawn for this plan to a specific runner. Auto-mode pauses with reason 'runner_offline' if the pinned runner goes offline. Default 'any' picks the first online runner.";
 
+/// Hover text for the per-plan Failover policy (T11.5). Surfaces the
+/// shared-filesystem requirement upfront so the user understands the
+/// trade-off before opting into sibling failover.
+const RUNNER_FAILOVER_TOOLTIP =
+  "When the pinned runner is offline: 'pause' (default) — pause auto-mode with reason 'runner_offline' and wait for the runner to return. 'sibling' — re-dispatch the next agent to a sibling online runner. For sibling to be useful, your runners must share project directories (NFS, git remote with auto-pull, or similar) — otherwise the sibling lacks the deleted runner's branches and uncommitted state.";
+
+/// Disabled-tooltip shown when the user has not pinned a runner yet —
+/// failover is meaningless without a pin to fail over from.
+const RUNNER_FAILOVER_DISABLED_TOOLTIP =
+  "Pin a runner first. Failover only applies when a plan is pinned to a specific runner.";
+
 /// Plan-level auto-mode + auto-advance toggles. Reads/writes
 /// `/api/plans/:name/config`. The `max_fix_attempts` input only renders
 /// when auto-mode is on; 0 means "merge but never spawn a fix agent".
@@ -890,6 +901,12 @@ function AutoModeControls({ planName }: { planName: string }) {
         runnerId={config.runnerId}
         disabled={busy}
         onChange={(rid) => update({ runnerId: rid })}
+      />
+      <FailoverPicker
+        runnerId={config.runnerId}
+        runnerFailover={config.runnerFailover ?? "pause"}
+        disabled={busy}
+        onChange={(policy) => update({ runnerFailover: policy })}
       />
       {config.autoMode && (
         <label
@@ -978,6 +995,51 @@ export function RunnerPicker({
             {runnerId} (unknown)
           </option>
         )}
+      </select>
+    </label>
+  );
+}
+
+/// Per-plan runner failover policy (T11.5). Two-state toggle: "pause"
+/// (today's behaviour, T11.4) or "sibling" (re-dispatch on offline).
+/// Disabled until the user pins a runner — failover is meaningless
+/// without a pin to fail over from. The shared-filesystem caveat lives
+/// in the tooltip rather than the toggle label so the header stays
+/// scannable.
+export function FailoverPicker({
+  runnerId,
+  runnerFailover,
+  disabled,
+  onChange,
+}: {
+  runnerId: string | null;
+  runnerFailover: "pause" | "sibling";
+  disabled?: boolean;
+  onChange: (policy: "pause" | "sibling") => void;
+}) {
+  const mode = useRunnerStore((s) => s.mode);
+
+  // Standalone deployment: no runners, no failover concept.
+  if (mode === "standalone") return null;
+
+  const noPin = runnerId === null;
+  const tooltip = noPin ? RUNNER_FAILOVER_DISABLED_TOOLTIP : RUNNER_FAILOVER_TOOLTIP;
+
+  return (
+    <label className="flex items-center gap-1.5 text-gray-400" title={tooltip}>
+      <span>Failover</span>
+      <select
+        value={runnerFailover}
+        disabled={disabled || noPin}
+        onChange={(e) => {
+          const v = e.target.value as "pause" | "sibling";
+          onChange(v);
+        }}
+        className="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 text-gray-200 outline-none focus:border-indigo-500 disabled:opacity-50"
+        aria-label="Runner failover policy for this plan"
+      >
+        <option value="pause">pause</option>
+        <option value="sibling">sibling</option>
       </select>
     </label>
   );

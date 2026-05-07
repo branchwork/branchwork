@@ -610,3 +610,164 @@ fn put_runner_id_re_pin_clears_runner_offline_pause() {
     assert_eq!(body["runnerId"], "runner-new");
     assert!(body["pausedReason"].is_null(), "pause should clear: {body}");
 }
+
+// ── T11.5: per-plan runner failover policy ──────────────────────────────
+
+#[test]
+fn get_config_returns_pause_failover_by_default() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-rf-default",
+        &minimal_plan("cfg-rf-default", &d.project),
+    );
+
+    let (s, body) = d.get("/api/plans/cfg-rf-default/config");
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["runnerFailover"], "pause", "got: {body}");
+}
+
+#[test]
+fn put_runner_failover_round_trips_when_pinned() {
+    let d = TestDashboard::new();
+    d.create_plan("cfg-rf-rt", &minimal_plan("cfg-rf-rt", &d.project));
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_test_runner(&db_path, "runner-x", "online");
+
+    // Pin first, then opt into sibling failover.
+    let (s, _) = d.put(
+        "/api/plans/cfg-rf-rt/config",
+        json!({"runnerId": "runner-x"}),
+    );
+    assert_eq!(s, 200);
+    let (s, body) = d.put(
+        "/api/plans/cfg-rf-rt/config",
+        json!({"runnerFailover": "sibling"}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["runnerFailover"], "sibling");
+
+    // Re-read confirms persistence.
+    let (s, body) = d.get("/api/plans/cfg-rf-rt/config");
+    assert_eq!(s, 200);
+    assert_eq!(body["runnerFailover"], "sibling");
+}
+
+#[test]
+fn put_runner_failover_atomic_with_pin_in_one_request() {
+    // Setting both runnerId and runnerFailover in a single PUT applies
+    // both: the pin write goes first (UPSERTs the row with default
+    // 'pause'), then the failover write flips it to 'sibling'.
+    let d = TestDashboard::new();
+    d.create_plan("cfg-rf-atomic", &minimal_plan("cfg-rf-atomic", &d.project));
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_test_runner(&db_path, "runner-x", "online");
+
+    let (s, body) = d.put(
+        "/api/plans/cfg-rf-atomic/config",
+        json!({"runnerId": "runner-x", "runnerFailover": "sibling"}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["runnerId"], "runner-x");
+    assert_eq!(body["runnerFailover"], "sibling");
+}
+
+#[test]
+fn put_runner_failover_without_pin_returns_409() {
+    let d = TestDashboard::new();
+    d.create_plan("cfg-rf-no-pin", &minimal_plan("cfg-rf-no-pin", &d.project));
+
+    let (s, body) = d.put(
+        "/api/plans/cfg-rf-no-pin/config",
+        json!({"runnerFailover": "sibling"}),
+    );
+    assert_eq!(s, 409, "body: {body}");
+    assert_eq!(body["error"], "no_runner_pin");
+
+    // Default 'pause' was preserved (no row exists).
+    let (s, body) = d.get("/api/plans/cfg-rf-no-pin/config");
+    assert_eq!(s, 200);
+    assert_eq!(body["runnerFailover"], "pause");
+}
+
+#[test]
+fn put_invalid_runner_failover_returns_400() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-rf-invalid",
+        &minimal_plan("cfg-rf-invalid", &d.project),
+    );
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_test_runner(&db_path, "runner-x", "online");
+    let (s, _) = d.put(
+        "/api/plans/cfg-rf-invalid/config",
+        json!({"runnerId": "runner-x"}),
+    );
+    assert_eq!(s, 200);
+
+    let (s, body) = d.put(
+        "/api/plans/cfg-rf-invalid/config",
+        json!({"runnerFailover": "yolo"}),
+    );
+    assert_eq!(s, 400, "body: {body}");
+    assert_eq!(body["error"], "invalid_runner_failover");
+}
+
+#[test]
+fn put_partial_preserves_unspecified_runner_failover() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-rf-partial",
+        &minimal_plan("cfg-rf-partial", &d.project),
+    );
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_test_runner(&db_path, "runner-x", "online");
+
+    let (s, _) = d.put(
+        "/api/plans/cfg-rf-partial/config",
+        json!({"runnerId": "runner-x", "runnerFailover": "sibling"}),
+    );
+    assert_eq!(s, 200);
+
+    // PUT autoMode only — runnerFailover must NOT revert.
+    let (s, body) = d.put(
+        "/api/plans/cfg-rf-partial/config",
+        json!({"autoMode": true}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(
+        body["runnerFailover"], "sibling",
+        "policy clobbered: {body}"
+    );
+}
+
+#[test]
+fn re_pinning_preserves_runner_failover_at_api_layer() {
+    // The DB-layer test pins this invariant; this test verifies the
+    // API plumbing keeps it intact (the unified PUT writes runner_id
+    // before runner_failover).
+    let d = TestDashboard::new();
+    d.create_plan("cfg-rf-repin", &minimal_plan("cfg-rf-repin", &d.project));
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_test_runner(&db_path, "runner-a", "online");
+    seed_test_runner(&db_path, "runner-b", "online");
+
+    let (s, _) = d.put(
+        "/api/plans/cfg-rf-repin/config",
+        json!({"runnerId": "runner-a", "runnerFailover": "sibling"}),
+    );
+    assert_eq!(s, 200);
+
+    // Re-pin to runner-b WITHOUT touching runnerFailover.
+    let (s, body) = d.put(
+        "/api/plans/cfg-rf-repin/config",
+        json!({"runnerId": "runner-b"}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["runnerId"], "runner-b");
+    assert_eq!(body["runnerFailover"], "sibling");
+}

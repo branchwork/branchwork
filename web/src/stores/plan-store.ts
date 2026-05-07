@@ -98,6 +98,12 @@ export interface PlanConfig {
   /// dispatcher pauses the plan with `paused_reason='runner_offline'` if
   /// the pinned runner is offline at spawn time.
   runnerId: string | null;
+  /// Per-plan runner failover policy (T11.5). `"pause"` (default, T11.4
+  /// behaviour) or `"sibling"` (re-dispatch to a sibling online runner
+  /// when the pinned runner goes offline). Always present; the schema
+  /// default is `"pause"` for plans without a pin (where the value is
+  /// inert — failover only kicks in for pinned plans).
+  runnerFailover: "pause" | "sibling";
 }
 
 export interface PlanConfigPatch {
@@ -113,6 +119,9 @@ export interface PlanConfigPatch {
   /// explicit `null` (clear pin = "any online runner"), or a runner id
   /// string (pin to that runner).
   runnerId?: string | null;
+  /// Per-plan runner failover policy (T11.5). `undefined` = don't touch.
+  /// Setting on a plan with no pin returns 409 from the server.
+  runnerFailover?: "pause" | "sibling";
 }
 
 /// Live status of the auto-mode loop for a single plan, driven by the

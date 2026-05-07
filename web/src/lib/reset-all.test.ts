@@ -55,6 +55,7 @@ function seedAllStores() {
         pausedReason: null,
         parallel: false,
         runnerId: null,
+        runnerFailover: "pause",
       },
     },
     autoModeRuntimes: { "user-a-plan": { state: "merging", task: "1.1" } },

@@ -15,6 +15,7 @@ function defaultConfig(overrides: Partial<PlanConfig> = {}): PlanConfig {
     pausedReason: null,
     parallel: false,
     runnerId: null,
+    runnerFailover: "pause",
     ...overrides,
   };
 }

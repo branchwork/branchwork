@@ -522,6 +522,13 @@ struct PlanConfig {
     /// the plan with `paused_reason='runner_offline'` if the pinned
     /// runner is offline at spawn time.
     runner_id: Option<String>,
+    /// Per-plan runner failover policy (T11.5). `"pause"` (default,
+    /// today's T11.4 behaviour) or `"sibling"` (re-dispatch to a sibling
+    /// online runner when the pinned runner goes offline). Always serialised
+    /// — for unpinned plans the value is the schema default `"pause"`,
+    /// which is harmless because failover only triggers when there's a
+    /// pin to fail over from.
+    runner_failover: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -544,6 +551,12 @@ pub struct PlanConfigBody {
     /// that runner). Same `deserialize_some` shim as `paused_reason`.
     #[serde(default, deserialize_with = "deserialize_some")]
     runner_id: Option<Option<String>>,
+    /// Per-plan runner failover policy (T11.5). `Some("pause")` /
+    /// `Some("sibling")` writes the policy on the existing pin row;
+    /// `None` leaves the policy untouched. Setting on a plan with no
+    /// pin is rejected (the failover concept only applies when there's
+    /// a pin to fail over from).
+    runner_failover: Option<String>,
 }
 
 /// Serde shim to distinguish absent fields from explicit null. With field
@@ -583,13 +596,22 @@ fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
         )
         .unwrap_or((false, 3, None, false));
 
-    let runner_id = db
+    let (runner_id, runner_failover) = db
         .query_row(
-            "SELECT runner_id FROM plan_runner_affinity WHERE plan_name = ?1",
+            "SELECT runner_id, runner_failover FROM plan_runner_affinity WHERE plan_name = ?1",
             params![name],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
-        .ok();
+        .map(|(rid, rf)| (Some(rid), rf))
+        .unwrap_or_else(|_| (None, "pause".to_string()));
+
+    // Coerce unknown legacy values to "pause" so the UI never sees a
+    // surprising third state. The `set_plan_runner_failover` validator
+    // gates this at write time but a manual SQL UPDATE could land here.
+    let runner_failover = match runner_failover.as_str() {
+        "sibling" => runner_failover,
+        _ => "pause".to_string(),
+    };
 
     // The unified config keeps both tables' `parallel` flags in lockstep,
     // but in case they ever diverge (manual SQL, partial migration), OR
@@ -602,6 +624,7 @@ fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
         paused_reason,
         parallel: mode_parallel || advance_parallel,
         runner_id,
+        runner_failover,
     }
 }
 
@@ -788,6 +811,27 @@ pub async fn put_plan_config(
         }
     }
 
+    // Per-plan runner failover policy (T11.5). Validate first so a bad
+    // value rejects the entire request before we mutate anything else.
+    // The validation also gates `runner_id`'s "explicit null clears the
+    // pin" path: if the user is setting failover='sibling' AND clearing
+    // the pin in the same request, we accept the failover write but it
+    // becomes a no-op (no pin row to UPDATE) — the API surfaces that as
+    // 409 below. This sequencing means we never half-apply the request.
+    if let Some(policy) = body.runner_failover.as_deref()
+        && policy != "pause"
+        && policy != "sibling"
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_runner_failover",
+                "message": "runnerFailover must be 'pause' or 'sibling'.",
+            })),
+        )
+            .into_response();
+    }
+
     // Per-plan runner pin (T11.4). `Absent` (None) leaves the pin
     // untouched. Explicit-null clears it (back to "any online runner").
     // An explicit value writes/replaces the pin. Audit either way so the
@@ -854,6 +898,62 @@ pub async fn put_plan_config(
                         "reason": "runner_repinned",
                     }),
                 );
+            }
+        }
+    }
+
+    // Per-plan runner failover policy (T11.5). Runs AFTER the pin write
+    // so a single PUT can set both the pin and the policy atomically:
+    // `set_plan_runner_id` UPSERTs the row with default 'pause', then
+    // this UPDATE flips it to 'sibling' if requested. Setting failover
+    // without a pin is a 409 — it's a meaningless config and silently
+    // dropping it would leave the user wondering why the toggle didn't
+    // stick.
+    if let Some(policy) = body.runner_failover.as_deref() {
+        match crate::db::set_plan_runner_failover(&state.db, &name, policy) {
+            Ok(true) => {
+                {
+                    let db = state.db.lock().unwrap();
+                    crate::audit::log(
+                        &db,
+                        auth.org_id(),
+                        auth.0.as_ref().map(|u| u.id.as_str()),
+                        auth.0.as_ref().map(|u| u.email.as_str()),
+                        crate::audit::actions::CONFIG_RUNNER_AFFINITY,
+                        crate::audit::resources::PLAN,
+                        Some(&name),
+                        Some(&serde_json::json!({"runnerFailover": policy}).to_string()),
+                    );
+                }
+                crate::ws::broadcast_event(
+                    &state.broadcast_tx,
+                    "plan_runner_affinity_changed",
+                    serde_json::json!({
+                        "plan": name,
+                        "runner_failover": policy,
+                    }),
+                );
+            }
+            Ok(false) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "no_runner_pin",
+                        "message": "Set a runner pin before configuring failover policy. \
+                                    Failover only applies when a plan is pinned to a specific runner.",
+                    })),
+                )
+                    .into_response();
+            }
+            Err(()) => {
+                // Already validated above, so this should be unreachable.
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_runner_failover",
+                    })),
+                )
+                    .into_response();
             }
         }
     }
