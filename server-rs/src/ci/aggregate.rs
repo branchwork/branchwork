@@ -43,7 +43,30 @@
 //! and source tag (`via-config` or `via-classifier`) so a post-mortem can
 //! reconstruct exactly why a run was excluded.
 
+use std::sync::OnceLock;
+
+use regex::Regex;
+
 use crate::saas::runner_protocol::{CiAggregate, CiRunSummary};
+
+/// Regex used by the level-4 smart classifier:
+/// `(?i)docker|deploy|publish|release|bench|fuzz`. Compiled once per
+/// process. Lives in `aggregate` rather than `resolution` so the runner
+/// binary (which deliberately does not depend on plan-parser /
+/// repo-config) can still partition by classifier when the server did
+/// not ship an explicit allowlist on the wire.
+fn classifier_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)docker|deploy|publish|release|bench|fuzz").unwrap())
+}
+
+/// `true` when a workflow name should block by default — i.e. its name
+/// does NOT match the deploy/release/bench/fuzz pattern. Public so that
+/// the dispatcher (server side) and the runner-side aggregator can
+/// share a single classifier definition.
+pub fn is_workflow_blocking_by_default(name: &str) -> bool {
+    !classifier_regex().is_match(name)
+}
 
 /// How the caller derived the blocking-workflow allowlist. The value is
 /// load-bearing only for audit-log purposes — the aggregator does not
@@ -136,6 +159,7 @@ impl<'a> BlockingFilter<'a> {
 ///   reached only when downstream skips are intentional.
 /// - `failing_run_id` is the first failing run by input order (callers sort
 ///   by `createdAt` upstream).
+#[allow(dead_code)] // unfiltered legacy entry point retained for tests + back-compat
 pub fn compute(runs: &[CiRunSummary]) -> CiAggregate {
     compute_with_filter(runs, None)
 }

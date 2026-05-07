@@ -452,6 +452,24 @@ pub enum WireMessage {
     /// because `tests` failed upstream is **not** a success), then
     /// applies the aggregation rule in 0.3 to produce a [`CiAggregate`].
     ///
+    /// `blocking_workflows` carries the level-1-3 (phase / plan / repo
+    /// `branchwork.toml`) explicit allowlist of workflow names that must
+    /// gate merge advancement. The runner has no plan YAML access, so
+    /// the server resolves these levels and ships the result here:
+    ///
+    /// - `Some(list)` ⇒ apply the list verbatim via
+    ///   [`crate::ci::aggregate::compute_with_filter`] with
+    ///   `BlockingSource::Config`. Workflows outside the list are
+    ///   informational; their failures do not poison the aggregate.
+    /// - `None` ⇒ no explicit allowlist; runner runs the level-4 smart
+    ///   classifier (`(?i)docker|deploy|publish|release|bench|fuzz`)
+    ///   over the discovered workflow names with `BlockingSource::Classifier`.
+    ///
+    /// Older runners that don't know the field will still deserialize
+    /// thanks to `#[serde(default)]`; they fall through to the
+    /// pre-1.2 unfiltered path. After Phase 1.2 ships everywhere, the
+    /// filter is uniformly applied on both sides.
+    ///
     /// Best-effort: the loop polls on a ~30 s cadence and a missed reply
     /// just retries on the next tick.
     GetCiRunStatus {
@@ -459,6 +477,10 @@ pub enum WireMessage {
         plan_name: String,
         task_number: String,
         merged_sha: String,
+        /// Server-resolved level-1-3 explicit allowlist; see variant doc
+        /// for the apply rule. `None` ≡ field absent on the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocking_workflows: Option<Vec<String>>,
     },
     /// Runner reply with the resolved aggregate, or `None` when no
     /// workflow run exists yet for the SHA (still polling) or `gh` is
@@ -1776,12 +1798,15 @@ mod tests {
             plan_name: "auto-mode-merge-ci-fix-loop".into(),
             task_number: "0.3".into(),
             merged_sha: "abcd1234".into(),
+            blocking_workflows: None,
         };
         assert!(msg.is_best_effort());
         assert_eq!(msg.event_type(), "get_ci_run_status");
         let env = Envelope::best_effort("r1".into(), msg);
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains("\"type\":\"get_ci_run_status\""));
+        // None ⇒ field omitted on the wire (skip_serializing_if).
+        assert!(!json.contains("blocking_workflows"));
         let back: Envelope = serde_json::from_str(&json).unwrap();
         match back.message {
             WireMessage::GetCiRunStatus {
@@ -1789,11 +1814,60 @@ mod tests {
                 plan_name,
                 task_number,
                 merged_sha,
+                blocking_workflows,
             } => {
                 assert_eq!(req_id, "req-37");
                 assert_eq!(plan_name, "auto-mode-merge-ci-fix-loop");
                 assert_eq!(task_number, "0.3");
                 assert_eq!(merged_sha, "abcd1234");
+                assert!(blocking_workflows.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_ci_run_status_with_blocking_workflows_round_trip() {
+        let msg = WireMessage::GetCiRunStatus {
+            req_id: "req-37b".into(),
+            plan_name: "demo-plan".into(),
+            task_number: "1.2".into(),
+            merged_sha: "abcd1234".into(),
+            blocking_workflows: Some(vec!["tests".into(), "lint".into()]),
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"blocking_workflows\":[\"tests\",\"lint\"]"));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::GetCiRunStatus {
+                blocking_workflows, ..
+            } => {
+                assert_eq!(
+                    blocking_workflows,
+                    Some(vec!["tests".to_string(), "lint".to_string()])
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Older runner JSON without the field must still deserialize — pre-1.2
+    /// runners don't know about `blocking_workflows` and we want their
+    /// payloads to default to `None` (unfiltered behaviour) rather than
+    /// reject the message.
+    #[test]
+    fn get_ci_run_status_legacy_payload_without_field_defaults_to_none() {
+        let raw = r#"{"runner_id":"r1","type":"get_ci_run_status","req_id":"legacy","plan_name":"p","task_number":"1.1","merged_sha":"sha"}"#;
+        let env: Envelope = serde_json::from_str(raw).expect("legacy payload should parse");
+        match env.message {
+            WireMessage::GetCiRunStatus {
+                blocking_workflows, ..
+            } => {
+                assert!(
+                    blocking_workflows.is_none(),
+                    "missing field must default to None for backwards compat"
+                );
             }
             other => panic!("unexpected variant: {other:?}"),
         }

@@ -46,6 +46,13 @@ mod saas {
 // nested `#[path]` inside an inline module resolves the path
 // relative to the synthetic `<parent>/<mod_name>/` directory and
 // breaks for files outside that subtree.
+//
+// `ci::aggregate::is_workflow_blocking_by_default` carries the level-4
+// smart classifier the runner falls back on when the server didn't ship
+// an explicit allowlist on the wire. The classifier lives next to
+// `compute_with_filter` rather than in `ci::resolution` so the runner
+// can depend on it without pulling the plan-parser / repo-config
+// machinery (those are server-only crates).
 #[path = "../ci/aggregate.rs"]
 pub mod ci_aggregate;
 mod ci {
@@ -1404,10 +1411,12 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             plan_name,
             task_number: _,
             merged_sha,
+            blocking_workflows,
         } => {
             let req_id = req_id.clone();
             let plan_name = plan_name.clone();
             let merged_sha = merged_sha.clone();
+            let blocking_workflows = blocking_workflows.clone();
 
             // Always record plan→sha so a follow-up `CiFailureLog { run_id:
             // None }` can re-resolve.
@@ -1416,11 +1425,17 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                 cache.record_plan_sha(plan_name.clone(), merged_sha.clone());
             }
 
-            // Fast path: serve a fresh cached aggregate.
+            // Fast path: serve a fresh cached aggregate. The cache is keyed
+            // by SHA only — same SHA + same allowlist hits the cached
+            // entry. A different allowlist coming in for the same SHA
+            // (rare in practice — the user would have to edit
+            // `ci_blocking_workflows` mid-poll) recomputes from the cached
+            // raw runs via `re_filter_cached_aggregate` so we don't hit
+            // `gh` again.
             let cached = state.ci_cache.lock().await.fresh(&merged_sha);
 
             let aggregate = if let Some(cached) = cached {
-                cached
+                re_filter_cached_aggregate(cached, blocking_workflows.as_deref())
             } else {
                 let cwd = state
                     .plan_cwd
@@ -1430,9 +1445,10 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                     .cloned()
                     .unwrap_or_else(|| state.cwd.clone());
 
+                let allowlist = blocking_workflows.clone();
                 let computed = run_blocking_with_timeout(GH_TIMEOUT, {
                     let sha = merged_sha.clone();
-                    move || compute_ci_aggregate(&cwd, &sha)
+                    move || compute_ci_aggregate(&cwd, &sha, allowlist.as_deref())
                 })
                 .await
                 .unwrap_or(None);
@@ -1844,34 +1860,63 @@ fn gh_run_list_full(cwd: &Path, sha: &str) -> Option<Vec<GhRunDetail>> {
 /// or when the runs vec is empty (still polling). The `Reglyze`-shape
 /// aggregation — failure-poisons-skip — is in [`aggregate_runs`].
 ///
+/// `blocking_workflows` is the level-1-3 explicit allowlist resolved
+/// server-side and shipped to the runner via [`WireMessage::GetCiRunStatus`].
+/// `Some(list)` ⇒ apply the list verbatim (`BlockingSource::Config`).
+/// `None` ⇒ runner runs the level-4 smart classifier itself
+/// (`BlockingSource::Classifier`). See [`aggregate_runs`] for the
+/// workflow-graph rule and the per-run `informational` partition.
+///
 /// Wall-clock for the full `gh run list` + per-run `gh run view` chain is
 /// recorded into the trailing CI-poll latency ring so the next
 /// `RunnerHealth` tick reports fresh p50/p99 numbers. Latency is captured
 /// even when the call returns `None` (gh missing / no runs yet) — the
 /// dashboard cares about how long the call took, not whether it found
 /// anything.
-fn compute_ci_aggregate(cwd: &Path, sha: &str) -> Option<CiAggregate> {
+fn compute_ci_aggregate(
+    cwd: &Path,
+    sha: &str,
+    blocking_workflows: Option<&[String]>,
+) -> Option<CiAggregate> {
     let started = Instant::now();
-    let result = compute_ci_aggregate_inner(cwd, sha);
+    let result = compute_ci_aggregate_inner(cwd, sha, blocking_workflows);
     let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
     runner_health::record_ci_poll_ms(elapsed_ms);
     result
 }
 
-fn compute_ci_aggregate_inner(cwd: &Path, sha: &str) -> Option<CiAggregate> {
+fn compute_ci_aggregate_inner(
+    cwd: &Path,
+    sha: &str,
+    blocking_workflows: Option<&[String]>,
+) -> Option<CiAggregate> {
     let runs = gh_run_list_full(cwd, sha)?;
     if runs.is_empty() {
         return None;
     }
-    Some(aggregate_runs(runs))
+    Some(aggregate_runs(runs, blocking_workflows))
 }
 
 /// Build the per-SHA aggregate from `gh run list` rows. Sorts inputs by
-/// `createdAt` ascending so the shared rule in [`ci::aggregate::compute`]
-/// picks the root-cause failure as `failing_run_id` rather than a
-/// downstream one. Mode-shared aggregation rule (Reglyze regression test
-/// lives in `ci::aggregate::tests`).
-fn aggregate_runs(mut runs: Vec<GhRunDetail>) -> CiAggregate {
+/// `createdAt` ascending so the shared rule in
+/// [`ci::aggregate::compute_with_filter`] picks the root-cause failure as
+/// `failing_run_id` rather than a downstream one. Mode-shared aggregation
+/// rule (Reglyze regression test lives in `ci::aggregate::tests`).
+///
+/// `blocking_workflows` carries the resolved level-1-3 explicit allowlist
+/// from the server. When `Some(list)`, runs whose `workflow_name` is not
+/// in the list are flagged informational and excluded from the aggregate
+/// `conclusion` / `failing_run_id` (audit log: `via-config`). When
+/// `None`, the level-4 smart classifier
+/// (`(?i)docker|deploy|publish|release|bench|fuzz`) is applied to the
+/// runner's own discovered workflow names (audit log: `via-classifier`).
+fn aggregate_runs(
+    mut runs: Vec<GhRunDetail>,
+    blocking_workflows: Option<&[String]>,
+) -> CiAggregate {
+    use ci::aggregate::is_workflow_blocking_by_default;
+    use ci::aggregate::{BlockingFilter, compute_with_filter};
+
     // Sort by createdAt ascending. `gh` emits ISO-8601 strings which sort
     // lexicographically into chronological order; missing timestamps stay
     // in input order via `Option`'s default `Ord` (None < Some(_)).
@@ -1891,15 +1936,71 @@ fn aggregate_runs(mut runs: Vec<GhRunDetail>) -> CiAggregate {
             // mark_upstream_skips below sets this — initialize to false so
             // the rule has a single source of truth.
             skipped_due_to_upstream: false,
-            // The runner aggregator never partitions by allowlist — that's
-            // the server-side `compute_with_filter` consumer's job. Default
-            // to false so the runner's wire payload stays compact.
+            // compute_with_filter sets this from the partition decision.
             informational: false,
         })
         .collect();
 
     ci::aggregate::mark_upstream_skips(&mut summaries);
-    ci::aggregate::compute(&summaries)
+
+    match blocking_workflows {
+        Some(list) => {
+            let filter = BlockingFilter::config(list);
+            compute_with_filter(&summaries, Some(&filter))
+        }
+        None => {
+            // Level-4 fallback: classifier over discovered workflow names.
+            // Build the allowlist from the runs themselves, then apply
+            // compute_with_filter so the per-run `informational` flag is
+            // set the same way as in the explicit-allowlist path.
+            let allowlist: Vec<String> = summaries
+                .iter()
+                .map(|s| s.workflow_name.clone())
+                .filter(|name| is_workflow_blocking_by_default(name))
+                .collect();
+            let filter = BlockingFilter::classifier(&allowlist);
+            compute_with_filter(&summaries, Some(&filter))
+        }
+    }
+}
+
+/// Re-apply the resolved allowlist to a previously-cached aggregate. The
+/// runner's `CiAggregateCache` is keyed by SHA only — same SHA + same
+/// allowlist returns the cached aggregate cheaply, but a different
+/// allowlist coming in for the same SHA (e.g. the user edited
+/// `ci_blocking_workflows` between two polls) needs the cached
+/// `CiRunSummary` rows re-partitioned without paying for another
+/// `gh run list` shell-out.
+///
+/// The cached aggregate already has `skipped_due_to_upstream` set
+/// correctly — that flag depends only on the runs themselves — so we
+/// pass the cached `runs` straight back through `compute_with_filter`.
+fn re_filter_cached_aggregate(
+    cached: Option<CiAggregate>,
+    blocking_workflows: Option<&[String]>,
+) -> Option<CiAggregate> {
+    use ci::aggregate::is_workflow_blocking_by_default;
+    use ci::aggregate::{BlockingFilter, compute_with_filter};
+
+    let cached = cached?;
+    let summaries = cached.runs;
+
+    let aggregate = match blocking_workflows {
+        Some(list) => {
+            let filter = BlockingFilter::config(list);
+            compute_with_filter(&summaries, Some(&filter))
+        }
+        None => {
+            let allowlist: Vec<String> = summaries
+                .iter()
+                .map(|s| s.workflow_name.clone())
+                .filter(|name| is_workflow_blocking_by_default(name))
+                .collect();
+            let filter = BlockingFilter::classifier(&allowlist);
+            compute_with_filter(&summaries, Some(&filter))
+        }
+    };
+    Some(aggregate)
 }
 
 /// List non-dot directories at the top level of the runner's home dir.
@@ -3394,7 +3495,13 @@ mod tests {
 
     #[test]
     fn aggregate_runs_reglyze_fixture_marks_skipped_due_to_upstream() {
-        let aggregate = aggregate_runs(reglyze_fixture());
+        // Pass `None` for the explicit allowlist so the runner falls
+        // through to the level-4 classifier — `tests` and `lint` block,
+        // `deploy` is informational. The Reglyze rule still poisons the
+        // aggregate because the failing run (`tests`) is in the blocking
+        // subset, and `deploy.skipped_due_to_upstream` is set by
+        // `mark_upstream_skips` regardless of the partition decision.
+        let aggregate = aggregate_runs(reglyze_fixture(), None);
         assert_eq!(aggregate.status, "completed");
         assert_eq!(aggregate.conclusion.as_deref(), Some("failure"));
         assert_eq!(aggregate.failing_run_id.as_deref(), Some("100"));
@@ -3410,6 +3517,13 @@ mod tests {
             by_workflow["deploy"].skipped_due_to_upstream,
             "deploy must be marked skipped_due_to_upstream when tests failed in same SHA"
         );
+        // Classifier puts `deploy` in the informational subset.
+        assert!(
+            by_workflow["deploy"].informational,
+            "deploy must be flagged informational by the level-4 classifier"
+        );
+        assert!(!by_workflow["tests"].informational);
+        assert!(!by_workflow["lint"].informational);
     }
 
     #[test]
@@ -3430,15 +3544,45 @@ mod tests {
                 created_at: Some("2026-04-12T10:00:01Z".into()),
             },
         ];
-        let aggregate = aggregate_runs(runs);
+        let aggregate = aggregate_runs(runs, None);
         assert_eq!(aggregate.conclusion.as_deref(), Some("success"));
         assert!(aggregate.failing_run_id.is_none());
         // deploy.skipped_due_to_upstream must be false — no failure in set.
         assert!(!aggregate.runs.iter().any(|r| r.skipped_due_to_upstream));
     }
 
+    /// Pre-1.2 invariant: a *blocking* in-progress run holds the gate.
+    /// The classifier puts `tests` in the blocking subset, so its
+    /// in_progress status must propagate to `aggregate.status`.
     #[test]
-    fn aggregate_runs_in_progress_when_any_run_pending() {
+    fn aggregate_runs_in_progress_when_blocking_run_pending() {
+        let runs = vec![
+            GhRunDetail {
+                database_id: 300,
+                workflow_name: "tests".into(),
+                status: "in_progress".into(),
+                conclusion: None,
+                created_at: Some("2026-04-12T10:00:00Z".into()),
+            },
+            GhRunDetail {
+                database_id: 301,
+                workflow_name: "deploy".into(),
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                created_at: Some("2026-04-12T10:00:01Z".into()),
+            },
+        ];
+        let aggregate = aggregate_runs(runs, None);
+        assert_eq!(aggregate.status, "in_progress");
+        assert!(aggregate.conclusion.is_none());
+    }
+
+    /// Phase-1.2 partition: an in-progress *informational* run does NOT
+    /// hold the gate. The classifier puts `deploy` in the informational
+    /// subset, so a still-running deploy alongside a green `tests` must
+    /// resolve to `completed`/`success`.
+    #[test]
+    fn aggregate_runs_informational_in_progress_does_not_hold_gate() {
         let runs = vec![
             GhRunDetail {
                 database_id: 300,
@@ -3455,14 +3599,25 @@ mod tests {
                 created_at: Some("2026-04-12T10:00:01Z".into()),
             },
         ];
-        let aggregate = aggregate_runs(runs);
-        assert_eq!(aggregate.status, "in_progress");
-        assert!(aggregate.conclusion.is_none());
+        let aggregate = aggregate_runs(runs, None);
+        assert_eq!(
+            aggregate.status, "completed",
+            "informational deploy must not block the gate"
+        );
+        assert_eq!(aggregate.conclusion.as_deref(), Some("success"));
+        let by_workflow: HashMap<&str, &CiRunSummary> = aggregate
+            .runs
+            .iter()
+            .map(|s| (s.workflow_name.as_str(), s))
+            .collect();
+        assert!(by_workflow["deploy"].informational);
+        assert!(!by_workflow["tests"].informational);
     }
 
     #[test]
     fn aggregate_runs_failing_run_id_picks_earliest_by_created_at() {
         // Two failing runs, second created_at chronologically earlier.
+        // Both names ("later", "earlier") are blocking by the classifier.
         let runs = vec![
             GhRunDetail {
                 database_id: 500,
@@ -3479,8 +3634,105 @@ mod tests {
                 created_at: Some("2026-04-12T10:00:00Z".into()),
             },
         ];
-        let aggregate = aggregate_runs(runs);
+        let aggregate = aggregate_runs(runs, None);
         assert_eq!(aggregate.failing_run_id.as_deref(), Some("501"));
+    }
+
+    /// Explicit-allowlist path: the wire field carried `Some(["tests"])`
+    /// from the server. `lint` becomes informational because it's not in
+    /// the allowlist (this is precedence level 1-3, NOT the classifier),
+    /// so a green-tests + red-lint run set reports success.
+    #[test]
+    fn aggregate_runs_explicit_allowlist_demotes_lint_to_informational() {
+        let runs = vec![
+            GhRunDetail {
+                database_id: 700,
+                workflow_name: "tests".into(),
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                created_at: Some("2026-04-12T10:00:00Z".into()),
+            },
+            GhRunDetail {
+                database_id: 701,
+                workflow_name: "lint".into(),
+                status: "completed".into(),
+                conclusion: Some("failure".into()),
+                created_at: Some("2026-04-12T10:00:01Z".into()),
+            },
+        ];
+        let allowlist = vec!["tests".to_string()];
+        let aggregate = aggregate_runs(runs, Some(&allowlist));
+        assert_eq!(aggregate.status, "completed");
+        assert_eq!(aggregate.conclusion.as_deref(), Some("success"));
+        assert!(aggregate.failing_run_id.is_none());
+        let by_workflow: HashMap<&str, &CiRunSummary> = aggregate
+            .runs
+            .iter()
+            .map(|s| (s.workflow_name.as_str(), s))
+            .collect();
+        assert!(!by_workflow["tests"].informational);
+        assert!(by_workflow["lint"].informational);
+    }
+
+    /// Acceptance criterion for task 1.2: runner-side and standalone-side
+    /// aggregates must match for the same SHA + same allowlist + same
+    /// input runs. Tests both the explicit-allowlist path and the
+    /// classifier-fallback path.
+    #[test]
+    fn aggregate_runs_matches_dispatch_aggregate_for_same_input_and_filter() {
+        // Reuse the cross-mode parity check via a shared helper expressed
+        // entirely in `CiRunSummary` so we don't take a `gh` shell-out
+        // dependency. The runner's `aggregate_runs` is a superset of the
+        // server's `aggregate_with_resolution`: it sorts + lifts
+        // `GhRunDetail` to `CiRunSummary` first, then runs the same
+        // filter+compute pipeline.
+        let detail_runs = reglyze_fixture();
+
+        // Explicit allowlist case.
+        let allowlist = vec!["tests".to_string(), "lint".to_string()];
+        let runner_agg = aggregate_runs(detail_runs.clone(), Some(&allowlist));
+        let summaries: Vec<CiRunSummary> = detail_runs
+            .iter()
+            .map(|r| CiRunSummary {
+                run_id: r.database_id.to_string(),
+                workflow_name: r.workflow_name.clone(),
+                status: if r.status.is_empty() {
+                    "completed".to_string()
+                } else {
+                    r.status.clone()
+                },
+                conclusion: r.conclusion.clone(),
+                skipped_due_to_upstream: false,
+                informational: false,
+            })
+            .collect();
+        let mut server_summaries = summaries.clone();
+        ci::aggregate::mark_upstream_skips(&mut server_summaries);
+        // Server-side filter via the same pipeline (mark_upstream_skips +
+        // compute_with_filter on the explicit allowlist).
+        let filter = ci::aggregate::BlockingFilter::config(&allowlist);
+        let server_agg = ci::aggregate::compute_with_filter(&server_summaries, Some(&filter));
+        assert_eq!(
+            runner_agg, server_agg,
+            "runner aggregate must match server aggregate byte-for-byte for same allowlist"
+        );
+
+        // Classifier fallback case (None on the wire).
+        let runner_agg_default = aggregate_runs(detail_runs, None);
+        // Server side simulates the same fallback: classifier over the
+        // discovered workflow names.
+        let classifier_allowlist: Vec<String> = server_summaries
+            .iter()
+            .map(|s| s.workflow_name.clone())
+            .filter(|name| ci::aggregate::is_workflow_blocking_by_default(name))
+            .collect();
+        let classifier_filter = ci::aggregate::BlockingFilter::classifier(&classifier_allowlist);
+        let server_agg_default =
+            ci::aggregate::compute_with_filter(&server_summaries, Some(&classifier_filter));
+        assert_eq!(
+            runner_agg_default, server_agg_default,
+            "runner classifier-fallback aggregate must match server's"
+        );
     }
 
     #[tokio::test]
@@ -3493,7 +3745,7 @@ mod tests {
         let (state, mut rx) = make_test_state(dir.path().to_path_buf());
 
         // Pre-seed the cache so the handler doesn't shell out.
-        let aggregate = aggregate_runs(reglyze_fixture());
+        let aggregate = aggregate_runs(reglyze_fixture(), None);
         {
             let mut cache = state.ci_cache.lock().await;
             cache.put("merged-sha-1".to_string(), Some(aggregate.clone()));
@@ -3507,6 +3759,7 @@ mod tests {
                 plan_name: "demo-plan".into(),
                 task_number: "1.2".into(),
                 merged_sha: "merged-sha-1".into(),
+                blocking_workflows: None,
             },
         )
         .await;
@@ -3582,7 +3835,9 @@ mod tests {
         let (state, mut rx) = make_test_state(dir.path().to_path_buf());
 
         // Pre-seed the cache with a fully-aggregated entry for the SHA.
-        let aggregate = aggregate_runs(reglyze_fixture());
+        // Filter `None` ⇒ the runner runs the level-4 classifier; `tests`
+        // is blocking so the failure still poisons the aggregate.
+        let aggregate = aggregate_runs(reglyze_fixture(), None);
         // Sanity-check the aggregator before relying on it for the regression.
         assert_eq!(aggregate.failing_run_id.as_deref(), Some("100"));
         let deploy = aggregate
@@ -3610,6 +3865,7 @@ mod tests {
                 plan_name: "reglyze-plan".into(),
                 task_number: "0.4".into(),
                 merged_sha: "reglyze-sha".into(),
+                blocking_workflows: None,
             },
         )
         .await;

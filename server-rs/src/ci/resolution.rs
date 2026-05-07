@@ -41,30 +41,14 @@
 //! 3. `repo_config.phase.verification` if `Some`
 //! 4. `None` (no smart fallback — verify is opt-in).
 
-use std::sync::OnceLock;
-
-use regex::Regex;
-
 use crate::plan_parser::{ParsedPlan, PlanPhase};
 use crate::repo_config::RepoConfig;
 
-/// Compiled once per process. The pattern is case-insensitive and
-/// unanchored — it matches anywhere in the workflow name, so
-/// `Docker Publish`, `release-notes`, and `nightly-fuzz` are all
-/// classified as non-blocking.
-fn classifier_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)docker|deploy|publish|release|bench|fuzz").unwrap())
-}
-
-/// `true` when a workflow name should block by default — i.e. its name
-/// does NOT match the deploy/release/bench/fuzz pattern. Public so that
-/// later phases (UI surface, audit log) can show the same classification
-/// the resolver uses.
-#[allow(dead_code)] // consumed by phase 1.1+
-pub fn is_workflow_blocking_by_default(name: &str) -> bool {
-    !classifier_regex().is_match(name)
-}
+// `is_workflow_blocking_by_default` (the level-4 smart classifier) lives
+// in [`crate::ci::aggregate`] so the runner binary can use it without
+// pulling in plan-parser / repo-config (server-only crates). Re-exported
+// here so existing callers under `ci::resolution::*` keep working.
+pub use crate::ci::aggregate::is_workflow_blocking_by_default;
 
 /// Resolve the effective blocking-workflows allowlist for a phase.
 ///
@@ -95,6 +79,53 @@ pub fn resolve_blocking_workflows(
         .filter(|name| is_workflow_blocking_by_default(name))
         .cloned()
         .collect()
+}
+
+/// Resolve only the *explicit* allowlist (precedence levels 1-3) without
+/// the smart-classifier fallback. Returns `None` when no explicit
+/// allowlist is configured at the phase, plan, or repo level — the
+/// caller is expected to fall through to the level-4 classifier over the
+/// workflow names it actually discovers (e.g. from `gh run list`).
+///
+/// This split exists for the SaaS dispatch path: the server resolves
+/// levels 1-3 against the plan YAML it owns and ships the result to the
+/// runner over the wire as part of [`crate::saas::runner_protocol::WireMessage::GetCiRunStatus`].
+/// The runner has no plan YAML access, so it cannot run levels 1-3
+/// itself; it just receives the result and applies the classifier (level
+/// 4) over its own discovered workflow names when the wire field is
+/// `None`.
+///
+/// Standalone callers can use the same split for symmetry: server runs
+/// levels 1-3 here, then applies the classifier over the
+/// `gh`-discovered workflow names locally.
+#[allow(dead_code)] // consumed by phase 1.2+
+pub fn resolve_explicit_blocking_workflows(
+    plan: &ParsedPlan,
+    phase: &PlanPhase,
+    repo_config: Option<&RepoConfig>,
+) -> Option<Vec<String>> {
+    if let Some(list) = phase.ci_blocking_workflows.as_ref() {
+        return Some(list.clone());
+    }
+    if let Some(list) = plan.ci_blocking_workflows.as_ref() {
+        return Some(list.clone());
+    }
+    repo_config.and_then(|c| c.ci.blocking_workflows.clone())
+}
+
+/// Find the phase that owns a given task number on a parsed plan.
+///
+/// Used by the SaaS CI dispatch path: given a `ci_runs.task_number` value
+/// like `"1.2"`, locate the [`PlanPhase`] containing that task so the
+/// resolution helpers can read its `ci_blocking_workflows` /
+/// `phase_verification` fields. Returns `None` when no phase contains a
+/// task with that number — the caller treats that as "use plan-level or
+/// repo-level config without a phase override."
+#[allow(dead_code)] // consumed by phase 1.2+
+pub fn phase_for_task<'a>(plan: &'a ParsedPlan, task_number: &str) -> Option<&'a PlanPhase> {
+    plan.phases
+        .iter()
+        .find(|p| p.tasks.iter().any(|t| t.number == task_number))
 }
 
 /// Resolve the effective phase-verification command. `None` means no
@@ -388,5 +419,136 @@ mod tests {
         // Repo present but with no phase.verification.
         let repo = RepoConfig::default();
         assert!(resolve_phase_verification(&plan, &phase, Some(&repo)).is_none());
+    }
+
+    // ── resolve_explicit_blocking_workflows: levels 1-3 only ────────────
+
+    #[test]
+    fn explicit_level_1_phase_wins_when_set() {
+        let mut plan = empty_plan();
+        plan.ci_blocking_workflows = Some(vec!["plan-list".into()]);
+        let mut phase = empty_phase();
+        phase.ci_blocking_workflows = Some(vec!["phase-only".into()]);
+        let repo = RepoConfig {
+            ci: CiConfig {
+                blocking_workflows: Some(vec!["repo-list".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let got = resolve_explicit_blocking_workflows(&plan, &phase, Some(&repo));
+        assert_eq!(got, Some(vec!["phase-only".to_string()]));
+    }
+
+    #[test]
+    fn explicit_level_2_plan_used_when_phase_is_none() {
+        let mut plan = empty_plan();
+        plan.ci_blocking_workflows = Some(vec!["plan-only".into()]);
+        let phase = empty_phase();
+        let got = resolve_explicit_blocking_workflows(&plan, &phase, None);
+        assert_eq!(got, Some(vec!["plan-only".to_string()]));
+    }
+
+    #[test]
+    fn explicit_level_3_repo_used_when_phase_and_plan_are_none() {
+        let plan = empty_plan();
+        let phase = empty_phase();
+        let repo = RepoConfig {
+            ci: CiConfig {
+                blocking_workflows: Some(vec!["repo-only".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let got = resolve_explicit_blocking_workflows(&plan, &phase, Some(&repo));
+        assert_eq!(got, Some(vec!["repo-only".to_string()]));
+    }
+
+    #[test]
+    fn explicit_returns_none_when_no_level_is_configured() {
+        // No explicit allowlist anywhere — caller must run the classifier.
+        // Crucial: this MUST be `None`, not `Some(empty)`. An empty
+        // `Some` allowlist would mean "explicitly nothing blocks" (a
+        // legitimate user choice), whereas `None` means "fall through
+        // to the classifier."
+        let plan = empty_plan();
+        let phase = empty_phase();
+        assert!(resolve_explicit_blocking_workflows(&plan, &phase, None).is_none());
+        let empty_repo = RepoConfig::default();
+        assert!(resolve_explicit_blocking_workflows(&plan, &phase, Some(&empty_repo)).is_none());
+    }
+
+    #[test]
+    fn explicit_empty_list_is_returned_as_some() {
+        // A user who explicitly sets `ci_blocking_workflows: []` is
+        // saying "nothing blocks." The classifier must NOT kick in.
+        let mut plan = empty_plan();
+        plan.ci_blocking_workflows = Some(vec![]);
+        let phase = empty_phase();
+        let got = resolve_explicit_blocking_workflows(&plan, &phase, None);
+        assert_eq!(
+            got,
+            Some(vec![]),
+            "explicit empty allowlist must round-trip as Some(empty), not None"
+        );
+    }
+
+    // ── phase_for_task ──────────────────────────────────────────────────
+
+    fn task(number: &str) -> PlanTask {
+        PlanTask {
+            number: number.into(),
+            title: format!("task {number}"),
+            description: String::new(),
+            file_paths: vec![],
+            acceptance: String::new(),
+            dependencies: vec![],
+            produces_commit: true,
+            status: None,
+            status_updated_at: None,
+            cost_usd: None,
+            ci: None,
+        }
+    }
+
+    fn plan_with_phases(phases: Vec<PlanPhase>) -> ParsedPlan {
+        ParsedPlan {
+            phases,
+            ..empty_plan()
+        }
+    }
+
+    #[test]
+    fn phase_for_task_finds_owning_phase() {
+        let phase_a = PlanPhase {
+            tasks: vec![task("0.1"), task("0.2")],
+            ..empty_phase()
+        };
+        let phase_b = PlanPhase {
+            number: 1,
+            tasks: vec![task("1.1"), task("1.2")],
+            ..empty_phase()
+        };
+        let plan = plan_with_phases(vec![phase_a, phase_b]);
+        assert_eq!(phase_for_task(&plan, "0.2").map(|p| p.number), Some(0));
+        assert_eq!(phase_for_task(&plan, "1.1").map(|p| p.number), Some(1));
+        assert_eq!(phase_for_task(&plan, "1.2").map(|p| p.number), Some(1));
+    }
+
+    #[test]
+    fn phase_for_task_returns_none_for_unknown_number() {
+        let phase_a = PlanPhase {
+            tasks: vec![task("0.1")],
+            ..empty_phase()
+        };
+        let plan = plan_with_phases(vec![phase_a]);
+        assert!(phase_for_task(&plan, "9.9").is_none());
+        assert!(phase_for_task(&plan, "").is_none());
+    }
+
+    #[test]
+    fn phase_for_task_handles_empty_plan() {
+        let plan = empty_plan();
+        assert!(phase_for_task(&plan, "1.1").is_none());
     }
 }

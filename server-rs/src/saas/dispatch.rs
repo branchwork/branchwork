@@ -188,6 +188,20 @@ pub async fn get_ci_run_status_dispatch(
     task_number: &str,
     merged_sha: &str,
 ) -> Result<Option<CiAggregate>, CiStatusError> {
+    // Resolve levels 1-3 of the blocking-workflow allowlist on the server
+    // side: phase override > plan override > repo `branchwork.toml`.
+    // Both branches consume the result the same way — runner-mode ships
+    // it on the wire so the runner can apply it without plan YAML access,
+    // standalone-mode applies it locally. `None` means the user has no
+    // explicit allowlist anywhere, so the consumer falls through to the
+    // smart classifier (level 4) over its own discovered workflow names.
+    let blocking_workflows = resolve_explicit_blocking_workflows_for_task(
+        &state.plans_dir,
+        &state.db,
+        plan_name,
+        task_number,
+    );
+
     if org_has_runner(&state.db, org_id) {
         let req_id = Uuid::new_v4().to_string();
         let msg = WireMessage::GetCiRunStatus {
@@ -195,6 +209,7 @@ pub async fn get_ci_run_status_dispatch(
             plan_name: plan_name.to_string(),
             task_number: task_number.to_string(),
             merged_sha: merged_sha.to_string(),
+            blocking_workflows,
         };
         match runner_request(state, org_id, msg, READ_TIMEOUT).await {
             Ok(RunnerResponse::CiRunStatusResolved(aggregate)) => Ok(aggregate),
@@ -204,7 +219,7 @@ pub async fn get_ci_run_status_dispatch(
     } else {
         // Standalone: shell out to `gh run list` for the SHA in the plan's
         // project dir, then run the same rule (mark_upstream_skips +
-        // compute) the runner runs on its side.
+        // compute_with_filter) the runner runs on its side.
         let cwd = match crate::ci::project_dir_for(&state.plans_dir, &state.db, plan_name) {
             Some(d) => d,
             None => return Ok(None),
@@ -236,8 +251,84 @@ pub async fn get_ci_run_status_dispatch(
             })
             .collect();
         aggregate::mark_upstream_skips(&mut summaries);
-        Ok(Some(aggregate::compute(&summaries)))
+
+        // Apply the same explicit allowlist (level 1-3) the runner branch
+        // ships over the wire. If the explicit allowlist is `None`, fall
+        // through to the level-4 classifier over the discovered workflow
+        // names — this is the same fallback the runner runs in its
+        // `aggregate_runs` helper, so both paths produce byte-equal
+        // aggregates for the same inputs.
+        let aggregate = aggregate_with_resolution(&summaries, blocking_workflows.as_deref());
+        Ok(Some(aggregate))
     }
+}
+
+/// Apply the per-plan filter to a slice of [`CiRunSummary`]: explicit
+/// allowlist (level 1-3) when `Some`, otherwise the level-4 classifier
+/// over the discovered workflow names.
+///
+/// Lifted out of [`get_ci_run_status_dispatch`] so the runner side can
+/// reuse the exact same rule via the same code path. Public to the
+/// `crate::saas` module so [`crate::bin::branchwork_runner`]'s test
+/// fixtures can call it for parity assertions.
+pub(crate) fn aggregate_with_resolution(
+    summaries: &[CiRunSummary],
+    explicit_allowlist: Option<&[String]>,
+) -> CiAggregate {
+    use crate::ci::aggregate::{
+        BlockingFilter, compute_with_filter, is_workflow_blocking_by_default,
+    };
+
+    match explicit_allowlist {
+        Some(list) => {
+            let filter = BlockingFilter::config(list);
+            compute_with_filter(summaries, Some(&filter))
+        }
+        None => {
+            // Level-4 fallback: classifier over discovered workflow names.
+            // Build the allowlist by name then run compute_with_filter so
+            // the per-run `informational` flag is set consistently with
+            // the runner-mode path.
+            let allowlist: Vec<String> = summaries
+                .iter()
+                .map(|s| s.workflow_name.clone())
+                .filter(|name| is_workflow_blocking_by_default(name))
+                .collect();
+            let filter = BlockingFilter::classifier(&allowlist);
+            compute_with_filter(summaries, Some(&filter))
+        }
+    }
+}
+
+/// Look up the level-1-3 explicit blocking-workflow allowlist for a
+/// `(plan_name, task_number)` pair. Returns `None` when no explicit
+/// configuration is set (caller falls through to the classifier).
+///
+/// Layered lookup:
+/// 1. Parse the plan YAML to find the phase that owns `task_number`.
+/// 2. Read the project's `branchwork.toml` if present.
+/// 3. Resolve the explicit allowlist via [`crate::ci::resolution::resolve_explicit_blocking_workflows`].
+///
+/// Any step that fails (missing plan, unknown task number, plan parse
+/// error) collapses to `None` — the conservative default that lets the
+/// classifier kick in instead of accidentally letting unknown failures
+/// gate the merge.
+pub(crate) fn resolve_explicit_blocking_workflows_for_task(
+    plans_dir: &Path,
+    db: &Db,
+    plan_name: &str,
+    task_number: &str,
+) -> Option<Vec<String>> {
+    use crate::ci::resolution::{phase_for_task, resolve_explicit_blocking_workflows};
+
+    let plan_path = plans_dir.join(format!("{plan_name}.yaml"));
+    let plan = crate::plan_parser::parse_plan_file(&plan_path).ok()?;
+    let phase = phase_for_task(&plan, task_number)?;
+    let project_dir = crate::ci::project_dir_for(plans_dir, db, plan_name);
+    let repo_config = project_dir
+        .as_deref()
+        .and_then(crate::repo_config::load_for_project_dir);
+    resolve_explicit_blocking_workflows(&plan, phase, repo_config.as_ref())
 }
 
 /// Mode-aware failure-log fetch.
@@ -602,6 +693,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use rusqlite::Connection;
+    use tempfile::TempDir;
     use tokio::sync::{Mutex, mpsc, oneshot};
 
     use crate::saas::runner_protocol::Envelope;
@@ -849,6 +941,245 @@ mod tests {
         );
         assert_eq!(standalone_aggregate.failing_run_id.as_deref(), Some("100"));
         assert_eq!(standalone_aggregate.conclusion.as_deref(), Some("failure"));
+    }
+
+    /// **Phase 1.2 acceptance criterion.** Both dispatch branches must
+    /// produce byte-equal aggregates for the same SHA + same allowlist +
+    /// same input runs. We exercise both code paths via
+    /// `aggregate_with_resolution` (the standalone branch's actual
+    /// pipeline) and the runner-side equivalent (`compute_with_filter`
+    /// over the same `BlockingFilter::config`), and assert the outputs
+    /// match.
+    ///
+    /// The runner side is exercised in
+    /// `branchwork-runner::tests::aggregate_runs_matches_dispatch_aggregate_for_same_input_and_filter`
+    /// — this test pins the server-side half of the parity.
+    #[test]
+    fn parity_runner_and_standalone_aggregate_for_same_sha_and_allowlist() {
+        let mut summaries = reglyze_summaries();
+        // The fixture pre-runs `mark_upstream_skips`, but the standalone
+        // dispatch branch reapplies it before `compute_with_filter`. To
+        // mimic the dispatch shape, re-mark from scratch on a clean copy.
+        for s in &mut summaries {
+            s.skipped_due_to_upstream = false;
+            s.informational = false;
+        }
+        aggregate::mark_upstream_skips(&mut summaries);
+
+        // Explicit allowlist case — server resolved to ["tests", "lint"].
+        let allowlist = vec!["tests".to_string(), "lint".to_string()];
+        let standalone = aggregate_with_resolution(&summaries, Some(allowlist.as_slice()));
+        let filter = aggregate::BlockingFilter::config(&allowlist);
+        let runner_equivalent = aggregate::compute_with_filter(&summaries, Some(&filter));
+        assert_eq!(
+            standalone, runner_equivalent,
+            "standalone aggregate must match runner aggregate for same explicit allowlist"
+        );
+        // The Reglyze rule still wins because `tests` is in the
+        // blocking subset.
+        assert_eq!(standalone.conclusion.as_deref(), Some("failure"));
+        assert_eq!(standalone.failing_run_id.as_deref(), Some("100"));
+
+        // Classifier-fallback case — wire field None on both sides.
+        let standalone_default = aggregate_with_resolution(&summaries, None);
+        let classifier_allowlist: Vec<String> = summaries
+            .iter()
+            .map(|s| s.workflow_name.clone())
+            .filter(|n| aggregate::is_workflow_blocking_by_default(n))
+            .collect();
+        let classifier_filter = aggregate::BlockingFilter::classifier(&classifier_allowlist);
+        let runner_equivalent_default =
+            aggregate::compute_with_filter(&summaries, Some(&classifier_filter));
+        assert_eq!(
+            standalone_default, runner_equivalent_default,
+            "standalone classifier fallback must match runner's classifier fallback"
+        );
+    }
+
+    /// `aggregate_with_resolution` with an empty explicit allowlist
+    /// makes every run informational — the merge gate is wide open
+    /// (vacuous success). This is the contract we want when a user
+    /// explicitly sets `ci_blocking_workflows: []` to opt out entirely.
+    #[test]
+    fn aggregate_with_resolution_empty_allowlist_is_vacuous_success() {
+        let mut summaries = reglyze_summaries();
+        for s in &mut summaries {
+            s.skipped_due_to_upstream = false;
+            s.informational = false;
+        }
+        aggregate::mark_upstream_skips(&mut summaries);
+
+        let allowlist: Vec<String> = vec![];
+        let aggregate = aggregate_with_resolution(&summaries, Some(allowlist.as_slice()));
+        assert_eq!(aggregate.conclusion.as_deref(), Some("success"));
+        assert!(aggregate.failing_run_id.is_none());
+        assert!(
+            aggregate.runs.iter().all(|r| r.informational),
+            "every run must be flagged informational with an empty allowlist"
+        );
+    }
+
+    /// Server-side resolver: when the plan YAML carries an explicit
+    /// `ci_blocking_workflows` list, [`get_ci_run_status_dispatch`]
+    /// populates the wire field with that list. We capture the wire
+    /// envelope sent to the runner via a custom echo runner.
+    #[tokio::test]
+    async fn dispatch_populates_wire_blocking_workflows_from_plan_yaml() {
+        let db = db_with_online_runner("runner-1", "org-saas");
+        let runners = new_runner_registry();
+        // Capture the request envelope's allowlist so we can assert the
+        // server resolved + plumbed the wire field correctly.
+        let captured: Arc<StdMutex<Option<Option<Vec<String>>>>> = Arc::new(StdMutex::new(None));
+        let captured_clone = captured.clone();
+        install_echo_runner(&runners, "runner-1", move |msg| match msg {
+            WireMessage::GetCiRunStatus {
+                blocking_workflows, ..
+            } => {
+                *captured_clone.lock().unwrap() = Some(blocking_workflows.clone());
+                Some(RunnerResponse::CiRunStatusResolved(Some(CiAggregate {
+                    status: "completed".into(),
+                    conclusion: Some("success".into()),
+                    runs: vec![],
+                    failing_run_id: None,
+                })))
+            }
+            _ => None,
+        })
+        .await;
+
+        // Write a plan YAML that pins ci_blocking_workflows at the plan
+        // level and seats task 1.2 in phase 1.
+        let plans_dir = TempDir::new().unwrap();
+        let plan_yaml = r#"title: Demo
+context: ''
+ci_blocking_workflows: ["tests", "lint"]
+phases:
+  - number: 1
+    title: First
+    description: ''
+    tasks:
+      - number: '1.2'
+        title: A task
+        description: ''
+        file_paths: []
+        acceptance: ''
+"#;
+        std::fs::write(plans_dir.path().join("demo-plan.yaml"), plan_yaml).unwrap();
+
+        let mut state = test_app_state(db, runners);
+        state.plans_dir = plans_dir.path().to_path_buf();
+
+        let _ = get_ci_run_status_dispatch(&state, "org-saas", "demo-plan", "1.2", "sha-1")
+            .await
+            .expect("dispatch ok");
+
+        let captured = captured.lock().unwrap().clone().expect("envelope captured");
+        assert_eq!(
+            captured,
+            Some(vec!["tests".to_string(), "lint".to_string()]),
+            "wire field must carry the plan-level explicit allowlist"
+        );
+    }
+
+    /// When the plan YAML carries no explicit allowlist at any level,
+    /// the server ships `None` on the wire. The runner is responsible
+    /// for the level-4 classifier fallback.
+    #[tokio::test]
+    async fn dispatch_ships_none_on_wire_when_plan_has_no_explicit_allowlist() {
+        let db = db_with_online_runner("runner-1", "org-saas");
+        let runners = new_runner_registry();
+        let captured: Arc<StdMutex<Option<Option<Vec<String>>>>> = Arc::new(StdMutex::new(None));
+        let captured_clone = captured.clone();
+        install_echo_runner(&runners, "runner-1", move |msg| match msg {
+            WireMessage::GetCiRunStatus {
+                blocking_workflows, ..
+            } => {
+                *captured_clone.lock().unwrap() = Some(blocking_workflows.clone());
+                Some(RunnerResponse::CiRunStatusResolved(Some(CiAggregate {
+                    status: "completed".into(),
+                    conclusion: Some("success".into()),
+                    runs: vec![],
+                    failing_run_id: None,
+                })))
+            }
+            _ => None,
+        })
+        .await;
+
+        let plans_dir = TempDir::new().unwrap();
+        let plan_yaml = r#"title: Demo
+context: ''
+phases:
+  - number: 1
+    title: First
+    description: ''
+    tasks:
+      - number: '1.2'
+        title: A task
+        description: ''
+        file_paths: []
+        acceptance: ''
+"#;
+        std::fs::write(plans_dir.path().join("demo-plan.yaml"), plan_yaml).unwrap();
+
+        let mut state = test_app_state(db, runners);
+        state.plans_dir = plans_dir.path().to_path_buf();
+
+        let _ = get_ci_run_status_dispatch(&state, "org-saas", "demo-plan", "1.2", "sha-1")
+            .await
+            .expect("dispatch ok");
+
+        let captured = captured.lock().unwrap().clone().expect("envelope captured");
+        assert!(
+            captured.is_none(),
+            "wire field must be None when no explicit allowlist is configured"
+        );
+    }
+
+    /// `resolve_explicit_blocking_workflows_for_task` is robust to
+    /// missing plan files / unknown task numbers — both collapse to
+    /// `None` so the caller falls through to the classifier rather than
+    /// erroring out the dispatch.
+    #[test]
+    fn resolve_helper_returns_none_for_missing_plan_or_unknown_task() {
+        let db = empty_runners_db();
+        let plans_dir = TempDir::new().unwrap();
+
+        // Missing plan file.
+        assert!(
+            resolve_explicit_blocking_workflows_for_task(
+                plans_dir.path(),
+                &db,
+                "no-such-plan",
+                "1.2",
+            )
+            .is_none()
+        );
+
+        // Plan exists but the task number doesn't.
+        let plan_yaml = r#"title: Demo
+context: ''
+phases:
+  - number: 1
+    title: First
+    description: ''
+    tasks:
+      - number: '1.1'
+        title: A task
+        description: ''
+        file_paths: []
+        acceptance: ''
+"#;
+        std::fs::write(plans_dir.path().join("demo-plan.yaml"), plan_yaml).unwrap();
+        assert!(
+            resolve_explicit_blocking_workflows_for_task(
+                plans_dir.path(),
+                &db,
+                "demo-plan",
+                "9.9",
+            )
+            .is_none()
+        );
     }
 
     /// Negative path: org has no runner row at all → the dispatch shim
