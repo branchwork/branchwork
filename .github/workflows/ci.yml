@@ -99,5 +99,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Lint and format gates land before build so a fresh violation is
+      # caught early and so the build step's signal stays "did the bundle
+      # compile" rather than "is the codebase tidy".
+      - name: Lint (ESLint)
+        run: pnpm --filter @branchwork/web lint
+
+      - name: Format (Prettier)
+        run: pnpm --filter @branchwork/web format:check
+
       - name: Build
         run: pnpm --filter @branchwork/web build
