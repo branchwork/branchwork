@@ -795,6 +795,26 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE runners ADD COLUMN removed_at TEXT;")
         .ok();
 
+    // Per-runner health snapshot (T11.3). Populated from
+    // `WireMessage::RunnerHealth` ticks (~30 s cadence, best-effort). The
+    // server overwrites in place — only the latest snapshot matters; missed
+    // ticks during a flap are replaced by the next surviving tick. Every
+    // column nullable so a runner that never reported (offline at first
+    // boot) doesn't break `list_runners`.
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN outbox_depth INTEGER;")
+        .ok();
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN ws_reconnects_24h INTEGER;")
+        .ok();
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN ci_poll_ms_p50 INTEGER;")
+        .ok();
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN ci_poll_ms_p99 INTEGER;")
+        .ok();
+    // Wall-clock the most recent `RunnerHealth` was applied. Lets the UI
+    // chip distinguish "metrics fresh" from "metrics stale (runner went
+    // offline mid-poll)" without a separate query.
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN last_health_at TEXT;")
+        .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 

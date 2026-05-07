@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Navigate } from "react-router-dom";
 import {
   useRunnerStore,
+  worstHealthChip,
   type Runner,
   type RunnerDriverInfo,
   type RunnerDriverState,
@@ -13,6 +14,7 @@ import { Button } from "./ui/Button.js";
 import { Modal } from "./ui/Modal.js";
 import { RunnerEnrollModal } from "./RunnerEnrollModal.js";
 import { RunnerLogPanel } from "./RunnerLogPanel.js";
+import { RunnerHealthPanel } from "./RunnerHealthPanel.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError, toastWarn } from "../lib/toast.js";
 
@@ -196,6 +198,7 @@ function RunnerRow({ runner }: { runner: Runner }) {
           </div>
         </div>
         <div className="flex items-center gap-2 shrink-0">
+          <HealthChip runner={runner} />
           <DriverInventoryChip drivers={drivers} />
           <div className="text-right text-[11px] text-gray-500">
             {runner.lastSeenAt ? (
@@ -253,12 +256,13 @@ function RunnerRow({ runner }: { runner: Runner }) {
         )}
       </dl>
       {settingsOpen && <RunnerSettings runnerId={runner.id} />}
-      {/* Live tail of the runner's stdout/stderr (T11.1). Rendered inline
-          under the selected row instead of on a dedicated `/runners/{id}`
-          subroute — the brief mentions that URL but the dashboard's
-          existing per-runner UX is the Select toggle, and inline keeps the
-          users mental model of "this row is the runner I'm looking at"
-          intact. */}
+      {/* Live tail of the runner's stdout/stderr (T11.1) + Health panel
+          (T11.3). Rendered inline under the selected row instead of on a
+          dedicated `/runners/{id}` subroute — the brief mentions that URL
+          but the dashboard's existing per-runner UX is the Select toggle,
+          and inline keeps the user's mental model of "this row is the
+          runner I'm looking at" intact. */}
+      {isSelected && <RunnerHealthPanel runnerId={runner.id} />}
       {isSelected && <RunnerLogPanel runnerId={runner.id} />}
       <ShutdownRunnerModal
         open={shutdownOpen}
@@ -750,6 +754,32 @@ function SkipTriState({
 /// `not_installed` / `unauthenticated` — `unknown` rolls up as ready
 /// because we don't want to block on a flaky detector. Empty inventory
 /// renders nothing; the runner just hasn't reported yet.
+/// Worst-metric chip on the runner summary list (T11.3).
+///
+/// Renders the single most-actionable signal so a busy operator scanning
+/// the `/runners` page sees the row that needs attention without
+/// expanding it. Selection rule + thresholds live in `worstHealthChip`
+/// in runner-store; this component is the rendering side. Returns `null`
+/// when no metric crosses its threshold (the row is healthy).
+function HealthChip({ runner }: { runner: Runner }) {
+  const chip = worstHealthChip(runner);
+  if (chip.severity === "none") return null;
+  const tone =
+    chip.severity === "danger"
+      ? "border-red-700/50 bg-red-900/30 text-red-300"
+      : "border-amber-700/50 bg-amber-900/30 text-amber-300";
+  const icon = chip.severity === "danger" ? "⛔" : "⚠";
+  return (
+    <span
+      className={`text-[11px] px-2 py-0.5 rounded border ${tone} font-mono`}
+      data-testid="runner-health-chip"
+    >
+      <span aria-hidden="true">{icon} </span>
+      {chip.label}
+    </span>
+  );
+}
+
 function DriverInventoryChip({ drivers }: { drivers: RunnerDriverInfo[] }) {
   const [open, setOpen] = useState(false);
   if (drivers.length === 0) return null;

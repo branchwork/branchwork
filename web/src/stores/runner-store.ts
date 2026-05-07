@@ -16,6 +16,37 @@ import { deleteJson, fetchJson, postJson, putJson } from "../api.js";
 /// instead of duplicating the rule.
 export type DeploymentMode = "standalone" | "saas" | "unknown";
 
+/// Verdict for the per-runner version chip. Same vocabulary as the server
+/// (`server-rs/src/saas/runner_ws.rs::VersionMismatch::as_str`).
+export type VersionMismatch = "ok" | "patch" | "minor" | "major";
+
+/// Snapshot of one runner's health metrics. Populated from
+/// `WireMessage::RunnerHealth` ticks (~30 s cadence) and persisted in the
+/// `runners` table — every field NULL until the runner has reported once.
+export interface RunnerHealth {
+  outboxDepth: number | null;
+  wsReconnects24h: number | null;
+  ciPollMsP50: number | null;
+  ciPollMsP99: number | null;
+  /// ISO 8601 wall-clock for the last applied health snapshot. Lets the UI
+  /// distinguish "currently green" from "was green 5 minutes ago" when the
+  /// runner drops offline.
+  lastHealthAt: string | null;
+}
+
+/// One point on the per-runner sparkline. `ts` is ms-since-epoch; `p50`
+/// and `p99` are nullable because cold runners surface `—` rather than
+/// faking a 0-ms data point.
+export interface RunnerHealthSample {
+  ts: number;
+  p50: number | null;
+  p99: number | null;
+}
+
+/// Trailing-window cap for the sparkline ring. 120 ticks @ 30 s ≈ 60 min,
+/// matching the panel doc's window claim.
+export const RUNNER_HEALTH_HISTORY_CAP = 120;
+
 export interface Runner {
   id: string;
   name: string | null;
@@ -29,11 +60,29 @@ export interface Runner {
   /// Empty array means the runner has not reported yet (or the deserialize
   /// failed — server falls back to `[]` rather than failing the row).
   drivers?: RunnerDriverInfo[];
+  /// Health metrics snapshot. All fields nullable — runners that haven't
+  /// reported a `RunnerHealth` yet show `null` and the dashboard chip
+  /// stays neutral.
+  health?: RunnerHealth;
+  /// `ok | patch | minor | major`. Computed server-side by comparing the
+  /// runner's reported version against the dashboard's compiled-in
+  /// `CARGO_PKG_VERSION`. `ok` for an exact match OR an unparseable
+  /// runner version (custom build).
+  versionMismatch?: VersionMismatch;
 }
+
+/// Deployment-wide agent counts grouped by `agents.status`. Populated by
+/// `GET /api/runners` (per-org `SELECT status, COUNT(*) GROUP BY status`).
+/// Per-runner attribution is not feasible today: the agents table doesn't
+/// carry `runner_id` (T4.2 learning), so the dashboard's `Health` panel
+/// labels these honestly as "deployment-wide" rather than faking per-runner.
+export type AgentCounts = Record<string, number>;
 
 interface RunnersResponse {
   runners: Runner[];
   mode?: "standalone" | "saas";
+  agentCounts?: AgentCounts;
+  serverVersion?: string;
 }
 
 const SELECTED_RUNNER_STORAGE_KEY = "branchwork.selectedRunnerId";
@@ -220,6 +269,28 @@ interface RunnerStore {
   /// optional: 4.1's call site passes only `runner_id`; 4.5+ passes the
   /// payload's `drivers` array as well.
   applyDriversTouch: (payload: { runner_id: string; drivers?: RunnerDriverInfo[] }) => void;
+  /// Wired from `ws-store.ts` for `runner_health` (T11.3). Patches the
+  /// matching runner row's `health` snapshot + `versionMismatch` so the
+  /// per-row chip and Health panel update without a refetch. Drops the
+  /// payload silently when the runner row is unknown (a future fetchRunners
+  /// will reconcile).
+  applyHealth: (payload: {
+    runner_id: string;
+    outbox_depth: number;
+    ws_reconnects_24h: number;
+    ci_poll_ms_p50: number | null;
+    ci_poll_ms_p99: number | null;
+    version_mismatch: VersionMismatch | string;
+  }) => void;
+  /// Deployment-wide agent counts surfaced by `/api/runners`. Updated on
+  /// fetch; not driven by WS today (the existing `agent_started`/
+  /// `agent_stopped` events update agent-store but the per-org tally
+  /// here would need a re-aggregate that is cheaper to do server-side).
+  agentCounts: AgentCounts;
+  /// Server version pinned at build time (`env!("CARGO_PKG_VERSION")`).
+  /// Surfaced so the version chip can render `runner_version → server_version`
+  /// without a separate endpoint.
+  serverVersion: string | null;
   /// Per-runner log ring, keyed by `runner.id`. Pushed by the `runner_log`
   /// WS handler in `ws-store.ts`; consumed by `RunnerLogPanel`. Capped at
   /// `RUNNER_LOG_RING_CAP` lines per runner, FIFO eviction.
@@ -231,6 +302,13 @@ interface RunnerStore {
   /// `fetchRunnerConfig`; the Settings expander on RunnersPage subscribes
   /// here so the values survive a row re-render.
   configByRunnerId: Record<string, RunnerConfig>;
+  /// Trailing CI-poll latency history per runner, populated from
+  /// `RunnerHealth` WS events (one point per ~30 s tick). The last
+  /// `RUNNER_HEALTH_HISTORY_CAP` points are kept; the panel sparkline
+  /// reads from here. Each entry stores both p50 and p99 + the apply
+  /// timestamp so the panel can render a 60-minute window without an
+  /// extra fetch.
+  healthHistoryByRunnerId: Record<string, RunnerHealthSample[]>;
   /// Fetch (or refresh) `GET /api/runners/{id}/config` and cache the result
   /// under `configByRunnerId[id]`. The Settings expander calls this on first
   /// open.
@@ -282,6 +360,9 @@ const INITIAL_STATE: Pick<
   | "configByRunnerId"
   | "logsByRunnerId"
   | "shutdownRequestedAt"
+  | "agentCounts"
+  | "serverVersion"
+  | "healthHistoryByRunnerId"
 > = {
   mode: "unknown",
   runners: [],
@@ -292,6 +373,9 @@ const INITIAL_STATE: Pick<
   configByRunnerId: {},
   logsByRunnerId: {},
   shutdownRequestedAt: {},
+  agentCounts: {},
+  serverVersion: null,
+  healthHistoryByRunnerId: {},
 };
 
 /// Per-runner monotonic id counter for `RunnerLogEntry.id`. Module-scoped
@@ -336,6 +420,8 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
           selectedRunnerId,
           loaded: true,
           lastRunnersFetchedAt: Date.now(),
+          agentCounts: data.agentCounts ?? {},
+          serverVersion: data.serverVersion ?? null,
         });
       } catch {
         // Leave `loaded` false on error so the indicator stays hidden until
@@ -474,6 +560,58 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
     });
   },
 
+  applyHealth: (payload) => {
+    set((s) => {
+      const idx = s.runners.findIndex((r) => r.id === payload.runner_id);
+      const verdict: VersionMismatch =
+        payload.version_mismatch === "patch" ||
+        payload.version_mismatch === "minor" ||
+        payload.version_mismatch === "major"
+          ? payload.version_mismatch
+          : "ok";
+      const now = Date.now();
+      const nowIso = new Date(now).toISOString();
+      // Always extend the per-runner sparkline ring, even if the runner
+      // row is unknown — fetchRunners will reconcile and the history
+      // is keyed by id.
+      const previous = s.healthHistoryByRunnerId[payload.runner_id] ?? [];
+      const appended = [
+        ...previous,
+        {
+          ts: now,
+          p50: payload.ci_poll_ms_p50,
+          p99: payload.ci_poll_ms_p99,
+        },
+      ];
+      const trimmed =
+        appended.length > RUNNER_HEALTH_HISTORY_CAP
+          ? appended.slice(appended.length - RUNNER_HEALTH_HISTORY_CAP)
+          : appended;
+      const nextHistory = {
+        ...s.healthHistoryByRunnerId,
+        [payload.runner_id]: trimmed,
+      };
+      if (idx < 0) {
+        // Health frame for an unknown runner — keep the history ring so
+        // the panel has data when the row appears.
+        return { healthHistoryByRunnerId: nextHistory };
+      }
+      const next = s.runners.slice();
+      next[idx] = {
+        ...next[idx],
+        versionMismatch: verdict,
+        health: {
+          outboxDepth: payload.outbox_depth,
+          wsReconnects24h: payload.ws_reconnects_24h,
+          ciPollMsP50: payload.ci_poll_ms_p50,
+          ciPollMsP99: payload.ci_poll_ms_p99,
+          lastHealthAt: nowIso,
+        },
+      };
+      return { runners: next, healthHistoryByRunnerId: nextHistory };
+    });
+  },
+
   pushRunnerLog: (runnerId, entry) => {
     const nextId = (runnerLogIdSeq[runnerId] ?? 0) + 1;
     runnerLogIdSeq[runnerId] = nextId;
@@ -591,3 +729,51 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
     set({ ...INITIAL_STATE });
   },
 }));
+
+// ── Health chip helpers ─────────────────────────────────────────────────────
+
+/// Threshold past which the outbox-depth chip turns red. Mirrors the
+/// runner-side saturation point cited in the wire variant doc.
+export const OUTBOX_DEPTH_RED_THRESHOLD = 100;
+
+/// Threshold past which the 24 h reconnect chip turns red. Same value the
+/// runner-side `RunnerHealth` doc-comment names.
+export const WS_RECONNECTS_RED_THRESHOLD = 5;
+
+/// Severity of the worst metric on a runner row, used to color the
+/// summary-list chip. `none` ⇒ no chip is rendered (the row is healthy).
+export type HealthChipSeverity = "none" | "warn" | "danger";
+
+export interface HealthChip {
+  severity: HealthChipSeverity;
+  /// Short label like `outbox 142` / `version 0.2.x` / `6 reconnects`.
+  /// Empty string when severity is `none`.
+  label: string;
+}
+
+/// Pick the worst-severity metric on a runner row and produce a chip
+/// label. Order of precedence (worst first): major version mismatch,
+/// outbox saturation, minor version mismatch, ws reconnect storm. The
+/// patch-level mismatch is not surfaced as a chip — it shows up as a
+/// neutral note in the Health panel only.
+export function worstHealthChip(runner: Runner): HealthChip {
+  // Major version mismatch: protocol incompatibility likely; this is the
+  // single most actionable signal so it wins outright.
+  if (runner.versionMismatch === "major") {
+    const v = runner.version ?? "?";
+    return { severity: "danger", label: `version ${v}` };
+  }
+  const depth = runner.health?.outboxDepth ?? null;
+  if (depth !== null && depth > OUTBOX_DEPTH_RED_THRESHOLD) {
+    return { severity: "danger", label: `outbox ${depth}` };
+  }
+  const reconnects = runner.health?.wsReconnects24h ?? null;
+  if (reconnects !== null && reconnects > WS_RECONNECTS_RED_THRESHOLD) {
+    return { severity: "danger", label: `${reconnects} reconnects` };
+  }
+  if (runner.versionMismatch === "minor") {
+    const v = runner.version ?? "?";
+    return { severity: "warn", label: `version ${v}` };
+  }
+  return { severity: "none", label: "" };
+}

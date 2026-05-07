@@ -726,6 +726,23 @@ function dispatch(msg: WsMessage) {
         .pushRunnerLog(d.runner_id, { ts: d.ts, level: d.level, line: d.line });
       break;
     }
+    case "runner_health": {
+      // Periodic per-runner health snapshot (T11.3). Best-effort fan-out
+      // from the `RunnerHealth` wire variant; the server has already
+      // computed the version-mismatch verdict against `CARGO_PKG_VERSION`,
+      // so the store handler just patches the row and lets the chip /
+      // panel re-render.
+      const d = msg.data;
+      useRunnerStore.getState().applyHealth({
+        runner_id: d.runner_id,
+        outbox_depth: d.outbox_depth,
+        ws_reconnects_24h: d.ws_reconnects_24h,
+        ci_poll_ms_p50: d.ci_poll_ms_p50 ?? null,
+        ci_poll_ms_p99: d.ci_poll_ms_p99 ?? null,
+        version_mismatch: d.version_mismatch,
+      });
+      break;
+    }
   }
 
   // Notify external subscribers AFTER the built-in switch so they see

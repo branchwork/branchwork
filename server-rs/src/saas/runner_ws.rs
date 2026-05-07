@@ -841,6 +841,73 @@ async fn handle_runner_message(
             .await;
         }
 
+        WireMessage::RunnerHealth {
+            outbox_depth,
+            ws_reconnects_24h,
+            ci_poll_ms_p50,
+            ci_poll_ms_p99,
+        } => {
+            // Persist the latest snapshot in place — only the most recent
+            // values matter, missed ticks are absorbed by the next surviving
+            // tick. last_health_at is a freshness marker the dashboard uses
+            // to distinguish "currently green" from "was green five minutes
+            // ago" when the runner drops offline.
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute(
+                    "UPDATE runners SET \
+                       outbox_depth = ?1, \
+                       ws_reconnects_24h = ?2, \
+                       ci_poll_ms_p50 = ?3, \
+                       ci_poll_ms_p99 = ?4, \
+                       last_health_at = datetime('now') \
+                     WHERE id = ?5",
+                    params![
+                        *outbox_depth as i64,
+                        *ws_reconnects_24h as i64,
+                        ci_poll_ms_p50.map(|v| v as i64),
+                        ci_poll_ms_p99.map(|v| v as i64),
+                        runner_id,
+                    ],
+                )
+                .ok();
+            }
+
+            // Compute the version-mismatch verdict from the runner's
+            // most-recently-reported version (DB column populated by
+            // RunnerHello). The dashboard uses this to color the version
+            // chip — green/yellow/red. Done server-side so the same rule
+            // governs both /api/runners polling and live WS updates.
+            let server_version = env!("CARGO_PKG_VERSION");
+            let runner_version: Option<String> = {
+                let conn = state.db.lock().unwrap();
+                conn.query_row(
+                    "SELECT version FROM runners WHERE id = ?1",
+                    params![runner_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+            };
+            let version_mismatch =
+                classify_version_mismatch(runner_version.as_deref(), server_version);
+
+            broadcast_event(
+                &state.broadcast_tx,
+                "runner_health",
+                serde_json::json!({
+                    "runner_id": runner_id,
+                    "outbox_depth": outbox_depth,
+                    "ws_reconnects_24h": ws_reconnects_24h,
+                    "ci_poll_ms_p50": ci_poll_ms_p50,
+                    "ci_poll_ms_p99": ci_poll_ms_p99,
+                    "version": runner_version,
+                    "server_version": server_version,
+                    "version_mismatch": version_mismatch.as_str(),
+                }),
+            );
+        }
+
         WireMessage::RunnerLogLine { ts, level, line } => {
             // Pure fan-out: forward every line straight to the dashboard
             // WS. No DB persistence — log lines are ephemeral; long-term
@@ -924,12 +991,14 @@ pub async fn create_runner_token(
 /// `standalone` the indicator is hidden, in `saas` it shows online/offline/
 /// missing-runner state. See `deployment_mode` for the resolution rule.
 pub async fn list_runners(State(state): State<AppState>, user: crate::auth::AuthUser) -> Response {
+    let server_version = env!("CARGO_PKG_VERSION");
     let runners: Vec<serde_json::Value> = {
         let conn = state.db.lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, status, hostname, version, last_seen_at, created_at, \
-                        drivers_json \
+                        drivers_json, outbox_depth, ws_reconnects_24h, \
+                        ci_poll_ms_p50, ci_poll_ms_p99, last_health_at \
                  FROM runners WHERE org_id = ?1 AND removed_at IS NULL \
                  ORDER BY last_seen_at DESC",
             )
@@ -945,15 +1014,27 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                 .unwrap_or(serde_json::Value::Array(Vec::new()));
+            let runner_version: Option<String> = row.get(4)?;
+            let version_mismatch =
+                classify_version_mismatch(runner_version.as_deref(), server_version);
             Ok(serde_json::json!({
                 "id": row.get::<_, Option<String>>(0)?,
                 "name": row.get::<_, Option<String>>(1)?,
                 "status": row.get::<_, Option<String>>(2)?,
                 "hostname": row.get::<_, Option<String>>(3)?,
-                "version": row.get::<_, Option<String>>(4)?,
+                "version": runner_version,
                 "lastSeenAt": row.get::<_, Option<String>>(5)?,
                 "createdAt": row.get::<_, Option<String>>(6)?,
                 "drivers": drivers,
+                "health": {
+                    "outboxDepth": row.get::<_, Option<i64>>(8)?,
+                    "wsReconnects24h": row.get::<_, Option<i64>>(9)?,
+                    "ciPollMsP50": row.get::<_, Option<i64>>(10)?,
+                    "ciPollMsP99": row.get::<_, Option<i64>>(11)?,
+                    "lastHealthAt": row.get::<_, Option<String>>(12)?,
+                },
+                "versionMismatch": version_mismatch.as_str(),
+                "serverVersion": server_version,
             }))
         })
         .unwrap()
@@ -961,8 +1042,38 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
         .collect()
     };
 
+    // Deployment-wide agent counts grouped by status. The server doesn't
+    // tag agents with their runner today (T4.2 learning), so we surface
+    // the per-org tally and label it as such — same numbers every row sees.
+    let agent_counts = {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT status, COUNT(*) FROM agents \
+                 WHERE org_id = ?1 GROUP BY status",
+            )
+            .unwrap();
+        let mut counts = serde_json::Map::new();
+        if let Ok(rows) = stmt.query_map(params![user.org_id], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+        }) {
+            for entry in rows.flatten() {
+                if let (Some(status), n) = entry {
+                    counts.insert(status, serde_json::Value::from(n));
+                }
+            }
+        }
+        serde_json::Value::Object(counts)
+    };
+
     let mode = deployment_mode(&state.db, &user.org_id);
-    axum::Json(serde_json::json!({ "runners": runners, "mode": mode })).into_response()
+    axum::Json(serde_json::json!({
+        "runners": runners,
+        "mode": mode,
+        "agentCounts": agent_counts,
+        "serverVersion": server_version,
+    }))
+    .into_response()
 }
 
 /// Resolve the dashboard's deployment-mode discriminator for `org_id`.
@@ -992,6 +1103,175 @@ fn deployment_mode_from_signals(env_hint: bool, has_runner: bool) -> &'static st
         "saas"
     } else {
         "standalone"
+    }
+}
+
+// ── Version mismatch classification ─────────────────────────────────────────
+
+/// Verdict for the per-runner version chip on `/runners`. Computed from the
+/// `RunnerHello.version` column (DB-persisted) compared against the
+/// dashboard server's compiled-in `CARGO_PKG_VERSION`.
+///
+/// Mapping (semver-flavoured: `<major>.<minor>.<patch>` parsed leniently):
+/// - `Ok` ⇒ exact match, OR runner_version is `None` (we don't have a
+///   reading yet — chip stays neutral, no green check, no red).
+/// - `Patch` ⇒ same major + same minor, different patch (or extra trailing
+///   text). The protocol promise is "patch-compatible," so this is a
+///   neutral/info state — the chip renders green with a tooltip.
+/// - `Minor` ⇒ same major, different minor. The dashboard chip turns
+///   yellow ⚠ — still on the wire, but features may diverge.
+/// - `Major` ⇒ different major version. The dashboard chip turns red ⛔ —
+///   protocol incompatibility likely; operator should upgrade the runner.
+/// - `Unparseable` ⇒ the runner reported a version string that can't be
+///   parsed (free-form / pre-release / git sha). Falls through to
+///   `Ok` so a custom build doesn't show a misleading red chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionMismatch {
+    Ok,
+    Patch,
+    Minor,
+    Major,
+}
+
+impl VersionMismatch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VersionMismatch::Ok => "ok",
+            VersionMismatch::Patch => "patch",
+            VersionMismatch::Minor => "minor",
+            VersionMismatch::Major => "major",
+        }
+    }
+}
+
+/// Parse `<major>.<minor>.<patch>` leniently — anything after the third dot
+/// or a `-`/`+` is ignored (so `0.3.0-rc1` and `0.3.0+sha` both parse the
+/// same as `0.3.0`). Returns `None` for inputs missing major or minor; the
+/// caller treats unparseable as "ok" (don't paint a misleading red chip on
+/// a custom build).
+fn parse_semver_lenient(s: &str) -> Option<(u32, u32, u32)> {
+    // Cut at the first `-` or `+` so pre-release / build metadata don't
+    // break the integer parse.
+    let head = s.split(['-', '+']).next().unwrap_or(s);
+    let mut parts = head.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+pub fn classify_version_mismatch(
+    runner_version: Option<&str>,
+    server_version: &str,
+) -> VersionMismatch {
+    let Some(runner) = runner_version else {
+        return VersionMismatch::Ok;
+    };
+    if runner == server_version {
+        return VersionMismatch::Ok;
+    }
+    let (Some(r), Some(s)) = (
+        parse_semver_lenient(runner),
+        parse_semver_lenient(server_version),
+    ) else {
+        // One side is unparseable — be conservative and don't flag.
+        return VersionMismatch::Ok;
+    };
+    if r.0 != s.0 {
+        VersionMismatch::Major
+    } else if r.1 != s.1 {
+        VersionMismatch::Minor
+    } else if r.2 != s.2 {
+        VersionMismatch::Patch
+    } else {
+        VersionMismatch::Ok
+    }
+}
+
+#[cfg(test)]
+mod version_mismatch_tests {
+    use super::{VersionMismatch, classify_version_mismatch};
+
+    #[test]
+    fn exact_match_is_ok() {
+        assert_eq!(
+            classify_version_mismatch(Some("0.3.0"), "0.3.0"),
+            VersionMismatch::Ok
+        );
+    }
+
+    #[test]
+    fn missing_runner_version_is_ok() {
+        // Runner that hasn't reported yet (offline at first boot) shows a
+        // neutral chip — we don't paint red on absence of data.
+        assert_eq!(
+            classify_version_mismatch(None, "0.3.0"),
+            VersionMismatch::Ok
+        );
+    }
+
+    #[test]
+    fn patch_difference_is_patch() {
+        assert_eq!(
+            classify_version_mismatch(Some("0.3.0"), "0.3.1"),
+            VersionMismatch::Patch
+        );
+    }
+
+    #[test]
+    fn minor_difference_is_minor() {
+        assert_eq!(
+            classify_version_mismatch(Some("0.2.0"), "0.3.0"),
+            VersionMismatch::Minor
+        );
+        // Newer runner than server — same protocol-incompat shape.
+        assert_eq!(
+            classify_version_mismatch(Some("0.4.0"), "0.3.0"),
+            VersionMismatch::Minor
+        );
+    }
+
+    #[test]
+    fn major_difference_is_major() {
+        assert_eq!(
+            classify_version_mismatch(Some("1.0.0"), "0.3.0"),
+            VersionMismatch::Major
+        );
+    }
+
+    #[test]
+    fn pre_release_suffix_compares_as_base() {
+        // Custom build with a `-rc1` suffix shouldn't show major mismatch
+        // against a release of the same base version.
+        assert_eq!(
+            classify_version_mismatch(Some("0.3.0-rc1"), "0.3.0"),
+            VersionMismatch::Ok
+        );
+    }
+
+    #[test]
+    fn unparseable_falls_back_to_ok() {
+        // A runner build that reports `git-abc1234` shouldn't be flagged —
+        // we have no way to reason about it.
+        assert_eq!(
+            classify_version_mismatch(Some("git-abc1234"), "0.3.0"),
+            VersionMismatch::Ok
+        );
+    }
+
+    #[test]
+    fn missing_patch_treated_as_zero() {
+        assert_eq!(
+            classify_version_mismatch(Some("0.3"), "0.3.0"),
+            VersionMismatch::Ok
+        );
+        assert_eq!(
+            classify_version_mismatch(Some("0.3"), "0.3.5"),
+            VersionMismatch::Patch
+        );
     }
 }
 

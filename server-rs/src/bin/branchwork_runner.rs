@@ -195,6 +195,151 @@ mod runner_log {
     }
 }
 
+/// Per-runner runtime health metrics. Lives next to `runner_log` because
+/// the two share the same emission style (best-effort, no outbox, latest-
+/// snapshot-wins) and the same lifecycle (per-connection install /
+/// uninstall is unnecessary — these counters survive reconnects so the
+/// 24 h reconnect window stays accurate across flaps).
+mod runner_health {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// 24 h window for the reconnect counter. The dashboard chip turns red
+    /// past 5 events in this window.
+    pub const RECONNECT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// Cap on the in-memory CI-poll latency ring. Just enough to compute
+    /// stable percentiles over a few hours of polling without unbounded
+    /// growth. Each entry is a u32, so 256 entries is ~1 KB — trivially
+    /// affordable on the runner host.
+    pub const CI_LATENCY_RING_CAP: usize = 256;
+
+    /// Reconnect timestamps inside the trailing 24 h window. A push always
+    /// trims first so the reported count is always fresh; readers don't
+    /// need to filter.
+    static RECONNECTS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
+    /// Trailing CI-poll wall-clock samples (milliseconds). FIFO ring; new
+    /// samples push back, oldest evict from the front when the cap is hit.
+    static CI_LATENCIES_MS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    /// Record one reconnect. Call this once per `connect_and_run` invocation
+    /// after the WS handshake succeeds — the count is "successful reconnects
+    /// in the last 24 h," not "connection attempts." A flapping runner that
+    /// never establishes a WS still shows zero (the dashboard surfaces this
+    /// as `status=offline` instead).
+    pub fn record_reconnect() {
+        let now = Instant::now();
+        if let Ok(mut g) = RECONNECTS.lock() {
+            g.push(now);
+            // Trim outside the window.
+            g.retain(|t| now.duration_since(*t) < RECONNECT_WINDOW);
+        }
+    }
+
+    /// Read the current reconnect count in the trailing 24 h window. Trims
+    /// stale entries so even a tick that happens hours after the last
+    /// reconnect reports a fresh number.
+    pub fn ws_reconnects_24h() -> u32 {
+        let now = Instant::now();
+        if let Ok(mut g) = RECONNECTS.lock() {
+            g.retain(|t| now.duration_since(*t) < RECONNECT_WINDOW);
+            g.len() as u32
+        } else {
+            0
+        }
+    }
+
+    /// Record one CI poll wall-clock sample. Cap-bounded ring; pushes evict
+    /// the oldest entry when the cap is hit.
+    pub fn record_ci_poll_ms(ms: u32) {
+        if let Ok(mut g) = CI_LATENCIES_MS.lock() {
+            g.push(ms);
+            if g.len() > CI_LATENCY_RING_CAP {
+                let drop = g.len() - CI_LATENCY_RING_CAP;
+                g.drain(..drop);
+            }
+        }
+    }
+
+    /// Compute (p50, p99) over the current ring. Returns `(None, None)`
+    /// when no samples have been collected yet — the wire variant skips
+    /// these fields so the dashboard renders "—" rather than a bogus 0.
+    pub fn ci_latency_percentiles() -> (Option<u32>, Option<u32>) {
+        let snapshot = match CI_LATENCIES_MS.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return (None, None),
+        };
+        percentiles_from(&snapshot)
+    }
+
+    /// Pure split for testability. Sorts `samples` ascending and reads
+    /// `(p50, p99)` from the resulting indices. Returns `(None, None)` for
+    /// empty input.
+    pub fn percentiles_from(samples: &[u32]) -> (Option<u32>, Option<u32>) {
+        if samples.is_empty() {
+            return (None, None);
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let p50 = sorted[sorted.len() / 2];
+        // Nearest-rank p99: `ceil(0.99 * n) - 1`, clamped to last index.
+        let n = sorted.len();
+        let p99_idx = ((n as f64 * 0.99).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
+        let p99 = sorted[p99_idx];
+        (Some(p50), Some(p99))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn percentiles_empty() {
+            assert_eq!(percentiles_from(&[]), (None, None));
+        }
+
+        #[test]
+        fn percentiles_single() {
+            assert_eq!(percentiles_from(&[42]), (Some(42), Some(42)));
+        }
+
+        #[test]
+        fn percentiles_unsorted_input() {
+            // Inputs out of order — function must sort before reading.
+            let samples: Vec<u32> = vec![10, 5, 100, 20, 50];
+            let (p50, p99) = percentiles_from(&samples);
+            assert_eq!(p50, Some(20));
+            // p99 of 5 elements is the largest one (nearest-rank).
+            assert_eq!(p99, Some(100));
+        }
+
+        #[test]
+        fn percentiles_one_hundred_samples() {
+            // 100 samples 1..=100: p50 → 51 (mid index), p99 → 99 (index 98).
+            let samples: Vec<u32> = (1..=100).collect();
+            let (p50, p99) = percentiles_from(&samples);
+            assert_eq!(p50, Some(51));
+            assert_eq!(p99, Some(99));
+        }
+
+        #[test]
+        fn record_ci_poll_evicts_oldest_when_capped() {
+            // Push past the cap; verify the latest sample is in the
+            // distribution and the oldest got dropped.
+            for i in 0..(CI_LATENCY_RING_CAP as u32 + 10) {
+                record_ci_poll_ms(i);
+            }
+            let snapshot = CI_LATENCIES_MS.lock().unwrap().clone();
+            assert_eq!(snapshot.len(), CI_LATENCY_RING_CAP);
+            // First entries 0..10 dropped. The first surviving entry is 10.
+            assert_eq!(snapshot.first().copied(), Some(10));
+        }
+    }
+}
+
 /// Print to stdout AND ship as `RunnerLogLine` (level=info). Mirrors the
 /// existing `[runner] ...` prefix convention; callers keep their format
 /// strings unchanged.
@@ -524,6 +669,12 @@ async fn connect_and_run(
 
     log_info!("[runner] connected");
 
+    // Record this successful reconnect for the 24 h reconnect counter that
+    // ships with `RunnerHealth`. Done once per `connect_and_run` so a
+    // flapping link surfaces a rising count and triggers the dashboard's
+    // red chip past the threshold (5 in 24 h).
+    runner_health::record_reconnect();
+
     let state = Arc::new(RunnerState {
         runner_id: runner_id.to_string(),
         db: db.clone(),
@@ -584,11 +735,49 @@ async fn connect_and_run(
         }
     });
 
+    // ── Health ticker ───────────────────────────────────────────────────
+    // Periodic best-effort RunnerHealth snapshot. Fires every ~30 s; the
+    // dashboard's `Health` panel reads the latest snapshot, so missed
+    // ticks during a flap are absorbed by the next surviving tick.
+    let health_tx = ws_tx.clone();
+    let health_rid = runner_id.to_string();
+    let health_db = db.clone();
+    let health_ticker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        // Fire the first sample 30 s after connect rather than at t=0 so
+        // the dashboard sees a single fresh snapshot per reconnect rather
+        // than a burst of half-empty ones.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await; // consume the immediate-fire first tick
+        loop {
+            interval.tick().await;
+            let outbox_depth = {
+                let conn = health_db.lock().await;
+                outbox::runner_outbox_depth(&conn)
+            };
+            let (p50, p99) = runner_health::ci_latency_percentiles();
+            let snapshot = WireMessage::RunnerHealth {
+                outbox_depth: outbox_depth.min(u32::MAX as u64) as u32,
+                ws_reconnects_24h: runner_health::ws_reconnects_24h(),
+                ci_poll_ms_p50: p50,
+                ci_poll_ms_p99: p99,
+            };
+            let env = Envelope::best_effort(health_rid.clone(), snapshot);
+            if health_tx
+                .send(serde_json::to_string(&env).unwrap_or_default())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
     // ── Reader task: process incoming messages from SaaS ────────────────
     let read_result = ws_reader(ws_read, state.clone()).await;
 
     // ── Cleanup ─────────────────────────────────────────────────────────
     heartbeat.abort();
+    health_ticker.abort();
     writer.abort();
     // Drop the shipper sender slot so emits in the reconnect gap don't
     // count against the truncated tally; the consumer task ends naturally
@@ -1292,9 +1481,11 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
         | WireMessage::GithubActionsDetected { .. }
         | WireMessage::CiRunStatusResolved { .. }
         | WireMessage::CiFailureLogResolved { .. }
-        // The runner is the producer of `RunnerLogLine`; receiving one
-        // back from the server is a protocol violation we silently drop.
+        // The runner is the producer of `RunnerLogLine` and
+        // `RunnerHealth`; receiving either back from the server is a
+        // protocol violation we silently drop.
         | WireMessage::RunnerLogLine { .. }
+        | WireMessage::RunnerHealth { .. }
         // saas→runner variants the runner doesn't act on (no current handler).
         | WireMessage::TerminalReplay { .. }
         | WireMessage::Ping {} => {}
@@ -1586,7 +1777,22 @@ fn gh_run_list_full(cwd: &Path, sha: &str) -> Option<Vec<GhRunDetail>> {
 /// `None` when `gh run list` failed, when no runs exist for the SHA yet,
 /// or when the runs vec is empty (still polling). The `Reglyze`-shape
 /// aggregation — failure-poisons-skip — is in [`aggregate_runs`].
+///
+/// Wall-clock for the full `gh run list` + per-run `gh run view` chain is
+/// recorded into the trailing CI-poll latency ring so the next
+/// `RunnerHealth` tick reports fresh p50/p99 numbers. Latency is captured
+/// even when the call returns `None` (gh missing / no runs yet) — the
+/// dashboard cares about how long the call took, not whether it found
+/// anything.
 fn compute_ci_aggregate(cwd: &Path, sha: &str) -> Option<CiAggregate> {
+    let started = Instant::now();
+    let result = compute_ci_aggregate_inner(cwd, sha);
+    let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    runner_health::record_ci_poll_ms(elapsed_ms);
+    result
+}
+
+fn compute_ci_aggregate_inner(cwd: &Path, sha: &str) -> Option<CiAggregate> {
     let runs = gh_run_list_full(cwd, sha)?;
     if runs.is_empty() {
         return None;

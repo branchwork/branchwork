@@ -302,6 +302,32 @@ const RunnerLog = v.object({
   }),
 });
 
+/// Per-runner health snapshot — outbox depth, 24-hour reconnect count,
+/// CI-poll latency percentiles, version-mismatch verdict. Pushed on a
+/// ~30 s tick by the runner via the `RunnerHealth` wire variant; the
+/// server forwards (with `version_mismatch` computed against
+/// `CARGO_PKG_VERSION`) so the dashboard chip + Health panel update
+/// without a refetch.
+const RunnerHealth = v.object({
+  type: v.literal("runner_health"),
+  data: v.object({
+    runner_id: v.string(),
+    outbox_depth: v.number(),
+    ws_reconnects_24h: v.number(),
+    ci_poll_ms_p50: NullishNum,
+    ci_poll_ms_p99: NullishNum,
+    /// Runner-reported version (mirrors `runners.version` in the DB).
+    version: NullishStr,
+    /// Server's `env!("CARGO_PKG_VERSION")` — same value the API surfaces
+    /// at the response root so the chip can render `0.3.x → 0.4.x` style
+    /// labels.
+    server_version: NullishStr,
+    /// `ok | patch | minor | major` — same vocabulary as `versionMismatch`
+    /// on `/api/runners` rows.
+    version_mismatch: v.string(),
+  }),
+});
+
 /// Transport-level hello sent once by the server immediately after
 /// the WS upgrade succeeds (see `server-rs/src/ws.rs:30-42`). Not a
 /// domain event — no broadcast catalogue entry, no DB row, no UI
@@ -345,6 +371,7 @@ export const WsMessageSchema = v.variant("type", [
   RunnerDisconnected,
   RunnerDrivers,
   RunnerLog,
+  RunnerHealth,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;

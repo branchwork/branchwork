@@ -95,6 +95,19 @@ pub fn replay_runner_events(conn: &Connection, after_seq: u64) -> Vec<(u64, Stri
     .collect()
 }
 
+/// Count unacked rows in the runner outbox. Drives the runner-side
+/// `RunnerHealth` snapshot — > 100 ⇒ saturation chip turns red on the
+/// dashboard.
+pub fn runner_outbox_depth(conn: &Connection) -> u64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM runner_outbox WHERE acked = 0",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n.max(0) as u64)
+    .unwrap_or(0)
+}
+
 /// Prune old ACKed entries from the runner outbox. Keeps the most recent
 /// `keep` ACKed rows for debugging; deletes the rest.
 pub fn prune_runner_outbox(conn: &Connection, keep: u64) {

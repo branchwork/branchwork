@@ -111,6 +111,42 @@ pub enum WireMessage {
         line: String,
     },
 
+    /// Periodic per-runner health snapshot — outbox depth, 24-hour reconnect
+    /// count, CI-poll latency percentiles. Emitted on a ~30 s tick so the
+    /// dashboard's `Health` panel on `/runners/{id}` can show live numbers
+    /// without a server-side scrape job.
+    ///
+    /// Best-effort: same family as `Ping`/`Pong`. The "latest snapshot" is
+    /// what matters; missed ticks during a flap are replaced by the next
+    /// tick after reconnect, so there's no replay window worth paying the
+    /// outbox for. Version mismatch detection is **not** in this payload —
+    /// the server already knows the runner's version from `RunnerHello` and
+    /// compares it against `env!("CARGO_PKG_VERSION")` when serializing
+    /// `/api/runners` rows.
+    RunnerHealth {
+        /// Number of unacked rows in the runner's `runner_outbox` at emit
+        /// time. > 100 ⇒ saturation (server is slow to ACK or the WS is
+        /// flapping); the dashboard chip turns red past that threshold.
+        outbox_depth: u32,
+        /// Reconnect events in the trailing 24 h. > 5 ⇒ link instability;
+        /// the dashboard chip turns red past that threshold. The runner
+        /// trims the in-memory ring on every emit so this value is always
+        /// fresh.
+        ws_reconnects_24h: u32,
+        /// Median wall-clock (in ms) for `compute_ci_aggregate` over the
+        /// trailing window — covers the `gh run list` plus per-run
+        /// `gh run view` chain. `None` when no CI poll has happened on
+        /// this runner yet (fresh enrolments and plans without GitHub
+        /// Actions).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ci_poll_ms_p50: Option<u32>,
+        /// 99th percentile wall-clock (in ms) for `compute_ci_aggregate`
+        /// over the trailing window. `None` under the same conditions
+        /// as `ci_poll_ms_p50`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ci_poll_ms_p99: Option<u32>,
+    },
+
     // ── SaaS -> Runner ──────────────────────────────────────────────────
     /// Dashboard user clicked "Start" — spawn an agent.
     ///
@@ -674,6 +710,7 @@ impl WireMessage {
                 | WireMessage::CiFailureLog { .. }
                 | WireMessage::CiFailureLogResolved { .. }
                 | WireMessage::RunnerLogLine { .. }
+                | WireMessage::RunnerHealth { .. }
         )
     }
 
@@ -687,6 +724,7 @@ impl WireMessage {
             WireMessage::TaskStatusChanged { .. } => "task_status_changed",
             WireMessage::DriverAuthReport { .. } => "driver_auth_report",
             WireMessage::RunnerLogLine { .. } => "runner_log_line",
+            WireMessage::RunnerHealth { .. } => "runner_health",
             WireMessage::StartAgent { .. } => "start_agent",
             WireMessage::KillAgent { .. } => "kill_agent",
             WireMessage::ShutdownRequest { .. } => "shutdown_request",
@@ -1955,6 +1993,62 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn runner_health_round_trip() {
+        let msg = WireMessage::RunnerHealth {
+            outbox_depth: 3,
+            ws_reconnects_24h: 1,
+            ci_poll_ms_p50: Some(820),
+            ci_poll_ms_p99: Some(2100),
+        };
+        assert!(msg.is_best_effort(), "RunnerHealth must be best-effort");
+        assert_eq!(msg.event_type(), "runner_health");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        // Pin the discriminator + field names so a future rename can't
+        // silently break the wire.
+        assert!(json.contains("\"type\":\"runner_health\""));
+        assert!(json.contains("\"outbox_depth\":3"));
+        assert!(json.contains("\"ws_reconnects_24h\":1"));
+        assert!(json.contains("\"ci_poll_ms_p50\":820"));
+        assert!(json.contains("\"ci_poll_ms_p99\":2100"));
+        // Best-effort variants don't carry seq.
+        assert!(!json.contains("\"seq\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::RunnerHealth {
+                outbox_depth,
+                ws_reconnects_24h,
+                ci_poll_ms_p50,
+                ci_poll_ms_p99,
+            } => {
+                assert_eq!(outbox_depth, 3);
+                assert_eq!(ws_reconnects_24h, 1);
+                assert_eq!(ci_poll_ms_p50, Some(820));
+                assert_eq!(ci_poll_ms_p99, Some(2100));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_health_omits_unset_ci_latency_fields() {
+        // Fresh runners (or plans without GitHub Actions) have no CI poll
+        // samples yet — both percentile fields must be omitted from the
+        // wire so the dashboard can render them as "—" without seeing a
+        // bogus 0 ms.
+        let msg = WireMessage::RunnerHealth {
+            outbox_depth: 0,
+            ws_reconnects_24h: 0,
+            ci_poll_ms_p50: None,
+            ci_poll_ms_p99: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"ci_poll_ms_p50\""));
+        assert!(!json.contains("\"ci_poll_ms_p99\""));
     }
 
     #[test]

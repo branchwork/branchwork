@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useRunnerStore, type Runner, RUNNER_LOG_RING_CAP } from "./runner-store.js";
+import {
+  OUTBOX_DEPTH_RED_THRESHOLD,
+  RUNNER_HEALTH_HISTORY_CAP,
+  RUNNER_LOG_RING_CAP,
+  WS_RECONNECTS_RED_THRESHOLD,
+  useRunnerStore,
+  worstHealthChip,
+  type Runner,
+} from "./runner-store.js";
 
 afterEach(() => {
   useRunnerStore.getState().reset();
@@ -460,5 +468,193 @@ describe("runner-store", () => {
     useRunnerStore.getState().applyDisconnected({ runner_id: "r1" });
     expect(useRunnerStore.getState().shutdownRequestedAt).not.toHaveProperty("r1");
     expect(useRunnerStore.getState().runners[0].status).toBe("offline");
+  });
+
+  // ── T11.3 health metrics ────────────────────────────────────────────────
+
+  it("applyHealth patches the runner row + appends to the history ring", () => {
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1" })],
+    });
+    useRunnerStore.getState().applyHealth({
+      runner_id: "r1",
+      outbox_depth: 7,
+      ws_reconnects_24h: 2,
+      ci_poll_ms_p50: 800,
+      ci_poll_ms_p99: 1200,
+      version_mismatch: "ok",
+    });
+    const s = useRunnerStore.getState();
+    expect(s.runners[0].health).toMatchObject({
+      outboxDepth: 7,
+      wsReconnects24h: 2,
+      ciPollMsP50: 800,
+      ciPollMsP99: 1200,
+    });
+    expect(s.runners[0].versionMismatch).toBe("ok");
+    expect(s.healthHistoryByRunnerId.r1).toHaveLength(1);
+    expect(s.healthHistoryByRunnerId.r1[0]).toMatchObject({
+      p50: 800,
+      p99: 1200,
+    });
+  });
+
+  it("applyHealth still records history when the runner row is unknown", () => {
+    // Health frame can land before fetchRunners has the row (race during
+    // bootstrap). The history ring keys by runner id, so we keep the
+    // sparkline data and the panel can render it once the row appears.
+    useRunnerStore.setState({ runners: [] });
+    useRunnerStore.getState().applyHealth({
+      runner_id: "rGhost",
+      outbox_depth: 0,
+      ws_reconnects_24h: 0,
+      ci_poll_ms_p50: null,
+      ci_poll_ms_p99: null,
+      version_mismatch: "ok",
+    });
+    expect(useRunnerStore.getState().healthHistoryByRunnerId.rGhost).toHaveLength(1);
+    expect(useRunnerStore.getState().runners).toHaveLength(0);
+  });
+
+  it("applyHealth coerces unknown version_mismatch values to ok (forward-compat)", () => {
+    useRunnerStore.setState({ runners: [seedRunner({ id: "r1" })] });
+    useRunnerStore.getState().applyHealth({
+      runner_id: "r1",
+      outbox_depth: 0,
+      ws_reconnects_24h: 0,
+      ci_poll_ms_p50: null,
+      ci_poll_ms_p99: null,
+      // Server adds a new verdict; client should not crash.
+      version_mismatch: "future_verdict",
+    });
+    expect(useRunnerStore.getState().runners[0].versionMismatch).toBe("ok");
+  });
+
+  it("applyHealth caps the per-runner history ring at RUNNER_HEALTH_HISTORY_CAP", () => {
+    useRunnerStore.setState({ runners: [seedRunner({ id: "r1" })] });
+    for (let i = 0; i < RUNNER_HEALTH_HISTORY_CAP + 5; i++) {
+      useRunnerStore.getState().applyHealth({
+        runner_id: "r1",
+        outbox_depth: 0,
+        ws_reconnects_24h: 0,
+        ci_poll_ms_p50: i,
+        ci_poll_ms_p99: i,
+        version_mismatch: "ok",
+      });
+    }
+    const ring = useRunnerStore.getState().healthHistoryByRunnerId.r1;
+    expect(ring).toHaveLength(RUNNER_HEALTH_HISTORY_CAP);
+    // First surviving sample is index 5 (the first 5 evicted FIFO).
+    expect(ring[0].p50).toBe(5);
+  });
+
+  it("worstHealthChip flags major version mismatch as danger", () => {
+    const chip = worstHealthChip(
+      seedRunner({ id: "r1", version: "0.2.x", versionMismatch: "major" }),
+    );
+    expect(chip.severity).toBe("danger");
+    expect(chip.label).toContain("0.2.x");
+  });
+
+  it("worstHealthChip flags outbox saturation past the threshold", () => {
+    const chip = worstHealthChip(
+      seedRunner({
+        id: "r1",
+        versionMismatch: "ok",
+        health: {
+          outboxDepth: OUTBOX_DEPTH_RED_THRESHOLD + 42,
+          wsReconnects24h: 0,
+          ciPollMsP50: null,
+          ciPollMsP99: null,
+          lastHealthAt: null,
+        },
+      }),
+    );
+    expect(chip.severity).toBe("danger");
+    expect(chip.label).toContain("142");
+  });
+
+  it("worstHealthChip flags reconnect storms past the threshold as danger", () => {
+    const chip = worstHealthChip(
+      seedRunner({
+        id: "r1",
+        versionMismatch: "ok",
+        health: {
+          outboxDepth: 0,
+          wsReconnects24h: WS_RECONNECTS_RED_THRESHOLD + 1,
+          ciPollMsP50: null,
+          ciPollMsP99: null,
+          lastHealthAt: null,
+        },
+      }),
+    );
+    expect(chip.severity).toBe("danger");
+    expect(chip.label).toContain("reconnects");
+  });
+
+  it("worstHealthChip surfaces minor version mismatch as warn (not danger)", () => {
+    const chip = worstHealthChip(
+      seedRunner({ id: "r1", version: "0.4.0", versionMismatch: "minor" }),
+    );
+    expect(chip.severity).toBe("warn");
+  });
+
+  it("worstHealthChip returns severity:none when nothing crosses a threshold", () => {
+    const chip = worstHealthChip(
+      seedRunner({
+        id: "r1",
+        versionMismatch: "ok",
+        health: {
+          outboxDepth: 5,
+          wsReconnects24h: 1,
+          ciPollMsP50: 100,
+          ciPollMsP99: 200,
+          lastHealthAt: null,
+        },
+      }),
+    );
+    expect(chip.severity).toBe("none");
+    expect(chip.label).toBe("");
+  });
+
+  it("worstHealthChip returns severity:none when patch mismatch alone — chip suppresses", () => {
+    // Patch differences are not actionable on their own; the chip stays
+    // off, the Health panel surfaces them as a neutral note.
+    const chip = worstHealthChip(
+      seedRunner({ id: "r1", version: "0.3.4", versionMismatch: "patch" }),
+    );
+    expect(chip.severity).toBe("none");
+  });
+
+  it("fetchRunners populates agentCounts + serverVersion", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              runners: [
+                {
+                  id: "r1",
+                  name: "p",
+                  status: "online",
+                  hostname: "h",
+                  version: "0.3.0",
+                  lastSeenAt: null,
+                  createdAt: null,
+                },
+              ],
+              mode: "saas",
+              agentCounts: { running: 2, completed: 5, failed: 1 },
+              serverVersion: "0.3.0",
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+      ),
+    );
+    await useRunnerStore.getState().fetchRunners();
+    const s = useRunnerStore.getState();
+    expect(s.agentCounts).toEqual({ running: 2, completed: 5, failed: 1 });
+    expect(s.serverVersion).toBe("0.3.0");
   });
 });
