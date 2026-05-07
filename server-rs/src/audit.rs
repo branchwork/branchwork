@@ -34,6 +34,11 @@ pub mod actions {
     /// request returns 412 and this row records the attempt. Diff carries
     /// `{requested: true, reason: "worktrees_not_ready"}`.
     pub const CONFIG_PARALLEL_REFUSED: &str = "config.parallel_refused";
+    /// PUT /api/plans/:name/settings wrote new values for
+    /// `ci_blocking_workflows` and/or `phase_verification` to the plan
+    /// YAML. Diff carries the post-update fields (camelCase) — explicit
+    /// `null` is preserved so a remove shows up in the trail.
+    pub const CONFIG_PLAN_SETTINGS: &str = "config.plan_settings";
     /// User clicked Resume on the auto-mode pill: clear `paused_reason` and
     /// re-evaluate auto-advance from the most recently completed task. Audit
     /// payload carries `last_completed_task` so the trail captures which task

@@ -317,6 +317,10 @@ async fn run_server(cli: Cli) {
             get(api::plans::get_plan_config).put(api::plans::put_plan_config),
         )
         .route(
+            "/api/plans/{name}/settings",
+            get(api::plans::get_plan_settings).put(api::plans::put_plan_settings),
+        )
+        .route(
             "/api/plans/{name}/tasks/{task_number}/status",
             axum::routing::put(api::plans::set_task_status),
         )

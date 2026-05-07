@@ -1026,6 +1026,513 @@ pub async fn put_plan_config(
     (StatusCode::OK, Json(cfg)).into_response()
 }
 
+// ── GET/PUT /api/plans/:name/settings (Task 3.1) ─────────────────────────────
+//
+// Plan-level settings panel API: surface the per-plan
+// `ci_blocking_workflows` + `phase_verification` overrides, the workflows
+// discovered under `.github/workflows/`, and the `branchwork.toml` repo
+// defaults that the resolution helper falls back to. PUT writes the two
+// editable fields back to the plan YAML using a comment-preserving
+// line-based mutation (raw `serde_yaml::to_string` round-trips would drop
+// every comment in the file — plans frequently carry context comments).
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RepoDefaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_blocking_workflows: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ci_blocking_workflows_skip: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_verification: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanSettings {
+    /// Plan-level `ci_blocking_workflows` field from the YAML; `None`
+    /// when unset (resolution falls through to repo / classifier).
+    ci_blocking_workflows: Option<Vec<String>>,
+    /// Plan-level `phase_verification` field from the YAML; `None`
+    /// when unset.
+    phase_verification: Option<String>,
+    /// Workflow names enumerated from `<project>/.github/workflows/*.yml|*.yaml`
+    /// top-level `name:` field, with the filename stem as fallback. Empty
+    /// when the project has no workflows directory or none parse.
+    available_workflows: Vec<String>,
+    /// `[ci]` + `[phase]` view of the project-level `branchwork.toml`
+    /// (when present) so the UI can render a "default: …" hint next to
+    /// each editable field.
+    repo_defaults: RepoDefaults,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanSettingsBody {
+    /// Three-state field: `Absent` (None) leaves the YAML key untouched,
+    /// `ExplicitNull` (Some(None)) removes the key entirely, `ExplicitValue`
+    /// (Some(Some(v))) writes/replaces. Same `deserialize_some` shim that
+    /// the unified `/config` endpoint uses for `pausedReason`/`runnerId`.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    ci_blocking_workflows: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    phase_verification: Option<Option<String>>,
+}
+
+/// Read `<project>/.github/workflows/*.yml|*.yaml`, returning each
+/// workflow's `name:` (or its filename stem if missing/unparseable).
+/// Sorted + deduped so the UI gets a stable order. Returns empty when
+/// the directory is absent — the API never errors on a missing
+/// workflows folder.
+fn enumerate_available_workflows(project_dir: &std::path::Path) -> Vec<String> {
+    let workflows_dir = project_dir.join(".github").join("workflows");
+    let entries = match std::fs::read_dir(&workflows_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if !matches!(ext, "yml" | "yaml") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let name = read_workflow_name(&path).unwrap_or(stem);
+        names.push(name);
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Parse a workflow file and return the top-level `name:` field if it
+/// exists and is a string. `None` on parse error (caller falls back to
+/// the filename stem).
+fn read_workflow_name(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&raw).ok()?;
+    let map = value.as_mapping()?;
+    map.get(serde_yaml::Value::String("name".into()))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn repo_defaults_for(project_dir: Option<&std::path::Path>) -> RepoDefaults {
+    let Some(dir) = project_dir else {
+        return RepoDefaults::default();
+    };
+    match crate::repo_config::load_for_project_dir(dir) {
+        Some(cfg) => RepoDefaults {
+            ci_blocking_workflows: cfg.ci.blocking_workflows,
+            ci_blocking_workflows_skip: cfg.ci.blocking_workflows_skip,
+            phase_verification: cfg.phase.verification,
+        },
+        None => RepoDefaults::default(),
+    }
+}
+
+pub async fn get_plan_settings(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    {
+        let conn = state.db.lock().unwrap();
+        if !orgs::plan_belongs_to_org(&conn, &name, auth.org_id()) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    }
+
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(e) => {
+            // Malformed YAML → 4xx (Task 3.1 contract: never 5xx).
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "parse_error",
+                    "message": format!("Failed to parse plan: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let project_dir = crate::ci::project_dir_for(&state.plans_dir, &state.db, &name);
+    let available_workflows = project_dir
+        .as_deref()
+        .map(enumerate_available_workflows)
+        .unwrap_or_default();
+    let repo_defaults = repo_defaults_for(project_dir.as_deref());
+
+    let body = PlanSettings {
+        ci_blocking_workflows: plan.ci_blocking_workflows,
+        phase_verification: plan.phase_verification,
+        available_workflows,
+        repo_defaults,
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+pub async fn put_plan_settings(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(name): Path<String>,
+    Json(body): Json<PlanSettingsBody>,
+) -> axum::response::Response {
+    {
+        let conn = state.db.lock().unwrap();
+        if !orgs::plan_belongs_to_org(&conn, &name, auth.org_id()) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    }
+
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Markdown plans cannot express these fields. Reject up front instead
+    // of pretending the PUT applied — the Markdown parser silently drops
+    // ci_blocking_workflows / phase_verification on read.
+    if !matches!(
+        plan_path.extension().and_then(|e| e.to_str()),
+        Some("yaml") | Some("yml")
+    ) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "unsupported_format",
+                "message": "Plan settings can only be edited on YAML plans. Convert the plan first.",
+            })),
+        )
+            .into_response();
+    }
+
+    let raw = match std::fs::read_to_string(&plan_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "read_failed",
+                    "message": format!("Failed to read plan file: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate the YAML parses BEFORE we touch it. A malformed plan must
+    // surface as 4xx, never 5xx (Task 3.1 contract).
+    if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&raw) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "parse_error",
+                "message": format!("Failed to parse plan YAML: {e}"),
+            })),
+        )
+            .into_response();
+    }
+
+    let mut updated = raw.clone();
+
+    if let Some(opt) = body.ci_blocking_workflows.as_ref() {
+        let new_value = opt.as_ref().map(|list| {
+            serde_yaml::Value::Sequence(
+                list.iter()
+                    .map(|s| serde_yaml::Value::String(s.clone()))
+                    .collect(),
+            )
+        });
+        match update_yaml_top_level_key(&updated, "ci_blocking_workflows", new_value.as_ref()) {
+            Ok(s) => updated = s,
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "edit_failed",
+                        "message": format!("Failed to edit ci_blocking_workflows: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(opt) = body.phase_verification.as_ref() {
+        let new_value = opt.as_ref().map(|s| serde_yaml::Value::String(s.clone()));
+        match update_yaml_top_level_key(&updated, "phase_verification", new_value.as_ref()) {
+            Ok(s) => updated = s,
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "edit_failed",
+                        "message": format!("Failed to edit phase_verification: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Sanity round-trip: parse the post-edit YAML before writing so a bug
+    // in the line-based editor surfaces as 4xx + the file untouched on
+    // disk, rather than a corrupted plan that breaks every later GET.
+    if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&updated) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "edit_invalidated_yaml",
+                "message": format!("Edit produced invalid YAML: {e}"),
+            })),
+        )
+            .into_response();
+    }
+
+    if updated != raw
+        && let Err(e) = atomic_write(&plan_path, &updated)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "write_failed",
+                "message": format!("Failed to write plan file: {e}"),
+            })),
+        )
+            .into_response();
+    }
+
+    // Audit the change so settings edits show in the per-plan history.
+    let mut payload = serde_json::Map::new();
+    if let Some(opt) = body.ci_blocking_workflows.as_ref() {
+        payload.insert(
+            "ciBlockingWorkflows".into(),
+            match opt {
+                Some(v) => serde_json::json!(v),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    if let Some(opt) = body.phase_verification.as_ref() {
+        payload.insert(
+            "phaseVerification".into(),
+            match opt {
+                Some(v) => serde_json::json!(v),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    if !payload.is_empty() {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::CONFIG_PLAN_SETTINGS,
+            crate::audit::resources::PLAN,
+            Some(&name),
+            Some(&serde_json::Value::Object(payload).to_string()),
+        );
+    }
+
+    // Return the post-update GET shape so the UI can re-render without a
+    // second round-trip.
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "parse_error",
+                    "message": format!("Failed to parse plan after edit: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let project_dir = crate::ci::project_dir_for(&state.plans_dir, &state.db, &name);
+    let available_workflows = project_dir
+        .as_deref()
+        .map(enumerate_available_workflows)
+        .unwrap_or_default();
+    let repo_defaults = repo_defaults_for(project_dir.as_deref());
+
+    let response = PlanSettings {
+        ci_blocking_workflows: plan.ci_blocking_workflows,
+        phase_verification: plan.phase_verification,
+        available_workflows,
+        repo_defaults,
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Update a single top-level key in a YAML document while preserving
+/// every comment, blank line, and indentation outside the modified
+/// key's range.
+///
+/// - `Some(v)` replaces the existing key+value, or inserts a new entry
+///   immediately before the first `phases:` line (or at end-of-file
+///   when `phases:` is absent).
+/// - `None` removes the key+value entirely (no-op when the key isn't
+///   present).
+///
+/// Comments *inside* the replaced range (e.g. an inline comment on a
+/// list item) are not preserved — `serde_yaml::Value` doesn't carry
+/// them. Everything else (leading comments, trailing comments, blank
+/// lines, other top-level keys) survives byte-for-byte.
+fn update_yaml_top_level_key(
+    yaml: &str,
+    key: &str,
+    value: Option<&serde_yaml::Value>,
+) -> Result<String, String> {
+    let lines: Vec<&str> = yaml.split('\n').collect();
+    let key_range = find_top_level_key_range(&lines, key);
+
+    let replacement_block: Option<String> = match value {
+        Some(v) => Some(serialize_top_level_kv(key, v)?),
+        None => None,
+    };
+    let rep_lines: Option<Vec<String>> = replacement_block.map(|block| {
+        let trimmed = block.strip_suffix('\n').unwrap_or(&block);
+        trimmed.split('\n').map(|s| s.to_string()).collect()
+    });
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 4);
+
+    if let Some((start, end)) = key_range {
+        for line in &lines[..start] {
+            out.push((*line).to_string());
+        }
+        if let Some(rep) = rep_lines.as_ref() {
+            for l in rep {
+                out.push(l.clone());
+            }
+        }
+        for line in &lines[end..] {
+            out.push((*line).to_string());
+        }
+    } else {
+        match rep_lines.as_ref() {
+            None => return Ok(yaml.to_string()),
+            Some(rep) => {
+                let insert_at = find_top_level_key_line(&lines, "phases").unwrap_or(lines.len());
+                for line in &lines[..insert_at] {
+                    out.push((*line).to_string());
+                }
+                for l in rep {
+                    out.push(l.clone());
+                }
+                for line in &lines[insert_at..] {
+                    out.push((*line).to_string());
+                }
+            }
+        }
+    }
+
+    Ok(out.join("\n"))
+}
+
+fn serialize_top_level_kv(key: &str, value: &serde_yaml::Value) -> Result<String, String> {
+    let mut map = serde_yaml::Mapping::new();
+    map.insert(serde_yaml::Value::String(key.to_string()), value.clone());
+    serde_yaml::to_string(&serde_yaml::Value::Mapping(map)).map_err(|e| format!("yaml emit: {e}"))
+}
+
+/// Returns `(start, end)` line indices for the key's key+value lines.
+/// `start` points at the `key:` line; `end` is the index of the first
+/// line that is NOT part of the key's value (i.e. the slice
+/// `lines[start..end]` contains exactly the key+value).
+fn find_top_level_key_range(lines: &[&str], key: &str) -> Option<(usize, usize)> {
+    let start = find_top_level_key_line(lines, key)?;
+    let mut end = lines.len();
+    for (i, line) in lines.iter().enumerate().skip(start + 1) {
+        if line_terminates_key_range(line) {
+            end = i;
+            break;
+        }
+    }
+    Some((start, end))
+}
+
+fn find_top_level_key_line(lines: &[&str], key: &str) -> Option<usize> {
+    lines
+        .iter()
+        .position(|line| line_starts_with_top_level_key(line, key))
+}
+
+/// `true` iff `line` is `<key>:` (with optional inline value or
+/// comment) at column 0. Conservative: rejects quoted-key forms
+/// (`"key":`) and flow-style maps. Plan files don't use either at the
+/// top level, so this matches every legitimate field while staying
+/// trivial to reason about.
+fn line_starts_with_top_level_key(line: &str, key: &str) -> bool {
+    let bytes = line.as_bytes();
+    let kbytes = key.as_bytes();
+    if !bytes.starts_with(kbytes) {
+        return false;
+    }
+    let after = &bytes[kbytes.len()..];
+    if after.is_empty() || after[0] != b':' {
+        return false;
+    }
+    after.len() == 1 || matches!(after[1], b' ' | b'\t' | b'#')
+}
+
+/// `true` iff `line` ends the previous top-level key's value range:
+/// any non-blank line at column 0 that isn't a column-0 block-sequence
+/// continuation (`- item`). Comments at column 0 are treated as
+/// "leading" for the next key (the YAML editor convention) and so
+/// terminate the current range too — this keeps the next key's leading
+/// comment with that next key on delete.
+fn line_terminates_key_range(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let first = bytes[0];
+    if first == b' ' || first == b'\t' {
+        return false;
+    }
+    if first == b'-' && (bytes.len() == 1 || matches!(bytes[1], b' ' | b'\t')) {
+        return false;
+    }
+    true
+}
+
 // ── PUT /api/plans/:name/tasks/:num/status ───────────────────────────────────
 
 #[derive(Deserialize)]
@@ -4484,5 +4991,223 @@ mod resolve_folder_path_tests {
             resolve_folder_path("nested/subdir", home),
             PathBuf::from("/home/cpo/nested/subdir"),
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_settings_yaml_edit_tests {
+    //! Unit tests for the comment-preserving YAML editor used by
+    //! PUT /api/plans/:name/settings (Task 3.1).
+    use super::{
+        find_top_level_key_range, line_starts_with_top_level_key, line_terminates_key_range,
+        update_yaml_top_level_key,
+    };
+
+    fn lines_of(s: &str) -> Vec<&str> {
+        s.split('\n').collect()
+    }
+
+    #[test]
+    fn line_starts_with_top_level_key_matches_basic_forms() {
+        assert!(line_starts_with_top_level_key("title: hi", "title"));
+        assert!(line_starts_with_top_level_key("title:", "title"));
+        assert!(line_starts_with_top_level_key("title: # inline", "title"));
+        assert!(line_starts_with_top_level_key("title:\t hi", "title"));
+        // Not a match: indented, comment, key mismatch, no colon.
+        assert!(!line_starts_with_top_level_key("  title: hi", "title"));
+        assert!(!line_starts_with_top_level_key("# title: hi", "title"));
+        assert!(!line_starts_with_top_level_key("titles: hi", "title"));
+        assert!(!line_starts_with_top_level_key("title hi", "title"));
+    }
+
+    #[test]
+    fn line_terminates_key_range_recognises_all_value_continuations() {
+        // Continuations: indented or column-0 list items are part of the
+        // current value.
+        assert!(!line_terminates_key_range("  - item"));
+        assert!(!line_terminates_key_range("\t- item"));
+        assert!(!line_terminates_key_range("- item"));
+        assert!(!line_terminates_key_range(""));
+        // Terminators: comments and other top-level constructs end the
+        // range.
+        assert!(line_terminates_key_range("# leading comment for next key"));
+        assert!(line_terminates_key_range("phases:"));
+        assert!(line_terminates_key_range("ci_blocking_workflows: [a]"));
+    }
+
+    #[test]
+    fn find_range_for_inline_value() {
+        let yaml = "title: Hi\nci_blocking_workflows: [CI, lint]\nphases: []\n";
+        let lines = lines_of(yaml);
+        let range = find_top_level_key_range(&lines, "ci_blocking_workflows").unwrap();
+        assert_eq!(range, (1, 2), "inline value occupies exactly its own line");
+    }
+
+    #[test]
+    fn find_range_for_block_sequence_indented() {
+        let yaml = "title: Hi\nci_blocking_workflows:\n  - CI\n  - lint\nphases: []\n";
+        let lines = lines_of(yaml);
+        let range = find_top_level_key_range(&lines, "ci_blocking_workflows").unwrap();
+        assert_eq!(range, (1, 4));
+    }
+
+    #[test]
+    fn find_range_for_block_sequence_column_zero() {
+        // Column-0 list items are still part of the previous key's value.
+        let yaml = "title: Hi\nci_blocking_workflows:\n- CI\n- lint\nphases: []\n";
+        let lines = lines_of(yaml);
+        let range = find_top_level_key_range(&lines, "ci_blocking_workflows").unwrap();
+        assert_eq!(range, (1, 4));
+    }
+
+    #[test]
+    fn find_range_for_block_scalar_value() {
+        let yaml = "phase_verification: |\n  cargo fmt\n  cargo test\nphases: []\n";
+        let lines = lines_of(yaml);
+        let range = find_top_level_key_range(&lines, "phase_verification").unwrap();
+        assert_eq!(range, (0, 3));
+    }
+
+    #[test]
+    fn find_range_returns_none_when_key_absent() {
+        let yaml = "title: Hi\nphases: []\n";
+        let lines = lines_of(yaml);
+        assert!(find_top_level_key_range(&lines, "ci_blocking_workflows").is_none());
+    }
+
+    #[test]
+    fn comment_above_next_key_is_not_included_in_previous_range() {
+        // The comment on line 1 should be associated with the NEXT key,
+        // not the previous one — `line_terminates_key_range` returns
+        // true for column-0 comments.
+        let yaml = "ci_blocking_workflows: [CI]\n# leading for phase_verification\nphase_verification: x\nphases: []\n";
+        let lines = lines_of(yaml);
+        let range = find_top_level_key_range(&lines, "ci_blocking_workflows").unwrap();
+        assert_eq!(range, (0, 1));
+    }
+
+    #[test]
+    fn replace_inline_value_preserves_other_keys_and_comments() {
+        let yaml =
+            "title: Hi\n# CI workflows that block\nci_blocking_workflows: [CI]\nphases: []\n";
+        let new = serde_yaml::Value::Sequence(vec![
+            serde_yaml::Value::String("CI".into()),
+            serde_yaml::Value::String("lint".into()),
+        ]);
+        let out = update_yaml_top_level_key(yaml, "ci_blocking_workflows", Some(&new)).unwrap();
+        // Comment and other keys preserved.
+        assert!(out.contains("# CI workflows that block"));
+        assert!(out.starts_with("title: Hi"));
+        assert!(out.contains("phases: []"));
+        // New value present.
+        assert!(out.contains("ci_blocking_workflows:"));
+        assert!(out.contains("- CI"));
+        assert!(out.contains("- lint"));
+        // Old inline literal gone.
+        assert!(!out.contains("[CI]"));
+    }
+
+    #[test]
+    fn replace_block_sequence_with_smaller_list_preserves_surroundings() {
+        let yaml = "# top comment\ntitle: Hi\n\nci_blocking_workflows:\n  - CI\n  - lint\n  - audit\n\nphases:\n  - number: 1\n    title: P\n    tasks: []\n";
+        let new = serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("CI".into())]);
+        let out = update_yaml_top_level_key(yaml, "ci_blocking_workflows", Some(&new)).unwrap();
+        assert!(out.starts_with("# top comment"));
+        assert!(out.contains("title: Hi"));
+        assert!(out.contains("phases:"));
+        assert!(out.contains("    title: P"));
+        // Old members gone, new in place.
+        assert!(!out.contains("- audit"));
+        assert!(!out.contains("- lint"));
+        assert!(out.contains("- CI"));
+        // Re-parse round-trips.
+        let _: serde_yaml::Value = serde_yaml::from_str(&out).expect("post-edit must parse");
+    }
+
+    #[test]
+    fn remove_key_drops_only_its_lines() {
+        let yaml = "title: Hi\nci_blocking_workflows:\n  - CI\nphase_verification: bash verify.sh\nphases: []\n";
+        let out = update_yaml_top_level_key(yaml, "ci_blocking_workflows", None).unwrap();
+        assert!(!out.contains("ci_blocking_workflows"));
+        assert!(out.contains("title: Hi"));
+        assert!(out.contains("phase_verification: bash verify.sh"));
+        assert!(out.contains("phases: []"));
+    }
+
+    #[test]
+    fn remove_absent_key_is_noop() {
+        let yaml = "title: Hi\nphases: []\n";
+        let out = update_yaml_top_level_key(yaml, "ci_blocking_workflows", None).unwrap();
+        assert_eq!(out, yaml, "removing an absent key must not change the file");
+    }
+
+    #[test]
+    fn insert_new_key_lands_before_phases() {
+        let yaml = "title: Hi\ncontext: ''\nphases:\n  - number: 1\n    title: P\n    tasks: []\n";
+        let new = serde_yaml::Value::String("bash scripts/verify.sh".into());
+        let out = update_yaml_top_level_key(yaml, "phase_verification", Some(&new)).unwrap();
+        let pv_idx = out.find("phase_verification:").expect("must contain key");
+        let phases_idx = out.find("phases:").expect("must contain phases");
+        assert!(
+            pv_idx < phases_idx,
+            "new key must be inserted before `phases:` (got pv={pv_idx}, phases={phases_idx})\n{out}"
+        );
+        // Existing keys preserved.
+        assert!(out.contains("title: Hi"));
+        assert!(out.contains("context: ''"));
+        // Re-parse round-trips.
+        let v: serde_yaml::Value = serde_yaml::from_str(&out).expect("must parse");
+        let m = v.as_mapping().unwrap();
+        assert_eq!(
+            m.get(serde_yaml::Value::String("phase_verification".into()))
+                .and_then(|v| v.as_str()),
+            Some("bash scripts/verify.sh")
+        );
+    }
+
+    #[test]
+    fn insert_when_no_phases_appends_at_end() {
+        let yaml = "title: Hi\ncontext: ''\n";
+        let new = serde_yaml::Value::String("bash verify.sh".into());
+        let out = update_yaml_top_level_key(yaml, "phase_verification", Some(&new)).unwrap();
+        assert!(out.contains("title: Hi"));
+        assert!(out.contains("phase_verification: bash verify.sh"));
+    }
+
+    #[test]
+    fn full_round_trip_preserves_file_with_inline_comments_outside_target() {
+        let yaml = r#"# top header
+title: Demo
+project: foo  # inline comment on project
+context: |
+  multi line
+  body
+ci_blocking_workflows:
+  - CI
+  - lint
+# section comment
+phases:
+  - number: 1
+    title: P1
+    tasks:
+      - number: '1.1'
+        title: T1
+        acceptance: ''
+"#;
+        // Replace the list.
+        let new = serde_yaml::Value::Sequence(vec![
+            serde_yaml::Value::String("CI".into()),
+            serde_yaml::Value::String("docs".into()),
+        ]);
+        let out = update_yaml_top_level_key(yaml, "ci_blocking_workflows", Some(&new)).unwrap();
+        // Untouched keys + comments survive byte-for-byte.
+        assert!(out.contains("# top header"));
+        assert!(out.contains("# inline comment on project"));
+        assert!(out.contains("# section comment"));
+        assert!(out.contains("multi line\n  body"));
+        // New value in.
+        assert!(out.contains("- docs"));
+        // Round-trips through serde_yaml.
+        let _: serde_yaml::Value = serde_yaml::from_str(&out).expect("must parse");
     }
 }
