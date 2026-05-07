@@ -2041,6 +2041,27 @@ pub struct CreatePlanBody {
     runner_id: Option<String>,
 }
 
+/// Resolve a user-supplied folder string against `$HOME`. Three states:
+///   * `~` or `~/<rest>` → `home / <rest>` (tilde-expansion)
+///   * absolute path     → returned as-is
+///   * bare name         → `home / <name>` (NOT cwd-relative)
+///
+/// The bare-name → `$HOME/<name>` rule matches the user's mental model
+/// ("this is a folder name under my home directory") and avoids the
+/// 2026-05-07 bug where `PathBuf::from("myproj")` would land under the
+/// server process's cwd (e.g. `cargo run` from `server-rs/`). The runner
+/// resolver in `branchwork_runner.rs::resolve_runner_path` applies the
+/// same three-state rule against the *runner's* `$HOME`.
+fn resolve_folder_path(folder: &str, home: &std::path::Path) -> std::path::PathBuf {
+    if let Some(rest) = folder.strip_prefix('~') {
+        home.join(rest.trim_start_matches('/'))
+    } else if std::path::Path::new(folder).is_absolute() {
+        std::path::PathBuf::from(folder)
+    } else {
+        home.join(folder)
+    }
+}
+
 pub async fn create_plan(
     State(state): State<AppState>,
     auth: OptionalAuthUser,
@@ -2138,11 +2159,7 @@ pub async fn create_plan(
         }
     } else {
         let home = dirs::home_dir().unwrap();
-        let resolved = if body.folder.starts_with('~') {
-            home.join(body.folder[1..].trim_start_matches('/'))
-        } else {
-            std::path::PathBuf::from(&body.folder)
-        };
+        let resolved = resolve_folder_path(&body.folder, &home);
 
         if !resolved.exists() {
             if body.create_folder != Some(true) {
@@ -4393,5 +4410,59 @@ mod cascade_audit_tests {
                  (audit comment promises the row survives)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_folder_path_tests {
+    //! Three-state resolver pinned by Task 7.1 (2026-05-07 bug repro).
+    //! The runner-side equivalent in
+    //! `branchwork_runner.rs::resolve_runner_path` must agree on these
+    //! three cases — both apply the rule against their respective
+    //! `$HOME` (server's vs runner's), but the shape is identical.
+    use super::resolve_folder_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn bare_name_resolves_under_home() {
+        let home = Path::new("/home/cpo");
+        assert_eq!(
+            resolve_folder_path("myproj", home),
+            PathBuf::from("/home/cpo/myproj"),
+        );
+    }
+
+    #[test]
+    fn absolute_path_passes_through() {
+        let home = Path::new("/home/cpo");
+        assert_eq!(resolve_folder_path("/etc", home), PathBuf::from("/etc"));
+        assert_eq!(
+            resolve_folder_path("/var/lib/branchwork", home),
+            PathBuf::from("/var/lib/branchwork"),
+        );
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let home = Path::new("/home/cpo");
+        assert_eq!(
+            resolve_folder_path("~/foo", home),
+            PathBuf::from("/home/cpo/foo"),
+        );
+    }
+
+    #[test]
+    fn bare_tilde_resolves_to_home() {
+        let home = Path::new("/home/cpo");
+        assert_eq!(resolve_folder_path("~", home), PathBuf::from("/home/cpo"));
+    }
+
+    #[test]
+    fn nested_relative_path_resolves_under_home() {
+        let home = Path::new("/home/cpo");
+        assert_eq!(
+            resolve_folder_path("nested/subdir", home),
+            PathBuf::from("/home/cpo/nested/subdir"),
+        );
     }
 }

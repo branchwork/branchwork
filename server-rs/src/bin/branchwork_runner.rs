@@ -1616,16 +1616,26 @@ fn send_best_effort(state: &RunnerState, message: WireMessage) {
         .send(serde_json::to_string(&env).unwrap_or_default());
 }
 
-/// Resolve a runner-side folder path. `~` and `~/...` expand against
-/// `dirs::home_dir()`; everything else is treated as already-absolute and
-/// passed through unchanged.
+/// Resolve a runner-side folder path. Three states:
+///   * `~` or `~/<rest>` → `$HOME / <rest>` (tilde-expansion)
+///   * absolute path     → returned as-is
+///   * bare name         → `$HOME / <name>` (NOT cwd-relative)
+///
+/// The bare-name → `$HOME/<name>` rule matches the user's mental model
+/// ("this is a folder name under my home directory") and the standalone
+/// resolver in `api::plans::resolve_folder_path`. Pre-2026-05-07 a bare
+/// name like `myproj` would fall through to `PathBuf::from("myproj")`,
+/// then `mkdir -p` would treat it as absolute (`/myproj`) — wrong, just
+/// differently from the server-side bug.
 fn resolve_runner_path(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir().unwrap_or_default().join(rest)
-    } else if path == "~" {
-        dirs::home_dir().unwrap_or_default()
-    } else {
+    if let Some(rest) = path.strip_prefix('~') {
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(rest.trim_start_matches('/'))
+    } else if Path::new(path).is_absolute() {
         PathBuf::from(path)
+    } else {
+        dirs::home_dir().unwrap_or_default().join(path)
     }
 }
 
@@ -2582,10 +2592,19 @@ mod tests {
             resolve_runner_path("/tmp/branchwork-test"),
             PathBuf::from("/tmp/branchwork-test")
         );
-        // Bare names without ~ are not expanded.
-        assert_eq!(resolve_runner_path("relative"), PathBuf::from("relative"));
-        // ~user (not ~/) is not expanded — left as-is.
-        assert_eq!(resolve_runner_path("~root"), PathBuf::from("~root"));
+    }
+
+    #[test]
+    fn resolve_runner_path_bare_name_resolves_under_home() {
+        // 2026-05-07 fix: bare names land under `$HOME/<name>`, not under
+        // the runner process's cwd (which used to be `/<name>` because
+        // `mkdir -p` treats `PathBuf::from("myproj")` as relative to cwd).
+        let home = dirs::home_dir().expect("test host should have a home dir");
+        assert_eq!(resolve_runner_path("myproj"), home.join("myproj"));
+        assert_eq!(
+            resolve_runner_path("nested/subdir"),
+            home.join("nested/subdir")
+        );
     }
 
     #[test]
