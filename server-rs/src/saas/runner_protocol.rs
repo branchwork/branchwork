@@ -652,6 +652,19 @@ pub struct CiRunSummary {
     /// — when every job has `conclusion="skipped"` and any job's
     /// `steps[]` reports the skip was caused by `needs:` failure.
     pub skipped_due_to_upstream: bool,
+    /// `true` ≡ this run was excluded from the blocking subset by a
+    /// per-plan / per-phase / repo-level CI workflow filter (see
+    /// `ci::aggregate::compute_with_filter`). Informational runs surface
+    /// in the per-run breakdown but never gate `conclusion` or
+    /// `failing_run_id`. Defaults to `false` so older runner payloads
+    /// (no field) still deserialize cleanly, and so per-run JSON stays
+    /// compact when no filter was applied.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub informational: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // ── Driver auth info ────────────────────────────────────────────────────────
@@ -1801,6 +1814,7 @@ mod tests {
                     status: "completed".into(),
                     conclusion: Some("failure".into()),
                     skipped_due_to_upstream: false,
+                    informational: false,
                 },
                 CiRunSummary {
                     run_id: "1002".into(),
@@ -1808,6 +1822,7 @@ mod tests {
                     status: "completed".into(),
                     conclusion: Some("success".into()),
                     skipped_due_to_upstream: false,
+                    informational: false,
                 },
                 CiRunSummary {
                     run_id: "1003".into(),
@@ -1815,6 +1830,7 @@ mod tests {
                     status: "completed".into(),
                     conclusion: Some("skipped".into()),
                     skipped_due_to_upstream: true,
+                    informational: false,
                 },
             ],
             failing_run_id: Some("1001".into()),

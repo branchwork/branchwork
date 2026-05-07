@@ -1891,6 +1891,10 @@ fn aggregate_runs(mut runs: Vec<GhRunDetail>) -> CiAggregate {
             // mark_upstream_skips below sets this — initialize to false so
             // the rule has a single source of truth.
             skipped_due_to_upstream: false,
+            // The runner aggregator never partitions by allowlist — that's
+            // the server-side `compute_with_filter` consumer's job. Default
+            // to false so the runner's wire payload stays compact.
+            informational: false,
         })
         .collect();
 

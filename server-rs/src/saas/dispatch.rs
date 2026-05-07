@@ -232,6 +232,7 @@ pub async fn get_ci_run_status_dispatch(
                 },
                 conclusion: r.conclusion,
                 skipped_due_to_upstream: false,
+                informational: false,
             })
             .collect();
         aggregate::mark_upstream_skips(&mut summaries);
@@ -781,6 +782,7 @@ mod tests {
                 status: "completed".into(),
                 conclusion: Some("failure".into()),
                 skipped_due_to_upstream: false,
+                informational: false,
             },
             CiRunSummary {
                 run_id: "101".into(),
@@ -788,6 +790,7 @@ mod tests {
                 status: "completed".into(),
                 conclusion: Some("success".into()),
                 skipped_due_to_upstream: false,
+                informational: false,
             },
             CiRunSummary {
                 run_id: "102".into(),
@@ -795,6 +798,7 @@ mod tests {
                 status: "completed".into(),
                 conclusion: Some("skipped".into()),
                 skipped_due_to_upstream: false,
+                informational: false,
             },
         ];
         aggregate::mark_upstream_skips(&mut runs);

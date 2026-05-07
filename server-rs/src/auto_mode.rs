@@ -2172,6 +2172,7 @@ mod tests {
                 status: "completed".into(),
                 conclusion: Some("success".into()),
                 skipped_due_to_upstream: false,
+                informational: false,
             }],
             failing_run_id: None,
         }
@@ -2187,6 +2188,7 @@ mod tests {
                 status: "completed".into(),
                 conclusion: Some("failure".into()),
                 skipped_due_to_upstream: false,
+                informational: false,
             }],
             failing_run_id: Some(failing.to_string()),
         }
@@ -2202,6 +2204,7 @@ mod tests {
                 status: "in_progress".into(),
                 conclusion: None,
                 skipped_due_to_upstream: false,
+                informational: false,
             }],
             failing_run_id: None,
         }
@@ -2218,6 +2221,7 @@ mod tests {
                 status: "completed".into(),
                 conclusion: Some("failure".into()),
                 skipped_due_to_upstream: false,
+                informational: false,
             },
             CiRunSummary {
                 run_id: "101".into(),
@@ -2225,6 +2229,7 @@ mod tests {
                 status: "completed".into(),
                 conclusion: Some("success".into()),
                 skipped_due_to_upstream: false,
+                informational: false,
             },
             CiRunSummary {
                 run_id: "102".into(),
@@ -2232,6 +2237,7 @@ mod tests {
                 status: "completed".into(),
                 conclusion: Some("skipped".into()),
                 skipped_due_to_upstream: false,
+                informational: false,
             },
         ];
         crate::ci::aggregate::mark_upstream_skips(&mut runs);
