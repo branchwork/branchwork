@@ -110,3 +110,9 @@ jobs:
 
       - name: Build
         run: pnpm --filter @branchwork/web build
+
+      # Audit §20 bundle-size gate. Asserts the eagerly-loaded entry
+      # chunk stays under the gzipped budget so a careless `import`
+      # of a heavy dep can't silently regress first-paint cost.
+      - name: Bundle-size budget
+        run: pnpm --filter @branchwork/web bundle:check
