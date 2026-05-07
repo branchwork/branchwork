@@ -108,7 +108,7 @@ export function getInFlightAgentsFetch(): Promise<void> | null {
   return inFlightAgentsFetch;
 }
 
-export const useAgentStore = create<AgentStore>((set, get) => ({
+export const useAgentStore = create<AgentStore>((set) => ({
   agents: [],
   selectedAgentId: null,
   agentOutput: {},

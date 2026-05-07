@@ -7,7 +7,6 @@ import {
   MAX_OUTPUT_LINES,
   useAgentStore,
   type AgentOutputLine,
-  type AgentDiff,
 } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
@@ -297,11 +296,11 @@ function StreamJsonView({ agentId, isActive }: { agentId: string; isActive: bool
   const fetchAgentOutput = useAgentStore((s) => s.fetchAgentOutput);
   const outputRef = useRef<HTMLDivElement>(null);
 
-  const output = agentOutput[agentId] ?? [];
+  const output = useMemo(() => agentOutput[agentId] ?? [], [agentOutput, agentId]);
 
   useEffect(() => {
     fetchAgentOutput(agentId);
-  }, [agentId]);
+  }, [agentId, fetchAgentOutput]);
 
   useEffect(() => {
     if (outputRef.current) {

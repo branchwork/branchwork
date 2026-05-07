@@ -129,6 +129,7 @@ export function Tabs<V extends string>({
       role="tablist"
       aria-label={label}
       onKeyDown={onKeyDown}
+      tabIndex={-1}
       className={`flex ${className}`}
     >
       {tabs.map((cfg) => {

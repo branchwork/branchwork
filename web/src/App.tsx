@@ -77,7 +77,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [user]);
+  }, [user, fetchPlans, fetchAgents, fetchSettings, fetchDrivers, fetchRunners, fetchOrgs, connect]);
 
   // Refetch when the tab becomes visible again — covers events missed
   // while the browser throttled or suspended the WebSocket.
@@ -193,14 +193,14 @@ function RouteSync() {
     } else if (selectedPlanName) {
       clearSelectedPlan();
     }
-  }, [routePlanName, selectedPlanName]);
+  }, [routePlanName, selectedPlanName, selectPlan, clearSelectedPlan]);
 
   useEffect(() => {
     const next = routeAgentId ?? null;
     if (next !== selectedAgentId) {
       selectAgent(next);
     }
-  }, [routeAgentId, selectedAgentId]);
+  }, [routeAgentId, selectedAgentId, selectAgent]);
 
   return null;
 }

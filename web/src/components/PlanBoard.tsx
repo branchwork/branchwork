@@ -1011,7 +1011,7 @@ export function AutoModeStatusPill({ planName }: { planName: string }) {
   if (isPaused) {
     const reason = config.pausedReason ?? runtime?.reason ?? "unknown";
     const label = humanPauseReason(reason);
-    async function resume() {
+    const resume = async () => {
       setResuming(true);
       try {
         const cfg = await putJson<PlanConfig>(`/api/plans/${planName}/config`, {
@@ -1023,7 +1023,7 @@ export function AutoModeStatusPill({ planName }: { planName: string }) {
       } finally {
         setResuming(false);
       }
-    }
+    };
     return (
       <span className="flex-shrink-0 inline-flex items-center gap-1.5 text-xs">
         <span

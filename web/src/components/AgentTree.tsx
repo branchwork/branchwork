@@ -28,7 +28,7 @@ export function AgentTree() {
 
   useEffect(() => {
     fetchAgents();
-  }, []);
+  }, [fetchAgents]);
 
   // Filter agents
   const filtered = useMemo(() => {

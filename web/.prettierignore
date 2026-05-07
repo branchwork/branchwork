@@ -1,0 +1,9 @@
+dist
+node_modules
+.playwright-artifacts
+playwright-report
+test-results
+coverage
+package-lock.json
+pnpm-lock.yaml
+*.md
