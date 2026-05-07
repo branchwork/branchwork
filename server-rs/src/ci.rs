@@ -12,6 +12,7 @@
 //!   pending | running | success | failure | cancelled | unknown
 
 pub mod aggregate;
+pub mod resolution;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
