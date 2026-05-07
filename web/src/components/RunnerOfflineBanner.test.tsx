@@ -64,10 +64,9 @@ describe("RunnerOfflineBanner", () => {
   });
 
   it("renders banner copy when pausedReason is runner_offline", () => {
-    seed(
-      defaultConfig({ pausedReason: "runner_offline", runnerId: "runner-1" }),
-      [{ id: "runner-1", name: "alpha", status: "offline" }],
-    );
+    seed(defaultConfig({ pausedReason: "runner_offline", runnerId: "runner-1" }), [
+      { id: "runner-1", name: "alpha", status: "offline" },
+    ]);
     render(<RunnerOfflineBanner planName={PLAN} />);
     expect(screen.getByText(/Auto-mode paused: pinned runner/i)).toBeTruthy();
     // The runner's name (not its id) is what we show by preference.
@@ -76,10 +75,7 @@ describe("RunnerOfflineBanner", () => {
   });
 
   it("falls back to the runner id when the row is not in the store", () => {
-    seed(
-      defaultConfig({ pausedReason: "runner_offline", runnerId: "runner-stale" }),
-      [],
-    );
+    seed(defaultConfig({ pausedReason: "runner_offline", runnerId: "runner-stale" }), []);
     render(<RunnerOfflineBanner planName={PLAN} />);
     expect(screen.getByText("runner-stale")).toBeTruthy();
   });

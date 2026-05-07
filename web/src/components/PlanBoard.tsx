@@ -952,10 +952,7 @@ export function RunnerPicker({
   const pinnedKnown = runnerId === null || runners.some((r) => r.id === runnerId);
 
   return (
-    <label
-      className="flex items-center gap-1.5 text-gray-400"
-      title={RUNNER_PICKER_TOOLTIP}
-    >
+    <label className="flex items-center gap-1.5 text-gray-400" title={RUNNER_PICKER_TOOLTIP}>
       <span>Runner</span>
       <select
         value={value}
@@ -1076,7 +1073,8 @@ export function RunnerOfflineBanner({ planName }: { planName: string }) {
       </span>
       <div className="flex-1 text-amber-100">
         <div className="font-medium">
-          Auto-mode paused: pinned runner <span className="font-mono">{pinnedLabel}</span> is offline.
+          Auto-mode paused: pinned runner <span className="font-mono">{pinnedLabel}</span> is
+          offline.
         </div>
         <div className="mt-0.5 text-amber-200/80">
           Wait for the runner to reconnect and click Resume, or pick a different runner from the
