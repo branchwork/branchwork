@@ -223,6 +223,14 @@ mod runner_health {
     /// samples push back, oldest evict from the front when the cap is hit.
     static CI_LATENCIES_MS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
+    /// Reap timestamps for orphaned session sockets / zombie children
+    /// inside the trailing 24 h window. Bumped from two paths:
+    /// (a) `cleanup_and_reattach_runner` when a stale socket has no
+    /// listener, and (b) the `waitpid` reaper when a detached child
+    /// exits between heartbeats. Pushes trim outside the window so the
+    /// counter is always fresh on read.
+    static ORPHANS_REAPED: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
     /// Record one reconnect. Call this once per `connect_and_run` invocation
     /// after the WS handshake succeeds — the count is "successful reconnects
     /// in the last 24 h," not "connection attempts." A flapping runner that
@@ -243,6 +251,31 @@ mod runner_health {
     pub fn ws_reconnects_24h() -> u32 {
         let now = Instant::now();
         if let Ok(mut g) = RECONNECTS.lock() {
+            g.retain(|t| now.duration_since(*t) < RECONNECT_WINDOW);
+            g.len() as u32
+        } else {
+            0
+        }
+    }
+
+    /// Bump the orphan-reap counter. Call once per stale socket
+    /// (`cleanup_and_reattach_runner`) and once per reaped zombie
+    /// (waitpid reaper) so `RunnerHealth.orphans_reaped_24h` reflects
+    /// the named-wart "the supervisor died but the runner kept running"
+    /// failure mode (Task 11.6).
+    pub fn record_orphan_reaped() {
+        let now = Instant::now();
+        if let Ok(mut g) = ORPHANS_REAPED.lock() {
+            g.push(now);
+            g.retain(|t| now.duration_since(*t) < RECONNECT_WINDOW);
+        }
+    }
+
+    /// Read the current orphan-reaped count in the trailing 24 h window.
+    /// Same trim-then-count idiom as `ws_reconnects_24h`.
+    pub fn orphans_reaped_24h() -> u32 {
+        let now = Instant::now();
+        if let Ok(mut g) = ORPHANS_REAPED.lock() {
             g.retain(|t| now.duration_since(*t) < RECONNECT_WINDOW);
             g.len() as u32
         } else {
@@ -687,6 +720,14 @@ async fn connect_and_run(
         shutdown_requested: shutdown.clone(),
     });
 
+    // ── Reattach to surviving session daemons (Task 11.6) ────────────────
+    // Re-populate `state.agents` from `<cwd>/.branchwork-runner-sessions/`.
+    // Idempotent: agents already in memory are skipped, so calling this
+    // on every reconnect catches new survivors without double-spawning.
+    // Sockets whose owning daemon is dead get reaped (and counted into
+    // `orphans_reaped_24h`).
+    cleanup_and_reattach_runner(&state).await;
+
     // ── Writer task: flush channel messages to WebSocket ─────────────────
     let writer = tokio::spawn(ws_writer(ws_write, ws_rx));
 
@@ -735,6 +776,19 @@ async fn connect_and_run(
         }
     });
 
+    // ── Zombie reaper (Task 11.6) ───────────────────────────────────────
+    // Detached session daemons (CommandExt::pre_exec calls setsid + we
+    // never `wait()` them) become zombies when they exit between
+    // heartbeats. The reaper polls every 5 s and `waitpid(-1, WNOHANG)`s
+    // any pending children, emitting one log line per reap so a pile-up
+    // (e.g. an OOM-killer storm taking out half a dozen daemons in a
+    // burst) surfaces in the dashboard tail as well as the host's
+    // `journalctl`. Cancellation: aborted with the rest of the
+    // per-connection tasks at the end of `connect_and_run` — process-
+    // global lifetime would also be fine but the per-connection scope
+    // keeps the join-handle wiring uniform.
+    let reaper = spawn_zombie_reaper();
+
     // ── Health ticker ───────────────────────────────────────────────────
     // Periodic best-effort RunnerHealth snapshot. Fires every ~30 s; the
     // dashboard's `Health` panel reads the latest snapshot, so missed
@@ -761,6 +815,7 @@ async fn connect_and_run(
                 ws_reconnects_24h: runner_health::ws_reconnects_24h(),
                 ci_poll_ms_p50: p50,
                 ci_poll_ms_p99: p99,
+                orphans_reaped_24h: runner_health::orphans_reaped_24h(),
             };
             let env = Envelope::best_effort(health_rid.clone(), snapshot);
             if health_tx
@@ -778,6 +833,7 @@ async fn connect_and_run(
     // ── Cleanup ─────────────────────────────────────────────────────────
     heartbeat.abort();
     health_ticker.abort();
+    reaper.abort();
     writer.abort();
     // Drop the shipper sender slot so emits in the reconnect gap don't
     // count against the truncated tally; the consumer task ends naturally
@@ -1984,7 +2040,8 @@ async fn spawn_agent(
     let prompt_bytes = prompt.as_bytes().to_vec();
 
     let io_task = tokio::spawn(async move {
-        if let Err(e) = forward_agent_io(&sock, &ws_tx, &runner_id, &aid, &prompt_bytes).await {
+        if let Err(e) = forward_agent_io(&sock, &ws_tx, &runner_id, &aid, Some(&prompt_bytes)).await
+        {
             log_warn!("[runner] agent {aid} I/O error: {e}");
         }
 
@@ -2013,18 +2070,27 @@ async fn spawn_agent(
 }
 
 /// Connect to a session daemon and forward I/O between it and the WebSocket.
+///
+/// `prompt = Some(bytes)` means "fresh spawn — inject the prompt the first
+/// time the daemon shows its readiness glyph (Claude `❯`)." `prompt = None`
+/// means "reattach — the daemon was spawned by a previous runner process,
+/// has already shown readiness and consumed its prompt; do not inject."
+/// The reattach path is what `cleanup_and_reattach` uses on runner restart
+/// (Task 11.6).
 async fn forward_agent_io(
     socket_path: &Path,
     ws_tx: &mpsc::UnboundedSender<String>,
     runner_id: &str,
     agent_id: &str,
-    prompt: &[u8],
+    prompt: Option<&[u8]>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = connect_to_socket(socket_path).await?;
 
     // Read output from the daemon and forward to SaaS.
     let mut readiness_buf = Vec::with_capacity(16 * 1024);
-    let mut prompt_injected = false;
+    // Reattach path skips readiness detection entirely — the daemon is
+    // already past the prompt, so we'd inject mid-conversation.
+    let mut prompt_injected = prompt.is_none();
 
     loop {
         match session_protocol::read_frame(&mut stream).await {
@@ -2035,9 +2101,11 @@ async fn forward_agent_io(
                     if readiness_buf.len() > 16 * 1024 {
                         readiness_buf.drain(..readiness_buf.len() - 8 * 1024);
                     }
-                    if is_ready(&readiness_buf) {
+                    if is_ready(&readiness_buf)
+                        && let Some(prompt_bytes) = prompt
+                    {
                         // Inject prompt.
-                        let input_msg = session_protocol::Message::Input(prompt.to_vec());
+                        let input_msg = session_protocol::Message::Input(prompt_bytes.to_vec());
                         session_protocol::write_frame(&mut stream, &input_msg).await?;
                         prompt_injected = true;
                     }
@@ -2068,6 +2136,103 @@ async fn forward_agent_io(
     }
 
     Ok(())
+}
+
+/// Scan `<cwd>/.branchwork-runner-sessions/` for live session-daemon
+/// sockets and reattach to each. Mirrors
+/// [`crate::agents::AgentRegistry::cleanup_and_reattach`] for the
+/// runner-side. Sockets whose owning daemon refuses connection are
+/// reaped: the socket file plus its sibling pidfile are unlinked and
+/// the orphan counter is incremented (one log line per reap so a
+/// pile-up of stale sockets surfaces in the dashboard).
+///
+/// Idempotent: agents already in `state.agents` are skipped, so calling
+/// this on every WebSocket reconnect catches new survivors without
+/// double-spawning I/O tasks for ones we already track.
+async fn cleanup_and_reattach_runner(state: &Arc<RunnerState>) {
+    let sessions_dir = state.cwd.join(".branchwork-runner-sessions");
+    let entries = match std::fs::read_dir(&sessions_dir) {
+        Ok(e) => e,
+        Err(_) => return, // no dir = no agents, common on first boot
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Only look at .sock files; .pid / .log siblings are handled below.
+        if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+            continue;
+        }
+        let agent_id = stem.to_string();
+
+        // Already tracking this agent in-process — skip.
+        if state.agents.lock().await.contains_key(&agent_id) {
+            continue;
+        }
+
+        // Probe the socket. A live daemon accepts connections; a dead one
+        // either has the socket file lingering on disk (Unix doesn't
+        // unlink on process exit) or the kernel returns ECONNREFUSED.
+        match connect_to_socket(&path).await {
+            Ok(_) => {
+                // Live — spawn a forwarder. Drop the probe stream; the
+                // forwarder establishes its own connection (cheaper than
+                // threading a borrowed handle through `tokio::spawn`).
+                let ws_tx = state.ws_tx.clone();
+                let runner_id = state.runner_id.clone();
+                let aid = agent_id.clone();
+                let sock = path.clone();
+                let io_task = tokio::spawn(async move {
+                    if let Err(e) = forward_agent_io(&sock, &ws_tx, &runner_id, &aid, None).await {
+                        log_warn!("[runner] reattached agent {aid} I/O error: {e}");
+                    }
+
+                    // Daemon exited — report.
+                    let stopped = WireMessage::AgentStopped {
+                        agent_id: aid.clone(),
+                        status: "completed".into(),
+                        cost_usd: None,
+                        stop_reason: None,
+                    };
+                    let env = Envelope::best_effort(runner_id.clone(), stopped);
+                    let _ = ws_tx.send(serde_json::to_string(&env).unwrap_or_default());
+                });
+
+                // PID is unknown on reattach (the daemon is detached and
+                // we never had its pid in this process). 0 is the in-tree
+                // sentinel that ShutdownRequest's drain step already
+                // skips; KillAgent uses libc::kill which would treat 0 as
+                // "send to my own process group" — guard there too.
+                state.agents.lock().await.insert(
+                    agent_id.clone(),
+                    AgentHandle {
+                        pid: 0,
+                        socket_path: path.clone(),
+                        io_task,
+                        cwd: state.cwd.clone(),
+                    },
+                );
+                log_info!(
+                    "[runner] reattached agent {agent_id} via {}",
+                    path.display()
+                );
+            }
+            Err(_) => {
+                // Dead socket — reap. Best-effort cleanup of socket +
+                // pidfile sibling. Increment the 24 h orphan counter so
+                // RunnerHealth surfaces this on the dashboard.
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(path.with_extension("pid"));
+                runner_health::record_orphan_reaped();
+                log_warn!(
+                    "[runner] reaped orphan session socket {} (no listener)",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 // ── Outbox integration ──────────────────────────────────────────────────────
@@ -2259,6 +2424,55 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
         }
     }
     Ok(result)
+}
+
+/// Spawn the zombie reaper task. On Unix the runner spawns session
+/// daemons with `setsid` + `pre_exec`, then never `wait()`s them — the
+/// dashboard's expectation is that they outlive the runner. When one
+/// exits before the runner notices, it lingers as `<defunct>` until
+/// reaped. The reaper claims any pending exits every 5 s via
+/// `waitpid(-1, WNOHANG)` and emits a single log line per reap (Task
+/// 11.6 acceptance: at most one line per reaped zombie).
+///
+/// Windows has no zombie semantics in the same way (handles, not PIDs,
+/// hold the exit code) so the reaper is a Unix-only no-op task there:
+/// the function still returns a JoinHandle so the cleanup wiring at the
+/// end of `connect_and_run` is uniform.
+fn spawn_zombie_reaper() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            const TICK: Duration = Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(TICK).await;
+                loop {
+                    let mut status: libc::c_int = 0;
+                    // SAFETY: waitpid is async-signal-safe and the syscall
+                    // returns immediately under WNOHANG. We pass a valid
+                    // pointer for the status output and -1 for "any child."
+                    let pid = unsafe { libc::waitpid(-1, &mut status as *mut _, libc::WNOHANG) };
+                    if pid > 0 {
+                        runner_health::record_orphan_reaped();
+                        log_warn!("[runner] reaped zombie session daemon pid={pid}");
+                        // Loop to drain any other ready zombies in the
+                        // same tick — a burst (e.g. OOM-killer spree)
+                        // gets one log line per reap rather than one
+                        // per tick.
+                        continue;
+                    }
+                    // 0 = no children ready; -1 = no children at all (ECHILD).
+                    break;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows: zombies aren't a thing in the POSIX sense; the
+            // runner-side handle is closed on exit. Sleep forever so the
+            // JoinHandle stays valid.
+            std::future::pending::<()>().await;
+        }
+    })
 }
 
 async fn connect_to_socket(
@@ -3469,5 +3683,97 @@ mod tests {
         handle_server_message(&state, &env).await;
 
         assert!(state.shutdown_requested.load(AtomicOrdering::Relaxed));
+    }
+
+    // ── cleanup_and_reattach_runner (Task 11.6) ────────────────────────────
+
+    #[tokio::test]
+    async fn reattach_reaps_socket_with_no_listener() {
+        // A bare file in `.branchwork-runner-sessions/` named `<id>.sock`
+        // is not a real socket: connect() returns ECONNREFUSED. Reattach
+        // must unlink it (plus the .pid sibling) and bump the orphan
+        // counter so RunnerHealth surfaces a count > 0 next tick.
+        let dir = TempDir::new().unwrap();
+        let (state, _rx) = make_test_state(dir.path().to_path_buf());
+        let sessions_dir = state.cwd.join(".branchwork-runner-sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let sock = sessions_dir.join("ghost.sock");
+        let pid = sessions_dir.join("ghost.pid");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::write(&pid, b"99999\n").unwrap();
+        let baseline = runner_health::orphans_reaped_24h();
+
+        cleanup_and_reattach_runner(&state).await;
+
+        assert!(!sock.exists(), "stale socket must be unlinked");
+        assert!(!pid.exists(), "stale pidfile must be unlinked");
+        assert_eq!(
+            runner_health::orphans_reaped_24h(),
+            baseline + 1,
+            "orphan counter must be bumped",
+        );
+        assert!(
+            state.agents.lock().await.is_empty(),
+            "no listener = no reattach",
+        );
+    }
+
+    #[tokio::test]
+    async fn reattach_skips_already_tracked_agents() {
+        // Idempotency: cleanup_and_reattach_runner runs on every WS
+        // reconnect; agents the runner already tracks must NOT be
+        // double-reattached (would spawn a second forwarder).
+        let dir = TempDir::new().unwrap();
+        let (state, _rx) = make_test_state(dir.path().to_path_buf());
+        let sessions_dir = state.cwd.join(".branchwork-runner-sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let sock = sessions_dir.join("known.sock");
+        // Stale socket file on disk so we can prove the loop visited it.
+        std::fs::write(&sock, b"").unwrap();
+        // Pre-populate state.agents with a matching entry — like a
+        // freshly-spawned agent that's still alive in this process.
+        let dummy_task = tokio::spawn(async {});
+        state.agents.lock().await.insert(
+            "known".to_string(),
+            AgentHandle {
+                pid: 0,
+                socket_path: sock.clone(),
+                io_task: dummy_task,
+                cwd: state.cwd.clone(),
+            },
+        );
+        let baseline = runner_health::orphans_reaped_24h();
+
+        cleanup_and_reattach_runner(&state).await;
+
+        // Known agent stays — and crucially the socket file was NOT
+        // reaped (the reattach loop saw it in state.agents and skipped
+        // the connect probe entirely).
+        assert!(state.agents.lock().await.contains_key("known"));
+        assert!(
+            sock.exists(),
+            "tracked agent's socket must not be reaped on reattach",
+        );
+        assert_eq!(
+            runner_health::orphans_reaped_24h(),
+            baseline,
+            "no orphan must be counted for a tracked agent",
+        );
+    }
+
+    #[tokio::test]
+    async fn reattach_no_sessions_dir_is_a_noop() {
+        // Fresh runner: the sessions dir doesn't exist yet. Reattach
+        // must early-return cleanly — no crash, no spurious counter
+        // bump.
+        let dir = TempDir::new().unwrap();
+        let (state, _rx) = make_test_state(dir.path().to_path_buf());
+        // Confirm there's no sessions dir.
+        assert!(!state.cwd.join(".branchwork-runner-sessions").exists());
+
+        let baseline = runner_health::orphans_reaped_24h();
+        cleanup_and_reattach_runner(&state).await;
+        assert_eq!(runner_health::orphans_reaped_24h(), baseline);
+        assert!(state.agents.lock().await.is_empty());
     }
 }

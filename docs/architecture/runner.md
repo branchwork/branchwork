@@ -624,14 +624,14 @@ A bestiary of how things break and what the dashboard sees:
 - **Recovery:** Restart `branchwork-runner` with the same `--cwd` and
   the same `runner.db` (i.e. don't blow away `~/.branchwork-runner/`).
   The reconnect handshake re-registers the runner, the outbox replays
-  pending events, but the runner has **no mechanism to re-attach to
-  pre-existing session daemons** — the in-memory `state.agents` map is
-  empty, so any future `AgentInput` / `KillAgent` for an old agent is
-  silently dropped. The session daemons will keep running until their
-  driver exits naturally or the operator kills them by hand. This is
-  the runner-side analogue of the self-hosted server's
-  `cleanup_and_reattach` and is currently a gap; it is the second
-  wart in the runner that needs filling in.
+  pending events, and the runner-side `cleanup_and_reattach_runner`
+  (Task 11.6) sweeps `<cwd>/.branchwork-runner-sessions/` for live
+  socket files: each one with a listening daemon is reattached into
+  `state.agents` (so subsequent `AgentInput` / `KillAgent` reach the
+  right socket again), and any socket whose owning daemon is dead is
+  unlinked and counted into `RunnerHealth.orphans_reaped_24h`. The
+  reattach skips prompt re-injection because the daemon is already
+  past its readiness glyph.
 
 ### Customer machine reboot
 

@@ -32,6 +32,13 @@ export interface RunnerHealth {
   /// distinguish "currently green" from "was green 5 minutes ago" when the
   /// runner drops offline.
   lastHealthAt: string | null;
+  /// Trailing-24 h count of session daemons reaped by the runner (Task
+  /// 11.6). Bumped each time the runner finds a stale `<id>.sock` on
+  /// startup or `waitpid`s a detached zombie. `null` until the runner
+  /// has reported once with the field. The dashboard chip surfaces a
+  /// non-zero value so the user knows the silent-rot failure mode
+  /// happened, even after the cleanup ran.
+  orphansReaped24h: number | null;
 }
 
 /// One point on the per-runner sparkline. `ts` is ms-since-epoch; `p50`
@@ -280,6 +287,9 @@ interface RunnerStore {
     ws_reconnects_24h: number;
     ci_poll_ms_p50: number | null;
     ci_poll_ms_p99: number | null;
+    /// Optional for back-compat: older runner builds don't include this
+    /// field. The store treats missing/null as 0 for chip purposes.
+    orphans_reaped_24h?: number | null;
     version_mismatch: VersionMismatch | string;
   }) => void;
   /// Deployment-wide agent counts surfaced by `/api/runners`. Updated on
@@ -606,6 +616,7 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
           ciPollMsP50: payload.ci_poll_ms_p50,
           ciPollMsP99: payload.ci_poll_ms_p99,
           lastHealthAt: nowIso,
+          orphansReaped24h: payload.orphans_reaped_24h ?? null,
         },
       };
       return { runners: next, healthHistoryByRunnerId: nextHistory };
@@ -740,6 +751,12 @@ export const OUTBOX_DEPTH_RED_THRESHOLD = 100;
 /// runner-side `RunnerHealth` doc-comment names.
 export const WS_RECONNECTS_RED_THRESHOLD = 5;
 
+/// Threshold past which the orphans-reaped chip escalates from `warn` to
+/// `danger`. One reap is worth surfacing (silent rot happened) but is not
+/// alarming on its own; a steady stream above this threshold means the
+/// daemon-host-supervisor pairing is unhealthy and deserves a red chip.
+export const ORPHANS_REAPED_RED_THRESHOLD = 5;
+
 /// Severity of the worst metric on a runner row, used to color the
 /// summary-list chip. `none` ⇒ no chip is rendered (the row is healthy).
 export type HealthChipSeverity = "none" | "warn" | "danger";
@@ -774,6 +791,17 @@ export function worstHealthChip(runner: Runner): HealthChip {
   if (runner.versionMismatch === "minor") {
     const v = runner.version ?? "?";
     return { severity: "warn", label: `version ${v}` };
+  }
+  // Orphan reap surfaces below the version-warn so a stable runner with
+  // a recent reap still flags `version` first if both are non-zero.
+  // `null` ⇒ unknown (older runner) ⇒ no chip.
+  const orphans = runner.health?.orphansReaped24h ?? null;
+  if (orphans !== null && orphans > 0) {
+    const severity: HealthChipSeverity = orphans > ORPHANS_REAPED_RED_THRESHOLD ? "danger" : "warn";
+    return {
+      severity,
+      label: `${orphans} orphan${orphans === 1 ? "" : "s"} reaped`,
+    };
   }
   return { severity: "none", label: "" };
 }

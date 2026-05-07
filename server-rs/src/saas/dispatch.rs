@@ -428,6 +428,39 @@ pub fn list_drivers_local(state: &AppState) -> serde_json::Value {
     })
 }
 
+/// Best-effort `KillAgent` fan-out to every currently connected runner.
+///
+/// Used by [`crate::agents::AgentRegistry::cleanup_and_reattach`] for
+/// remote-mode rows that survive a server restart: the server has no
+/// `agents.runner_id` column (today) so it can't pinpoint the owning
+/// runner. Sending the message to every runner is safe — the runner-side
+/// handler in `branchwork_runner.rs::handle_server_message` no-ops on
+/// unknown ids — and idempotent if a runner happens to still have the
+/// agent in memory.
+///
+/// No outbox, no ACK: the call is a hint, not a contract. A runner that
+/// is offline doesn't need the message (its in-memory state is empty
+/// anyway after a process restart) and a runner that is mid-flap will
+/// catch up on next reconnect via cleanup_and_reattach on its own end.
+pub async fn fan_out_kill_agents(state: &AppState, agent_ids: &[String]) {
+    if agent_ids.is_empty() {
+        return;
+    }
+    let runners = state.runners.lock().await;
+    for runner in runners.values() {
+        for agent_id in agent_ids {
+            let env = crate::saas::runner_protocol::Envelope::best_effort(
+                "server".into(),
+                WireMessage::KillAgent {
+                    agent_id: agent_id.clone(),
+                },
+            );
+            let payload = serde_json::to_string(&env).unwrap_or_default();
+            let _ = runner.command_tx.send(payload);
+        }
+    }
+}
+
 /// In-memory cache lookup. Returns `None` when the runner is not
 /// currently connected or when it has not yet sent a hello/auth report.
 async fn read_cached_drivers(

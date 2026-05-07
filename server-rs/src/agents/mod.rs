@@ -339,15 +339,22 @@ impl AgentRegistry {
 
     /// Clean up dead agents and reattach alive ones (from previous server runs).
     ///
-    /// Every row in `running|starting` is either reattached or marked orphaned:
+    /// Every row in `running|starting` is either reattached or marked dead:
     /// - **PTY mode**: if we have a `supervisor_socket`, the daemon PID is
-    ///   alive, and we can reconnect, the agent is live again. Any other
-    ///   outcome (no socket recorded, PID dead, connect refused) → orphaned.
+    ///   alive, and we can reconnect, the agent is live again. PID-dead rows
+    ///   become `killed`/`supervisor_died` (the supervisor specifically went
+    ///   away — usually `kill -9` or OOM); other failures (no socket
+    ///   recorded, connect refused) become `failed`/`orphaned`.
+    /// - **Remote mode** (SaaS runner-managed agents): the runner owns the
+    ///   PID; the server can't probe it locally. Marked
+    ///   `killed`/`supervisor_died` and a best-effort `KillAgent` is fanned
+    ///   out to every online runner so any in-memory state on a survivor
+    ///   matches.
     /// - **Stream-JSON mode** (check agents): the server held the child's
     ///   stdin/stdout; those handles are gone after a crash and there is no
     ///   reattach path. Always orphaned.
     ///
-    /// Broadcasting `agent_stopped` for each orphan is what lets the frontend
+    /// Broadcasting `agent_stopped` for each row is what lets the frontend
     /// unlock task cards — without it, a server crash mid-run leaves
     /// `taskLocked` true forever because the agent row never leaves the
     /// `running`/`starting` set.
@@ -368,14 +375,35 @@ impl AgentRegistry {
             .collect()
         };
 
+        // Collect remote agent ids so we can fan out a KillAgent to every
+        // online runner once the DB rows are flipped. Remote rows that
+        // survive a server restart are suspect: the server does not know
+        // which runner owns them (no `agents.runner_id` column today) and
+        // any runner that still has the agent in memory needs a nudge to
+        // drop it. KillAgent is idempotent on unknown ids, so a fan-out
+        // to every runner is safe.
+        let mut remote_dead: Vec<String> = Vec::new();
+
         for (id, pid, socket, mode) in rows {
-            // Stream-JSON agents have no supervisor: the server itself held
-            // their stdin/stdout. After a restart those handles are gone —
-            // even if the PID happens to still be alive (or has been reused)
-            // we cannot talk to it. Orphan every row unconditionally.
-            if mode != "pty" {
-                self.mark_orphaned(&id, "stream-json agent: IO handles lost on server restart");
-                continue;
+            match mode.as_str() {
+                "remote" => {
+                    self.mark_supervisor_died(
+                        &id,
+                        "remote agent stale on server restart — runner ownership lost",
+                    );
+                    remote_dead.push(id);
+                    continue;
+                }
+                "pty" => {}
+                _ => {
+                    // Stream-JSON agents have no supervisor: the server itself
+                    // held their stdin/stdout. After a restart those handles
+                    // are gone — even if the PID happens to still be alive
+                    // (or has been reused) we cannot talk to it. Orphan
+                    // every row unconditionally.
+                    self.mark_orphaned(&id, "stream-json agent: IO handles lost on server restart");
+                    continue;
+                }
             }
 
             let socket_path = match socket.as_deref() {
@@ -388,7 +416,10 @@ impl AgentRegistry {
 
             let alive = pid.map(process_alive).unwrap_or(false);
             if !alive {
-                self.mark_orphaned(&id, &format!("supervisor PID {pid:?} not alive on boot"));
+                self.mark_supervisor_died(
+                    &id,
+                    &format!("supervisor PID {pid:?} not alive on boot"),
+                );
                 continue;
             }
 
@@ -404,6 +435,18 @@ impl AgentRegistry {
                     &format!("supervisor socket unreachable: {}", socket_path.display()),
                 );
             }
+        }
+
+        // Fan out KillAgent to every online runner so any survivor that still
+        // has these agents in memory drops them. Best-effort: if the runner
+        // is offline / disconnected the message is dropped; if it doesn't
+        // know the agent the handler no-ops. We do this AFTER the DB flips
+        // so the dashboard already shows the rows as terminal by the time
+        // any runner-side state changes echo back.
+        if !remote_dead.is_empty()
+            && let Some(state) = self.app_state.get()
+        {
+            crate::saas::dispatch::fan_out_kill_agents(state, &remote_dead).await;
         }
 
         // Second pass: normalize task_status rows. A task stuck in `checking`
@@ -584,11 +627,47 @@ impl AgentRegistry {
         );
     }
 
+    /// Mark an agent `killed` + stop_reason='supervisor_died' and broadcast
+    /// the change. Used by cleanup_and_reattach (PID dead branch) and the
+    /// 30 s supervisor-liveness poller in `main` for the named-wart case
+    /// where a session daemon was killed out of band (`kill -9`, OOM
+    /// killer) while the row was running. The classification is more
+    /// specific than `orphaned`: the row's history isn't lost, the
+    /// supervisor specifically went away.
+    pub(crate) fn mark_supervisor_died(&self, agent_id: &str, detail: &str) {
+        {
+            let db = self.db.lock().unwrap();
+            db.execute(
+                "UPDATE agents SET status = 'killed', \
+                     stop_reason = 'supervisor_died', \
+                     finished_at = datetime('now') \
+                 WHERE id = ? AND status IN ('running', 'starting')",
+                rusqlite::params![agent_id],
+            )
+            .ok();
+        }
+        broadcast_event(
+            &self.broadcast_tx,
+            "agent_stopped",
+            serde_json::json!({
+                "id": agent_id,
+                "status": "killed",
+                "stop_reason": "supervisor_died",
+                "reason": detail,
+            }),
+        );
+        println!(
+            "[Branchwork] Agent {} marked killed/supervisor_died — {detail}",
+            &agent_id[..8.min(agent_id.len())]
+        );
+    }
+
     /// Mark an agent `failed` + stop_reason='orphaned' and broadcast the
     /// change so any connected browser unlocks the task card without
-    /// waiting for a manual refresh. Used by cleanup_and_reattach when the
-    /// daemon/child PID is not alive — the row was from a previous server
-    /// run whose supervisor did not survive.
+    /// waiting for a manual refresh. Used by cleanup_and_reattach for
+    /// pre-history orphan classes (no socket recorded, stream-json IO
+    /// handles lost). PID-dead rows go through
+    /// [`Self::mark_supervisor_died`] instead.
     fn mark_orphaned(&self, agent_id: &str, detail: &str) {
         {
             let db = self.db.lock().unwrap();
@@ -2012,12 +2091,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_orphans_pty_row_with_dead_supervisor_pid() {
+    async fn cleanup_marks_pty_row_with_dead_pid_as_supervisor_died() {
         let (db, _dir) = fresh_db();
         let (registry, mut rx) = test_registry(db.clone());
 
         // Socket present but PID very unlikely to be alive. i32::MAX is above
-        // the typical pid_max; kill(0) will return ESRCH.
+        // the typical pid_max; kill(0) will return ESRCH. The named-wart
+        // (Task 11.6) classification: the supervisor specifically went
+        // away (kill -9, OOM killer) — the row's history isn't lost, so
+        // `killed`/`supervisor_died` is the right label, not the more
+        // generic `failed`/`orphaned`.
         insert_agent(
             &db,
             "pty-dead",
@@ -2030,15 +2113,43 @@ mod tests {
         registry.cleanup_and_reattach().await;
 
         let (status, reason) = agent_status(&db, "pty-dead");
-        assert_eq!(status, "failed");
-        assert_eq!(reason.as_deref(), Some("orphaned"));
+        assert_eq!(status, "killed");
+        assert_eq!(reason.as_deref(), Some("supervisor_died"));
 
         let events = drain_events(&mut rx);
         assert!(
             events
                 .iter()
-                .any(|e| e.contains("pty-dead") && e.contains("orphaned")),
-            "missing orphan broadcast: {events:?}"
+                .any(|e| e.contains("pty-dead") && e.contains("supervisor_died")),
+            "missing supervisor_died broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_marks_remote_row_as_supervisor_died() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // Remote-mode rows survive a server restart but the server has lost
+        // ownership knowledge: it doesn't know which runner originally took
+        // them, so it can't probe the daemon. Mark every survivor
+        // killed/supervisor_died and rely on dispatch::fan_out_kill_agents
+        // (best-effort, no-op when no runner is connected) to clear any
+        // leftover runner-side state.
+        insert_agent(&db, "remote-stale", "remote", "running", None, None);
+
+        registry.cleanup_and_reattach().await;
+
+        let (status, reason) = agent_status(&db, "remote-stale");
+        assert_eq!(status, "killed");
+        assert_eq!(reason.as_deref(), Some("supervisor_died"));
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("remote-stale") && e.contains("supervisor_died")),
+            "missing supervisor_died broadcast: {events:?}"
         );
     }
 

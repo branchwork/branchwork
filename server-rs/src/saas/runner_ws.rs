@@ -928,6 +928,7 @@ async fn handle_runner_message(
             ws_reconnects_24h,
             ci_poll_ms_p50,
             ci_poll_ms_p99,
+            orphans_reaped_24h,
         } => {
             // Persist the latest snapshot in place — only the most recent
             // values matter, missed ticks are absorbed by the next surviving
@@ -942,13 +943,15 @@ async fn handle_runner_message(
                        ws_reconnects_24h = ?2, \
                        ci_poll_ms_p50 = ?3, \
                        ci_poll_ms_p99 = ?4, \
+                       orphans_reaped_24h = ?5, \
                        last_health_at = datetime('now') \
-                     WHERE id = ?5",
+                     WHERE id = ?6",
                     params![
                         *outbox_depth as i64,
                         *ws_reconnects_24h as i64,
                         ci_poll_ms_p50.map(|v| v as i64),
                         ci_poll_ms_p99.map(|v| v as i64),
+                        *orphans_reaped_24h as i64,
                         runner_id,
                     ],
                 )
@@ -983,6 +986,7 @@ async fn handle_runner_message(
                     "ws_reconnects_24h": ws_reconnects_24h,
                     "ci_poll_ms_p50": ci_poll_ms_p50,
                     "ci_poll_ms_p99": ci_poll_ms_p99,
+                    "orphans_reaped_24h": orphans_reaped_24h,
                     "version": runner_version,
                     "server_version": server_version,
                     "version_mismatch": version_mismatch.as_str(),
@@ -1080,7 +1084,8 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
             .prepare(
                 "SELECT id, name, status, hostname, version, last_seen_at, created_at, \
                         drivers_json, outbox_depth, ws_reconnects_24h, \
-                        ci_poll_ms_p50, ci_poll_ms_p99, last_health_at \
+                        ci_poll_ms_p50, ci_poll_ms_p99, last_health_at, \
+                        orphans_reaped_24h \
                  FROM runners WHERE org_id = ?1 AND removed_at IS NULL \
                  ORDER BY last_seen_at DESC",
             )
@@ -1114,6 +1119,7 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
                     "ciPollMsP50": row.get::<_, Option<i64>>(10)?,
                     "ciPollMsP99": row.get::<_, Option<i64>>(11)?,
                     "lastHealthAt": row.get::<_, Option<String>>(12)?,
+                    "orphansReaped24h": row.get::<_, Option<i64>>(13)?,
                 },
                 "versionMismatch": version_mismatch.as_str(),
                 "serverVersion": server_version,

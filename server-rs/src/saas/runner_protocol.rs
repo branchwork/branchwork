@@ -145,6 +145,16 @@ pub enum WireMessage {
         /// as `ci_poll_ms_p50`.
         #[serde(skip_serializing_if = "Option::is_none")]
         ci_poll_ms_p99: Option<u32>,
+        /// Number of orphaned session daemons reaped in the trailing 24 h
+        /// (Task 11.6 named wart). Bumped from two paths on the runner:
+        /// `cleanup_and_reattach_runner` finding a socket with no
+        /// listener, and the `waitpid` reaper claiming a detached child
+        /// that exited between heartbeats. The dashboard chip surfaces
+        /// the value > 0 so the user knows the silent-rot failure mode
+        /// happened. Defaults to 0 on older runners that don't ship the
+        /// field.
+        #[serde(default)]
+        orphans_reaped_24h: u32,
     },
 
     // ── SaaS -> Runner ──────────────────────────────────────────────────
@@ -2002,6 +2012,7 @@ mod tests {
             ws_reconnects_24h: 1,
             ci_poll_ms_p50: Some(820),
             ci_poll_ms_p99: Some(2100),
+            orphans_reaped_24h: 4,
         };
         assert!(msg.is_best_effort(), "RunnerHealth must be best-effort");
         assert_eq!(msg.event_type(), "runner_health");
@@ -2014,6 +2025,7 @@ mod tests {
         assert!(json.contains("\"ws_reconnects_24h\":1"));
         assert!(json.contains("\"ci_poll_ms_p50\":820"));
         assert!(json.contains("\"ci_poll_ms_p99\":2100"));
+        assert!(json.contains("\"orphans_reaped_24h\":4"));
         // Best-effort variants don't carry seq.
         assert!(!json.contains("\"seq\""));
         let back: Envelope = serde_json::from_str(&json).unwrap();
@@ -2023,11 +2035,13 @@ mod tests {
                 ws_reconnects_24h,
                 ci_poll_ms_p50,
                 ci_poll_ms_p99,
+                orphans_reaped_24h,
             } => {
                 assert_eq!(outbox_depth, 3);
                 assert_eq!(ws_reconnects_24h, 1);
                 assert_eq!(ci_poll_ms_p50, Some(820));
                 assert_eq!(ci_poll_ms_p99, Some(2100));
+                assert_eq!(orphans_reaped_24h, 4);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -2044,11 +2058,34 @@ mod tests {
             ws_reconnects_24h: 0,
             ci_poll_ms_p50: None,
             ci_poll_ms_p99: None,
+            orphans_reaped_24h: 0,
         };
         let env = Envelope::best_effort("r1".into(), msg);
         let json = serde_json::to_string(&env).unwrap();
         assert!(!json.contains("\"ci_poll_ms_p50\""));
         assert!(!json.contains("\"ci_poll_ms_p99\""));
+    }
+
+    #[test]
+    fn runner_health_back_compat_default_orphans_reaped() {
+        // Older runner builds that pre-date Task 11.6 don't emit
+        // `orphans_reaped_24h`. The server must still parse the frame and
+        // default the field to 0 — the `#[serde(default)]` attribute on
+        // the variant locks that contract in.
+        let json =
+            r#"{"runner_id":"r1","type":"runner_health","outbox_depth":2,"ws_reconnects_24h":0}"#;
+        let env: Envelope = serde_json::from_str(json).unwrap();
+        match env.message {
+            WireMessage::RunnerHealth {
+                orphans_reaped_24h,
+                outbox_depth,
+                ..
+            } => {
+                assert_eq!(orphans_reaped_24h, 0, "default must be 0");
+                assert_eq!(outbox_depth, 2);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

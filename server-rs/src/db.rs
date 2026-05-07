@@ -900,6 +900,15 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE runners ADD COLUMN last_health_at TEXT;")
         .ok();
 
+    // Task 11.6: orphans reaped in the trailing 24 h window. Bumped each
+    // time the runner finds a stale session socket on startup or reaps a
+    // detached zombie via waitpid mid-flight. Stays NULL until the first
+    // RunnerHealth tick after the runner upgrades to a 11.6+ build, then
+    // is overwritten in place — same write-through pattern as the other
+    // RunnerHealth columns.
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN orphans_reaped_24h INTEGER;")
+        .ok();
+
     // Per-plan runner affinity (T11.4). One row per pinned plan: presence
     // of the row + `runner_id` set means "this runner only"; absent row
     // means "any online runner" (the historic `pick_runner_for_org`

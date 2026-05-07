@@ -567,6 +567,7 @@ describe("runner-store", () => {
           ciPollMsP50: null,
           ciPollMsP99: null,
           lastHealthAt: null,
+          orphansReaped24h: null,
         },
       }),
     );
@@ -585,6 +586,7 @@ describe("runner-store", () => {
           ciPollMsP50: null,
           ciPollMsP99: null,
           lastHealthAt: null,
+          orphansReaped24h: null,
         },
       }),
     );
@@ -610,6 +612,7 @@ describe("runner-store", () => {
           ciPollMsP50: 100,
           ciPollMsP99: 200,
           lastHealthAt: null,
+          orphansReaped24h: 0,
         },
       }),
     );
@@ -622,6 +625,67 @@ describe("runner-store", () => {
     // off, the Health panel surfaces them as a neutral note.
     const chip = worstHealthChip(
       seedRunner({ id: "r1", version: "0.3.4", versionMismatch: "patch" }),
+    );
+    expect(chip.severity).toBe("none");
+  });
+
+  it("worstHealthChip flags one orphan reaped as warn (Task 11.6)", () => {
+    // A single reap is the canonical "silent rot happened, but cleanup
+    // worked" signal. Surface as warn — operator should know it
+    // happened but it is not a steady-state failure.
+    const chip = worstHealthChip(
+      seedRunner({
+        id: "r1",
+        versionMismatch: "ok",
+        health: {
+          outboxDepth: 0,
+          wsReconnects24h: 0,
+          ciPollMsP50: null,
+          ciPollMsP99: null,
+          lastHealthAt: null,
+          orphansReaped24h: 1,
+        },
+      }),
+    );
+    expect(chip.severity).toBe("warn");
+    expect(chip.label).toContain("1 orphan reaped");
+  });
+
+  it("worstHealthChip escalates to danger past the orphan-reap threshold", () => {
+    const chip = worstHealthChip(
+      seedRunner({
+        id: "r1",
+        versionMismatch: "ok",
+        health: {
+          outboxDepth: 0,
+          wsReconnects24h: 0,
+          ciPollMsP50: null,
+          ciPollMsP99: null,
+          lastHealthAt: null,
+          orphansReaped24h: 12,
+        },
+      }),
+    );
+    expect(chip.severity).toBe("danger");
+    expect(chip.label).toContain("12 orphans reaped");
+  });
+
+  it("worstHealthChip ignores null orphans count (older runner, no signal)", () => {
+    // Pre-Task-11.6 runners don't ship the field; the store coerces
+    // missing values to null and the chip suppresses entirely.
+    const chip = worstHealthChip(
+      seedRunner({
+        id: "r1",
+        versionMismatch: "ok",
+        health: {
+          outboxDepth: 0,
+          wsReconnects24h: 0,
+          ciPollMsP50: null,
+          ciPollMsP99: null,
+          lastHealthAt: null,
+          orphansReaped24h: null,
+        },
+      }),
     );
     expect(chip.severity).toBe("none");
   });

@@ -168,37 +168,40 @@ async fn run_server(cli: Cli) {
     // call would be a programmer error, so swallow the result silently.
     let _ = registry.app_state.set(state.clone());
 
-    // Background: monitor detached agents (check PIDs every 30s)
+    // Background: monitor PTY supervisor liveness every 30s. A daemon that
+    // gets `kill -9`'d (OOM killer, operator typo, runaway debugger) leaves
+    // the agent row at status='running' forever — `on_agent_exit` only
+    // fires on socket EOF and a SIGKILL'd daemon may leave the kernel side
+    // wedged before the read task observes EOF. The 30 s tick is the
+    // backstop that flips dead-PID rows to `killed`/`supervisor_died` so
+    // the dashboard unlocks the task card. Mode-gated to PTY because
+    // remote rows live on a different host (no local PID to probe) and
+    // stream-json rows have no supervisor at all (their status flips
+    // directly through `check_agent`).
+    let registry_monitor = registry.clone();
     let db_monitor = db;
-    let tx_monitor = broadcast_tx.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            let db = db_monitor.lock().unwrap();
-            let mut stmt = db
-                .prepare("SELECT id, pid FROM agents WHERE status IN ('running', 'starting')")
-                .unwrap();
-            let agents: Vec<(String, i64)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .flatten()
-                .collect();
+            let agents: Vec<(String, i64)> = {
+                let db = db_monitor.lock().unwrap();
+                let mut stmt = match db.prepare(
+                    "SELECT id, pid FROM agents \
+                     WHERE status IN ('running', 'starting') \
+                       AND mode = 'pty' AND pid IS NOT NULL",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map(|it| it.flatten().collect())
+                    .unwrap_or_default()
+            };
             for (id, pid) in agents {
-                let alive = agents::process_alive(pid);
-                if !alive {
-                    db.execute(
-                        "UPDATE agents SET status = 'completed', finished_at = datetime('now') WHERE id = ?",
-                        rusqlite::params![id],
-                    ).ok();
-                    crate::ws::broadcast_event(
-                        &tx_monitor,
-                        "agent_stopped",
-                        serde_json::json!({"id": id, "status": "completed", "exit_code": 0}),
-                    );
-                    println!(
-                        "[Branchwork] Detached agent {} (pid {}) finished",
-                        &id[..8.min(id.len())],
-                        pid
+                if !agents::process_alive(pid) {
+                    registry_monitor.mark_supervisor_died(
+                        &id,
+                        &format!("supervisor PID {pid} no longer alive"),
                     );
                 }
             }

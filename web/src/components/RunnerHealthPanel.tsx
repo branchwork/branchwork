@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import {
+  ORPHANS_REAPED_RED_THRESHOLD,
   OUTBOX_DEPTH_RED_THRESHOLD,
   WS_RECONNECTS_RED_THRESHOLD,
   useRunnerStore,
@@ -45,6 +46,7 @@ export function RunnerHealthPanel({ runnerId }: { runnerId: string }) {
   const p50 = health?.ciPollMsP50 ?? null;
   const p99 = health?.ciPollMsP99 ?? null;
   const lastHealthAt = health?.lastHealthAt ?? null;
+  const orphansReaped = health?.orphansReaped24h ?? null;
 
   return (
     <div
@@ -67,6 +69,7 @@ export function RunnerHealthPanel({ runnerId }: { runnerId: string }) {
         <div className="flex flex-col gap-2">
           <ReconnectMetric value={reconnects} />
           <OutboxMetric value={outbox} />
+          <OrphansReapedMetric value={orphansReaped} />
           <VersionMetric runner={runner} serverVersion={serverVersion} />
         </div>
       </div>
@@ -234,6 +237,24 @@ function OutboxMetric({ value }: { value: number | null }) {
       value={value === null ? "—" : value.toString()}
       tone={danger ? "danger" : "neutral"}
       data-testid="outbox-metric"
+    />
+  );
+}
+
+function OrphansReapedMetric({ value }: { value: number | null }) {
+  // null ⇒ runner pre-dates Task 11.6, no chip warning. 0 ⇒ healthy
+  // (neutral). >0 ⇒ silent rot has happened and the runner caught it
+  // (warn). Above the red threshold ⇒ steady-state failure (danger).
+  let tone: MetricTone = "neutral";
+  if (value !== null && value > 0) {
+    tone = value > ORPHANS_REAPED_RED_THRESHOLD ? "danger" : "warn";
+  }
+  return (
+    <MetricRow
+      label="Orphans reaped (24h)"
+      value={value === null ? "—" : value.toString()}
+      tone={tone}
+      data-testid="orphans-reaped-metric"
     />
   );
 }
