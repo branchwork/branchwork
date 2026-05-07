@@ -13,13 +13,17 @@ import { fetchJson, postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
 import { DeletePlanModal } from "./DeletePlanModal.js";
+import { PlanSettings } from "./PlanSettings.js";
 import { Button } from "./ui/Button.js";
 import { Modal } from "./ui/Modal.js";
+import { Tabs } from "./ui/Tabs.js";
 import { TouchTarget } from "./ui/TouchTarget.js";
 import { toastError } from "../lib/toast.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
 import { StaleDataChip } from "./StaleDataChip.js";
 import { CompletedTasksContext } from "../lib/plan-context.js";
+
+type PlanBoardTab = "board" | "settings";
 
 export function PlanBoard() {
   const plan = usePlanStore((s) => s.selectedPlan);
@@ -30,6 +34,7 @@ export function PlanBoard() {
   const [checkingAll, setCheckingAll] = useState(false);
   const [checkingPlan, setCheckingPlan] = useState(false);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<PlanBoardTab>("board");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmCheckAll, setConfirmCheckAll] = useState(false);
@@ -309,50 +314,71 @@ export function PlanBoard() {
       <UncommittedWorkBanner planName={plan.name} />
       <RunnerOfflineBanner planName={plan.name} />
 
-      {/* Status filter */}
-      <div className="flex items-center gap-1 mb-4">
-        <span className="text-[10px] text-gray-600 mr-1">Filter</span>
-        {[
-          { value: null, label: "All" },
-          { value: "pending", label: "Pending", color: "text-gray-400" },
-          { value: "in_progress", label: "Active", color: "text-amber-400" },
-          { value: "completed", label: "Done", color: "text-emerald-400" },
-          { value: "failed", label: "Failed", color: "text-red-400" },
-        ].map((f) => (
-          <TouchTarget key={f.value ?? "all"}>
-            <button
-              onClick={() => setStatusFilter(f.value)}
-              className={`px-2 py-0.5 text-[10px] rounded transition ${
-                statusFilter === f.value
-                  ? `${f.color ?? "text-gray-200"} bg-gray-800 font-semibold`
-                  : "text-gray-600 hover:text-gray-400"
-              }`}
-            >
-              {f.label}
-            </button>
-          </TouchTarget>
-        ))}
-      </div>
+      {/* Tabs: Board (phase cards + filter) vs Settings (per-plan
+          ci_blocking_workflows + phase_verification overrides + repo
+          defaults). The header (title, controls, banners) is shared
+          across both — only the body switches. */}
+      <Tabs<PlanBoardTab>
+        label="Plan view"
+        value={activeTab}
+        onChange={setActiveTab}
+        className="border-b border-gray-800 mb-4"
+        tabs={[
+          { value: "board", label: "Board" },
+          { value: "settings", label: "Settings" },
+        ]}
+      />
 
-      {/* Phase cards -- vertical layout. The CompletedTasksContext
-          provider hoists the plan-wide done/skipped Set to a single
-          allocation per plan render (audit §10 minor): every TaskCard
-          dependency-gate check reads from this Set instead of rebuilding
-          its own. */}
-      <CompletedTasksContext.Provider value={completedSet}>
-        <div className="space-y-3 pb-4">
-          {plan.phases.map((phase) => (
-            <PhaseCard
-              key={phase.number}
-              phase={phase}
-              planName={plan.name}
-              statusFilter={statusFilter}
-            />
-          ))}
-        </div>
-      </CompletedTasksContext.Provider>
+      {activeTab === "board" ? (
+        <>
+          {/* Status filter */}
+          <div className="flex items-center gap-1 mb-4">
+            <span className="text-[10px] text-gray-600 mr-1">Filter</span>
+            {[
+              { value: null, label: "All" },
+              { value: "pending", label: "Pending", color: "text-gray-400" },
+              { value: "in_progress", label: "Active", color: "text-amber-400" },
+              { value: "completed", label: "Done", color: "text-emerald-400" },
+              { value: "failed", label: "Failed", color: "text-red-400" },
+            ].map((f) => (
+              <TouchTarget key={f.value ?? "all"}>
+                <button
+                  onClick={() => setStatusFilter(f.value)}
+                  className={`px-2 py-0.5 text-[10px] rounded transition ${
+                    statusFilter === f.value
+                      ? `${f.color ?? "text-gray-200"} bg-gray-800 font-semibold`
+                      : "text-gray-600 hover:text-gray-400"
+                  }`}
+                >
+                  {f.label}
+                </button>
+              </TouchTarget>
+            ))}
+          </div>
 
-      <VerificationSection verification={plan.verification ?? null} />
+          {/* Phase cards -- vertical layout. The CompletedTasksContext
+              provider hoists the plan-wide done/skipped Set to a single
+              allocation per plan render (audit §10 minor): every TaskCard
+              dependency-gate check reads from this Set instead of rebuilding
+              its own. */}
+          <CompletedTasksContext.Provider value={completedSet}>
+            <div className="space-y-3 pb-4">
+              {plan.phases.map((phase) => (
+                <PhaseCard
+                  key={phase.number}
+                  phase={phase}
+                  planName={plan.name}
+                  statusFilter={statusFilter}
+                />
+              ))}
+            </div>
+          </CompletedTasksContext.Provider>
+
+          <VerificationSection verification={plan.verification ?? null} />
+        </>
+      ) : (
+        <PlanSettings planName={plan.name} />
+      )}
     </div>
   );
 }
