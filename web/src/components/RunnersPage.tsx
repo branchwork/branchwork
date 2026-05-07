@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Navigate } from "react-router-dom";
 import {
   useRunnerStore,
@@ -7,12 +7,14 @@ import {
   type RunnerDriverState,
 } from "../stores/runner-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
+import { useToastStore } from "../stores/toast-store.js";
 import { Banner } from "./ui/Banner.js";
 import { Button } from "./ui/Button.js";
+import { Modal } from "./ui/Modal.js";
 import { RunnerEnrollModal } from "./RunnerEnrollModal.js";
 import { RunnerLogPanel } from "./RunnerLogPanel.js";
 import { formatRelative } from "../lib/time.js";
-import { toastWarn } from "../lib/toast.js";
+import { toastError, toastWarn } from "../lib/toast.js";
 
 const EFFORT_LEVELS: { value: string; label: string }[] = [
   { value: "low", label: "Low" },
@@ -41,9 +43,18 @@ const EFFORT_LEVELS: { value: string; label: string }[] = [
 ///   user away on a cold visit (`mode` is `unknown` until the fetch
 ///   resolves).
 ///
-/// Disconnect is intentionally absent today: the server does not yet
-/// expose a runner-revoke or kill-connection endpoint, and the brief
-/// allows omitting it until the API lands.
+/// - Shutdown / Revoke (T11.2): each row carries two actions. "Request
+///   shutdown" (orange) sends a reliable `WireMessage::ShutdownRequest`
+///   over the runner's WS; the runner is expected to drain its session
+///   daemons and exit. The button flips to a "Requested at <ts>" label
+///   and, after 30s with no `runner_disconnected`, surfaces a "Runner
+///   ignored shutdown — revoke instead?" affordance. "Revoke" (red,
+///   danger) opens a confirmation modal that calls `DELETE
+///   /api/runners/{id}` to drop every runner_token row + soft-delete
+///   the runner record. The runner's next reconnect attempt with the
+///   now-revoked token gets 401. The current WS stays alive until the
+///   runner closes it or the server's keepalive times out — the modal
+///   documents this honestly so the user doesn't expect a kill -9.
 export function RunnersPage() {
   const mode = useRunnerStore((s) => s.mode);
   const loaded = useRunnerStore((s) => s.loaded);
@@ -171,6 +182,8 @@ function RunnerRow({ runner }: { runner: Runner }) {
   const setSelectedRunnerId = useRunnerStore((s) => s.setSelectedRunnerId);
   const isSelected = selectedRunnerId === runner.id;
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [shutdownOpen, setShutdownOpen] = useState(false);
+  const [revokeOpen, setRevokeOpen] = useState(false);
 
   return (
     <li className="px-4 py-3" data-testid="runner-row">
@@ -218,6 +231,11 @@ function RunnerRow({ runner }: { runner: Runner }) {
           >
             {isSelected ? "Selected" : "Select"}
           </button>
+          <RunnerActions
+            runner={runner}
+            onShutdown={() => setShutdownOpen(true)}
+            onRevoke={() => setRevokeOpen(true)}
+          />
         </div>
       </div>
       <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-gray-500">
@@ -242,7 +260,314 @@ function RunnerRow({ runner }: { runner: Runner }) {
           users mental model of "this row is the runner I'm looking at"
           intact. */}
       {isSelected && <RunnerLogPanel runnerId={runner.id} />}
+      <ShutdownRunnerModal
+        open={shutdownOpen}
+        runner={runner}
+        onClose={() => setShutdownOpen(false)}
+      />
+      <RevokeRunnerModal open={revokeOpen} runner={runner} onClose={() => setRevokeOpen(false)} />
     </li>
+  );
+}
+
+/// 30 seconds after a Request-shutdown click, surface a fallback affordance
+/// pointing the operator at Revoke. The brief calls this out explicitly:
+/// "if the runner doesn't disconnect within 30s, a 'Runner ignored
+/// shutdown — revoke token instead?' secondary affordance appears."
+const SHUTDOWN_FALLBACK_MS = 30_000;
+
+/// Action cluster for one runner row: Request shutdown (orange) +
+/// Revoke (red). Pulled out of the row so the row's render stays
+/// readable. Uses the new `Button` "warn" variant for the orange
+/// shutdown button so the audit-log warn pill, banners, and this
+/// button all share the WARN palette.
+function RunnerActions({
+  runner,
+  onShutdown,
+  onRevoke,
+}: {
+  runner: Runner;
+  onShutdown: () => void;
+  onRevoke: () => void;
+}) {
+  const requestedAt = useRunnerStore((s) => s.shutdownRequestedAt[runner.id] ?? null);
+
+  // Timer to flip into the 30s fallback state. `now` rerenders the row
+  // periodically while a request is in flight so the relative label and
+  // the fallback affordance update without a separate parent rerender.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (requestedAt === null) return;
+    const id = setInterval(() => setNow(Date.now()), 5_000);
+    return () => clearInterval(id);
+  }, [requestedAt]);
+
+  const isOnline = runner.status === "online";
+  const isOffline = runner.status === "offline";
+  const elapsed = requestedAt === null ? 0 : now - requestedAt;
+  const ignored = requestedAt !== null && elapsed >= SHUTDOWN_FALLBACK_MS && !isOffline;
+
+  return (
+    <div className="flex items-center gap-2">
+      {requestedAt === null ? (
+        <Button
+          variant="warn"
+          size="sm"
+          onClick={onShutdown}
+          disabled={!isOnline}
+          title={
+            isOnline
+              ? "Ask the runner to drain its session daemons and exit"
+              : "Runner is offline — nothing to ask"
+          }
+          data-testid={`runner-shutdown-${runner.id}`}
+        >
+          Request shutdown
+        </Button>
+      ) : (
+        <span
+          className="text-[11px] px-2 py-0.5 rounded border border-amber-700/50 bg-amber-900/30 text-amber-200"
+          data-testid={`runner-shutdown-requested-${runner.id}`}
+        >
+          {ignored
+            ? "Shutdown ignored"
+            : `Requested ${formatRelative(new Date(requestedAt).toISOString())}`}
+        </span>
+      )}
+      {ignored && (
+        <Button
+          variant="danger"
+          size="sm"
+          onClick={onRevoke}
+          data-testid={`runner-shutdown-fallback-revoke-${runner.id}`}
+        >
+          Revoke instead
+        </Button>
+      )}
+      <Button
+        variant="danger"
+        size="sm"
+        onClick={onRevoke}
+        data-testid={`runner-revoke-${runner.id}`}
+      >
+        Revoke
+      </Button>
+    </div>
+  );
+}
+
+function ShutdownRunnerModal({
+  open,
+  runner,
+  onClose,
+}: {
+  open: boolean;
+  runner: Runner;
+  onClose: () => void;
+}) {
+  const requestRunnerShutdown = useRunnerStore((s) => s.requestRunnerShutdown);
+  const agents = useAgentStore((s) => s.agents);
+  // Today the server does not tag `agents` rows with their `runner_id`
+  // (deployment-wide tally is what /runners shows). For SaaS deployments
+  // with a single runner this matches reality; multi-runner deployments
+  // get a slightly conservative count (any in-flight agent on the
+  // deployment is listed). Callers will not be surprised by an over-
+  // count; the alternative (silently under-count) is worse.
+  const inFlightAgents = useMemo(
+    () => agents.filter((a) => a.status === "running" || a.status === "starting"),
+    [agents],
+  );
+  const [reason, setReason] = useState("");
+  const [confirmInFlight, setConfirmInFlight] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const inFlightCount = inFlightAgents.length;
+  const needsConfirm = inFlightCount > 0;
+  const canSubmit = !submitting && (!needsConfirm || confirmInFlight);
+
+  // Reset the form whenever the modal reopens, otherwise a previous
+  // session's "I understand" checkbox state would carry over.
+  useEffect(() => {
+    if (open) {
+      setReason("");
+      setConfirmInFlight(false);
+      setSubmitting(false);
+    }
+  }, [open]);
+
+  async function submit() {
+    setSubmitting(true);
+    try {
+      const trimmedReason = reason.trim();
+      const resp = await requestRunnerShutdown(runner.id, {
+        reason: trimmedReason.length > 0 ? trimmedReason : undefined,
+        confirmInFlight: needsConfirm ? confirmInFlight : undefined,
+      });
+      useToastStore.getState().push({
+        kind: "success",
+        title: "Shutdown requested",
+        body:
+          resp.inFlightAgents.length > 0
+            ? `${resp.inFlightAgents.length} in-flight agent${
+                resp.inFlightAgents.length === 1 ? "" : "s"
+              } draining; the runner is expected to exit shortly.`
+            : "The runner is expected to exit shortly.",
+      });
+      onClose();
+    } catch (e) {
+      toastError(e, "Shutdown request failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Request runner shutdown"
+      description={`Ask runner "${runner.name?.trim() || runner.id}" to drain its session daemons and exit. This is a request — the runner can ignore it. To stop a wedged runner, revoke its token instead.`}
+    >
+      <div className="mt-3 text-xs text-gray-300 space-y-3">
+        {needsConfirm ? (
+          <div data-testid="shutdown-modal-in-flight">
+            <Banner kind="warn">
+              <p className="font-medium">
+                {inFlightCount} in-flight agent{inFlightCount === 1 ? "" : "s"} will be drained.
+              </p>
+              <ul className="mt-2 list-disc pl-5 space-y-0.5 text-[11px] font-mono text-gray-400 max-h-32 overflow-y-auto">
+                {inFlightAgents.slice(0, 8).map((a) => (
+                  <li key={a.id}>
+                    {a.id} ({a.task_id ?? "no task"})
+                  </li>
+                ))}
+                {inFlightAgents.length > 8 && (
+                  <li className="text-gray-500">… and {inFlightAgents.length - 8} more</li>
+                )}
+              </ul>
+              <p className="mt-2 text-[11px] text-amber-200">
+                Drain (graceful): the runner asks each agent's CLI to exit cleanly. Orphan: if the
+                runner ignores this request, the host operator's process supervisor still owns the
+                kill switch.
+              </p>
+            </Banner>
+          </div>
+        ) : (
+          <p className="text-gray-400">No agents are currently in flight on this deployment.</p>
+        )}
+
+        <label className="block">
+          <span className="text-[11px] font-medium text-gray-300">Reason (optional)</span>
+          <input
+            type="text"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. host upgrade, draining for maintenance"
+            data-testid="shutdown-modal-reason"
+            className="mt-1 w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-indigo-600"
+          />
+          <span className="text-[11px] text-gray-500 mt-1 block">
+            Echoed in the runner's `[runner] shutdown requested by SaaS:` log line.
+          </span>
+        </label>
+
+        {needsConfirm && (
+          <label className="flex items-start gap-2 text-[11px] text-gray-300">
+            <input
+              type="checkbox"
+              checked={confirmInFlight}
+              onChange={(e) => setConfirmInFlight(e.target.checked)}
+              className="mt-0.5"
+              data-testid="shutdown-modal-confirm"
+            />
+            <span>
+              I understand this stops {inFlightCount} in-flight agent
+              {inFlightCount === 1 ? "" : "s"}.
+            </span>
+          </label>
+        )}
+      </div>
+
+      <div className="mt-5 flex items-center justify-end gap-2">
+        <Button variant="secondary" size="sm" onClick={onClose} disabled={submitting}>
+          Cancel
+        </Button>
+        <Button
+          variant="warn"
+          size="sm"
+          onClick={() => void submit()}
+          disabled={!canSubmit}
+          loading={submitting}
+          data-testid="shutdown-modal-submit"
+        >
+          Request shutdown
+        </Button>
+      </div>
+    </Modal>
+  );
+}
+
+function RevokeRunnerModal({
+  open,
+  runner,
+  onClose,
+}: {
+  open: boolean;
+  runner: Runner;
+  onClose: () => void;
+}) {
+  const revokeRunner = useRunnerStore((s) => s.revokeRunner);
+  const [submitting, setSubmitting] = useState(false);
+
+  async function submit() {
+    setSubmitting(true);
+    try {
+      const resp = await revokeRunner(runner.id);
+      useToastStore.getState().push({
+        kind: "success",
+        title: "Runner revoked",
+        body: `${resp.tokensRevoked} token${resp.tokensRevoked === 1 ? "" : "s"} revoked. The runner cannot reconnect without re-running the install command.`,
+      });
+      onClose();
+    } catch (e) {
+      toastError(e, "Revoke failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Revoke runner"
+      description={`Revoke runner "${runner.name?.trim() || runner.id}". This deletes its enrolment tokens and removes it from the active list.`}
+    >
+      <div className="mt-3 space-y-3" data-testid="revoke-modal-warning">
+        <Banner kind="warn">
+          <p className="font-medium">This action cannot be undone.</p>
+          <p className="mt-1 text-[11px] text-amber-200">
+            The runner will be unable to reconnect without re-running the install command. The
+            current connection stays alive until the runner closes it or the server's keepalive
+            timeout fires — revoke is not a kill -9.
+          </p>
+        </Banner>
+      </div>
+      <div className="mt-5 flex items-center justify-end gap-2">
+        <Button variant="secondary" size="sm" onClick={onClose} disabled={submitting}>
+          Cancel
+        </Button>
+        <Button
+          variant="danger"
+          size="sm"
+          onClick={() => void submit()}
+          disabled={submitting}
+          loading={submitting}
+          data-testid="revoke-modal-submit"
+        >
+          Revoke runner
+        </Button>
+      </div>
+    </Modal>
   );
 }
 

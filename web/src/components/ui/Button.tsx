@@ -1,7 +1,7 @@
 import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from "react";
-import { BRAND, DANGER, MUTED } from "../../lib/tokens.js";
+import { BRAND, DANGER, MUTED, WARN } from "../../lib/tokens.js";
 
-export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
+export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger" | "warn";
 export type ButtonSize = "sm" | "md";
 
 /// Variant class strings shared with `IconButton`. Re-exported so the
@@ -12,6 +12,12 @@ export const BUTTON_VARIANT_CLASSES: Record<ButtonVariant, string> = {
   secondary: `${MUTED.solidBg} border ${MUTED.softBorder} ${MUTED.solidText} hover:border-gray-600 disabled:opacity-50`,
   ghost: "bg-transparent text-gray-300 hover:text-gray-100 disabled:opacity-50",
   danger: `${DANGER.solidBg} ${DANGER.solidBgHover} ${DANGER.solidText} disabled:opacity-50`,
+  /// Amber/warn surface used for non-destructive but-attention-needed
+  /// actions: "Request shutdown" on the runner row sits between the
+  /// gray Settings/Select buttons and the red Revoke. Picks up the
+  /// shared WARN token so the audit-log warn pill, banners, and this
+  /// button all read the same hue.
+  warn: `${WARN.solidBg} ${WARN.solidBgHover} ${WARN.solidText} disabled:opacity-50`,
 };
 
 const SIZE_CLASSES: Record<ButtonSize, string> = {

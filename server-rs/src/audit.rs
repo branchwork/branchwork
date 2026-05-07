@@ -47,6 +47,19 @@ pub mod actions {
     /// `{runner_id, effort: Option<String>, skip_permissions: Option<bool>}`,
     /// where `null` means the override was cleared (back to inherit).
     pub const CONFIG_RUNNER_OVERRIDE: &str = "config.runner_override";
+    /// `POST /api/runners/{id}/shutdown` — operator clicked "Request
+    /// shutdown" on the dashboard. The server enqueued a reliable
+    /// `WireMessage::ShutdownRequest` to the runner; whether the runner
+    /// honored it is a separate observation (the row flips to
+    /// `runner_disconnected` if it did). Diff carries
+    /// `{runner_id, reason: Option<String>, in_flight_agents: Vec<String>}`.
+    pub const RUNNER_SHUTDOWN_REQUESTED: &str = "runner.shutdown_requested";
+    /// `DELETE /api/runners/{id}` — operator revoked a runner from the
+    /// dashboard: every `runner_tokens` row for the runner is deleted (so
+    /// the next reconnect fails 401 at the WS upgrade) and the `runners`
+    /// row is soft-deleted via `removed_at`. Diff carries
+    /// `{runner_id, runner_name, tokens_revoked: usize}`.
+    pub const RUNNER_REVOKED: &str = "runner.revoked";
     pub const ORG_MEMBER_ADD: &str = "org.member_add";
     pub const ORG_MEMBER_REMOVE: &str = "org.member_remove";
     pub const ORG_MEMBER_ROLE_CHANGE: &str = "org.member_role_change";
@@ -94,6 +107,7 @@ pub mod resources {
     pub const USER: &str = "user";
     pub const CONFIG: &str = "config";
     pub const SSO_PROVIDER: &str = "sso_provider";
+    pub const RUNNER: &str = "runner";
 }
 
 /// A single audit log entry as returned by the API.

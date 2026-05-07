@@ -364,4 +364,101 @@ describe("runner-store", () => {
     useRunnerStore.getState().reset();
     expect(useRunnerStore.getState().logsByRunnerId).toEqual({});
   });
+
+  it("requestRunnerShutdown POSTs to /shutdown with reason+confirm and stamps shutdownRequestedAt", async () => {
+    let postBody: unknown = null;
+    let postPath: string | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+        const path = typeof input === "string" ? input : (input as Request).url;
+        postPath = path;
+        postBody = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          JSON.stringify({ queued: true, seq: 7, inFlightAgents: ["a-1", "a-2"] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    const before = Date.now();
+    const resp = await useRunnerStore
+      .getState()
+      .requestRunnerShutdown("runner-77", { reason: "host upgrade", confirmInFlight: true });
+    expect(resp).toEqual({ queued: true, seq: 7, inFlightAgents: ["a-1", "a-2"] });
+    expect(postPath).toMatch(/\/api\/runners\/runner-77\/shutdown$/);
+    expect(postBody).toEqual({ reason: "host upgrade", confirmInFlight: true });
+    const stamp = useRunnerStore.getState().shutdownRequestedAt["runner-77"];
+    expect(stamp).toBeGreaterThanOrEqual(before);
+  });
+
+  it("revokeRunner DELETEs /api/runners/{id} and removes the row from runners", async () => {
+    useRunnerStore.setState({
+      mode: "saas",
+      loaded: true,
+      runners: [seedRunner({ id: "r1" }), seedRunner({ id: "r2", name: "secondary" })],
+      driversByRunnerId: { r1: [], r2: [] },
+      shutdownRequestedAt: { r1: 1234 },
+      configByRunnerId: {
+        r1: {
+          runnerId: "r1",
+          effort: "high",
+          skipPermissions: false,
+          override: { effort: null, skipPermissions: null },
+        },
+      },
+    });
+    let calledMethod: string | null = null;
+    let calledPath: string | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+        calledMethod = init?.method ?? "GET";
+        calledPath = typeof input === "string" ? input : (input as Request).url;
+        return new Response(JSON.stringify({ revoked: true, tokensRevoked: 1 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    const resp = await useRunnerStore.getState().revokeRunner("r1");
+    expect(resp).toEqual({ revoked: true, tokensRevoked: 1 });
+    expect(calledMethod).toBe("DELETE");
+    expect(calledPath).toMatch(/\/api\/runners\/r1$/);
+    const s = useRunnerStore.getState();
+    expect(s.runners.map((r) => r.id)).toEqual(["r2"]);
+    expect(s.driversByRunnerId).not.toHaveProperty("r1");
+    expect(s.shutdownRequestedAt).not.toHaveProperty("r1");
+    expect(s.configByRunnerId).not.toHaveProperty("r1");
+  });
+
+  it("revokeRunner reassigns selectedRunnerId when the revoked runner was selected", async () => {
+    useRunnerStore.setState({
+      mode: "saas",
+      loaded: true,
+      runners: [seedRunner({ id: "r1" }), seedRunner({ id: "r2", name: "second" })],
+      selectedRunnerId: "r1",
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ revoked: true, tokensRevoked: 1 }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      ),
+    );
+    await useRunnerStore.getState().revokeRunner("r1");
+    expect(useRunnerStore.getState().selectedRunnerId).toBe("r2");
+  });
+
+  it("applyDisconnected clears shutdownRequestedAt so the 30s fallback does not fire", () => {
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1" })],
+      shutdownRequestedAt: { r1: Date.now() - 60_000 },
+    });
+    useRunnerStore.getState().applyDisconnected({ runner_id: "r1" });
+    expect(useRunnerStore.getState().shutdownRequestedAt).not.toHaveProperty("r1");
+    expect(useRunnerStore.getState().runners[0].status).toBe("offline");
+  });
 });

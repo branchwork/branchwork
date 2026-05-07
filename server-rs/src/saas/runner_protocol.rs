@@ -137,6 +137,28 @@ pub enum WireMessage {
     /// Kill a running agent.
     KillAgent { agent_id: String },
 
+    /// Operator clicked "Request shutdown" on the dashboard. The runner is
+    /// expected to stop accepting new work, gracefully drain its session
+    /// daemons (matching the supervisor's existing graceful-exit sequence),
+    /// and exit cleanly.
+    ///
+    /// **Reliable**: outbox-backed and replayed if the runner disconnects
+    /// before consuming it. The operator's intent should survive a flap —
+    /// a runner that reconnects after a transient network blip should
+    /// still honor the shutdown.
+    ///
+    /// The runner is free to ignore this if it is wedged or refuses; the
+    /// server has no way to force-kill (no inbound path). If the runner
+    /// ignores, the dashboard's secondary affordance is to revoke the
+    /// token via `DELETE /api/runners/{id}`.
+    ShutdownRequest {
+        /// Free-form human-readable reason emitted by the operator. Echoed
+        /// in the runner's structured log line so the host operator (the
+        /// only one with kill -9) can correlate.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// Resize the agent's PTY.
     ResizeTerminal {
         agent_id: String,
@@ -667,6 +689,7 @@ impl WireMessage {
             WireMessage::RunnerLogLine { .. } => "runner_log_line",
             WireMessage::StartAgent { .. } => "start_agent",
             WireMessage::KillAgent { .. } => "kill_agent",
+            WireMessage::ShutdownRequest { .. } => "shutdown_request",
             WireMessage::ResizeTerminal { .. } => "resize_terminal",
             WireMessage::AgentInput { .. } => "agent_input",
             WireMessage::TerminalReplay { .. } => "terminal_replay",
@@ -1930,6 +1953,47 @@ mod tests {
                 assert_eq!(level, "warn");
                 assert_eq!(line, "[truncated 42 lines]");
             }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shutdown_request_is_reliable() {
+        // Acceptance criterion: ShutdownRequest must be classified reliable
+        // so the outbox replays it on reconnect — a runner that flaps mid-
+        // shutdown should still honor the operator's intent.
+        let msg = WireMessage::ShutdownRequest { reason: None };
+        assert!(!msg.is_best_effort(), "ShutdownRequest must be reliable");
+        assert_eq!(msg.event_type(), "shutdown_request");
+    }
+
+    #[test]
+    fn shutdown_request_round_trip_with_reason() {
+        let msg = WireMessage::ShutdownRequest {
+            reason: Some("operator clicked Request shutdown".into()),
+        };
+        let env = Envelope::reliable("server".into(), 7, msg);
+        let json = serde_json::to_string(&env).unwrap();
+        // Wire shape: tagged union with snake_case discriminator.
+        assert!(json.contains("\"type\":\"shutdown_request\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::ShutdownRequest { reason } => {
+                assert_eq!(reason.as_deref(), Some("operator clicked Request shutdown"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shutdown_request_round_trip_without_reason() {
+        // The dashboard may omit `reason` entirely. Older runner builds that
+        // predate this variant get a parse error and ignore the frame, which
+        // is the same effective outcome as ignoring the request.
+        let json = r#"{"seq":3,"runner_id":"server","type":"shutdown_request"}"#;
+        let env: Envelope = serde_json::from_str(json).unwrap();
+        match env.message {
+            WireMessage::ShutdownRequest { reason } => assert!(reason.is_none()),
             other => panic!("unexpected variant: {other:?}"),
         }
     }

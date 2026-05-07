@@ -785,6 +785,16 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE runner_tokens ADD COLUMN claimed_runner_id TEXT;")
         .ok();
 
+    // Soft-delete marker for revoked runners (DELETE /api/runners/{id}).
+    // NULL means the runner is active; a datetime stamp means the operator
+    // revoked the runner from the dashboard. We keep the row so historic
+    // `agents.runner_id` references stay resolvable, but `list_runners`
+    // filters them out so the UI doesn't show ghosts. The companion
+    // revoke step deletes every `runner_tokens` row for the runner_name +
+    // org so the next reconnect attempt fails the WS upgrade with 401.
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN removed_at TEXT;")
+        .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 

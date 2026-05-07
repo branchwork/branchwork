@@ -31,6 +31,8 @@ use crate::audit;
 use crate::auth::AuthUser;
 use crate::config::Effort;
 use crate::db::{RunnerConfig, runner_config, set_runner_config};
+use crate::saas::outbox;
+use crate::saas::runner_protocol::{Envelope, WireMessage};
 use crate::state::AppState;
 
 /// Body for `PUT /api/runners/{id}/config`. Each field uses
@@ -210,11 +212,229 @@ pub async fn put_runner_config(
 fn runner_belongs_to_org(state: &AppState, runner_id: &str, org_id: &str) -> bool {
     let conn = state.db.lock().unwrap();
     conn.query_row(
-        "SELECT 1 FROM runners WHERE id = ?1 AND org_id = ?2",
+        "SELECT 1 FROM runners WHERE id = ?1 AND org_id = ?2 AND removed_at IS NULL",
         params![runner_id, org_id],
         |_row| Ok(()),
     )
     .is_ok()
+}
+
+/// Body for `POST /api/runners/{id}/shutdown`. Both fields are optional —
+/// the dashboard sends an explicit confirmation flag for in-flight agents
+/// (the modal's "I understand" checkbox) and a free-form reason that is
+/// echoed back to the runner for the operator's log.
+#[derive(Deserialize)]
+pub struct RunnerShutdownBody {
+    /// Free-form reason the operator typed (e.g. "host upgrade"); echoed
+    /// in the runner's `[runner] shutdown requested by SaaS:` log line.
+    /// `None` is fine — the runner just logs `(no reason given)`.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Set by the dashboard after the user checks the "I understand this
+    /// stops N in-flight agent(s)" box. The server still inspects the
+    /// agents row count itself; this flag is documentation, not auth.
+    #[serde(default, rename = "confirmInFlight")]
+    pub _confirm_in_flight: Option<bool>,
+}
+
+/// `POST /api/runners/{id}/shutdown` — ask the runner to drain and exit.
+///
+/// Reliable delivery: enqueued in `inbox_pending` so a runner that's
+/// transiently disconnected still picks up the request on its next
+/// reconnect. The runner is free to ignore (or be wedged); revoking the
+/// token via `DELETE /api/runners/{id}` is the next escalation.
+///
+/// Response: `200 { queued: true, inFlightAgents: [...] }` on success;
+/// `404` when the runner doesn't belong to the caller's org or has been
+/// soft-deleted already.
+pub async fn shutdown_runner(
+    State(state): State<AppState>,
+    Path(runner_id): Path<String>,
+    user: AuthUser,
+    Json(body): Json<RunnerShutdownBody>,
+) -> impl IntoResponse {
+    if !runner_belongs_to_org(&state, &runner_id, &user.org_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "runner_not_found" })),
+        )
+            .into_response();
+    }
+
+    // Snapshot in-flight agents — both for the audit row and the response
+    // body. The dashboard may surface this as a follow-up notification if
+    // any of these agents fail to drain cleanly. Filter to runner-owned
+    // (mode='remote') AND status in {starting,running} to match the
+    // dashboard's "in-flight" semantics.
+    let in_flight: Vec<String> = {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM agents \
+                 WHERE org_id = ?1 AND mode = 'remote' \
+                   AND status IN ('starting', 'running')",
+            )
+            .expect("prepare agents query");
+        stmt.query_map(params![user.org_id], |row| row.get::<_, String>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    };
+
+    let message = WireMessage::ShutdownRequest {
+        reason: body.reason.clone(),
+    };
+    let payload = serde_json::to_string(&message).unwrap_or_default();
+    let seq = {
+        let conn = state.db.lock().unwrap();
+        outbox::enqueue_server_command(&conn, &runner_id, message.event_type(), &payload)
+    };
+    let envelope = Envelope::reliable("server".to_string(), seq, message);
+    let env_json = serde_json::to_string(&envelope).unwrap_or_default();
+
+    // Push immediately if the runner is currently online. The outbox
+    // covers reconnect — push-immediately covers "online right now" so
+    // the operator sees a fast response in the common case.
+    if let Some(runner) = state.runners.lock().await.get(&runner_id) {
+        let _ = runner.command_tx.send(env_json);
+    }
+
+    // Audit. Use the new RUNNER resource type so the activity-log filter
+    // can group shutdown + revoke entries together.
+    let diff = serde_json::json!({
+        "runner_id": runner_id,
+        "reason": body.reason,
+        "in_flight_agents": in_flight,
+    })
+    .to_string();
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            &user.org_id,
+            Some(&user.id),
+            Some(&user.email),
+            audit::actions::RUNNER_SHUTDOWN_REQUESTED,
+            audit::resources::RUNNER,
+            Some(&runner_id),
+            Some(&diff),
+        );
+    }
+
+    Json(serde_json::json!({
+        "queued": true,
+        "seq": seq,
+        "inFlightAgents": in_flight,
+    }))
+    .into_response()
+}
+
+/// `DELETE /api/runners/{id}` — revoke the runner.
+///
+/// Server-side only. Two SQL operations under a single lock:
+///  - delete every `runner_tokens` row whose `claimed_runner_id = ?1` so
+///    the runner's persisted token can no longer authenticate; the next
+///    WS upgrade attempt fails with 401 in `validate_runner_token`.
+///  - set `runners.removed_at = datetime('now')` so `list_runners`
+///    filters the row out. We do NOT hard-delete: the `agents` rows that
+///    reference this runner stay resolvable for historic terminal logs
+///    and audit links.
+///
+/// Response: `200 { revoked: true, tokensRevoked: <usize> }`. `404` when
+/// the runner doesn't belong to the caller's org or has already been
+/// revoked.
+///
+/// The current WS connection (if any) stays alive until the runner
+/// closes it or the keepalive times out; the dashboard documents this in
+/// the confirmation modal so the user doesn't expect a kill -9.
+pub async fn delete_runner(
+    State(state): State<AppState>,
+    Path(runner_id): Path<String>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    let runner_name: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT name FROM runners WHERE id = ?1 AND org_id = ?2 AND removed_at IS NULL",
+            params![runner_id, user.org_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+
+    // Membership + double-revoke check rolled in: if the SELECT above came
+    // back empty, the row either doesn't exist, isn't ours, or was already
+    // revoked. All three map to 404 — the dashboard won't render a Revoke
+    // button against a row in any of those states.
+    if !runner_belongs_to_org(&state, &runner_id, &user.org_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "runner_not_found" })),
+        )
+            .into_response();
+    }
+
+    let tokens_revoked: usize = {
+        let conn = state.db.lock().unwrap();
+        // Delete tokens claimed by this runner. There may be 0 (token was
+        // never claimed because the runner never connected) or 1+ (an
+        // operator may have re-issued a token without revoking the old
+        // one). Either way: every row that points at this runner_id goes.
+        let revoked = conn
+            .execute(
+                "DELETE FROM runner_tokens WHERE claimed_runner_id = ?1 AND org_id = ?2",
+                params![runner_id, user.org_id],
+            )
+            .unwrap_or(0);
+        // Soft-delete the runner row.
+        conn.execute(
+            "UPDATE runners SET removed_at = datetime('now') WHERE id = ?1 AND org_id = ?2",
+            params![runner_id, user.org_id],
+        )
+        .ok();
+        revoked
+    };
+
+    // Drop the in-memory ConnectedRunner handle so future commands fail
+    // fast instead of being silently sent to a now-doomed WS. We do NOT
+    // close the WS here — the runner's read loop will see the next ACK
+    // attempt fail (or the keepalive will fire) and shut itself down.
+    state.runners.lock().await.remove(&runner_id);
+
+    let diff = serde_json::json!({
+        "runner_id": runner_id,
+        "runner_name": runner_name,
+        "tokens_revoked": tokens_revoked,
+    })
+    .to_string();
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            &user.org_id,
+            Some(&user.id),
+            Some(&user.email),
+            audit::actions::RUNNER_REVOKED,
+            audit::resources::RUNNER,
+            Some(&runner_id),
+            Some(&diff),
+        );
+    }
+
+    // Dashboard listens for `runner_disconnected` via the WS broadcast;
+    // synthesize one here so the runner-store flips to offline / disappears
+    // immediately, regardless of whether the runner WS is still up.
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "runner_disconnected",
+        serde_json::json!({ "runner_id": runner_id, "reason": "revoked" }),
+    );
+
+    Json(serde_json::json!({
+        "revoked": true,
+        "tokensRevoked": tokens_revoked,
+    }))
+    .into_response()
 }
 
 /// Resolve the values the SaaS dispatcher should ship in `StartAgent`:
@@ -277,5 +497,320 @@ mod tests {
         };
         let (_, skip) = resolve_for_dispatch(&cfg, "high", false);
         assert!(skip);
+    }
+
+    // ── Shutdown / revoke endpoints (Task 11.2) ──────────────────────────────
+
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use rusqlite::params;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+
+    use crate::auth::AuthUser;
+    use crate::saas::runner_protocol::Envelope;
+    use crate::saas::runner_ws::{
+        ConnectedRunner, RunnerRegistry, RunnerResponse, new_runner_registry,
+    };
+
+    fn full_db() -> (crate::db::Db, tempfile::TempDir) {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::init(&tempdir.path().join("test.db"));
+        (db, tempdir)
+    }
+
+    fn seed_runner_with_token(
+        db: &crate::db::Db,
+        runner_id: &str,
+        org_id: &str,
+        user_id: &str,
+        token_hash: &str,
+    ) {
+        let conn = db.lock().unwrap();
+        // The migration auto-creates a default-user inside default-org. For
+        // any other org we'd seed our own user, but every test here uses
+        // default-org to keep the FK chain happy.
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, email, password_hash) \
+             VALUES (?1, 'tester@example.com', 'x')",
+            params![user_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runners (id, name, org_id, status, last_seen_at) \
+             VALUES (?1, 'test', ?2, 'online', datetime('now'))",
+            params![runner_id, org_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runner_tokens \
+             (token_hash, runner_name, org_id, created_by, claimed_runner_id) \
+             VALUES (?1, 'test', ?2, ?3, ?4)",
+            params![token_hash, org_id, user_id, runner_id],
+        )
+        .unwrap();
+    }
+
+    async fn install_capturing_runner(
+        registry: &RunnerRegistry,
+        runner_id: &str,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<RunnerResponse>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (cmd_tx, rx) = mpsc::unbounded_channel::<String>();
+        registry.lock().await.insert(
+            runner_id.to_string(),
+            ConnectedRunner {
+                command_tx: cmd_tx,
+                hostname: None,
+                version: None,
+                drivers: None,
+                pending,
+            },
+        );
+        rx
+    }
+
+    fn test_app_state(db: crate::db::Db, runners: RunnerRegistry) -> AppState {
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let plans_dir = PathBuf::from("/tmp/branchwork-test-plans-runners");
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            plans_dir.clone(),
+            PathBuf::from("/tmp/branchwork-test-claude-runners"),
+            0,
+            true,
+        );
+        AppState {
+            db,
+            plans_dir,
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners,
+            settings_path: PathBuf::from("/tmp/branchwork-test-settings-runners.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    fn auth_user(org_id: &str, user_id: &str) -> AuthUser {
+        AuthUser {
+            id: user_id.to_string(),
+            email: "tester@example.com".to_string(),
+            org_id: org_id.to_string(),
+            org_role: "owner".to_string(),
+        }
+    }
+
+    /// Drain the response body into a JSON Value so the assertions can poke
+    /// at fields without re-deriving the response type.
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    #[tokio::test]
+    async fn shutdown_endpoint_enqueues_reliable_command_and_pushes_to_runner() {
+        let (db, _td) = full_db();
+        let user_id = "tester-1";
+        seed_runner_with_token(&db, "runner-shut-1", "default-org", user_id, "hash-1");
+
+        let runners = new_runner_registry();
+        let mut envelope_rx = install_capturing_runner(&runners, "runner-shut-1").await;
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = shutdown_runner(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("runner-shut-1".to_string()),
+            auth_user("default-org", user_id),
+            axum::Json(RunnerShutdownBody {
+                reason: Some("host upgrade".into()),
+                _confirm_in_flight: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["queued"], serde_json::json!(true));
+        assert!(json["seq"].is_number(), "seq missing in {json}");
+
+        // Online runner must have received the envelope on its command_tx.
+        let raw = tokio::time::timeout(std::time::Duration::from_millis(500), envelope_rx.recv())
+            .await
+            .expect("envelope arrives within 500ms")
+            .expect("channel still open");
+        let env: Envelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(env.message.event_type(), "shutdown_request");
+        match env.message {
+            WireMessage::ShutdownRequest { reason } => {
+                assert_eq!(reason.as_deref(), Some("host upgrade"));
+            }
+            other => panic!("expected ShutdownRequest, got {other:?}"),
+        }
+
+        // Reliable: must have hit the outbox so a flap also picks it up.
+        let pending_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM inbox_pending \
+                 WHERE runner_id = 'runner-shut-1' AND command_type = 'shutdown_request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pending_count, 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_endpoint_404s_for_unknown_runner() {
+        let (db, _td) = full_db();
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let resp = shutdown_runner(
+            axum::extract::State(state),
+            axum::extract::Path("never-existed".to_string()),
+            auth_user("default-org", "default-user"),
+            axum::Json(RunnerShutdownBody {
+                reason: None,
+                _confirm_in_flight: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_endpoint_revokes_tokens_and_soft_deletes_runner() {
+        let (db, _td) = full_db();
+        let user_id = "tester-2";
+        seed_runner_with_token(&db, "runner-revoke-1", "default-org", user_id, "hash-r1");
+
+        let runners = new_runner_registry();
+        let _envelope_rx = install_capturing_runner(&runners, "runner-revoke-1").await;
+        let state = test_app_state(db.clone(), runners.clone());
+
+        // Precondition: token present, runner not soft-deleted.
+        let tokens_pre: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM runner_tokens WHERE claimed_runner_id = ?1",
+                params!["runner-revoke-1"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(tokens_pre, 1);
+
+        let resp = delete_runner(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("runner-revoke-1".to_string()),
+            auth_user("default-org", user_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["revoked"], serde_json::json!(true));
+        assert_eq!(json["tokensRevoked"], serde_json::json!(1));
+
+        // Tokens are gone — next reconnect with the now-revoked token will
+        // fail validate_runner_token (NULL row return) at the WS upgrade.
+        let tokens_post: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM runner_tokens WHERE claimed_runner_id = ?1",
+                params!["runner-revoke-1"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(tokens_post, 0);
+
+        // Runner row soft-deleted via removed_at — list_runners filters on it.
+        let removed_at: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT removed_at FROM runners WHERE id = ?1",
+                params!["runner-revoke-1"],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+        assert!(removed_at.is_some(), "removed_at must be set");
+
+        // In-memory ConnectedRunner handle must be dropped so future
+        // commands fail fast instead of routing to a doomed WS.
+        assert!(
+            !runners.lock().await.contains_key("runner-revoke-1"),
+            "ConnectedRunner handle must be removed on revoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_endpoint_404s_on_double_revoke() {
+        let (db, _td) = full_db();
+        let user_id = "tester-3";
+        seed_runner_with_token(&db, "runner-double", "default-org", user_id, "hash-double");
+
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let r1 = delete_runner(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("runner-double".to_string()),
+            auth_user("default-org", user_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let r2 = delete_runner(
+            axum::extract::State(state),
+            axum::extract::Path("runner-double".to_string()),
+            auth_user("default-org", user_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            r2.status(),
+            StatusCode::NOT_FOUND,
+            "second revoke must 404 because removed_at is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_runner_is_filtered_from_runner_belongs_to_org() {
+        // Defends the pivot in `runner_belongs_to_org` against accidental
+        // regression: shutdown/config/delete must all 404 on a soft-deleted
+        // runner so the dashboard cannot keep mutating a runner the user
+        // already revoked.
+        let (db, _td) = full_db();
+        let user_id = "tester-4";
+        seed_runner_with_token(&db, "runner-soft", "default-org", user_id, "hash-soft");
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE runners SET removed_at = datetime('now') WHERE id = ?1",
+                params!["runner-soft"],
+            )
+            .unwrap();
+        }
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+        assert!(!runner_belongs_to_org(&state, "runner-soft", "default-org"));
     }
 }

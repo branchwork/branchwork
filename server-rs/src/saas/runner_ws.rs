@@ -865,6 +865,7 @@ async fn handle_runner_message(
         WireMessage::Pong {}
         | WireMessage::StartAgent { .. }
         | WireMessage::KillAgent { .. }
+        | WireMessage::ShutdownRequest { .. }
         | WireMessage::ResizeTerminal { .. }
         | WireMessage::AgentInput { .. }
         | WireMessage::TerminalReplay { .. }
@@ -929,7 +930,8 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
             .prepare(
                 "SELECT id, name, status, hostname, version, last_seen_at, created_at, \
                         drivers_json \
-                 FROM runners WHERE org_id = ?1 ORDER BY last_seen_at DESC",
+                 FROM runners WHERE org_id = ?1 AND removed_at IS NULL \
+                 ORDER BY last_seen_at DESC",
             )
             .unwrap();
         stmt.query_map(params![user.org_id], |row| {

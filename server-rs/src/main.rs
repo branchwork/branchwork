@@ -457,6 +457,14 @@ async fn run_server(cli: Cli) {
             "/api/runners/{runner_id}/config",
             get(api::runners::get_runner_config).put(api::runners::put_runner_config),
         )
+        .route(
+            "/api/runners/{runner_id}/shutdown",
+            post(api::runners::shutdown_runner),
+        )
+        .route(
+            "/api/runners/{runner_id}",
+            delete(api::runners::delete_runner),
+        )
         // Populate AuthUser on every request. Protected handlers opt in by
         // taking `AuthUser` as an extractor; public routes (health, login,
         // signup, static) are unaffected.

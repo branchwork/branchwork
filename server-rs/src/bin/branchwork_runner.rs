@@ -55,6 +55,7 @@ mod ci {
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -283,6 +284,12 @@ struct RunnerState {
     /// for a plan — that's the auto-mode 3.1 use-case where the loop has
     /// dropped the run id by the time it decides to fetch a log.
     ci_cache: Arc<Mutex<CiAggregateCache>>,
+    /// Set to `true` when the runner has accepted a `WireMessage::ShutdownRequest`
+    /// from the SaaS server. Causes the reconnect loop to break out and the
+    /// process to exit cleanly after the in-flight session daemons have been
+    /// asked to drain. Shared via `Arc` so the main loop sees the same flag
+    /// the message handler flips.
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 struct AgentHandle {
@@ -421,6 +428,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Build the WebSocket URL.
     let ws_url = build_ws_url(&cli.saas_url, &cli.token);
 
+    // Process-wide shutdown flag. Flipped by `WireMessage::ShutdownRequest`
+    // (operator clicked the dashboard button) to break out of the reconnect
+    // loop after the current connection ends. Cloned per connection so each
+    // `RunnerState` sees the same atomic.
+    let shutdown = Arc::new(AtomicBool::new(false));
+
     // Reconnect loop with exponential backoff.
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
@@ -431,13 +444,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // every subsequent `log_info!`/`log_warn!` reaches the dashboard.
         println!("[runner] connecting to {}", cli.saas_url);
 
-        match connect_and_run(&ws_url, &runner_id, &cwd, &server_bin, db.clone()).await {
+        match connect_and_run(
+            &ws_url,
+            &runner_id,
+            &cwd,
+            &server_bin,
+            db.clone(),
+            shutdown.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 println!("[runner] connection closed cleanly");
             }
             Err(e) => {
                 eprintln!("[runner] connection error: {e}");
             }
+        }
+
+        // Operator-requested shutdown takes precedence over reconnect. By
+        // the time we get here, `handle_server_message` has already asked
+        // every session daemon to exit; we just close out cleanly so the
+        // host's process supervisor doesn't restart us. Token revocation
+        // (Revoke button) is handled by the SaaS side: a now-revoked token
+        // would fail the WS upgrade with 401 on the next connect attempt
+        // anyway, but acknowledging the shutdown intent here gives a
+        // cleaner exit message in journalctl.
+        if shutdown.load(AtomicOrdering::Relaxed) {
+            println!("[runner] shutdown requested by SaaS — exiting");
+            return Ok(());
         }
 
         // Jitter: ±25% of backoff.
@@ -470,6 +505,7 @@ async fn connect_and_run(
     cwd: &Path,
     server_bin: &Path,
     db: Arc<Mutex<Connection>>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Connect via tokio-tungstenite.
     let (ws_stream, _response) = tokio_tungstenite::connect_async(ws_url).await?;
@@ -497,6 +533,7 @@ async fn connect_and_run(
         server_bin: server_bin.to_path_buf(),
         plan_cwd: Arc::new(Mutex::new(HashMap::new())),
         ci_cache: Arc::new(Mutex::new(CiAggregateCache::default())),
+        shutdown_requested: shutdown.clone(),
     });
 
     // ── Writer task: flush channel messages to WebSocket ─────────────────
@@ -641,6 +678,15 @@ async fn ws_reader(
         }
 
         handle_server_message(&state, &envelope).await;
+
+        // After processing each frame, check if a ShutdownRequest just
+        // flipped the shutdown flag — if so, drop the WS by returning. The
+        // outer reconnect loop checks the same flag and exits the process
+        // cleanly instead of sleeping + retrying.
+        if state.shutdown_requested.load(AtomicOrdering::Relaxed) {
+            log_info!("[runner] closing WS after honored shutdown");
+            break;
+        }
     }
 
     Ok(())
@@ -735,6 +781,59 @@ async fn handle_server_message(state: &RunnerState, envelope: &Envelope) {
                         .status();
                 }
             }
+        }
+
+        WireMessage::ShutdownRequest { reason } => {
+            // Operator clicked "Request shutdown" on the dashboard. The
+            // runner is free to ignore this — we don't (today). Drain
+            // every in-flight session daemon via SIGTERM (Unix) /
+            // taskkill (Windows), then flip the process-wide shutdown
+            // flag so the reconnect loop exits cleanly after this WS
+            // closes. The reconnect-loop check is what actually exits
+            // the process; flipping the flag here is what makes that
+            // check short-circuit instead of looping.
+            //
+            // Note we do NOT process::exit() inline — that would race
+            // with in-flight ACK frames the runner still owes the SaaS
+            // server. Letting the WS close naturally lets the SaaS see
+            // a clean disconnect, broadcast `runner_disconnected`, and
+            // flip the dashboard status pill to offline.
+            let reason_str = reason.as_deref().unwrap_or("(no reason given)");
+            log_info!("[runner] shutdown requested by SaaS: {reason_str}");
+
+            // Drain in-flight agents. Mirrors the KillAgent handler but
+            // applied across the whole map. The session daemons get
+            // SIGTERM, which lets them flush their PTY and write a
+            // graceful-exit footer in <socket>.log — the dashboard's
+            // /terminal replay surface stays consistent.
+            let mut agents = state.agents.lock().await;
+            let drained: Vec<AgentHandle> = agents.drain().map(|(_, h)| h).collect();
+            drop(agents);
+            for handle in drained {
+                handle.io_task.abort();
+                // Skip kill on pid=0 — that's a sentinel value used by
+                // unit tests (seed_test_agent), and on Unix `kill(0,
+                // SIGTERM)` sends to the calling process group which
+                // would terminate the runner itself.
+                if handle.pid == 0 {
+                    continue;
+                }
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(handle.pid as i32, libc::SIGTERM);
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &handle.pid.to_string(), "/T"])
+                        .status();
+                }
+            }
+
+            // Flip the flag — `ws_reader` checks it at top of every loop
+            // iteration and breaks, and the outer reconnect loop checks
+            // it before sleeping.
+            state.shutdown_requested.store(true, AtomicOrdering::Relaxed);
         }
 
         WireMessage::AgentInput { agent_id, data } => {
@@ -2178,6 +2277,7 @@ mod tests {
             server_bin: PathBuf::from("/usr/bin/true"),
             plan_cwd: Arc::new(Mutex::new(HashMap::new())),
             ci_cache: Arc::new(Mutex::new(CiAggregateCache::default())),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         });
         (state, ws_rx)
     }
@@ -3118,5 +3218,50 @@ mod tests {
             }
             other => panic!("expected CiFailureLogResolved, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_request_flips_flag_and_drains_agents() {
+        // Acceptance pin (server-side): the runner-side handler MUST flip
+        // the shutdown flag and drain its in-flight agents, so the SaaS
+        // side can treat ShutdownRequest as the cooperative shutdown
+        // primitive rather than just a notification.
+        let dir = TempDir::new().unwrap();
+        let (state, _rx) = make_test_state(dir.path().to_path_buf());
+        seed_test_agent(&state, "agent-shutdown", &state.cwd.clone()).await;
+        seed_test_agent(&state, "agent-shutdown-2", &state.cwd.clone()).await;
+        assert_eq!(state.agents.lock().await.len(), 2);
+
+        let env = Envelope::reliable(
+            "server".into(),
+            1,
+            WireMessage::ShutdownRequest {
+                reason: Some("dashboard click".into()),
+            },
+        );
+        handle_server_message(&state, &env).await;
+
+        assert!(state.shutdown_requested.load(AtomicOrdering::Relaxed));
+        // Drained — the daemons we seeded had pid=0 so SIGTERM was a no-op
+        // syscall, but the agents map MUST be empty so future StartAgent
+        // requests don't collide on agent_id reuse during the drain
+        // window.
+        assert_eq!(state.agents.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_request_without_reason_is_accepted() {
+        // The dashboard may omit `reason`; the handler must not panic.
+        let dir = TempDir::new().unwrap();
+        let (state, _rx) = make_test_state(dir.path().to_path_buf());
+
+        let env = Envelope::reliable(
+            "server".into(),
+            2,
+            WireMessage::ShutdownRequest { reason: None },
+        );
+        handle_server_message(&state, &env).await;
+
+        assert!(state.shutdown_requested.load(AtomicOrdering::Relaxed));
     }
 }

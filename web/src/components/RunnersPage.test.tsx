@@ -198,4 +198,123 @@ describe("RunnersPage", () => {
     fireEvent.click(screen.getByTestId("runner-select-r1"));
     expect(setSelectedRunnerId).toHaveBeenCalledWith("r1");
   });
+
+  it("Shutdown opens a confirmation modal that gates on the in-flight checkbox", async () => {
+    const requestRunnerShutdown = vi.fn().mockResolvedValue({
+      queued: true,
+      seq: 1,
+      inFlightAgents: ["a1"],
+    });
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1", name: "laptop", status: "online" })],
+      requestRunnerShutdown,
+    });
+    useAgentStore.setState({ agents: [seedAgent({ id: "a1", status: "running" })] });
+
+    render(<RunnersPage />);
+    fireEvent.click(screen.getByTestId("runner-shutdown-r1"));
+
+    // Modal renders with the "1 in-flight agent" warning.
+    await waitFor(() => {
+      expect(screen.getByTestId("shutdown-modal-in-flight")).toBeTruthy();
+    });
+
+    // Submit is disabled until the user explicitly checks the
+    // "I understand" box.
+    const submit = screen.getByTestId("shutdown-modal-submit") as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    expect(requestRunnerShutdown).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("shutdown-modal-confirm"));
+    expect(submit.disabled).toBe(false);
+
+    // Type a reason and submit.
+    fireEvent.change(screen.getByTestId("shutdown-modal-reason"), {
+      target: { value: "host upgrade" },
+    });
+    fireEvent.click(submit);
+
+    await waitFor(() => {
+      expect(requestRunnerShutdown).toHaveBeenCalledWith("r1", {
+        reason: "host upgrade",
+        confirmInFlight: true,
+      });
+    });
+  });
+
+  it("Shutdown submit is allowed without confirm when no agents are in flight", async () => {
+    const requestRunnerShutdown = vi.fn().mockResolvedValue({
+      queued: true,
+      seq: 1,
+      inFlightAgents: [],
+    });
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1", name: "laptop", status: "online" })],
+      requestRunnerShutdown,
+    });
+    useAgentStore.setState({ agents: [] });
+
+    render(<RunnersPage />);
+    fireEvent.click(screen.getByTestId("runner-shutdown-r1"));
+    await waitFor(() => {
+      expect(screen.getByTestId("shutdown-modal-submit")).toBeTruthy();
+    });
+
+    // No checkbox should be rendered when no agents are in flight.
+    expect(screen.queryByTestId("shutdown-modal-confirm")).toBeNull();
+
+    const submit = screen.getByTestId("shutdown-modal-submit") as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    fireEvent.click(submit);
+    await waitFor(() => {
+      expect(requestRunnerShutdown).toHaveBeenCalledWith("r1", {
+        reason: undefined,
+        confirmInFlight: undefined,
+      });
+    });
+  });
+
+  it("Revoke opens a confirmation modal and DELETEs on submit", async () => {
+    const revokeRunner = vi.fn().mockResolvedValue({ revoked: true, tokensRevoked: 1 });
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1", name: "laptop", status: "online" })],
+      revokeRunner,
+    });
+
+    render(<RunnersPage />);
+    fireEvent.click(screen.getByTestId("runner-revoke-r1"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("revoke-modal-warning")).toBeTruthy();
+    });
+    fireEvent.click(screen.getByTestId("revoke-modal-submit"));
+
+    await waitFor(() => {
+      expect(revokeRunner).toHaveBeenCalledWith("r1");
+    });
+  });
+
+  it("renders the 'Requested at' label after a shutdown request", () => {
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1", name: "laptop", status: "online" })],
+      shutdownRequestedAt: { r1: Date.now() },
+    });
+    render(<RunnersPage />);
+    expect(screen.getByTestId("runner-shutdown-requested-r1")).toBeTruthy();
+    // Original Request-shutdown button must NOT be in the DOM while the
+    // request is in flight — the label takes its place.
+    expect(screen.queryByTestId("runner-shutdown-r1")).toBeNull();
+  });
+
+  it("renders the 30s 'shutdown ignored' fallback after the timeout elapses", () => {
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1", name: "laptop", status: "online" })],
+      shutdownRequestedAt: { r1: Date.now() - 60_000 },
+    });
+    render(<RunnersPage />);
+    expect(screen.getByTestId("runner-shutdown-requested-r1").textContent).toMatch(
+      /Shutdown ignored/,
+    );
+    expect(screen.getByTestId("runner-shutdown-fallback-revoke-r1")).toBeTruthy();
+  });
 });

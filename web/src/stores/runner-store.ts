@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { fetchJson, postJson, putJson } from "../api.js";
+import { deleteJson, fetchJson, postJson, putJson } from "../api.js";
 
 /// Deployment mode discriminator returned by `GET /api/runners`. Drives
 /// whether the `RunnerStatus` indicator renders at all (audit §17 / 4.1):
@@ -140,6 +140,27 @@ export interface RunnerConfigPatch {
   skipPermissions?: boolean | null;
 }
 
+/// Server response for `POST /api/runners/{id}/shutdown`. `inFlightAgents`
+/// is the snapshot of agents the server enumerated when it enqueued the
+/// `ShutdownRequest` wire frame — the dashboard echoes the count back into
+/// the toast so the operator sees what they just signed off on. The runner
+/// is responsible for draining these gracefully; the server cannot force-
+/// kill them.
+export interface RunnerShutdownResponse {
+  queued: boolean;
+  seq: number;
+  inFlightAgents: string[];
+}
+
+/// Server response for `DELETE /api/runners/{id}`. `tokensRevoked` is the
+/// number of `runner_tokens` rows the server deleted; usually 1, but a
+/// runner may have been re-tokened without a previous revoke so the count
+/// is informative rather than authoritative.
+export interface RunnerRevokeResponse {
+  revoked: boolean;
+  tokensRevoked: number;
+}
+
 interface RunnerStore {
   /// Resolved deployment mode. Starts as `unknown` so the indicator stays
   /// hidden until we know the answer (avoids flashing the amber "register
@@ -218,6 +239,27 @@ interface RunnerStore {
   /// GET so we update `configByRunnerId` from the response — no follow-up
   /// fetch needed.
   saveRunnerConfig: (runnerId: string, patch: RunnerConfigPatch) => Promise<RunnerConfig>;
+  /// POST `/api/runners/{id}/shutdown`. Reliable: the server enqueues a
+  /// `WireMessage::ShutdownRequest` that survives a runner-side disconnect.
+  /// The runner is expected to drain its session daemons and exit. If it
+  /// ignores the request (wedged event loop, etc.), the dashboard's
+  /// secondary affordance is `revokeRunner`.
+  requestRunnerShutdown: (
+    runnerId: string,
+    body: { reason?: string; confirmInFlight?: boolean },
+  ) => Promise<RunnerShutdownResponse>;
+  /// DELETE `/api/runners/{id}`. Server-side: deletes every
+  /// `runner_tokens` row claimed by this runner (the next reconnect
+  /// attempt with the now-revoked token gets 401 from the WS upgrade
+  /// handler) and soft-deletes the runner row. Updates the in-memory
+  /// store so the row disappears immediately.
+  revokeRunner: (runnerId: string) => Promise<RunnerRevokeResponse>;
+  /// Track the moment a shutdown was requested for `runnerId`, so the UI
+  /// can show "Requested at <ts>" and surface the 30-second "runner
+  /// ignored shutdown" fallback affordance. Cleared by `applyDisconnected`
+  /// when the runner actually drops the connection (the cooperative
+  /// path) and by `revokeRunner` (the escalation path).
+  shutdownRequestedAt: Record<string, number>;
   /// Drop everything back to its initial shape. Driven by `reset-all.ts` on
   /// logout so user A's runner inventory doesn't bleed into user B's tab.
   reset: () => void;
@@ -239,6 +281,7 @@ const INITIAL_STATE: Pick<
   | "selectedRunnerId"
   | "configByRunnerId"
   | "logsByRunnerId"
+  | "shutdownRequestedAt"
 > = {
   mode: "unknown",
   runners: [],
@@ -248,6 +291,7 @@ const INITIAL_STATE: Pick<
   selectedRunnerId: null,
   configByRunnerId: {},
   logsByRunnerId: {},
+  shutdownRequestedAt: {},
 };
 
 /// Per-runner monotonic id counter for `RunnerLogEntry.id`. Module-scoped
@@ -386,14 +430,24 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
     set((s) => {
       const nowIso = new Date().toISOString();
       const idx = s.runners.findIndex((r) => r.id === payload.runner_id);
-      if (idx < 0) return {};
+      // Always clear the "shutdown requested" stamp on disconnect — the
+      // runner has cooperated (or has been revoked, in which case we
+      // already cleared it in revokeRunner). Either way, the 30s ignored-
+      // shutdown affordance should not fire after a confirmed exit.
+      const remainingShutdowns = { ...s.shutdownRequestedAt };
+      delete remainingShutdowns[payload.runner_id];
+      if (idx < 0) {
+        return Object.keys(remainingShutdowns).length === Object.keys(s.shutdownRequestedAt).length
+          ? {}
+          : { shutdownRequestedAt: remainingShutdowns };
+      }
       const next = s.runners.slice();
       next[idx] = {
         ...next[idx],
         status: "offline",
         lastSeenAt: nowIso,
       };
-      return { runners: next };
+      return { runners: next, shutdownRequestedAt: remainingShutdowns };
     });
   },
 
@@ -469,6 +523,64 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
       configByRunnerId: { ...s.configByRunnerId, [runnerId]: cfg },
     }));
     return cfg;
+  },
+
+  requestRunnerShutdown: async (runnerId, body) => {
+    const resp = await postJson<RunnerShutdownResponse>(
+      `/api/runners/${encodeURIComponent(runnerId)}/shutdown`,
+      {
+        reason: body.reason,
+        confirmInFlight: body.confirmInFlight,
+      },
+    );
+    // Stamp the request time so the row label can flip to
+    // "Requested at <ts>" and the 30s fallback can fire. We deliberately
+    // do not flip the runner's `status` here — only the WS
+    // `runner_disconnected` broadcast or a follow-up
+    // `applyDisconnected({reason:"revoked"})` should mark the runner
+    // offline, so a runner that ignores the shutdown still surfaces as
+    // online until the operator escalates to revoke.
+    set((s) => ({
+      shutdownRequestedAt: { ...s.shutdownRequestedAt, [runnerId]: Date.now() },
+    }));
+    return resp;
+  },
+
+  revokeRunner: async (runnerId) => {
+    const resp = await deleteJson<RunnerRevokeResponse>(
+      `/api/runners/${encodeURIComponent(runnerId)}`,
+    );
+    // Optimistically drop the runner from the list — the server's
+    // `runner_disconnected` synthetic broadcast will reconcile, but the
+    // user expects the row to disappear instantly when they click
+    // Revoke.
+    set((s) => {
+      const remainingRunners = s.runners.filter((r) => r.id !== runnerId);
+      const remainingDrivers = { ...s.driversByRunnerId };
+      delete remainingDrivers[runnerId];
+      const remainingShutdowns = { ...s.shutdownRequestedAt };
+      delete remainingShutdowns[runnerId];
+      const remainingConfigs = { ...s.configByRunnerId };
+      delete remainingConfigs[runnerId];
+      const remainingLogs = { ...s.logsByRunnerId };
+      delete remainingLogs[runnerId];
+      // If the user revoked the currently-selected runner, fall back to
+      // the next-most-recent row (or null if none remain).
+      const nextSelected =
+        s.selectedRunnerId === runnerId ? (remainingRunners[0]?.id ?? null) : s.selectedRunnerId;
+      if (nextSelected !== s.selectedRunnerId) {
+        writePersistedSelectedRunnerId(nextSelected);
+      }
+      return {
+        runners: remainingRunners,
+        driversByRunnerId: remainingDrivers,
+        shutdownRequestedAt: remainingShutdowns,
+        configByRunnerId: remainingConfigs,
+        logsByRunnerId: remainingLogs,
+        selectedRunnerId: nextSelected,
+      };
+    });
+    return resp;
   },
 
   reset: () => {
