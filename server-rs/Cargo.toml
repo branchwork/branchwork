@@ -20,6 +20,7 @@ notify = { version = "8", features = ["macos_fsevent"] }
 notify-debouncer-mini = "0.6"
 rusqlite = { version = "0.35", features = ["bundled"] }
 serde_yaml = "0.9"
+toml = "0.8"
 portable-pty = "0.9"
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }

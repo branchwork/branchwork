@@ -212,7 +212,10 @@ branchwork-runner \
 - [reference/configuration.md](configuration.md) — non-flag
   configuration: `~/.claude/` layout, SMTP env vars (budget alerts),
   driver API-key probes, and the variables that look like config but
-  aren't (`DATABASE_URL`, `JWT_SECRET`, `branchwork.toml`).
+  aren't (`DATABASE_URL`, `JWT_SECRET`, `~/.branchworkrc`).
+- [reference/branchwork-toml.md](branchwork-toml.md) — per-project
+  `branchwork.toml` for CI workflow filtering and phase-end
+  verification.
 - [architecture/overview.md](../architecture/overview.md) — which
   binary runs where, and how they cooperate.
 - [architecture/session-daemon.md](../architecture/session-daemon.md) —

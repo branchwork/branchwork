@@ -205,7 +205,7 @@ the explanation:
 | `JWT_SECRET` | Branchwork does not issue JWTs. The `jsonwebtoken` crate is used only to **validate** OIDC ID tokens during SSO sign-in, against keys fetched from the IdP's JWKS endpoint ([`auth/sso.rs:486`](../../server-rs/src/auth/sso.rs)). |
 | `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` | SSO credentials are stored **per organisation** in the SQLite `org_sso_config` table ([`auth/sso.rs:276`](../../server-rs/src/auth/sso.rs)) and managed through the SSO admin API, not via env vars. |
 | `AUTH_COOKIE_SECRET` / `SESSION_SECRET` | Session tokens are random bytes generated at sign-in and stored in the `auth_sessions` table; there is no signing key to configure. |
-| `branchwork.toml` / `~/.branchworkrc` | Branchwork has no TOML or rc-file configuration layer. All knobs are CLI flags or environment variables, both of which are documented in this section and in [reference/cli.md](cli.md). |
+| `~/.branchworkrc` | Branchwork has no rc-file configuration layer. Global knobs are CLI flags or environment variables, both of which are documented in this section and in [reference/cli.md](cli.md). The one TOML file Branchwork *does* read is `~/<project>/branchwork.toml`, a **per-project** override for CI workflow filtering and phase-end verification — see [reference/branchwork-toml.md](branchwork-toml.md). It is not a global config surface. |
 
 If you find a variable in the source that this page does not list, the
 acceptance criterion for this doc has been violated — please open an

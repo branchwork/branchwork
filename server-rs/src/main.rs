@@ -14,6 +14,7 @@ mod notifications;
 mod persisted_settings;
 mod plan_curate;
 mod plan_parser;
+mod repo_config;
 mod saas;
 mod state;
 mod static_files;
