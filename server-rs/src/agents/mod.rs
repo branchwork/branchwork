@@ -1,6 +1,7 @@
 pub mod check_agent;
 pub mod driver;
 pub mod git_ops;
+pub mod phase_check;
 pub mod prompt;
 pub mod pty_agent;
 pub mod session_protocol;
@@ -1370,8 +1371,149 @@ pub async fn try_auto_advance(
         }),
     );
 
-    // Find the next sequentially-numbered phase that has at least one ready
-    // task. Skip phases that are already fully done.
+    // Phase 2.2 gate: when a `phase_verification` command is configured at
+    // the phase / plan / repo `branchwork.toml` layer AND the trigger came
+    // from the auto-mode merge pipeline (i.e. `merged_sha.is_some()` — a
+    // real commit exists to verify against), defer the next-phase advance
+    // to the `phase_check` listener that subscribed to `phase_completed`
+    // above. The Check agent runs the verification command on a fresh
+    // worktree at `merged_sha`; on success it calls
+    // [`advance_after_phase_verify`] (the same scan-and-spawn block we
+    // would run here); on failure it pauses auto-mode for the plan.
+    //
+    // Manual completion paths (PUT /tasks/:id/status, MCP, resume) pass
+    // `merged_sha=None` — there's no commit to verify against, so we
+    // bypass the gate and fall through to the immediate next-phase
+    // advance, preserving pre-2.2 behaviour for manual flows.
+    if merged_sha.is_some() && phase_verification_configured(&plan, current_phase) {
+        return;
+    }
+
+    spawn_next_phase_tasks(
+        &registry,
+        &plans_dir,
+        &plan,
+        current_phase,
+        &status_map,
+        &done_set,
+        max_budget_usd,
+        &work_dir,
+        effort,
+        port,
+    )
+    .await;
+}
+
+/// Resolve `phase_verification` for the just-completed phase across plan,
+/// per-phase, and repo `branchwork.toml` layers. Used by both
+/// [`try_auto_advance`] (to gate the next-phase advance) and
+/// [`crate::agents::phase_check`] (to decide whether to spawn a Check
+/// agent at all).
+fn phase_verification_configured(plan: &ParsedPlan, phase: &PlanPhase) -> bool {
+    let project_dir = plan
+        .project
+        .as_ref()
+        .and_then(|p| dirs::home_dir().map(|h| h.join(p)));
+    let repo_config = project_dir
+        .as_deref()
+        .and_then(crate::repo_config::load_for_project_dir);
+    crate::ci::resolution::resolve_phase_verification(plan, phase, repo_config.as_ref()).is_some()
+}
+
+/// Re-entry point for the phase_check listener after the verify Check
+/// agent reports a passing verdict. Re-derives the same plan / status /
+/// budget / work_dir state that [`try_auto_advance`] computed, then runs
+/// the identical next-phase scan-and-spawn block. Splitting this out
+/// (rather than re-calling `try_auto_advance` with a "skip-verify" flag)
+/// keeps `phase_completed` from being re-broadcast on the verify pass.
+pub async fn advance_after_phase_verify(
+    registry: AgentRegistry,
+    plans_dir: PathBuf,
+    plan_name: String,
+    current_phase_number: u32,
+    effort: Effort,
+    port: u16,
+) {
+    let plan_path = match plan_parser::find_plan_file(&plans_dir, &plan_name) {
+        Some(p) => p,
+        None => return,
+    };
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let current_phase = match plan
+        .phases
+        .iter()
+        .find(|p| p.number == current_phase_number)
+    {
+        Some(p) => p,
+        None => return,
+    };
+
+    let status_map: HashMap<String, String> = {
+        let conn = registry.db.lock().unwrap();
+        let mut stmt = match conn
+            .prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?1")
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        stmt.query_map(rusqlite::params![plan_name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    };
+    let done_set = {
+        let conn = registry.db.lock().unwrap();
+        completed_task_numbers(&conn, &plan_name)
+    };
+    let max_budget_usd = match remaining_budget(&registry.db, &plan_name) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let work_dir: PathBuf = {
+        let home = dirs::home_dir().unwrap();
+        plan.project
+            .as_ref()
+            .map(|p| home.join(p))
+            .unwrap_or_else(|| std::env::current_dir().unwrap())
+    };
+
+    spawn_next_phase_tasks(
+        &registry,
+        &plans_dir,
+        &plan,
+        current_phase,
+        &status_map,
+        &done_set,
+        max_budget_usd,
+        &work_dir,
+        effort,
+        port,
+    )
+    .await;
+}
+
+/// Inner helper: scan for the next phase with ready tasks, spawn them,
+/// broadcast `phase_advanced`, optionally fan out the webhook. Extracted
+/// from [`try_auto_advance`] so [`advance_after_phase_verify`] can call
+/// the same block without re-broadcasting `phase_completed`.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_next_phase_tasks(
+    registry: &AgentRegistry,
+    plans_dir: &Path,
+    plan: &ParsedPlan,
+    current_phase: &PlanPhase,
+    status_map: &HashMap<String, String>,
+    done_set: &std::collections::HashSet<String>,
+    max_budget_usd: Option<f64>,
+    work_dir: &Path,
+    effort: Effort,
+    port: u16,
+) {
+    let plan_name = &plan.name;
     let next_phase = plan
         .phases
         .iter()
@@ -1412,15 +1554,15 @@ pub async fn try_auto_advance(
     );
 
     spawn_ready_tasks(
-        &registry,
-        &plans_dir,
-        &plan,
+        registry,
+        plans_dir,
+        plan,
         next_phase,
         &ready_tasks,
         effort,
         port,
         max_budget_usd,
-        &work_dir,
+        work_dir,
     )
     .await;
 
@@ -1437,7 +1579,7 @@ pub async fn try_auto_advance(
     let webhook_snapshot = registry.webhook_url.read().unwrap().clone();
     if webhook_snapshot.is_some() {
         let msg = crate::notifications::phase_advance_message(
-            &plan_name,
+            plan_name,
             current_phase.number,
             next_phase.number,
             next_phase
@@ -3485,6 +3627,304 @@ mod tests {
         assert!(
             !has_phase_advanced(&events, plan),
             "phase_advanced must not fire on the last phase: {events:?}",
+        );
+    }
+
+    // ── Task 2.2 — phase_verification gate ───────────────────────────
+    //
+    // The gate added in Phase 2.2 short-circuits the next-phase advance
+    // inside `try_auto_advance` when (a) `merged_sha.is_some()` AND (b)
+    // `resolve_phase_verification` returns Some for the just-completed
+    // phase. The deferred next-phase scan is meant to run later, when
+    // the `phase_check` listener calls `advance_after_phase_verify`
+    // after the verify Check agent passes.
+    //
+    // These tests pin the gate behaviour without spawning the actual
+    // Check agent (no `claude` binary on the test runner). They use
+    // YAML plans that set `phase_verification` directly on the phase so
+    // the resolution helper returns Some without needing a
+    // `branchwork.toml` on disk.
+
+    /// `phase_verification` set on the just-completed phase + merged_sha
+    /// passed in: phase_completed STILL fires, but phase_advanced is
+    /// suppressed (deferred to the listener).
+    #[tokio::test]
+    async fn phase_verification_gate_suppresses_phase_advanced_on_merged_path() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "verify-gated";
+        // Phase 1 has phase_verification set, phase 2 exists as a
+        // would-be advance target. With the gate active, completing
+        // 1.1 with a merged_sha should fire phase_completed but NOT
+        // phase_advanced — the listener will handle that later.
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   phase_verification: \"true\"\n\
+             \x20   tasks:\n\
+             \x20     - number: \"1.1\"\n\
+             \x20       title: One-One\n\
+             \x20 - number: 2\n\
+             \x20   title: P2\n\
+             \x20   tasks:\n\
+             \x20     - number: \"2.1\"\n\
+             \x20       title: Two-One\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        set_task_status(&db, plan, "1.1", "completed");
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "1.1".to_string(),
+            Effort::Medium,
+            registry.port,
+            Some("sha-1".to_string()),
+        )
+        .await;
+
+        let events = drain_events(&mut rx);
+        let completed = phase_completed_events(&events, plan);
+        assert_eq!(
+            completed.len(),
+            1,
+            "phase_completed must still fire even when the gate defers next-phase: {events:?}",
+        );
+        // Gate effect: the next-phase advance is deferred to the
+        // phase_check listener. No `phase_advanced` should fire on this
+        // tick — the auto-advance flow returned early after broadcasting
+        // phase_completed.
+        assert!(
+            !has_phase_advanced(&events, plan),
+            "phase_advanced must NOT fire when phase_verification is configured + merged_sha is some: {events:?}",
+        );
+    }
+
+    /// `phase_verification` set on the just-completed phase + manual
+    /// completion path (merged_sha = None): the gate is bypassed and the
+    /// existing next-phase advance still fires. This preserves
+    /// pre-2.2 manual-completion semantics — the gate only kicks in
+    /// when there's a real merge SHA to verify against.
+    #[tokio::test]
+    async fn phase_verification_gate_bypassed_when_no_merged_sha() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "verify-manual";
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   phase_verification: \"true\"\n\
+             \x20   tasks:\n\
+             \x20     - number: \"1.1\"\n\
+             \x20       title: One-One\n\
+             \x20 - number: 2\n\
+             \x20   title: P2\n\
+             \x20   tasks:\n\
+             \x20     - number: \"2.1\"\n\
+             \x20       title: Two-One\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        set_task_status(&db, plan, "1.1", "completed");
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "1.1".to_string(),
+            Effort::Medium,
+            registry.port,
+            None, // ← manual completion, gate must be bypassed
+        )
+        .await;
+
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            phase_completed_events(&events, plan).len(),
+            1,
+            "phase_completed must fire: {events:?}",
+        );
+        // Manual path: gate is bypassed, phase_advanced still fires
+        // (matches pre-2.2 behaviour for the manual flow).
+        assert!(
+            has_phase_advanced(&events, plan),
+            "phase_advanced MUST fire on the manual completion path even with verification configured: {events:?}",
+        );
+    }
+
+    /// `advance_after_phase_verify` is the re-entry point the
+    /// phase_check listener calls after a passing verify. It must NOT
+    /// re-broadcast `phase_completed` (that already fired before the
+    /// gate deferred us) but it MUST run the same next-phase
+    /// scan-and-spawn block. The test uses a verification-gated plan,
+    /// drives `try_auto_advance` to set the gate, drains the events,
+    /// then directly invokes `advance_after_phase_verify` to simulate
+    /// the listener's success path. Expected: phase_advanced fires
+    /// once, phase_completed does NOT fire again.
+    #[tokio::test]
+    async fn advance_after_phase_verify_runs_next_phase_scan_without_rebroadcast() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "verify-resume";
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   phase_verification: \"true\"\n\
+             \x20   tasks:\n\
+             \x20     - number: \"1.1\"\n\
+             \x20       title: One-One\n\
+             \x20 - number: 2\n\
+             \x20   title: P2\n\
+             \x20   tasks:\n\
+             \x20     - number: \"2.1\"\n\
+             \x20       title: Two-One\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        // Step 1: drive the gate. phase_completed fires, phase_advanced
+        // does not. (Re-using the gate-suppression test's setup; we
+        // assert here too so a regression in the gate doesn't
+        // silently make the listener test pass for the wrong reason.)
+        set_task_status(&db, plan, "1.1", "completed");
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "1.1".to_string(),
+            Effort::Medium,
+            registry.port,
+            Some("sha-1".to_string()),
+        )
+        .await;
+
+        let events_gate = drain_events(&mut rx);
+        assert_eq!(
+            phase_completed_events(&events_gate, plan).len(),
+            1,
+            "phase_completed must fire on the gate tick: {events_gate:?}",
+        );
+        assert!(
+            !has_phase_advanced(&events_gate, plan),
+            "gate must defer phase_advanced: {events_gate:?}",
+        );
+
+        // Step 2: the listener simulates a passing verify by calling
+        // advance_after_phase_verify. This must spawn 2.1 and fire
+        // phase_advanced, but NOT re-fire phase_completed.
+        advance_after_phase_verify(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            1,
+            Effort::Medium,
+            registry.port,
+        )
+        .await;
+
+        let events_resume = drain_events(&mut rx);
+        assert!(
+            phase_completed_events(&events_resume, plan).is_empty(),
+            "phase_completed must NOT re-fire on the resume path: {events_resume:?}",
+        );
+        assert!(
+            has_phase_advanced(&events_resume, plan),
+            "phase_advanced MUST fire on the resume path: {events_resume:?}",
+        );
+        assert!(
+            agent_task_ids(&db, plan).contains("2.1"),
+            "task 2.1 must be claimed/spawned by the resume path: {:?}",
+            agent_task_ids(&db, plan),
+        );
+    }
+
+    /// No `phase_verification` configured anywhere + merged_sha passed:
+    /// the gate doesn't engage, phase_advanced fires alongside
+    /// phase_completed (re-asserting the Task 2.1 behaviour the existing
+    /// test pinned).
+    #[tokio::test]
+    async fn phase_verification_gate_does_not_engage_when_unconfigured() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "verify-none";
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"1.1\"\n\
+             \x20       title: One-One\n\
+             \x20 - number: 2\n\
+             \x20   title: P2\n\
+             \x20   tasks:\n\
+             \x20     - number: \"2.1\"\n\
+             \x20       title: Two-One\n",
+        );
+        enable_auto_mode(&db, plan);
+
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        set_task_status(&db, plan, "1.1", "completed");
+        let _ = drain_events(&mut rx);
+        try_auto_advance(
+            registry.clone(),
+            plans_dir.clone(),
+            plan.to_string(),
+            "1.1".to_string(),
+            Effort::Medium,
+            registry.port,
+            Some("sha-x".to_string()),
+        )
+        .await;
+
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            phase_completed_events(&events, plan).len(),
+            1,
+            "phase_completed must fire: {events:?}",
+        );
+        assert!(
+            has_phase_advanced(&events, plan),
+            "phase_advanced MUST fire when no verification is configured: {events:?}",
         );
     }
 }

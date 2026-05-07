@@ -226,6 +226,14 @@ async fn run_server(cli: Cli) {
     // `docs/reference/configuration.md` under "Auto-mode (idle finish)".
     auto_mode::spawn_idle_poller(state.clone(), auto_mode::IdleFinishConfig::from_env());
 
+    // Start the phase-end verify Check agent listener (Task 2.2). Always on
+    // — it's a no-op for plans that don't configure `phase_verification`,
+    // and for `phase_completed` events with a null `phase_sha` (manual
+    // task completion paths). The listener subscribes to the dashboard
+    // broadcast channel and spawns a Check agent + worktree per phase
+    // boundary that has a verify command configured.
+    agents::phase_check::spawn_listener(state.clone());
+
     // Hourly retention purger: hard-deletes plan_snapshots rows past
     // `expires_at` (and their archive YAML), audits one
     // `plan.snapshot_purged` row per snapshot.
