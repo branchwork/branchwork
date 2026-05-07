@@ -466,3 +466,147 @@ fn get_surfaces_paused_reason_when_set() {
     // distinguish "user opted out" from "loop self-paused".
     assert_eq!(body["autoMode"], true);
 }
+
+// ── runner affinity (T11.4) ──────────────────────────────────────────────────
+
+fn seed_test_runner(db_path: &std::path::Path, runner_id: &str, status: &str) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "INSERT INTO runners (id, name, org_id, status, last_seen_at) \
+         VALUES (?1, ?2, 'default-org', ?3, datetime('now'))",
+        params![runner_id, runner_id, status],
+    )
+    .unwrap();
+}
+
+#[test]
+fn get_config_returns_null_runner_id_by_default() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-rid-default",
+        &minimal_plan("cfg-rid-default", &d.project),
+    );
+
+    let (s, body) = d.get("/api/plans/cfg-rid-default/config");
+    assert_eq!(s, 200, "body: {body}");
+    assert!(body["runnerId"].is_null(), "got: {body}");
+}
+
+#[test]
+fn put_runner_id_round_trips_via_unified_config() {
+    let d = TestDashboard::new();
+    d.create_plan("cfg-rid-rt", &minimal_plan("cfg-rid-rt", &d.project));
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_test_runner(&db_path, "runner-x", "online");
+
+    let (s, body) = d.put(
+        "/api/plans/cfg-rid-rt/config",
+        json!({"runnerId": "runner-x"}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["runnerId"], "runner-x");
+
+    // Re-read via GET to confirm persistence.
+    let (s, body) = d.get("/api/plans/cfg-rid-rt/config");
+    assert_eq!(s, 200);
+    assert_eq!(body["runnerId"], "runner-x");
+}
+
+#[test]
+fn put_runner_id_explicit_null_clears_the_pin() {
+    let d = TestDashboard::new();
+    d.create_plan("cfg-rid-clear", &minimal_plan("cfg-rid-clear", &d.project));
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_test_runner(&db_path, "runner-x", "online");
+
+    // First, set the pin.
+    let (s, _) = d.put(
+        "/api/plans/cfg-rid-clear/config",
+        json!({"runnerId": "runner-x"}),
+    );
+    assert_eq!(s, 200);
+
+    // Then explicit null clears it (back to "any online runner").
+    let (s, body) = d.put("/api/plans/cfg-rid-clear/config", json!({"runnerId": null}));
+    assert_eq!(s, 200, "body: {body}");
+    assert!(body["runnerId"].is_null(), "got: {body}");
+
+    // The clear must DELETE the row, not just NULL the column.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plan_runner_affinity WHERE plan_name = ?1",
+            params!["cfg-rid-clear"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn put_partial_preserves_unspecified_runner_id() {
+    // Setting auto_mode without touching runner_id leaves the existing
+    // pin intact (mirrors the auto_mode/max_fix_attempts contract).
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-rid-partial",
+        &minimal_plan("cfg-rid-partial", &d.project),
+    );
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_test_runner(&db_path, "runner-x", "online");
+
+    let (s, _) = d.put(
+        "/api/plans/cfg-rid-partial/config",
+        json!({"runnerId": "runner-x"}),
+    );
+    assert_eq!(s, 200);
+
+    // PUT autoMode only — runnerId must NOT clear.
+    let (s, body) = d.put(
+        "/api/plans/cfg-rid-partial/config",
+        json!({"autoMode": true}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["runnerId"], "runner-x", "pin clobbered: {body}");
+}
+
+#[test]
+fn put_runner_id_re_pin_clears_runner_offline_pause() {
+    // If the loop self-paused with runner_offline because the previous
+    // pin went offline, repinning to a now-online runner should clear
+    // the pause proactively (no manual Resume click).
+    let d = TestDashboard::new();
+    d.create_plan("cfg-rid-repin", &minimal_plan("cfg-rid-repin", &d.project));
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    seed_test_runner(&db_path, "runner-old", "offline");
+    seed_test_runner(&db_path, "runner-new", "online");
+
+    // Pin to the offline one + simulate a runner_offline pause.
+    let (s, _) = d.put(
+        "/api/plans/cfg-rid-repin/config",
+        json!({"autoMode": true, "runnerId": "runner-old"}),
+    );
+    assert_eq!(s, 200);
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE plan_auto_mode \
+         SET paused_reason = 'runner_offline', paused_at = datetime('now') \
+         WHERE plan_name = ?1",
+        params!["cfg-rid-repin"],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Repin to an online runner.
+    let (s, body) = d.put(
+        "/api/plans/cfg-rid-repin/config",
+        json!({"runnerId": "runner-new"}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["runnerId"], "runner-new");
+    assert!(body["pausedReason"].is_null(), "pause should clear: {body}");
+}

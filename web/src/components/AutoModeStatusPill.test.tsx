@@ -12,6 +12,7 @@ function defaultConfig(overrides: Partial<PlanConfig> = {}): PlanConfig {
     maxFixAttempts: 3,
     pausedReason: null,
     parallel: false,
+    runnerId: null,
     ...overrides,
   };
 }

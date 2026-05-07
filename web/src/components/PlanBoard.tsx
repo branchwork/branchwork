@@ -8,6 +8,7 @@ import {
 } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useAgentStore, type Agent } from "../stores/agent-store.js";
+import { useRunnerStore } from "../stores/runner-store.js";
 import { fetchJson, postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
 import { EditableText } from "./EditableText.js";
@@ -306,6 +307,7 @@ export function PlanBoard() {
       </div>
 
       <UncommittedWorkBanner planName={plan.name} />
+      <RunnerOfflineBanner planName={plan.name} />
 
       {/* Status filter */}
       <div className="flex items-center gap-1 mb-4">
@@ -797,6 +799,12 @@ const AUTO_ADVANCE_TOOLTIP =
 /// without letting an operator trip the gate by accident.
 const PARALLEL_DISABLED_TOOLTIP = "Available once worktree isolation ships";
 
+/// Hover text for the per-plan Runner pin (T11.4). Explains the trade-off
+/// upfront so the user understands why the plan can pause if the pinned
+/// runner goes offline.
+const RUNNER_PICKER_TOOLTIP =
+  "Pin every spawn for this plan to a specific runner. Auto-mode pauses with reason 'runner_offline' if the pinned runner goes offline. Default 'any' picks the first online runner.";
+
 /// Plan-level auto-mode + auto-advance toggles. Reads/writes
 /// `/api/plans/:name/config`. The `max_fix_attempts` input only renders
 /// when auto-mode is on; 0 means "merge but never spawn a fix agent".
@@ -878,6 +886,11 @@ function AutoModeControls({ planName }: { planName: string }) {
         disabled
         onChange={() => {}}
       />
+      <RunnerPicker
+        runnerId={config.runnerId}
+        disabled={busy}
+        onChange={(rid) => update({ runnerId: rid })}
+      />
       {config.autoMode && (
         <label
           className="flex items-center gap-1.5 text-gray-400"
@@ -906,6 +919,70 @@ function AutoModeControls({ planName }: { planName: string }) {
         </label>
       )}
     </div>
+  );
+}
+
+/// Per-plan runner pin (T11.4). Lists ONLINE runners + an "any" option;
+/// reads/writes via `PlanConfigPatch.runnerId`. If the plan is currently
+/// pinned to a runner that is offline (or no longer exists), the pinned
+/// id is still rendered as an explicit option so the user can see what
+/// it's set to and either repin or clear. Hidden in standalone mode
+/// (no SaaS runners) — the picker is only meaningful when there are
+/// runners to pick between.
+export function RunnerPicker({
+  runnerId,
+  disabled,
+  onChange,
+}: {
+  runnerId: string | null;
+  disabled?: boolean;
+  onChange: (id: string | null) => void;
+}) {
+  const runners = useRunnerStore((s) => s.runners);
+  const mode = useRunnerStore((s) => s.mode);
+
+  // Standalone deployment: hide entirely. The pin only matters when the
+  // dispatcher is routing to runners.
+  if (mode === "standalone") return null;
+  // No runners enrolled yet: the dropdown would only carry "any". Hide
+  // until there is a real choice.
+  if (runners.length === 0 && !runnerId) return null;
+
+  const value = runnerId ?? "__any__";
+  const pinnedKnown = runnerId === null || runners.some((r) => r.id === runnerId);
+
+  return (
+    <label
+      className="flex items-center gap-1.5 text-gray-400"
+      title={RUNNER_PICKER_TOOLTIP}
+    >
+      <span>Runner</span>
+      <select
+        value={value}
+        disabled={disabled}
+        onChange={(e) => {
+          const v = e.target.value;
+          onChange(v === "__any__" ? null : v);
+        }}
+        className="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 text-gray-200 outline-none focus:border-indigo-500 disabled:opacity-50"
+        aria-label="Runner pin for this plan"
+      >
+        <option value="__any__">any (online)</option>
+        {runners.map((r) => (
+          <option key={r.id} value={r.id}>
+            {r.name ?? r.id} {r.status !== "online" ? "(offline)" : ""}
+          </option>
+        ))}
+        {/* Stale pin: the runner row vanished (revoked, never connected
+            from this server, etc). Surface it explicitly so the user can
+            see and clear it instead of silently swapping back to "any". */}
+        {!pinnedKnown && runnerId && (
+          <option key={runnerId} value={runnerId}>
+            {runnerId} (unknown)
+          </option>
+        )}
+      </select>
+    </label>
   );
 }
 
@@ -967,6 +1044,45 @@ export function UncommittedWorkBanner({ planName }: { planName: string }) {
       >
         Inspect agent
       </button>
+    </div>
+  );
+}
+
+/// Banner above the board for the `runner_offline` pause (T11.4). The
+/// dispatcher pauses the plan when the pinned runner went offline at
+/// spawn time. Resolution paths: (a) the pinned runner reconnects and
+/// the user clicks Resume on the pill, OR (b) the user repins to a
+/// different runner via the Runner picker (a re-pin to an online runner
+/// auto-clears this pause server-side, see `put_plan_config`).
+export function RunnerOfflineBanner({ planName }: { planName: string }) {
+  const config = usePlanStore((s) => s.planConfigs[planName] ?? null);
+  const runners = useRunnerStore((s) => s.runners);
+
+  if (config?.pausedReason !== "runner_offline") return null;
+
+  const pinned = runners.find((r) => r.id === config.runnerId);
+  const pinnedLabel = pinned?.name ?? config.runnerId ?? "this runner";
+
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-start gap-3 rounded border border-amber-700/50 bg-amber-900/20 px-4 py-3 text-sm"
+    >
+      <span
+        aria-hidden="true"
+        className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-amber-700/60 text-xs font-bold text-amber-100"
+      >
+        !
+      </span>
+      <div className="flex-1 text-amber-100">
+        <div className="font-medium">
+          Auto-mode paused: pinned runner <span className="font-mono">{pinnedLabel}</span> is offline.
+        </div>
+        <div className="mt-0.5 text-amber-200/80">
+          Wait for the runner to reconnect and click Resume, or pick a different runner from the
+          dropdown above.
+        </div>
+      </div>
     </div>
   );
 }
@@ -1105,6 +1221,8 @@ function humanPauseReason(reason: string): string {
   if (reason === "merge_conflict") return "merge conflict";
   if (reason === "fix_cap_reached") return "fix cap reached";
   if (reason === "ci_stalled") return "CI stalled";
+  if (reason === "runner_offline") return "runner offline";
+  if (reason === "agent_left_uncommitted_work") return "uncommitted work";
   if (reason.startsWith("merge_failed")) return "merge failed";
   if (reason.startsWith("fix_merge_failed")) return "fix merge failed";
   if (reason.startsWith("fix_spawn_failed")) return "fix spawn failed";

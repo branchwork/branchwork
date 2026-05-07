@@ -54,6 +54,7 @@ function seedAllStores() {
         maxFixAttempts: 3,
         pausedReason: null,
         parallel: false,
+        runnerId: null,
       },
     },
     autoModeRuntimes: { "user-a-plan": { state: "merging", task: "1.1" } },

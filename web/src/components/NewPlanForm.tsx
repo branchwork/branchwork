@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { HttpError, fetchJson, postJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
+import { useRunnerStore } from "../stores/runner-store.js";
 import { formatRelative } from "../lib/time.js";
 import { httpErrorBody } from "../lib/error.js";
 import { toastError } from "../lib/toast.js";
@@ -41,6 +42,25 @@ export function NewPlanForm({ onClose }: Props) {
   const [creating, setCreating] = useState(false);
   const [confirmCreate, setConfirmCreate] = useState<string | null>(null);
   const [runnerStatus, setRunnerStatus] = useState<RunnerStatus | null>(null);
+  // T11.4: optional runner pin. Defaults to the user's currently-focused
+  // runner (`runner-store.selectedRunnerId`) so the natural flow is
+  // "pick the runner you're working on, create the plan there". The user
+  // can override to "any" to fall back to the dispatcher's first-online
+  // logic.
+  const selectedRunnerId = useRunnerStore((s) => s.selectedRunnerId);
+  const runners = useRunnerStore((s) => s.runners);
+  const runnerMode = useRunnerStore((s) => s.mode);
+  const [runnerId, setRunnerId] = useState<string | null>(selectedRunnerId);
+  // Reflect store updates into the form: if the user lands on the page
+  // before runners load, the default seeds once `selectedRunnerId`
+  // becomes non-null. Skip after first explicit user touch (tracked via
+  // `runnerTouched`) so we don't clobber an explicit "any" choice.
+  const [runnerTouched, setRunnerTouched] = useState(false);
+  useEffect(() => {
+    if (!runnerTouched && runnerId === null && selectedRunnerId !== null) {
+      setRunnerId(selectedRunnerId);
+    }
+  }, [selectedRunnerId, runnerId, runnerTouched]);
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const goToAgent = useGoToAgent();
   const fetchPlans = usePlanStore((s) => s.fetchPlans);
@@ -89,6 +109,10 @@ export function NewPlanForm({ onClose }: Props) {
         folder,
         createFolder: !!confirmCreate,
         templateId: templateId || undefined,
+        // T11.4: send the picked runner id. `null` (any) is encoded as
+        // omitted so older servers ignore it cleanly; explicit string
+        // pins the plan-creation agent to that runner.
+        ...(runnerId ? { runnerId } : {}),
       });
 
       selectAgent(res.agentId);
@@ -259,6 +283,34 @@ export function NewPlanForm({ onClose }: Props) {
           An agent will explore the folder and create a structured plan with phases and tasks.
         </p>
       </div>
+
+      {/* Runner picker (T11.4) — SaaS-only, hidden in standalone */}
+      {runnerMode !== "standalone" && runners.length > 0 && (
+        <div className="mb-4">
+          <label className="block text-sm font-medium text-gray-400 mb-1.5">Runner</label>
+          <select
+            value={runnerId ?? "__any__"}
+            onChange={(e) => {
+              const v = e.target.value;
+              setRunnerTouched(true);
+              setRunnerId(v === "__any__" ? null : v);
+            }}
+            className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-indigo-600"
+            aria-label="Runner pin for the new plan"
+          >
+            <option value="__any__">any (online)</option>
+            {runners.map((r) => (
+              <option key={r.id} value={r.id} disabled={r.status !== "online"}>
+                {r.name ?? r.id} {r.status !== "online" ? "(offline)" : ""}
+              </option>
+            ))}
+          </select>
+          <p className="text-[10px] text-gray-600 mt-1">
+            The plan-creation agent will spawn on this runner. You can repin or clear from the plan
+            board after the plan is created.
+          </p>
+        </div>
+      )}
 
       {/* Submit */}
       <Button

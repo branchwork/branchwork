@@ -81,6 +81,7 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
         driver: driver_name,
         user_id,
         org_id: _opt_org,
+        runner_id: explicit_runner_id,
     } = opts;
 
     let agent_id = uuid::Uuid::new_v4().to_string();
@@ -132,16 +133,62 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
         }),
     );
 
-    // Pick the runner up-front so we can apply its per-runner override to
-    // `effort` / `skip_permissions` before building the StartAgent envelope
-    // (the runner does not re-resolve). If no runner can be picked, we keep
-    // the row at `starting`; an outbox replay only kicks in once we know
-    // which runner to enqueue against.
-    let Some(runner_id) = pick_runner_for_org(&state.db, org_id) else {
-        eprintln!(
-            "[spawn_ops] org {org_id} has runner row(s) but selection failed; agent {agent_id} stays in 'starting'"
-        );
-        return agent_id;
+    // Per-plan runner affinity (T11.4): explicit override from the caller
+    // > plan pin > "first online" fallback. The pin path BLOCKS dispatch
+    // when the runner is offline (the brief's option (a)) — we pause the
+    // plan with `paused_reason='runner_offline'` instead of outboxing,
+    // because the user has explicitly said "this runner only" and silent
+    // queueing would be a worse surprise than a visible pause.
+    //
+    // The fallback path (no pin, no explicit override) preserves today's
+    // behaviour and DOES outbox to the most-recently-seen runner so a
+    // transiently-offline runner picks up via replay on reconnect.
+    let runner_id = match resolve_runner_for_spawn(&state.db, org_id, plan_name, explicit_runner_id)
+    {
+        SpawnTarget::Runner(id) => id,
+        SpawnTarget::PinnedRunnerOffline { runner_id, plan } => {
+            eprintln!(
+                "[spawn_ops] plan '{plan}' pinned to runner '{runner_id}' but runner is offline; pausing plan"
+            );
+            crate::db::auto_mode_pause(&state.db, &plan, "runner_offline");
+            crate::ws::broadcast_event(
+                &state.broadcast_tx,
+                "auto_mode_paused",
+                serde_json::json!({
+                    "plan": plan,
+                    "task": task_id,
+                    "reason": "runner_offline",
+                    "runner_id": runner_id,
+                }),
+            );
+            // Mark the just-inserted starting row as failed so the UI can
+            // display the actual failure rather than leaving it spinning.
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute(
+                    "UPDATE agents SET status = 'failed', stop_reason = 'runner_offline', \
+                     finished_at = datetime('now') WHERE id = ?1",
+                    params![agent_id],
+                )
+                .ok();
+            }
+            crate::ws::broadcast_event(
+                &state.broadcast_tx,
+                "agent_stopped",
+                serde_json::json!({
+                    "id": agent_id,
+                    "status": "failed",
+                    "stop_reason": "runner_offline",
+                }),
+            );
+            return agent_id;
+        }
+        SpawnTarget::NoRunner => {
+            eprintln!(
+                "[spawn_ops] org {org_id} has runner row(s) but selection failed; agent {agent_id} stays in 'starting'"
+            );
+            return agent_id;
+        }
     };
 
     // Resolve per-runner override → server default for the two fields the
@@ -187,6 +234,88 @@ fn pick_runner_for_org(db: &crate::db::Db, org_id: &str) -> Option<String> {
         |row| row.get::<_, String>(0),
     )
     .ok()
+}
+
+/// Outcome of [`resolve_runner_for_spawn`].
+enum SpawnTarget {
+    /// Dispatch to this runner.
+    Runner(String),
+    /// The plan is pinned to a specific runner that is currently offline.
+    /// The dispatcher must pause the plan with
+    /// `paused_reason='runner_offline'` rather than outboxing.
+    PinnedRunnerOffline { runner_id: String, plan: String },
+    /// No runner could be selected at all — the org has no runners. Shouldn't
+    /// happen in practice because callers above gate on `org_has_runner`.
+    NoRunner,
+}
+
+/// Resolve the target runner for an agent spawn, honouring per-plan
+/// runner affinity (T11.4).
+///
+/// Priority:
+///   1. `explicit_runner_id` — caller-supplied override (used by the
+///      plan-creation flow where `plan_name` is `None`). Online check
+///      mirrors the pinned path: offline ⇒ no fallback.
+///   2. `plan_runner_affinity.runner_id` for `plan_name` (when set).
+///      Offline ⇒ `PinnedRunnerOffline`, NOT a silent fallback. The
+///      brief's option (a): explicit "this runner is gone, your call"
+///      beats implicit-fallback.
+///   3. `pick_runner_for_org` — today's behaviour: most-recently-seen
+///      (online preferred, but accepts offline so the outbox can replay).
+fn resolve_runner_for_spawn(
+    db: &crate::db::Db,
+    org_id: &str,
+    plan_name: Option<&str>,
+    explicit_runner_id: Option<&str>,
+) -> SpawnTarget {
+    if let Some(rid) = explicit_runner_id {
+        return match runner_status(db, rid) {
+            Some(true) => SpawnTarget::Runner(rid.to_string()),
+            // Offline or unknown: treat as a pin failure. For the
+            // plan-creation flow we don't have a plan to pause, so the
+            // dispatcher logs and bails (the row stays at `starting`).
+            // Surface the same `PinnedRunnerOffline` shape so the caller
+            // can decide; if `plan_name` is absent we fall through to
+            // `NoRunner` since there is nothing to pause.
+            _ => match plan_name {
+                Some(plan) => SpawnTarget::PinnedRunnerOffline {
+                    runner_id: rid.to_string(),
+                    plan: plan.to_string(),
+                },
+                None => SpawnTarget::NoRunner,
+            },
+        };
+    }
+
+    if let Some(plan) = plan_name
+        && let Some(rid) = crate::db::plan_runner_id(db, plan)
+    {
+        return match runner_status(db, &rid) {
+            Some(true) => SpawnTarget::Runner(rid),
+            _ => SpawnTarget::PinnedRunnerOffline {
+                runner_id: rid,
+                plan: plan.to_string(),
+            },
+        };
+    }
+
+    pick_runner_for_org(db, org_id)
+        .map(SpawnTarget::Runner)
+        .unwrap_or(SpawnTarget::NoRunner)
+}
+
+/// Read the `runners.status` column. Returns `Some(true)` when the runner
+/// row's status is `'online'`, `Some(false)` for any other status, and
+/// `None` when no row exists for `runner_id`.
+fn runner_status(db: &crate::db::Db, runner_id: &str) -> Option<bool> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT status FROM runners WHERE id = ?1",
+        params![runner_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .map(|s| s == "online")
 }
 
 /// Reliable delivery: enqueue first so an offline runner picks this up
@@ -407,6 +536,7 @@ mod tests {
             driver: Some("claude"),
             user_id: None,
             org_id: Some(org_id),
+            runner_id: None,
         };
         let agent_id = start_agent_dispatch(&state, org_id, opts).await;
 
@@ -509,6 +639,7 @@ mod tests {
             driver: Some("claude"),
             user_id: None,
             org_id: Some(org_id),
+            runner_id: None,
         };
         let agent_id = start_agent_dispatch(&state, org_id, opts).await;
 
@@ -675,5 +806,251 @@ mod tests {
             event.contains(agent_id),
             "broadcast should reference {agent_id}: {event}"
         );
+    }
+
+    // ── T11.4: per-plan runner affinity dispatch tests ──────────────────
+
+    /// Acceptance: pinning a plan to a specific (online) runner routes
+    /// every spawn for that plan to the pinned runner — even when there
+    /// are other online runners that `pick_runner_for_org` would prefer
+    /// by recency.
+    #[tokio::test]
+    async fn pinned_plan_routes_to_pinned_runner_not_first_online() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        seed_runner(&db, "runner-recent", org_id, "online");
+        // Make runner-pinned older than runner-recent so the
+        // most-recently-seen tiebreaker would pick runner-recent if the
+        // pin were not honoured.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO runners (id, name, org_id, status, last_seen_at) \
+                 VALUES (?1, 'pinned', ?2, 'online', datetime('now', '-1 hour'))",
+                params!["runner-pinned", org_id],
+            )
+            .unwrap();
+        }
+
+        // Pin the plan to the older runner.
+        crate::db::set_plan_runner_id(&db, "demo-plan", org_id, Some("runner-pinned"));
+
+        let runners = new_runner_registry();
+        let mut pinned_rx = install_capturing_runner(&runners, "runner-pinned").await;
+        let _recent_rx = install_capturing_runner(&runners, "runner-recent").await;
+        let state = test_app_state(db.clone(), runners);
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        let opts = StartPtyOpts {
+            prompt: "do work".to_string(),
+            cwd: &cwd,
+            plan_name: Some("demo-plan"),
+            task_id: Some("1.1"),
+            effort: crate::config::Effort::Medium,
+            branch: Some("branchwork/demo-plan/1.1"),
+            is_continue: false,
+            max_budget_usd: None,
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+            runner_id: None,
+        };
+        let _agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        // The pinned runner must receive the StartAgent envelope. The
+        // capturing channel is keyed by runner id, so the fact that
+        // `pinned_rx` receives is the proof of routing — the
+        // envelope's `runner_id` field carries the *sender* ("server"),
+        // not the destination.
+        let payload = tokio::time::timeout(Duration::from_millis(500), pinned_rx.recv())
+            .await
+            .expect("envelope should arrive at pinned runner")
+            .expect("channel still open");
+        let envelope: Envelope = serde_json::from_str(&payload).unwrap();
+        assert!(matches!(envelope.message, WireMessage::StartAgent { .. }));
+    }
+
+    /// Acceptance: pinning to an offline runner pauses the plan with
+    /// `paused_reason='runner_offline'` and broadcasts `auto_mode_paused`.
+    /// No StartAgent envelope must reach any runner — the user has
+    /// explicitly opted out of fallback.
+    #[tokio::test]
+    async fn pinned_offline_runner_pauses_plan_and_does_not_dispatch() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        // The pinned runner is offline; another online runner exists
+        // but must NOT be silently chosen.
+        seed_runner(&db, "runner-online", org_id, "online");
+        seed_runner(&db, "runner-pinned-offline", org_id, "offline");
+        crate::db::set_plan_runner_id(&db, "demo-plan", org_id, Some("runner-pinned-offline"));
+
+        let runners = new_runner_registry();
+        let mut online_rx = install_capturing_runner(&runners, "runner-online").await;
+        let state = test_app_state(db.clone(), runners);
+
+        let mut bc_rx = state.broadcast_tx.subscribe();
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        let opts = StartPtyOpts {
+            prompt: "do work".to_string(),
+            cwd: &cwd,
+            plan_name: Some("demo-plan"),
+            task_id: Some("1.1"),
+            effort: crate::config::Effort::Medium,
+            branch: Some("branchwork/demo-plan/1.1"),
+            is_continue: false,
+            max_budget_usd: None,
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+            runner_id: None,
+        };
+        let agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        // No envelope to the online runner.
+        let leak = tokio::time::timeout(Duration::from_millis(150), online_rx.recv()).await;
+        assert!(
+            leak.is_err(),
+            "no envelope must reach a non-pinned runner: got {leak:?}"
+        );
+
+        // Plan paused with the right reason in DB.
+        let paused: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT paused_reason FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["demo-plan"],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        assert_eq!(paused.as_deref(), Some("runner_offline"));
+
+        // Agent row flipped to failed/runner_offline.
+        let (status, stop_reason): (String, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status, stop_reason FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(status, "failed");
+        assert_eq!(stop_reason.as_deref(), Some("runner_offline"));
+
+        // auto_mode_paused must have been broadcast (drain a few events
+        // since agent_started fires before the pause).
+        let mut saw_paused = false;
+        for _ in 0..6 {
+            match tokio::time::timeout(Duration::from_millis(150), bc_rx.recv()).await {
+                Ok(Ok(s)) if s.contains("auto_mode_paused") && s.contains("runner_offline") => {
+                    saw_paused = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            saw_paused,
+            "auto_mode_paused with runner_offline must broadcast"
+        );
+    }
+
+    /// Acceptance: an unpinned plan keeps today's "first online" semantics
+    /// — `pick_runner_for_org` picks the most-recently-seen online runner
+    /// and the dispatcher routes there.
+    #[tokio::test]
+    async fn unpinned_plan_falls_back_to_first_online() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        // No `plan_runner_affinity` row inserted; rely on fallback.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO runners (id, name, org_id, status, last_seen_at) \
+                 VALUES (?1, 'older', ?2, 'online', datetime('now', '-2 hours'))",
+                params!["runner-older", org_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runners (id, name, org_id, status, last_seen_at) \
+                 VALUES (?1, 'newer', ?2, 'online', datetime('now'))",
+                params!["runner-newer", org_id],
+            )
+            .unwrap();
+        }
+
+        let runners = new_runner_registry();
+        let _older_rx = install_capturing_runner(&runners, "runner-older").await;
+        let mut newer_rx = install_capturing_runner(&runners, "runner-newer").await;
+        let state = test_app_state(db, runners);
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        let opts = StartPtyOpts {
+            prompt: "do work".to_string(),
+            cwd: &cwd,
+            plan_name: Some("demo-plan"),
+            task_id: Some("1.1"),
+            effort: crate::config::Effort::Medium,
+            branch: Some("branchwork/demo-plan/1.1"),
+            is_continue: false,
+            max_budget_usd: None,
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+            runner_id: None,
+        };
+        let _agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        let payload = tokio::time::timeout(Duration::from_millis(500), newer_rx.recv())
+            .await
+            .expect("envelope should arrive at newer runner")
+            .expect("channel still open");
+        let envelope: Envelope = serde_json::from_str(&payload).unwrap();
+        assert!(matches!(envelope.message, WireMessage::StartAgent { .. }));
+    }
+
+    /// Acceptance: an explicit `runner_id` override (e.g. from
+    /// `NewPlanForm`) wins over `pick_runner_for_org` even when no plan
+    /// pin exists. Online check applies the same way as the pin path.
+    #[tokio::test]
+    async fn explicit_runner_override_wins_over_pick_first_online() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        seed_runner(&db, "runner-default", org_id, "online");
+        seed_runner(&db, "runner-explicit", org_id, "online");
+
+        let runners = new_runner_registry();
+        let _default_rx = install_capturing_runner(&runners, "runner-default").await;
+        let mut explicit_rx = install_capturing_runner(&runners, "runner-explicit").await;
+        let state = test_app_state(db, runners);
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        // No plan_name (mirrors NewPlanForm) but explicit runner_id.
+        let opts = StartPtyOpts {
+            prompt: "do work".to_string(),
+            cwd: &cwd,
+            plan_name: None,
+            task_id: None,
+            effort: crate::config::Effort::Medium,
+            branch: None,
+            is_continue: false,
+            max_budget_usd: None,
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+            runner_id: Some("runner-explicit"),
+        };
+        let _agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        let payload = tokio::time::timeout(Duration::from_millis(500), explicit_rx.recv())
+            .await
+            .expect("envelope should arrive at explicit runner")
+            .expect("channel still open");
+        let envelope: Envelope = serde_json::from_str(&payload).unwrap();
+        assert!(matches!(envelope.message, WireMessage::StartAgent { .. }));
     }
 }

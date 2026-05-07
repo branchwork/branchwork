@@ -200,6 +200,48 @@ pub fn set_runner_config(db: &Db, runner_id: &str, org_id: &str, cfg: &RunnerCon
     .ok();
 }
 
+/// Read the per-plan runner affinity. Returns `Some(runner_id)` when the
+/// plan is pinned to a specific runner, or `None` when no row exists (the
+/// historic "any online runner" behaviour). Wired into
+/// `spawn_ops::start_agent_via_runner` (T11.4) so every agent spawn for
+/// the plan honours the pin.
+pub fn plan_runner_id(db: &Db, plan_name: &str) -> Option<String> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT runner_id FROM plan_runner_affinity WHERE plan_name = ?1",
+        params![plan_name],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Persist (or clear) the per-plan runner affinity. `runner_id = None`
+/// deletes the row (back to "any online runner"); `Some` UPSERTs it.
+/// Idempotent.
+pub fn set_plan_runner_id(db: &Db, plan_name: &str, org_id: &str, runner_id: Option<&str>) {
+    let conn = db.lock().unwrap();
+    match runner_id {
+        Some(rid) => {
+            conn.execute(
+                "INSERT INTO plan_runner_affinity (plan_name, runner_id, org_id, updated_at) \
+                 VALUES (?1, ?2, ?3, datetime('now')) \
+                 ON CONFLICT(plan_name) DO UPDATE SET \
+                    runner_id = excluded.runner_id, \
+                    updated_at = excluded.updated_at",
+                params![plan_name, rid, org_id],
+            )
+            .ok();
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM plan_runner_affinity WHERE plan_name = ?1",
+                params![plan_name],
+            )
+            .ok();
+        }
+    }
+}
+
 /// Per-plan retry cap for fix agents. Mirrors the schema default (3) so
 /// plans without a `plan_auto_mode` row return the same value the loop
 /// would see if one had been UPSERTed with defaults. The auto-mode loop
@@ -815,6 +857,26 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE runners ADD COLUMN last_health_at TEXT;")
         .ok();
 
+    // Per-plan runner affinity (T11.4). One row per pinned plan: presence
+    // of the row + `runner_id` set means "this runner only"; absent row
+    // means "any online runner" (the historic `pick_runner_for_org`
+    // behaviour). Dispatch consults this on every spawn; if the pinned
+    // runner is offline, the plan is paused with
+    // `paused_reason='runner_offline'`. Lives in its own table to mirror
+    // the existing per-plan-config pattern (`plan_auto_mode`,
+    // `plan_auto_advance`, `plan_budget`) and avoid touching the
+    // `plan_project.project NOT NULL` column for plans without a project
+    // override.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plan_runner_affinity (
+             plan_name  TEXT PRIMARY KEY,
+             runner_id  TEXT NOT NULL,
+             org_id     TEXT NOT NULL DEFAULT 'default-org',
+             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );",
+    )
+    .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 
@@ -913,6 +975,7 @@ mod tests {
         assert!(tables.contains(&"plan_org".to_string()));
         assert!(tables.contains(&"audit_logs".to_string()));
         assert!(tables.contains(&"plan_snapshots".to_string()));
+        assert!(tables.contains(&"plan_runner_affinity".to_string()));
     }
 
     #[test]
@@ -1898,6 +1961,84 @@ mod tests {
         let cfg = runner_config(&db, "runner-c");
         assert!(cfg.effort.is_none());
         assert!(cfg.skip_permissions.is_none());
+    }
+
+    // ── plan_runner_affinity (T11.4) ─────────────────────────────────────
+
+    #[test]
+    fn plan_runner_id_returns_none_when_unset() {
+        let (db, _dir) = test_db();
+        assert_eq!(plan_runner_id(&db, "missing-plan"), None);
+    }
+
+    #[test]
+    fn set_plan_runner_id_round_trips() {
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-a", "default-org");
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-a"));
+        assert_eq!(
+            plan_runner_id(&db, "plan-a"),
+            Some("runner-a".to_string()),
+            "explicit pin should round-trip via the helper"
+        );
+    }
+
+    #[test]
+    fn set_plan_runner_id_replaces_existing_pin() {
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-a", "default-org");
+        seed_runner(&db, "runner-b", "default-org");
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-a"));
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-b"));
+        assert_eq!(plan_runner_id(&db, "plan-a"), Some("runner-b".to_string()));
+    }
+
+    #[test]
+    fn set_plan_runner_id_clear_deletes_row() {
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-a", "default-org");
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-a"));
+        set_plan_runner_id(&db, "plan-a", "default-org", None);
+        assert_eq!(plan_runner_id(&db, "plan-a"), None);
+
+        // Clearing twice (or clearing a non-existent pin) is a silent no-op.
+        set_plan_runner_id(&db, "plan-a", "default-org", None);
+        let count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM plan_runner_affinity WHERE plan_name = ?1",
+                params!["plan-a"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn plan_runner_affinity_does_not_touch_plan_project_project_column() {
+        // Regression: the affinity table is intentionally separate from
+        // `plan_project` so we never accidentally clobber a project
+        // override (which is NOT NULL on that table) when setting a
+        // runner pin for a plan with no project override yet.
+        let (db, _dir) = test_db();
+        seed_runner(&db, "runner-a", "default-org");
+
+        // No plan_project row should be created or modified.
+        set_plan_runner_id(&db, "plan-a", "default-org", Some("runner-a"));
+        let pp_rows: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM plan_project WHERE plan_name = ?1",
+                params!["plan-a"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            pp_rows, 0,
+            "setting runner pin must not touch plan_project (the project column is NOT NULL there)"
+        );
     }
 
     #[test]

@@ -1425,6 +1425,7 @@ async fn spawn_ready_tasks(
                 driver: None,
                 user_id: None,
                 org_id: None,
+                runner_id: None,
             },
         )
         .await;

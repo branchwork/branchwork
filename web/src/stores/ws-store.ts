@@ -488,6 +488,14 @@ function dispatch(msg: WsMessage) {
       planStore.setAutoModeRuntime(d.plan, null);
       break;
     }
+    case "plan_runner_affinity_changed": {
+      // T11.4: server applied a per-plan runner pin (or cleared it).
+      // Patch the local PlanConfig so the dropdown + banner reflect the
+      // new state without a refetch.
+      const d = msg.data;
+      planStore.patchPlanConfig(d.plan, { runnerId: d.runner_id ?? null });
+      break;
+    }
     case "task_advanced": {
       // Intra-phase advance: a task finished and one or more sibling tasks
       // in the same phase are being spawned. Refresh agents so the new rows

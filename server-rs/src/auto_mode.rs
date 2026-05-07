@@ -762,6 +762,7 @@ pub async fn spawn_fix_agent(
         driver: None,
         user_id: None,
         org_id: Some(org_id),
+        runner_id: None,
     };
     let agent_id = start_agent_dispatch(state, org_id, opts).await;
 

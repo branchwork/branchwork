@@ -131,6 +131,7 @@ const AutoModePaused = v.object({
     task: NullishStr,
     reason: v.string(),
     target: NullishStr,
+    runner_id: v.optional(v.string()),
   }),
 });
 
@@ -139,6 +140,15 @@ const AutoModeResumed = v.object({
   data: v.object({
     plan: v.string(),
     last_completed_task: NullishStr,
+    reason: v.optional(v.string()),
+  }),
+});
+
+const PlanRunnerAffinityChanged = v.object({
+  type: v.literal("plan_runner_affinity_changed"),
+  data: v.object({
+    plan: v.string(),
+    runner_id: NullishStr,
   }),
 });
 
@@ -372,6 +382,7 @@ export const WsMessageSchema = v.variant("type", [
   RunnerDrivers,
   RunnerLog,
   RunnerHealth,
+  PlanRunnerAffinityChanged,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;

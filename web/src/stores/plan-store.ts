@@ -93,6 +93,11 @@ export interface PlanConfig {
   /// at the API layer with 412 until worktree-per-agent isolation ships
   /// (3.5.3) — the UI renders the switch disabled until then.
   parallel: boolean;
+  /// Per-plan runner pin (T11.4). `null` = "any online runner" (today's
+  /// behaviour); set = pin every spawn for this plan to that runner. The
+  /// dispatcher pauses the plan with `paused_reason='runner_offline'` if
+  /// the pinned runner is offline at spawn time.
+  runnerId: string | null;
 }
 
 export interface PlanConfigPatch {
@@ -104,6 +109,10 @@ export interface PlanConfigPatch {
   /// last completed task. Only the loop sets non-null values; the wire
   /// silently ignores non-null patches here.
   pausedReason?: string | null;
+  /// Per-plan runner pin (T11.4). Three states: `undefined` (don't touch),
+  /// explicit `null` (clear pin = "any online runner"), or a runner id
+  /// string (pin to that runner).
+  runnerId?: string | null;
 }
 
 /// Live status of the auto-mode loop for a single plan, driven by the

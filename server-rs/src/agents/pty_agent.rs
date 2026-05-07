@@ -48,6 +48,12 @@ pub struct StartPtyOpts<'a> {
     pub user_id: Option<&'a str>,
     /// Org this agent belongs to (for org-level budget tracking).
     pub org_id: Option<&'a str>,
+    /// Explicit runner pin from the caller (T11.4). When set, the SaaS
+    /// dispatcher routes the spawn to this runner, ignoring any
+    /// `plan_runner_affinity` row. Used by the plan-creation flow
+    /// (`NewPlanForm`) where no plan name exists yet, but the user has
+    /// chosen a target runner. Standalone path ignores this field.
+    pub runner_id: Option<&'a str>,
 }
 
 pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -> String {
@@ -63,6 +69,7 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         driver: driver_name,
         user_id,
         org_id,
+        runner_id: _runner_id, // standalone path ignores it
     } = opts;
     let (driver_name, driver) = registry.drivers.get_or_default(driver_name);
     let id = uuid::Uuid::new_v4().to_string();
@@ -1172,6 +1179,7 @@ mod tests {
                 driver: Some("claude"),
                 user_id: None,
                 org_id: None,
+                runner_id: None,
             },
         )
         .await;
@@ -1291,6 +1299,7 @@ mod tests {
                 driver: Some("aider"),
                 user_id: None,
                 org_id: None,
+                runner_id: None,
             },
         )
         .await;

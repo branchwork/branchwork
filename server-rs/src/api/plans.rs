@@ -517,6 +517,11 @@ struct PlanConfig {
     /// the unified PUT. Toggling to true is rejected at the API layer
     /// until worktrees ship (3.5.3).
     parallel: bool,
+    /// Per-plan runner affinity (T11.4). `None` = "any online runner";
+    /// `Some(id)` pins every spawn to that runner. The dispatcher pauses
+    /// the plan with `paused_reason='runner_offline'` if the pinned
+    /// runner is offline at spawn time.
+    runner_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -533,6 +538,12 @@ pub struct PlanConfigBody {
     /// `Absent` from `ExplicitNull`, which a plain `Option<String>` can't.
     #[serde(default, deserialize_with = "deserialize_some")]
     paused_reason: Option<Option<String>>,
+    /// Three-state field for the runner pin (T11.4): `Absent` (None,
+    /// don't touch), `ExplicitNull` (Some(None), clear the pin = "any
+    /// online runner"), `ExplicitValue` (Some(Some("runner-x")), pin to
+    /// that runner). Same `deserialize_some` shim as `paused_reason`.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    runner_id: Option<Option<String>>,
 }
 
 /// Serde shim to distinguish absent fields from explicit null. With field
@@ -572,6 +583,14 @@ fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
         )
         .unwrap_or((false, 3, None, false));
 
+    let runner_id = db
+        .query_row(
+            "SELECT runner_id FROM plan_runner_affinity WHERE plan_name = ?1",
+            params![name],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+
     // The unified config keeps both tables' `parallel` flags in lockstep,
     // but in case they ever diverge (manual SQL, partial migration), OR
     // them so a single "yes" wins. 3.5.3 will reject toggle attempts to
@@ -582,6 +601,7 @@ fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
         max_fix_attempts,
         paused_reason,
         parallel: mode_parallel || advance_parallel,
+        runner_id,
     }
 }
 
@@ -765,6 +785,76 @@ pub async fn put_plan_config(
         state.cancel_plan(&name);
         for (agent_id, org_id) in &fix_agents_to_kill {
             let _ = crate::agents::spawn_ops::kill_agent_dispatch(&state, org_id, agent_id).await;
+        }
+    }
+
+    // Per-plan runner pin (T11.4). `Absent` (None) leaves the pin
+    // untouched. Explicit-null clears it (back to "any online runner").
+    // An explicit value writes/replaces the pin. Audit either way so the
+    // history shows when/who changed routing.
+    if let Some(rid_opt) = body.runner_id.as_ref() {
+        let rid_ref = rid_opt.as_deref();
+        crate::db::set_plan_runner_id(&state.db, &name, auth.org_id(), rid_ref);
+        {
+            let db = state.db.lock().unwrap();
+            crate::audit::log(
+                &db,
+                auth.org_id(),
+                auth.0.as_ref().map(|u| u.id.as_str()),
+                auth.0.as_ref().map(|u| u.email.as_str()),
+                crate::audit::actions::CONFIG_RUNNER_AFFINITY,
+                crate::audit::resources::PLAN,
+                Some(&name),
+                Some(&serde_json::json!({"runnerId": rid_ref}).to_string()),
+            );
+        }
+        crate::ws::broadcast_event(
+            &state.broadcast_tx,
+            "plan_runner_affinity_changed",
+            serde_json::json!({
+                "plan": name,
+                "runner_id": rid_ref,
+            }),
+        );
+
+        // If a previous `runner_offline` pause is now resolvable (the
+        // user pinned to a different runner that is online), clear it
+        // proactively so the user doesn't have to click Resume separately.
+        if let Some(rid) = rid_ref {
+            let was_paused_runner_offline = {
+                let db = state.db.lock().unwrap();
+                db.query_row(
+                    "SELECT paused_reason FROM plan_auto_mode WHERE plan_name = ?1",
+                    params![name],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+                .as_deref()
+                    == Some("runner_offline")
+            };
+            let online = {
+                let db = state.db.lock().unwrap();
+                db.query_row(
+                    "SELECT status FROM runners WHERE id = ?1",
+                    params![rid],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .as_deref()
+                    == Some("online")
+            };
+            if was_paused_runner_offline && online {
+                crate::db::auto_mode_resume(&state.db, &name);
+                crate::ws::broadcast_event(
+                    &state.broadcast_tx,
+                    "auto_mode_resumed",
+                    serde_json::json!({
+                        "plan": name,
+                        "reason": "runner_repinned",
+                    }),
+                );
+            }
         }
     }
 
@@ -1305,6 +1395,7 @@ pub async fn start_task(
             driver: body.driver.as_deref(),
             user_id: user_id_str.as_deref(),
             org_id: Some(&org_id_str),
+            runner_id: None,
         },
     )
     .await;
@@ -1543,6 +1634,7 @@ pub async fn start_phase_tasks(
                 driver: body.driver.as_deref(),
                 user_id: user_id_str.as_deref(),
                 org_id: Some(&org_id_str),
+                runner_id: None,
             },
         )
         .await;
@@ -1842,6 +1934,11 @@ pub struct CreatePlanBody {
     folder: String,
     create_folder: Option<bool>,
     template_id: Option<String>,
+    /// Optional runner pin selected on `NewPlanForm` (T11.4). When set,
+    /// the plan-creation agent runs on this runner regardless of which
+    /// runner is most-recently-seen for the org. The user can later
+    /// pin the resulting plan to the same runner from `PlanBoard`.
+    runner_id: Option<String>,
 }
 
 pub async fn create_plan(
@@ -2054,6 +2151,11 @@ pub async fn create_plan(
             driver: None,
             user_id: None,
             org_id: Some(&org_id_str),
+            // T11.4: when the user picks a runner in `NewPlanForm`, route
+            // the plan-creation agent to that runner. No plan exists yet
+            // so we can't pin the affinity row — the user can do that
+            // from `PlanBoard` once the plan is created.
+            runner_id: body.runner_id.as_deref(),
         },
     )
     .await;
@@ -2267,6 +2369,7 @@ pub struct DeletePlanQuery {
 /// | plan_budget          | PRIMARY KEY              | cascade   |
 /// | task_learnings       | NOT NULL                 | cascade   |
 /// | plan_org             | PRIMARY KEY              | cascade   |
+/// | plan_runner_affinity | PRIMARY KEY              | cascade   |
 /// | agents               | nullable (no FK)         | preserve  |
 /// | plan_snapshots       | NOT NULL                 | preserve  |
 ///
@@ -2307,6 +2410,7 @@ pub(crate) const PLAN_CASCADE_TABLES: &[&str] = &[
     "plan_budget",
     "task_learnings",
     "plan_org",
+    "plan_runner_affinity",
 ];
 
 /// Tables that contain a `plan_name` column but are intentionally NOT

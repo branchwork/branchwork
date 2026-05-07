@@ -344,6 +344,7 @@ pub async fn fix_ci(
             driver: body.driver.as_deref(),
             user_id: None,
             org_id: Some(&org_id_str),
+            runner_id: None,
         },
     )
     .await;

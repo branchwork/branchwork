@@ -47,6 +47,10 @@ pub mod actions {
     /// `{runner_id, effort: Option<String>, skip_permissions: Option<bool>}`,
     /// where `null` means the override was cleared (back to inherit).
     pub const CONFIG_RUNNER_OVERRIDE: &str = "config.runner_override";
+    /// `PUT /api/plans/{name}/config` set or cleared the per-plan runner
+    /// affinity (T11.4). Diff carries `{runnerId: Option<String>}` —
+    /// `null` means the pin was cleared (back to "any online runner").
+    pub const CONFIG_RUNNER_AFFINITY: &str = "config.runner_affinity";
     /// `POST /api/runners/{id}/shutdown` — operator clicked "Request
     /// shutdown" on the dashboard. The server enqueued a reliable
     /// `WireMessage::ShutdownRequest` to the runner; whether the runner

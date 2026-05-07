@@ -580,6 +580,12 @@ mod tests {
             params![plan],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO plan_runner_affinity (plan_name, runner_id, org_id) \
+             VALUES (?1, 'runner-x', 'default-org')",
+            params![plan],
+        )
+        .unwrap();
     }
 
     fn read_snapshot_row(
