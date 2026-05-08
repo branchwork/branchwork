@@ -81,8 +81,10 @@ Flag-level detail, file layouts, schemas.
 
 Deployment, upgrades, day-2 ops.
 
-- [operations/self-hosted.md](operations/self-hosted.md) _(stub)_ — single
-  binary on a laptop or server, SQLite, local agents.
+- [operations/self-hosted.md](operations/self-hosted.md) — single
+  binary on a laptop or server, SQLite, local agents. Includes
+  copy-pasteable systemd unit and launchd plist, Windows/NSSM notes,
+  log paths, backup, and the stop-swap-start upgrade procedure.
 - [operations/saas-runner.md](operations/saas-runner.md) _(stub)_ —
   runner token issuance, connection URL, reconnect/backoff, PATH
   requirements, systemd unit.
