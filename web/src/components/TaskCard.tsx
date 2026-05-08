@@ -126,6 +126,10 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
   const discardAgentBranch = useAgentStore((s) => s.discardAgentBranch);
   const [discarding, setDiscarding] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  // Two-step confirm for the destructive Reset menu item. First click arms,
+  // second commits. Auto-disarms after 4 s so a stale armed state can't fire
+  // accidentally when the user reopens the menu later.
+  const [resetArmed, setResetArmed] = useState(false);
 
   // undefined/true → show Merge; false → hide Merge (task not expected to produce a commit)
   const canMerge = task.producesCommit !== false;
@@ -246,6 +250,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
   }
 
   async function updateStatus(newStatus: string) {
+    setResetArmed(false);
     try {
       await putJson(`/api/plans/${planName}/tasks/${task.number}/status`, {
         status: newStatus,
@@ -257,6 +262,12 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
   }
 
   async function resetStatus() {
+    if (!resetArmed) {
+      // First click — arm. Second click within 4 s commits the reset.
+      setResetArmed(true);
+      return;
+    }
+    setResetArmed(false);
     try {
       await postJson(`/api/plans/${planName}/tasks/${task.number}/reset-status`, {});
       await selectPlan(planName);
@@ -264,6 +275,14 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
       toastError(e, "Reset failed");
     }
   }
+
+  // Auto-disarm the Reset confirm so a stale armed state from an abandoned
+  // dropdown can't fire when the user comes back later.
+  useEffect(() => {
+    if (!resetArmed) return;
+    const t = setTimeout(() => setResetArmed(false), 4000);
+    return () => clearTimeout(t);
+  }, [resetArmed]);
 
   async function cycleStatus() {
     const idx = STATUS_ORDER.indexOf(status as (typeof STATUS_ORDER)[number]);
@@ -347,14 +366,22 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
               <DropdownSeparator />
               {/* Reset — clears the task_status row entirely. Useful when
                   a task has ended up stuck in `checking` or similar from
-                  a dead agent. Backend refuses if an agent is still live. */}
+                  a dead agent. Backend refuses if an agent is still live.
+                  Confirm-click pattern: first activation arms, second commits.
+                  Auto-disarms after 4 s so a stale armed state can't fire
+                  when the user reopens the menu later. */}
               <DropdownItem
                 onSelect={resetStatus}
                 variant="danger"
-                title="Clear status row — useful to unwedge a stuck 'checking' task"
+                title={
+                  resetArmed
+                    ? "Click again to confirm — clears the task's status row"
+                    : "Clear status row — useful to unwedge a stuck 'checking' task"
+                }
+                aria-label={resetArmed ? "Confirm reset task status" : "Reset task status"}
               >
                 <span className="w-1.5 h-1.5 rounded-full bg-red-400/80" />
-                Reset
+                {resetArmed ? "Click again to confirm" : "Reset"}
               </DropdownItem>
             </Dropdown>
             {/* Updated at */}

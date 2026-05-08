@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
 import { TaskCard } from "./TaskCard.js";
 import {
@@ -261,5 +261,124 @@ describe("TaskCard learnings", () => {
 
     // Count badge updates from "(1)" to "(2)".
     expect(screen.getByRole("button", { name: /^Learnings \(2\)/ })).toBeTruthy();
+  });
+});
+
+describe("TaskCard Reset confirm-click", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function installResetFetch() {
+    const calls: { url: string; method: string }[] = [];
+    const fn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.pathname + input.search
+            : input.url;
+      const method = init?.method ?? "GET";
+      calls.push({ url, method });
+      if (url.endsWith("/reset-status") && method === "POST") {
+        return new Response(
+          JSON.stringify({ ok: true, plan_name: PLAN, task_number: "1.1", cleared: 1 }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.match(/\/api\/plans\/[^/]+\/tasks\/[^/]+\/status$/) && method === "PUT") {
+        return new Response(
+          JSON.stringify({ ok: true, plan_name: PLAN, task_number: "1.1", status: "pending" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fn);
+    return { calls };
+  }
+
+  function openMenu() {
+    const trigger = screen.getByRole("button", { name: /Status menu for task 1\.1/ });
+    fireEvent.click(trigger);
+  }
+
+  it("first click on Reset arms; second click commits and POSTs reset-status", async () => {
+    const t = task({ status: "checking" });
+    seed(t);
+    const { calls } = installResetFetch();
+
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    openMenu();
+
+    // First click: arm. Label flips to the confirm copy. No POST yet.
+    const reset = screen.getByRole("menuitem", { name: /Reset task status/ });
+    fireEvent.click(reset);
+    expect(calls.find((c) => c.url.endsWith("/reset-status"))).toBeUndefined();
+
+    const confirm = await screen.findByRole("menuitem", { name: /Confirm reset task status/ });
+
+    // Second click: commits.
+    fireEvent.click(confirm);
+    await waitFor(() => {
+      const post = calls.find((c) => c.url.endsWith("/reset-status") && c.method === "POST");
+      expect(post).toBeDefined();
+      expect(post?.url).toBe(`/api/plans/${PLAN}/tasks/1.1/reset-status`);
+    });
+  });
+
+  it("auto-disarms after 4 s so a stale armed state can't fire later", async () => {
+    vi.useFakeTimers();
+    const t = task({ status: "checking" });
+    seed(t);
+    installResetFetch();
+
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Reset task status/ }));
+    // Armed copy is visible.
+    expect(screen.getByText(/Click again to confirm/)).toBeTruthy();
+
+    // Advance past the 4 s auto-disarm. `act` flushes the resulting state
+    // update so the next assertion sees the disarmed render.
+    act(() => {
+      vi.advanceTimersByTime(4500);
+    });
+
+    // Label reverts to "Reset" — the next click would re-arm, not commit.
+    expect(screen.getByRole("menuitem", { name: /Reset task status/ })).toBeTruthy();
+    expect(screen.queryByText(/Click again to confirm/)).toBeNull();
+  });
+
+  it("picking another status from the menu disarms the Reset confirm", async () => {
+    const t = task({ status: "checking" });
+    seed(t);
+    const { calls } = installResetFetch();
+
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    openMenu();
+
+    // Arm the reset.
+    fireEvent.click(screen.getByRole("menuitem", { name: /Reset task status/ }));
+    expect(screen.getByText(/Click again to confirm/)).toBeTruthy();
+
+    // Pick a different status — disarms.
+    const pending = screen.getByRole("menuitem", { name: /Pending/ });
+    fireEvent.click(pending);
+
+    await waitFor(() => {
+      // PUT for the status went out, but no reset-status POST.
+      const reset = calls.find((c) => c.url.endsWith("/reset-status"));
+      expect(reset).toBeUndefined();
+    });
+    // And the Reset item is back to its idle label.
+    expect(screen.getByRole("menuitem", { name: /Reset task status/ })).toBeTruthy();
   });
 });

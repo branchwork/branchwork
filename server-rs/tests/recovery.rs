@@ -59,6 +59,74 @@ fn reset_task_status_is_idempotent_and_broadcasts_null() {
     assert_eq!(body["cleared"], 0);
 }
 
+/// Reset must refuse while a live agent is still pointed at the task —
+/// otherwise the agent's next status write would land on a row the user
+/// thinks they cleared, and the dashboard would silently de-sync. The
+/// caller has to kill or finish the agent first.
+#[test]
+fn reset_task_status_refuses_while_agent_is_running() {
+    let d = TestDashboard::new();
+    let plan = d.create_plan("plan-running", &minimal_plan("plan-running", &d.project));
+
+    // Seed a status so the row exists — the test fails closed if the guard
+    // reaches DELETE despite the running agent.
+    let (s, _) = d.put(
+        &format!("/api/plans/{plan}/tasks/1.1/status"),
+        json!({"status": "checking"}),
+    );
+    assert_eq!(s, 200);
+
+    // Pin a live agent at this task. We seed agents.id directly because no
+    // public endpoint inserts a `running` row without spawning a real PTY,
+    // which the test env can't satisfy.
+    let db_path = d.dir.path().join(".claude/branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO agents (id, plan_name, task_id, cwd, status, started_at) \
+         VALUES ('agent-running-1', ?1, '1.1', '/tmp/scratch', 'running', datetime('now'))",
+        rusqlite::params![plan],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (s, body) = d.post(
+        &format!("/api/plans/{plan}/tasks/1.1/reset-status"),
+        json!({}),
+    );
+    assert_eq!(s, 409, "{body:?}");
+    assert_eq!(body["error"], "agent_running");
+    assert_eq!(body["agent_id"], "agent-running-1");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("Kill"),
+        "{body:?}"
+    );
+
+    // status row is unchanged — the row we seeded survives.
+    let (_s, status_body) = d.get(&format!("/api/plans/{plan}/statuses"));
+    let rows = status_body.as_array().expect("statuses array");
+    let row = rows
+        .iter()
+        .find(|r| r["task_number"] == "1.1")
+        .expect("1.1 row");
+    assert_eq!(row["status"], "checking", "{status_body:?}");
+
+    // Once the agent transitions out of running/starting, reset succeeds.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE agents SET status = 'completed' WHERE id = 'agent-running-1'",
+        rusqlite::params![],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (s, body) = d.post(
+        &format!("/api/plans/{plan}/tasks/1.1/reset-status"),
+        json!({}),
+    );
+    assert_eq!(s, 200, "{body:?}");
+    assert_eq!(body["cleared"], 1);
+}
+
 #[test]
 fn list_stale_branches_distinguishes_empty_from_populated() {
     let d = TestDashboard::new();
