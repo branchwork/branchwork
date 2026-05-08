@@ -56,7 +56,7 @@ const WARN_REPORT = {
       category: "agents",
       kind: "unknown_status",
       count: 1,
-      message: "1 agent row(s) have an unrecognised status value: \"haunted\"",
+      message: '1 agent row(s) have an unrecognised status value: "haunted"',
       affectedPlans: ["plan-alpha", "plan-bravo"],
       recovery: "reset_task_status",
     },

@@ -109,7 +109,11 @@ export function HealthStateIndicator() {
   const tone = error
     ? { dot: "bg-gray-500", text: "text-gray-400", label: "State unknown" }
     : hasWarnings
-      ? { dot: "bg-amber-400", text: "text-amber-300", label: `State warnings (${state!.warnings.length})` }
+      ? {
+          dot: "bg-amber-400",
+          text: "text-amber-300",
+          label: `State warnings (${state!.warnings.length})`,
+        }
       : { dot: "bg-emerald-500", text: "text-emerald-300", label: "State OK" };
 
   return (
@@ -173,7 +177,9 @@ function HealthStatePopover({
       {state.warnings.length === 0 ? (
         <div className="text-emerald-400">All checks green.</div>
       ) : (
-        state.warnings.map((w) => <WarningRow key={`${w.category}.${w.kind}`} w={w} onPlanClick={onPlanClick} />)
+        state.warnings.map((w) => (
+          <WarningRow key={`${w.category}.${w.kind}`} w={w} onPlanClick={onPlanClick} />
+        ))
       )}
       <div className="pt-1.5 border-t border-gray-800 text-gray-600 space-y-0.5">
         <div>
@@ -185,9 +191,8 @@ function HealthStatePopover({
           <span className="text-gray-400">
             {Object.values(state.categories.taskStatus.byStatus).reduce((a, b) => a + b, 0)}
           </span>{" "}
-          · CI runs:{" "}
-          <span className="text-gray-400">{state.categories.ciRuns.totalCount}</span>{" "}
-          (<span className="text-gray-500">{state.categories.ciRuns.dismissedCount} dismissed</span>)
+          · CI runs: <span className="text-gray-400">{state.categories.ciRuns.totalCount}</span> (
+          <span className="text-gray-500">{state.categories.ciRuns.dismissedCount} dismissed</span>)
         </div>
         <div>
           Last orphan sweep:{" "}
@@ -228,9 +233,7 @@ function WarningRow({ w, onPlanClick }: { w: HealthWarning; onPlanClick: () => v
           )}
         </div>
       )}
-      <div className="text-gray-500 italic">
-        {recoveryHint(w.recovery)}
-      </div>
+      <div className="text-gray-500 italic">{recoveryHint(w.recovery)}</div>
     </div>
   );
 }
