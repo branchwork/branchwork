@@ -6,21 +6,7 @@
 
 Plans live as YAML in `~/.claude/plans/`. Every task has a Start button. Click it and a Claude agent spins up on a dedicated git branch, you watch it work, type to it, and when it's done you review the diff and merge — all from the browser.
 
----
-
-## Why it exists
-
-Most AI coding tools run inside an editor on one machine. Branchwork turns your machine into a control plane: your plans, your agents, your git branches, your terminals — all remotely accessible, persistent across server restarts, and organized around the work you're actually trying to ship.
-
-It is a **project-management layer for AI agents**. Like Linear/Jira, except:
-
-- assignees are AI agents (Claude Code today, Aider/Codex/Gemini as drivers)
-- status updates come from the code and git, not from someone typing them
-- "complete a task" means: spawn an agent on a branch, watch it, review the diff, merge
-
-Ships as a single ~15 MB Rust binary. No Node, no Docker, no daemon to install separately.
-
----
+It is a **project-management layer for AI agents**. Like Linear/Jira, except assignees are AI agents (Claude Code today, Aider/Codex/Gemini as drivers), status updates come from the code and git, and "complete a task" means: spawn an agent on a branch, watch it, review the diff, merge. Ships as a single ~15 MB Rust binary. No Node, no Docker, no daemon to install separately.
 
 ## Screenshots
 
@@ -36,86 +22,34 @@ Ships as a single ~15 MB Rust binary. No Node, no Docker, no daemon to install s
 ### Sidebar — projects, driver auth status, effort level
 ![Sidebar](screenshots/01-sidebar.png)
 
----
+## Install
 
-## What it does
-
-**Interactive agent sessions from any browser.**  Spawn a Claude Code (or Aider, Codex, Gemini) agent for a task. Get a real xterm.js terminal, type at it, watch tool calls in real time. Sessions persist across server restarts — kill Branchwork, restart it, the agent is still working and the terminal reattaches.
-
-**Plans as YAML, not parsed markdown guesses.** Each plan lives in `~/.claude/plans/*.yaml` with phases, tasks, dependencies, file paths, acceptance criteria. Inline-editable from the UI. One-click migration from legacy `.md` plans.
-
-**Git-isolated changes with review before merge.** Each agent works on `branchwork/<plan>/<task>`. When it finishes, the task card shows a diff tab, the branch name, and a Merge button. Nothing lands on your working branch until you click it.
-
-**Check agents.** One-click "is this task actually done?" — spawns a read-only agent that reads the code and replies with a verdict. No heuristics, no false positives.
-
-**Multi-AI via drivers.** Each AI CLI has a driver defining its binary, prompt format, ready signal, cost parser, graceful-exit sequence, and auth-detection logic. Start button is disabled for drivers that aren't authenticated, with the exact command to fix it shown in the tooltip.
-
-**Cost tracking.** Per-agent USD reported by the CLI, aggregated per task and per plan. Budget limits per task.
-
-**CI integration.** If your repo has GitHub Actions, each task's badge shows the CI status for the commit that landed its merge.
-
-**Real-time by default.** WebSocket updates for agent output, task status, CI, plan file changes. Desktop notifications when agents finish.
-
-**Supervised sessions, no tmux.** Each interactive agent runs inside a detached supervisor daemon spawned as `branchwork-server session --socket <path>`. The daemon owns the PTY and exposes the session over a Unix socket (Linux/macOS) or named pipe (Windows). PTY output is mirrored to `<socket>.log` so reconnecting clients get the full transcript. No external dependency.
-
-**Bob Shell compatible.** Branchwork exposes an MCP (Model Context Protocol) server that Bob Shell can connect to. Query plans, get task details, update status, and manage your workflow using natural language commands through Bob. See [Bob Shell Integration](docs/bob-shell-integration.md) for setup and usage.
-
----
-
-## Build from source
-
-Requires Rust 1.85+, Node.js 20+, and pnpm.
+Pick one. All three land the same `branchwork-server` binary on your `PATH`. See [docs/quickstart.md](docs/quickstart.md) for the full five-minute walkthrough.
 
 ```sh
-# Build frontend
-pnpm --filter @branchwork/web build
+# Shell installer (Linux / macOS)
+curl -fsSL https://raw.githubusercontent.com/branchwork/branchwork/master/install.sh | sh
 
-# Build server (embeds frontend via rust-embed)
-cd server-rs && cargo build --release
+# Build from source (Rust 1.85+, Node.js 20+, pnpm)
+pnpm --filter @branchwork/web build && cd server-rs && cargo build --release
+
+# Run
+branchwork-server     # binds http://localhost:3100
 ```
 
-Binary: `server-rs/target/release/branchwork-server`. Single file, ~15 MB, no runtime dependencies.
+Open <http://localhost:3100> in any browser on your network.
 
-## Run it
+## Documentation
 
-```sh
-branchwork-server [OPTIONS]
-```
+The full documentation set lives under [`docs/`](docs/README.md).
 
-| Flag           | Default     | Description                                          |
-|----------------|-------------|------------------------------------------------------|
-| `--port`       | `3100`      | HTTP port                                            |
-| `--effort`     | `high`      | Default effort for agents (`low`, `medium`, `high`, `max`) |
-| `--claude-dir` | `~/.claude` | Path to `.claude` directory                          |
-
-Open `http://<host>:3100` in any browser on your network. Nothing else to install.
-
-### Prerequisites on the server machine
-
-- At least one supported AI CLI installed and authenticated:
-  - **Claude Code** (`claude`) — run `claude` once and complete OAuth login, or export `ANTHROPIC_API_KEY`
-  - Or: Aider, Codex, Gemini (their respective API keys)
-- Git (for branch isolation — Branchwork auto-inits repos that don't have one)
-
-#### Claude Code: pre-accept the bypass-permissions disclaimer
-
-Branchwork spawns agents with `--dangerously-skip-permissions` by default (toggle in the sidebar). On first use Claude Code shows an interactive "Bypass Permissions mode" disclaimer that requires a keyboard confirmation — when launched headlessly under Branchwork's PTY there's no one to press Enter, so the session ends immediately.
-
-Pre-accept it once by adding this to `~/.claude/settings.json` (top level, **not** under `permissions`):
-
-```json
-{
-  "skipDangerousModePermissionPrompt": true
-}
-```
-
-Branchwork can also run with the toggle off; in that mode Claude Code asks for per-tool approval inside the session and the disclaimer never appears.
-
-#### Claude Code: trust-workspace dialog is auto-skipped
-
-Branchwork sets `CLAUDE_CODE_SANDBOXED=1` on every spawned `claude` process. This is the official Anthropic-supported flag for containerised / sandboxed launches: the binary's first check inside its trust-workspace gate short-circuits to allow when this var is set, so agents spawned into a never-seen folder come up directly to their main UI instead of blocking at "Trust this workspace?". This is essential for SaaS runner deployments where new project folders are created on the fly.
-
-The flag is process-scoped — it only applies to `claude` invocations Branchwork spawns. Users running `claude` standalone in their terminal for non-Branchwork sessions still get the normal trust-workspace UX.
+- [**Quickstart**](docs/quickstart.md) — five-minute self-hosted path: install, run, first plan, session-persistence proof.
+- [**User guide**](docs/user-guide.md) — every dashboard surface: plans, tasks, agents, drivers, git flow, cost tracking, CI, auto-mode, notifications.
+- [**Architecture overview**](docs/architecture/overview.md) — the three binaries (`branchwork-server`, `session_daemon`, `branchwork-runner`), wire protocols, persistence model.
+- [**Operations**](docs/README.md#operations) — [self-hosted](docs/operations/self-hosted.md), [SaaS runner](docs/operations/saas-runner.md), [Docker](docs/operations/docker.md), [Helm + Terraform](docs/operations/helm-terraform.md), [upgrades and migrations](docs/operations/upgrades-and-migrations.md).
+- [**Reference**](docs/README.md#reference) — [CLI flags](docs/reference/cli.md), [configuration](docs/reference/configuration.md), [plan schema](docs/reference/plan-schema.md), [drivers](docs/reference/drivers.md).
+- [**Troubleshooting**](docs/troubleshooting.md) and [**glossary**](docs/glossary.md).
+- [**Bob Shell integration**](docs/bob-shell-integration.md) — connect Bob Shell to Branchwork's MCP server.
 
 ## Project structure
 
@@ -123,6 +57,8 @@ The flag is process-scoped — it only applies to `claude` invocations Branchwor
 Branchwork/
   server-rs/      Rust server (Axum, rusqlite, portable-pty, interprocess)
   web/            React frontend (Vite, Tailwind, xterm.js, Zustand)
+  deploy/         Dockerfile, compose overlays, Helm chart, Terraform module
+  docs/           Documentation (start at docs/README.md)
   screenshots/    Dashboard screenshots + demo recording
 ```
 

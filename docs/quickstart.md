@@ -50,6 +50,39 @@ richest feedback loop.
 You do not need to pre-create a git repo for your project: Branchwork
 auto-inits one the first time it needs a task branch.
 
+### Claude Code: pre-accept the bypass-permissions disclaimer
+
+Branchwork spawns agents with `--dangerously-skip-permissions` by
+default (toggle in the sidebar). On first use Claude Code shows an
+interactive *Bypass Permissions mode* disclaimer that requires a
+keyboard confirmation — when launched headlessly under Branchwork's
+PTY there's no one to press Enter, so the session ends immediately.
+
+Pre-accept it once by adding this to `~/.claude/settings.json` (top
+level, **not** under `permissions`):
+
+```json
+{
+  "skipDangerousModePermissionPrompt": true
+}
+```
+
+Branchwork can also run with the toggle off; in that mode Claude Code
+asks for per-tool approval inside the session and the disclaimer never
+appears.
+
+### Claude Code: trust-workspace dialog is auto-skipped
+
+Branchwork sets `CLAUDE_CODE_SANDBOXED=1` on every spawned `claude`
+process. This is the official Anthropic-supported flag for
+containerised / sandboxed launches: the binary's first check inside
+its trust-workspace gate short-circuits to *allow* when this var is
+set, so agents spawned into a never-seen folder come up directly to
+their main UI instead of blocking at "Trust this workspace?". The
+flag is process-scoped — it only applies to `claude` invocations
+Branchwork spawns. Users running `claude` standalone in their terminal
+for non-Branchwork sessions still get the normal trust-workspace UX.
+
 ## 3. Run the server
 
 ```sh
