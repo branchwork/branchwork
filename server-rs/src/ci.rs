@@ -504,6 +504,213 @@ pub fn spawn_poller(state: AppState) {
     });
 }
 
+// ── Backfill ────────────────────────────────────────────────────────────────
+
+/// Settings flag set after the first aggregate-aware backfill pass; further
+/// boots short-circuit on this without re-polling. Bump the suffix (`_v2_`,
+/// …) only when a future schema change requires re-running the backfill on
+/// already-migrated databases.
+const BACKFILL_GATE_KEY: &str = "ci_backfill_v1_done";
+
+/// Spawn a one-shot startup backfill that re-evaluates every `ci_runs` row
+/// with a SHA against the aggregate-aware dispatch path introduced in T1.3.
+/// Detached via `tokio::spawn` so the HTTP listener readiness probe is not
+/// blocked: the backfill races against the first poller tick, and either
+/// completes within the first 30 s window or trickles in alongside live
+/// polling work.
+///
+/// Idempotent and gated by [`BACKFILL_GATE_KEY`] in the `settings` table —
+/// the second boot logs `[ci-backfill] already applied, skipping` and returns.
+pub fn spawn_backfill(state: AppState) {
+    tokio::spawn(async move {
+        backfill_aggregates(state).await;
+    });
+}
+
+/// Re-poll every `ci_runs` row whose `commit_sha IS NOT NULL` against the
+/// aggregate-aware dispatch (T1.3) so legacy single-run-path verdicts that
+/// stored a passing Docker badge over a failing CI run get flipped to the
+/// correct aggregate verdict. Logs one line per row (even no-ops) so an
+/// operator can tell at a glance how many rows flipped, then sets the
+/// [`BACKFILL_GATE_KEY`] settings row so subsequent boots skip the routine.
+///
+/// Per-row failures (runner offline, malformed reply, missing aggregate)
+/// leave the row untouched and are logged. The gate is set unconditionally
+/// at the end of the pass — re-running after a transient outage requires
+/// flipping the flag manually (or wiping the row). This trade-off is
+/// documented in the task description: the goal is one backfill per
+/// database, not one backfill per online runner.
+pub async fn backfill_aggregates(state: AppState) {
+    if backfill_gate_is_set(&state.db) {
+        eprintln!("[ci-backfill] already applied, skipping");
+        return;
+    }
+
+    let project_dirs = resolve_project_dirs(&state.plans_dir, &state.db);
+
+    struct Row {
+        id: i64,
+        plan_name: String,
+        task_number: String,
+        commit_sha: String,
+        org_id: Option<String>,
+        old_status: String,
+        old_run_id: Option<String>,
+    }
+    let rows: Vec<Row> = {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT c.id, c.plan_name, c.task_number, c.commit_sha, a.org_id, \
+                    c.status, c.run_id \
+             FROM ci_runs c \
+             LEFT JOIN agents a ON c.agent_id = a.id \
+             WHERE c.commit_sha IS NOT NULL \
+             ORDER BY c.id ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[ci-backfill] prepare failed: {e}");
+                return;
+            }
+        };
+        stmt.query_map([], |r| {
+            Ok(Row {
+                id: r.get(0)?,
+                plan_name: r.get(1)?,
+                task_number: r.get(2)?,
+                commit_sha: r.get(3)?,
+                org_id: r.get(4)?,
+                old_status: r.get(5)?,
+                old_run_id: r.get(6)?,
+            })
+        })
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default()
+    };
+
+    let total = rows.len();
+    eprintln!("[ci-backfill] starting: {total} rows to re-poll");
+    let mut flipped = 0usize;
+    let mut offline = 0usize;
+
+    for row in rows {
+        // JOIN may have returned NULL when the agent row is gone or when
+        // ci_runs.agent_id was never set (legacy/manual inserts). Match
+        // poll_once's behaviour by defaulting to `default-org`.
+        let org_id = row.org_id.clone().unwrap_or_else(|| "default-org".into());
+
+        let aggregate = match get_ci_run_status_dispatch(
+            &state,
+            &org_id,
+            &row.plan_name,
+            &row.task_number,
+            &row.commit_sha,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(CiStatusError::Rpc(e)) => {
+                // Runner offline / timeout — leave the row alone. The next
+                // run only happens if someone manually flips the gate, so
+                // log loudly enough that an operator can spot the gap.
+                eprintln!(
+                    "[ci-backfill] {}/{}: runner offline, leaving row untouched: {e}",
+                    row.plan_name, row.task_number
+                );
+                offline += 1;
+                continue;
+            }
+            Err(CiStatusError::InvalidResponse) => {
+                eprintln!(
+                    "[ci-backfill] {}/{}: dispatch returned an unexpected reply variant",
+                    row.plan_name, row.task_number
+                );
+                continue;
+            }
+        };
+
+        let Some(agg) = aggregate else {
+            // No runs found for the SHA. Either the legacy row pointed at a
+            // SHA that never triggered CI, or `gh` is unavailable. Nothing
+            // to write; log so the operator can see the no-op.
+            eprintln!(
+                "[ci-backfill] {}/{}: {}:{} → no_runs",
+                row.plan_name,
+                row.task_number,
+                row.old_status,
+                row.old_run_id.as_deref().unwrap_or("-"),
+            );
+            continue;
+        };
+
+        let new_status = normalize(Some(&agg.status), agg.conclusion.as_deref());
+        let new_run_id = agg.failing_run_id.as_deref();
+        let run_url = new_run_id.and_then(|id| {
+            project_dirs
+                .get(&row.plan_name)
+                .and_then(|d| derive_run_url(d, id))
+        });
+
+        let changed = new_status != row.old_status || new_run_id != row.old_run_id.as_deref();
+        eprintln!(
+            "[ci-backfill] {}/{}: {}:{} → {}:{}{}",
+            row.plan_name,
+            row.task_number,
+            row.old_status,
+            row.old_run_id.as_deref().unwrap_or("-"),
+            new_status,
+            new_run_id.unwrap_or("-"),
+            if changed { " (flipped)" } else { "" },
+        );
+        if changed {
+            flipped += 1;
+        }
+
+        // Unconditionally write back: even when `new_status` matches the
+        // stored value, `run_url` and `run_id` may have changed (the
+        // canonical case is a stale Docker URL on a previously-stored
+        // green that is actually a CI failure on the same SHA).
+        update_row(
+            &state.db,
+            &state.broadcast_tx,
+            row.id,
+            &row.plan_name,
+            &row.task_number,
+            new_status,
+            agg.conclusion.as_deref(),
+            run_url.as_deref(),
+            new_run_id,
+        );
+    }
+
+    set_backfill_gate(&state.db);
+    eprintln!(
+        "[ci-backfill] done: {flipped}/{total} rows flipped, {offline} skipped (runner offline)"
+    );
+}
+
+fn backfill_gate_is_set(db: &Db) -> bool {
+    let conn = db.lock().unwrap();
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![BACKFILL_GATE_KEY],
+            |r| r.get(0),
+        )
+        .ok();
+    matches!(v.as_deref(), Some("1"))
+}
+
+fn set_backfill_gate(db: &Db) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, '1') \
+         ON CONFLICT(key) DO UPDATE SET value = '1'",
+        params![BACKFILL_GATE_KEY],
+    )
+    .ok();
+}
+
 /// Resolve the on-disk directory for a single plan. Mirrors the per-plan
 /// lookup inside [`resolve_project_dirs`] but cheaper when the caller only
 /// needs one plan — used by the failure-log endpoint.
@@ -1083,7 +1290,8 @@ mod tests {
     /// Seed a multi-tenant SQLite DB with the schema poll_once + the
     /// dispatch shim need: agents (org_id, cwd), ci_runs (with
     /// commit_sha + status), runners (online row makes
-    /// org_has_runner true).
+    /// org_has_runner true). Also creates the `settings` table that
+    /// `backfill_aggregates` reads/writes its idempotency gate from.
     fn poll_test_db(org_id: &str, runner_id: &str, plan_name: &str, sha: &str) -> Db {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1104,6 +1312,9 @@ mod tests {
                created_at TEXT DEFAULT (datetime('now')), \
                updated_at TEXT DEFAULT (datetime('now')), \
                failure_log TEXT, dismissed_at TEXT, org_id TEXT \
+             ); \
+             CREATE TABLE settings ( \
+               key TEXT PRIMARY KEY, value TEXT \
              );",
         )
         .unwrap();
@@ -1351,5 +1562,289 @@ mod tests {
         assert_eq!(conclusion.as_deref(), Some("success"));
         assert_eq!(run_url, None);
         assert_eq!(run_id, None);
+    }
+
+    // ── Backfill regression: legacy ci_runs rows written by the
+    // single-run path (`gh run list -L 1`) get re-evaluated against the
+    // aggregate-aware dispatch on first server startup. The pass is
+    // gated by a `settings` row so subsequent boots are no-ops.
+
+    /// Seed a `ci_runs` row in a terminal state — mirrors what the
+    /// legacy single-run path would have stored before T1.3 landed.
+    /// Returns the row id so the caller can read it back.
+    fn seed_terminal_ci_row(
+        db: &Db,
+        plan_name: &str,
+        sha: &str,
+        org_id: &str,
+        status: &str,
+        run_id: &str,
+        run_url: &str,
+    ) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, agent_id, \
+                                  provider, commit_sha, branch, status, \
+                                  conclusion, run_url, run_id, org_id) \
+             VALUES (?1, '1.3', 'agent-1', 'github', ?2, 'master', ?3, \
+                     ?3, ?4, ?5, ?6)",
+            params![plan_name, sha, status, run_url, run_id, org_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Acceptance: legacy `success` row for a SHA whose blocking run
+    /// actually failed gets flipped to `failure`, with `run_url` and
+    /// `run_id` deep-linking to the failing CI run rather than the
+    /// stored Docker badge. Settings flag is set after the pass.
+    #[tokio::test]
+    async fn backfill_flips_legacy_docker_success_to_aggregate_failure() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "varpulis-option-b-cep";
+        let sha = "12d31ceb6a9a93d906a017a9a7a85b269361ab91";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        // The default poll_test_db row is status='pending'; replace it
+        // with a stored Docker:success row that the legacy single-run
+        // path would have written. The poll_once short-circuit on
+        // status NOT IN (pending,running) means this row is invisible
+        // to the live poller — only the backfill can rewrite it.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "DELETE FROM ci_runs WHERE plan_name = ?1",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+        let row_id = seed_terminal_ci_row(
+            &db,
+            plan_name,
+            sha,
+            org_id,
+            "success",
+            "25520540186", // legacy Docker run id
+            "https://github.com/cep/cep/actions/runs/25520540186",
+        );
+
+        let runners = new_runner_registry();
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+
+        // Real cwd with a github origin so derive_run_url produces the
+        // failing-CI deep link the regression pins.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/cep/cep.git"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+
+        // resolve_project_dirs needs to find this plan's cwd; the
+        // simplest setup is to seed a plan_project row in a real
+        // plan_project table. We don't have that table in
+        // poll_test_db, so write a plan YAML in plans_dir instead and
+        // let the canonical resolver pick it up.
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            plans_dir.path().join(format!("{plan_name}.yaml")),
+            format!(
+                "name: {plan_name}\ntitle: t\nproject: {}\nphases:\n  - title: P1\n    tasks:\n      - number: '1.3'\n        title: t\n",
+                cwd.strip_prefix(dirs::home_dir().unwrap_or_default())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| cwd.display().to_string())
+            ),
+        )
+        .unwrap();
+
+        let state = poll_test_app_state(db.clone(), runners, plans_dir.path().to_path_buf());
+
+        backfill_aggregates(state).await;
+
+        // Row flipped to failure, pointing at the CI run, NOT the
+        // legacy Docker run.
+        let conn = db.lock().unwrap();
+        let (status, conclusion, run_id): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, conclusion, run_id FROM ci_runs WHERE id = ?1",
+                params![row_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "failure",
+            "legacy Docker:success must flip to failure"
+        );
+        assert_eq!(conclusion.as_deref(), Some("failure"));
+        assert_eq!(run_id.as_deref(), Some("25520540172"));
+
+        // Gate set so subsequent boots skip the backfill.
+        let gate: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![BACKFILL_GATE_KEY],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(gate.as_deref(), Some("1"));
+    }
+
+    /// Acceptance: a pre-existing `ci_backfill_v1_done='1'` settings
+    /// row makes the backfill a no-op. The responder, if installed,
+    /// would flip the row — assert that the row is left alone.
+    #[tokio::test]
+    async fn backfill_skips_when_gate_already_set() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "already-applied";
+        let sha = "deadbeefcafebabe000000000000000000000000";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        // Pre-set the gate.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, '1')",
+                params![BACKFILL_GATE_KEY],
+            )
+            .unwrap();
+        }
+        // Update the seeded row to a terminal-but-stale state. If the
+        // backfill ran, it would flip this to failure via the
+        // installed responder — so an unchanged status proves the
+        // gate skipped the pass.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE ci_runs SET status = 'success', run_id = 'legacy-id' \
+                 WHERE plan_name = ?1",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+
+        let runners = new_runner_registry();
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let state = poll_test_app_state(db.clone(), runners, plans_dir.path().to_path_buf());
+
+        backfill_aggregates(state).await;
+
+        let conn = db.lock().unwrap();
+        let (status, run_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, run_id FROM ci_runs WHERE plan_name = ?1",
+                params![plan_name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "success", "row must be untouched when gate is set");
+        assert_eq!(run_id.as_deref(), Some("legacy-id"));
+    }
+
+    /// Acceptance: a runner-offline pass leaves rows untouched but
+    /// STILL sets the gate. The next boot, with the responder finally
+    /// available, must NOT re-poll — flipping the gate manually is
+    /// the only way to retry. This is the explicit trade-off
+    /// documented in the task description.
+    #[tokio::test]
+    async fn backfill_runner_offline_leaves_rows_untouched_and_sets_gate() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "offline-during-backfill";
+        let sha = "0000000000000000000000000000000000000000";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        // Replace the seeded row with a terminal `success` row that
+        // we'd want flipped if the runner were online. The runners
+        // table still says 'online' (poll_test_db inserts that), so
+        // org_has_runner returns true and dispatch will try the
+        // runner branch — but we never install_aggregate_responder,
+        // so runner_request_with_registry returns NoConnectedRunner.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "DELETE FROM ci_runs WHERE plan_name = ?1",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+        let row_id = seed_terminal_ci_row(
+            &db,
+            plan_name,
+            sha,
+            org_id,
+            "success",
+            "legacy-docker-id",
+            "https://github.com/x/y/actions/runs/legacy-docker-id",
+        );
+
+        let runners = new_runner_registry();
+        // INTENTIONALLY no install_aggregate_responder — registry
+        // empty produces RunnerRpcError::NoConnectedRunner promptly.
+
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let state =
+            poll_test_app_state(db.clone(), runners.clone(), plans_dir.path().to_path_buf());
+
+        backfill_aggregates(state.clone()).await;
+
+        // Row is untouched — runner-offline did NOT corrupt it.
+        let (status, run_id): (String, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status, run_id FROM ci_runs WHERE id = ?1",
+                params![row_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(status, "success", "offline pass must not corrupt the row");
+        assert_eq!(run_id.as_deref(), Some("legacy-docker-id"));
+
+        // Gate IS set, even though we made no useful progress.
+        let gate: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![BACKFILL_GATE_KEY],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        assert_eq!(
+            gate.as_deref(),
+            Some("1"),
+            "gate must be set so subsequent boots don't retry the offline pass"
+        );
+
+        // Now that the responder IS installed, re-running the
+        // backfill must STILL leave the row alone — the gate
+        // short-circuits the dispatch entirely. This pins the
+        // documented trade-off: retry requires manual gate flip.
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+        backfill_aggregates(state).await;
+
+        let conn = db.lock().unwrap();
+        let (status, run_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, run_id FROM ci_runs WHERE id = ?1",
+                params![row_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "success",
+            "second pass must not run while gate is set"
+        );
+        assert_eq!(run_id.as_deref(), Some("legacy-docker-id"));
     }
 }

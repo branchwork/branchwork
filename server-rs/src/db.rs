@@ -734,6 +734,15 @@ fn migrate(conn: &Connection) {
         );
         CREATE INDEX IF NOT EXISTS idx_plan_snapshots_expires ON plan_snapshots(expires_at);
         CREATE INDEX IF NOT EXISTS idx_plan_snapshots_plan ON plan_snapshots(plan_name);
+
+        -- Generic key/value table for one-shot startup gates (e.g. the
+        -- `ci_backfill_v1_done` flag set after the first aggregate-aware
+        -- backfill of legacy `ci_runs` rows). Not org-scoped: gates here
+        -- describe migration state for the database as a whole.
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
         ",
     )
     .expect("failed to run schema migration");

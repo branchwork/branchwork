@@ -213,6 +213,14 @@ async fn run_server(cli: Cli) {
     // and no runner is connected).
     ci::spawn_poller(state.clone());
 
+    // One-shot startup backfill: re-evaluate every legacy `ci_runs` row
+    // against the aggregate-aware dispatch path so single-run-path verdicts
+    // (e.g. a passing Docker run shadowing a failing CI run on the same SHA)
+    // get flipped to the correct multi-workflow verdict. Idempotent: a
+    // settings-row gate makes subsequent boots a no-op. Detached so the
+    // HTTP listener readiness probe is not blocked by the per-row dispatch.
+    ci::spawn_backfill(state.clone());
+
     // Start the auto-mode idle poller (drivers without a Stop hook fall
     // back to a 60 s tick + idle threshold). Off by default; set
     // `BRANCHWORK_AUTO_FINISH_IDLE=1` to enable. Env vars are read once
