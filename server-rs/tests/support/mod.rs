@@ -15,6 +15,8 @@
 
 #![allow(dead_code)] // helpers used across multiple test files
 
+pub mod gh;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -28,6 +30,11 @@ pub struct TestDashboard {
     pub plans_dir: PathBuf,
     pub port: u16,
     pub base_url: String,
+    /// Optional scratch GitHub repo handle. Populated by
+    /// `with_github_repo()`; `Drop` deletes the repo before the
+    /// server child is killed so a stuck `gh repo delete` cannot
+    /// be silently dropped on the floor when the server exits.
+    gh_repo: Option<gh::GhRepo>,
     child: Child,
 }
 
@@ -97,8 +104,34 @@ impl TestDashboard {
             plans_dir,
             port,
             base_url,
+            gh_repo: None,
             child,
         }
+    }
+
+    /// Try to provision a private scratch GitHub repo for this test
+    /// (`gh repo create --private`) and push the current `master`. No-op
+    /// when `BRANCHWORK_TEST_GH_REPOS=1` is unset or `gh` is unavailable
+    /// — callers that need the remote should check `gh_repo()` and
+    /// branch on `Some`/`None`. The handle is owned by the dashboard
+    /// so `Drop` (i.e. test teardown) deletes the repo automatically.
+    pub fn with_github_repo(&mut self) -> &Option<gh::GhRepo> {
+        if self.gh_repo.is_none() {
+            self.gh_repo = gh::maybe_create(&self.project);
+        }
+        &self.gh_repo
+    }
+
+    /// Returns the currently-attached scratch repo, if any.
+    pub fn gh_repo(&self) -> Option<&gh::GhRepo> {
+        self.gh_repo.as_ref()
+    }
+
+    /// WebSocket URL for the broadcast channel. Returned as a string so
+    /// individual tests can pick the WS client they want without forcing
+    /// a tokio-tungstenite dev-dep on every consumer of `support::`.
+    pub fn ws_url(&self) -> String {
+        format!("ws://127.0.0.1:{}/ws", self.port)
     }
 
     pub fn post(&self, path: &str, body: Value) -> (u16, Value) {
@@ -204,6 +237,11 @@ impl TestDashboard {
 
 impl Drop for TestDashboard {
     fn drop(&mut self) {
+        // Delete the scratch GitHub repo first so the operator gets the
+        // stderr ping (if any) before the server child noise. The Drop
+        // on the inner GhRepo runs on take(), and propagates errors as
+        // best-effort log lines.
+        let _ = self.gh_repo.take();
         // SIGTERM first so on-disk state gets a chance to flush; SIGKILL
         // as a safety net if the server ignores it.
         let _ = self.child.kill();
