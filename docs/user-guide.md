@@ -8,10 +8,10 @@ internals, see [architecture/overview.md](architecture/overview.md).
 Branchwork ships as one binary (`branchwork-server`) that serves both
 the SPA and the HTTP/WebSocket API on `http://localhost:3100`. Every
 plan is a YAML file under `~/.claude/plans/`; every task runs on its
-own git branch under a per-agent supervisor daemon that survives
+own git branch under a per-agent session daemon that survives
 server restarts.
 
-The server runs on Linux, macOS, and Windows — the supervisor is
+The server runs on Linux, macOS, and Windows — the session daemon is
 backed by Unix domain sockets on Unix and named pipes
 (`\\.\pipe\<agent-id>`) on Windows, and CI exercises both
 `ubuntu-latest` and `windows-latest` on every push. The on-disk layout
@@ -255,7 +255,7 @@ unblocks dependants. It does **not** delete the task branch — use
 
 An **agent** is one CLI session (claude / aider / codex / gemini)
 running against one task on its own git branch. Each agent lives
-inside a detached supervisor daemon (`branchwork-server session`) so
+inside a detached session daemon (`branchwork-server session`) so
 killing the dashboard server doesn't kill the agent — see
 [architecture/overview.md](architecture/overview.md).
 
@@ -314,11 +314,11 @@ Three buttons in the panel header:
 
 A running agent doesn't depend on `branchwork-server`. Restart the
 server and reopen the page; the agent panel reattaches to the same
-supervisor daemon and replays the PTY transcript from
+session daemon and replays the PTY transcript from
 `~/.claude/sessions/<agent-id>.log`. This is the property exercised
 in step 5 of the [quickstart](quickstart.md).
 
-If the supervisor itself died (host reboot, OOM kill), the server
+If the session daemon itself died (host reboot, OOM kill), the server
 detects this on startup via `cleanup_and_reattach` and marks the
 agent `failed` with `stop_reason = orphaned`, broadcasting
 `agent_stopped` so the card unlocks.
@@ -820,7 +820,7 @@ sidebar.
 
 Subcommands (`branchwork-server <subcommand>`):
 
-- `session` — internal supervisor daemon, spawned by the server
+- `session` — internal session daemon, spawned by the server
   itself. Not for end users.
 - `mcp` — serve the Branchwork MCP tools over stdio (for Claude Code
   configured to spawn it as a child process). The same MCP handler

@@ -1,6 +1,6 @@
 # Architecture: session daemon
 
-The session daemon is the per-agent mini-supervisor that owns one PTY,
+The session daemon is the per-agent process that owns one PTY,
 one local socket listener, and one on-disk transcript log. There is one
 daemon per running agent; the dashboard server and (in SaaS) the
 runner attach to it as clients. It is what lets an agent survive a
@@ -128,7 +128,7 @@ PID-based liveness check, which we accept for the supervisor.
 ## Local IPC: socket vs. named pipe
 
 The daemon-to-client transport is abstracted through the
-[`interprocess`](https://crates.io/crates/interprocess) crate's
+[`interprocess`](https://docs.rs/interprocess) crate's
 `local_socket` module. `socket_name(path)` is the platform shim:
 
 - **Unix:** the path itself is the Unix domain socket file. The daemon

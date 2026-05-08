@@ -266,14 +266,13 @@ empty so the on-disk form stays terse.
 ### `file_paths`
 
 In YAML these are explicit list entries; in Markdown they are extracted
-by regex from the task body. The dashboard uses the merged list for two
-things:
+by regex from the task body. The dashboard uses the merged list for
+**prompt context** — the agent prompt enumerates `file_paths` so the
+agent knows which files the task touches.
 
-- **Auto-status file-existence heuristic** ([`auto_status::infer_status`](../../server-rs/src/auto_status.rs)) — caps at `in_progress`. It never auto-marks a task `completed`.
-- **Prompt context** — the agent prompt enumerates `file_paths` so the agent knows which files the task touches.
-
-Listing files that don't yet exist is fine — the heuristic flips a task
-to `in_progress` once any of them appears.
+Listing files that don't yet exist is fine — `task_status` is only
+written by explicit user or agent action, never inferred from the
+filesystem.
 
 ---
 

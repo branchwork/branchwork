@@ -3,7 +3,7 @@
 Branchwork speaks three protocols beyond plain HTTP:
 
 1. **Session IPC** — a Unix-domain-socket / Windows-named-pipe channel between
-   the server (or the runner) and a per-agent supervisor daemon. Length-prefixed
+   the server (or the runner) and a per-agent session daemon. Length-prefixed
    `postcard` frames over [`session_protocol::Message`].
 2. **Runner WebSocket** — JSON `Envelope`/`WireMessage` frames between the
    hosted server and remote runners, with a SQLite-backed outbox providing

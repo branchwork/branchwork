@@ -60,10 +60,10 @@ Defined on `Cli` in [`server-rs/src/config.rs`](../../server-rs/src/config.rs).
 
 ### `branchwork-server session` subcommand
 
-Run as a detached **per-agent supervisor daemon** owning one PTY plus a
+Run as a detached **per-agent session daemon** owning one PTY plus a
 local IPC socket. Normally invoked by the server itself when starting an
 agent; expose it directly only when debugging or writing alternate
-hosts. On Unix the supervisor `fork()`s + `setsid()`s; on Windows the
+hosts. On Unix the daemon `fork()`s + `setsid()`s; on Windows the
 parent must spawn it with `CREATE_NO_WINDOW | DETACHED_PROCESS` (no
 in-process detach). See [architecture/session-daemon.md](../architecture/session-daemon.md)
 for the full lifecycle.

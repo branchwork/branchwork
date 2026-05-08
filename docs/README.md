@@ -1,7 +1,7 @@
 # Branchwork Documentation
 
 Branchwork ships as three cooperating binaries: the **dashboard server**
-(`branchwork-server`), a per-session **supervisor daemon** (`branchwork-server
+(`branchwork-server`), a per-session **session daemon** (`branchwork-server
 session`, also installable as the standalone `session_daemon`), and — in
 SaaS mode only — the **runner** (`branchwork-runner`) that executes agents
 on behalf of a remote dashboard. This index links every planned page so you

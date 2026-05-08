@@ -6,13 +6,13 @@ their own machine (laptop, beefy build box, CI worker) which keeps a
 single authenticated WebSocket open to the hosted dashboard at
 `wss://app.branchwork.dev/ws/runner`. The dashboard sends commands
 ("spawn this agent on plan X, task Y"); the runner spawns the agent
-locally — using the same supervisor daemon as self-hosted mode — and
+locally — using the same session daemon as self-hosted mode — and
 streams events back. Local SQLite outboxes on both ends provide
 **at-least-once delivery** for reliable events across reconnects.
 
 This page is the focused reference for that one binary. For the
 three-binary picture start with [overview.md](overview.md). The session
-daemon the runner reuses as its supervisor is documented at
+daemon the runner reuses for each agent is documented at
 [session-daemon.md](session-daemon.md). The wire protocol is summarised
 inline below; the canonical reference is `WireMessage` in
 [`server-rs/src/saas/runner_protocol.rs`](../../server-rs/src/saas/runner_protocol.rs).
