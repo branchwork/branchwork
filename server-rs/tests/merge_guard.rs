@@ -80,6 +80,91 @@ fn empty_branch_merge_returns_409_not_500() {
 }
 
 #[test]
+fn empty_branch_merge_is_idempotent_across_retries() {
+    // Task 3.2 acceptance: graceful-exit-without-committing →
+    // POST /api/agents/:id/merge must 409, and re-running the merge
+    // attempt must produce the same response with no state mutation
+    // and never a 500. The 409 path returns BEFORE any branch-clearing
+    // UPDATE, broadcast, or ci_runs insert, so DB rows / branch refs
+    // survive every retry. The "graceful exit" shape on the agent row
+    // is `status='completed'` + `branch=Some(task_branch)`, matching
+    // the canonical on_agent_exit handler outcome.
+    //
+    // Break/restore acceptance: comment out the rev-list guard at
+    // server-rs/src/git_helpers.rs:144-161 and the first POST falls
+    // through to `git merge`, which silently no-ops on an empty
+    // branch and returns 200 — the assertion below fails.
+    let d = TestDashboard::new();
+    d.create_plan("mp-idem", &minimal_plan("mp-idem", &d.project));
+
+    let empty = "branchwork/mp-idem/1.1";
+    d.create_task_branch(empty, /* with_commit */ false);
+    seed_agent(
+        &d,
+        "agent-idem",
+        "mp-idem",
+        "1.1",
+        Some(empty),
+        Some("master"),
+    );
+
+    // First merge attempt: 409 with the empty-branch error shape.
+    let (s1, body1) = d.post("/api/agents/agent-idem/merge", json!({}));
+    assert_eq!(s1, 409, "first attempt: expected 409, got {s1}: {body1}");
+    let msg1 = body1["error"].as_str().unwrap_or("").to_string();
+    assert!(
+        msg1.contains("no commits") || msg1.contains("not committed"),
+        "first attempt: error should mention missing commits: {msg1}"
+    );
+
+    // Second merge attempt — must mirror the first, never 500.
+    let (s2, body2) = d.post("/api/agents/agent-idem/merge", json!({}));
+    assert_ne!(
+        s2, 500,
+        "second attempt must not 500 (idempotent retry): body={body2}"
+    );
+    assert_eq!(
+        s2, s1,
+        "second attempt status should mirror the first: {s2} vs {s1}"
+    );
+    assert_eq!(
+        body2["error"].as_str().unwrap_or(""),
+        msg1,
+        "second attempt error should match the first"
+    );
+
+    // Third for good measure — pure idempotency, no drift.
+    let (s3, body3) = d.post("/api/agents/agent-idem/merge", json!({}));
+    assert_ne!(s3, 500, "third attempt must not 500: body={body3}");
+    assert_eq!(s3, 409, "third attempt: still 409");
+
+    // Branch ref must survive every retry — no half-clean teardown.
+    assert!(
+        d.local_branches().contains(&empty.to_string()),
+        "task branch must survive idempotent retries: {:?}",
+        d.local_branches()
+    );
+
+    // The agent row's `branch` column is the success-path mutation
+    // (api/agents.rs:629). The 409 path returns before that UPDATE;
+    // verify explicitly so a future regression that prematurely
+    // clears the branch on 409 gets caught here.
+    let conn = rusqlite::Connection::open(d.dir.path().join(".claude/branchwork.db")).unwrap();
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT branch FROM agents WHERE id = 'agent-idem'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some(empty),
+        "agent.branch must not be cleared by a failed merge"
+    );
+}
+
+#[test]
 fn merge_with_real_commits_succeeds() {
     let d = TestDashboard::new();
     d.create_plan("mp-b", &minimal_plan("mp-b", &d.project));
