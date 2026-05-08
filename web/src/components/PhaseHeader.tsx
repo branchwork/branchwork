@@ -168,10 +168,7 @@ export function PhaseHeader({ planName, phaseNumber, forceCollapsed }: Props) {
       </button>
 
       {effectiveOpen && (
-        <div
-          id={`phase-${phaseNumber}-override-panel`}
-          className="px-3 pb-3 pt-1 space-y-2"
-        >
+        <div id={`phase-${phaseNumber}-override-panel`} className="px-3 pb-3 pt-1 space-y-2">
           {loading && (
             <p className="text-xs text-gray-500" role="status">
               Loading…
@@ -189,26 +186,19 @@ export function PhaseHeader({ planName, phaseNumber, forceCollapsed }: Props) {
             <>
               <div className="flex items-center justify-between gap-3">
                 <div className="text-xs text-gray-500">
-                  <span className="font-medium text-gray-400">
-                    Phase verification command
-                  </span>
+                  <span className="font-medium text-gray-400">Phase verification command</span>
                   <span className="ml-2">
                     {overriding ? (
                       <>Overrides plan default for this phase only.</>
                     ) : inherited?.source === "plan" ? (
                       <>
                         Inheriting from plan:{" "}
-                        <code className="text-gray-400 break-all">
-                          {inherited.value}
-                        </code>
+                        <code className="text-gray-400 break-all">{inherited.value}</code>
                       </>
                     ) : inherited?.source === "repo" ? (
                       <>
-                        Inheriting from{" "}
-                        <code className="text-gray-400">branchwork.toml</code>:{" "}
-                        <code className="text-gray-400 break-all">
-                          {inherited.value}
-                        </code>
+                        Inheriting from <code className="text-gray-400">branchwork.toml</code>:{" "}
+                        <code className="text-gray-400 break-all">{inherited.value}</code>
                       </>
                     ) : (
                       <>No phase verification configured at any level.</>

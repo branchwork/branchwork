@@ -57,10 +57,7 @@ export interface PhaseSettingsBody {
   phaseVerification?: Tristate<string>;
 }
 
-export function getPhaseSettings(
-  planName: string,
-  phaseNumber: number,
-): Promise<PhaseSettings> {
+export function getPhaseSettings(planName: string, phaseNumber: number): Promise<PhaseSettings> {
   return fetchJson<PhaseSettings>(
     `/api/plans/${encodeURIComponent(planName)}/phases/${phaseNumber}/settings`,
   );

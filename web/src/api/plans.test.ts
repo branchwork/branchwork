@@ -113,7 +113,9 @@ describe("resolvePhaseVerification", () => {
       source: "repo",
     });
     expect(
-      resolvePhaseVerification(ps({ repoVerification: "make verify", planVerification: "plan.sh" })),
+      resolvePhaseVerification(
+        ps({ repoVerification: "make verify", planVerification: "plan.sh" }),
+      ),
     ).toEqual({ value: "plan.sh", source: "plan" });
     expect(
       resolvePhaseVerification(
