@@ -31,6 +31,14 @@ use tokio::sync::broadcast;
 
 use super::session_protocol::{self, Message};
 
+/// Initial-resize grace window. The daemon holds the PTY reader for up to
+/// this long, waiting for the dashboard's first resize to land so Claude
+/// Code's first paint is sized for the actual viewport rather than the
+/// 120×40 fallback the PTY was opened at. Picked to comfortably exceed the
+/// typical WebSocket-connect-to-resize gap (~100 ms) without delaying the
+/// non-dashboard auto-mode/MCP spawn paths to a user-visible degree.
+const INITIAL_RESIZE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 #[derive(Args, Debug, Clone)]
 pub struct SessionArgs {
     /// Path to the local socket (or named pipe, on Windows) the daemon listens on.
@@ -380,6 +388,23 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(4);
     let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
+    // Initial-resize gate: hold the PTY reader until the first dashboard
+    // resize message arrives (and is applied) or `INITIAL_RESIZE_GRACE_MS`
+    // elapses, whichever comes first. The PTY is opened at the default
+    // 120×40, but Claude Code's first paint typically lands a sidebar-sized
+    // dashboard well before its model round-trip completes — so by holding
+    // off on draining the kernel PTY buffer we let `master.resize()` land
+    // first, and the bytes Claude emits in response to SIGWINCH are sized
+    // for the dashboard's actual viewport. Auto-mode / MCP / detached spawns
+    // never attach, so they fall through after the timeout — at which point
+    // the cosmetic geometry is moot (those callers don't read the PTY).
+    //
+    // `sync_channel(1)` lets a single fast Resize unblock the reader without
+    // requiring a tokio runtime in the PTY-reader OS thread; subsequent
+    // `try_send`s after the channel is full are silently dropped, which is
+    // fine — we only need ONE signal to open the gate.
+    let (gate_tx, gate_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
     // PTY → log + all connected clients. The read itself is blocking, so it
     // runs on a dedicated OS thread.
     {
@@ -388,6 +413,11 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
         let shutdown_tx = shutdown_tx.clone();
         std::thread::spawn(move || {
             use std::io::{Read, Write};
+            // Block until either a Resize lands (gate_tx.try_send) or
+            // INITIAL_RESIZE_GRACE_MS expires. We drop `gate_rx` after this
+            // point so additional try_sends from later resizes are no-ops.
+            let _ = gate_rx.recv_timeout(INITIAL_RESIZE_GRACE);
+            drop(gate_rx);
             let mut buf = [0u8; 4096];
             loop {
                 match pty_reader.read(&mut buf) {
@@ -432,8 +462,9 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
                     let master = master.clone();
                     let child = child.clone();
                     let shutdown_tx = shutdown_tx.clone();
+                    let gate_tx = gate_tx.clone();
                     tokio::spawn(async move {
-                        handle_client(stream, out_rx, in_tx, master, child, shutdown_tx).await;
+                        handle_client(stream, out_rx, in_tx, master, child, shutdown_tx, gate_tx).await;
                     });
                 }
                 Err(_) => break,
@@ -460,6 +491,7 @@ async fn handle_client(
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     shutdown_tx: broadcast::Sender<()>,
+    initial_resize_gate: std::sync::mpsc::SyncSender<()>,
 ) {
     let (read_half, write_half) = stream.split();
     let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
@@ -489,6 +521,17 @@ async fn handle_client(
                                 pixel_height: 0,
                             });
                         }
+                        // Open the initial-resize gate so the PTY reader
+                        // can start draining the kernel buffer. Apply the
+                        // resize FIRST so any bytes Claude emits in
+                        // response to the SIGWINCH (a fresh paint at the
+                        // dashboard's actual viewport) land before the
+                        // reader unblocks. After the gate is open
+                        // additional resizes still apply to the PTY but
+                        // the try_send here is a harmless no-op (the
+                        // single-slot channel is full, or the receiver
+                        // has been dropped).
+                        let _ = initial_resize_gate.try_send(());
                     }
                     Message::Kill => {
                         if let Ok(mut c) = child.lock() {
