@@ -114,8 +114,10 @@ Deployment, upgrades, day-2 ops.
   reconnect, plan file edited on disk not picked up, runner won't
   connect, driver auth fails. Links every existing repro/design note
   in `docs/`.
-- [glossary.md](glossary.md) _(stub)_ — plan / phase / task / agent /
-  driver / runner / org / verdict — the vocabulary used throughout.
+- [glossary.md](glossary.md) — single-page definitions for the
+  vocabulary used throughout the docs (server, runner, session daemon,
+  driver, plan, phase, task, project, effort, `produces_commit`,
+  auto-status, check agent, outbox, supervisor, …).
 
 ## Historical design & repro notes
 
