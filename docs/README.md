@@ -90,8 +90,11 @@ Deployment, upgrades, day-2 ops.
   (outbound WSS only), systemd / launchd / NSSM units, log paths,
   token rotation, multi-runner setups, and connect/reconnect
   troubleshooting.
-- [operations/docker.md](operations/docker.md) _(stub)_ —
-  `deploy/Dockerfile`, compose overlays, GHCR images.
+- [operations/docker.md](operations/docker.md) — `deploy/Dockerfile`,
+  the four compose overlays (base, SaaS, e2e, prod) with per-overlay
+  "use this when…" guidance, every env var grouped by the file that
+  passes it through, the named-volume / host-bind matrix, run and
+  tear-down recipes, and the ADR 0005 e2e-fixture rule.
 - [operations/helm-terraform.md](operations/helm-terraform.md) _(stub)_ —
   Helm chart (`sqlite` vs `postgres` modes), Terraform ECS Fargate module.
 - [operations/upgrades-and-migrations.md](operations/upgrades-and-migrations.md)
