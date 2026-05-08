@@ -211,12 +211,7 @@ async fn run_server(cli: Cli) {
 
     // Start CI status poller (best-effort; no-op if `gh` isn't installed
     // and no runner is connected).
-    ci::spawn_poller(
-        state.db.clone(),
-        state.runners.clone(),
-        state.broadcast_tx.clone(),
-        config.plans_dir.clone(),
-    );
+    ci::spawn_poller(state.clone());
 
     // Start the auto-mode idle poller (drivers without a Stop hook fall
     // back to a 60 s tick + idle threshold). Off by default; set
