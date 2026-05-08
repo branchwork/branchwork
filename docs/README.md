@@ -101,7 +101,10 @@ Deployment, upgrades, day-2 ops.
   variables / outputs, with pointers to `example.tfvars` and the
   Postgres-not-yet-implemented caveat.
 - [operations/upgrades-and-migrations.md](operations/upgrades-and-migrations.md)
-  _(stub)_ — upgrade path, SQLite→Postgres migration, rollback, backups.
+  — pre-upgrade checklist, idempotent `db::migrate` model, three-axis
+  binary version skew (server / runner / session daemon), explicit
+  list of what does **not** work after a downgrade, and the
+  SQLite→Postgres caveat (Helm stub only — Rust still SQLite-only).
 
 ## Troubleshooting & glossary
 
