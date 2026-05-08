@@ -47,6 +47,8 @@ the wire there is no difference downstream.
 | `created_at` | string (RFC 3339) | no | filesystem creation time of the plan file | Sets the timestamp shown in the dashboard "created" column. Useful when a plan is checked in from elsewhere and the file's metadata doesn't reflect when the plan was authored. |
 | `phases` | list of `YamlPlanPhase` | yes | — | Ordered phases. May be empty (`[]`) but the key must be present. |
 | `verification` | string (block scalar OK) | no | omitted | Numbered list of post-implementation verification steps. Surfaces as a collapsible section on the plan board and feeds the plan-level Check agent. Empty / whitespace-only values are normalised to omitted. |
+| `ci_blocking_workflows` | list of strings | no | omitted | Plan-wide allowlist of GitHub workflow names that block merges and auto-mode advancement. Every other workflow on the same SHA is treated as informational. See [CI workflow filter](#ci-workflow-filter). |
+| `phase_verification` | string (block scalar OK) | no | omitted | Plan-wide phase-end verify command, run by the Check agent at every phase merge. Per-phase value below overrides this. See [Phase-end verification](#phase-end-verification). |
 
 Unknown top-level keys are silently dropped (the parser uses `serde_yaml`
 without `deny_unknown_fields`); typos in field names will not raise an
@@ -60,6 +62,8 @@ error, they will just be ignored.
 | `title` | string | yes | — | Phase heading. |
 | `description` | string | no | `""` | Phase summary, rendered above the task list. |
 | `tasks` | list of `YamlPlanTask` | yes | — | Tasks in this phase. May be empty. |
+| `ci_blocking_workflows` | list of strings | no | omitted | Per-phase override of the plan-level `ci_blocking_workflows`. See [CI workflow filter](#ci-workflow-filter). |
+| `phase_verification` | string (block scalar OK) | no | omitted | Per-phase override of the plan-level `phase_verification`. See [Phase-end verification](#phase-end-verification). |
 
 ### Task — `YamlPlanTask`
 
@@ -125,6 +129,11 @@ backtick-quoted relative paths (`` `src/foo.rs` ``) and absolute paths
 field has no Markdown surface form. To opt a task out of merge, port the
 plan to YAML and set `produces_commit: false`.
 
+`ci_blocking_workflows` and `phase_verification` are also **always
+`None`** on Markdown-parsed plans — neither is expressible in the
+Markdown form. Markdown plans inherit those values from
+`branchwork.toml` (or fall through to the smart classifier) only.
+
 ---
 
 ## Field semantics
@@ -184,6 +193,68 @@ plan-level Check agent (the **Check Plan** button) reads it as the spec
 to verify the as-built plan against. Empty / whitespace-only strings
 are normalised to omitted. Round-trips through YAML and survives plan
 edits via the dashboard.
+
+### CI workflow filter
+
+`ci_blocking_workflows` (top-level **and** per-phase) names the GitHub
+workflows that block auto-mode advancement and feed the dashboard's
+red/green CI verdict. Every other workflow that ran on the merged SHA is
+captured in the aggregate as `informational: true` and never affects
+`conclusion` ([`server-rs/src/ci/aggregate.rs`](../../server-rs/src/ci/aggregate.rs)).
+
+This is the surface for "the project ships a `Docker Publish` /
+`release` / `bench` workflow that fails or hangs for unrelated reasons —
+don't let it block the merge gate." Names are matched **case-sensitively**
+against the workflow's top-level `name:` field (with the `.github/workflows/<file>.yml`
+filename stem as fallback when `name:` is absent).
+
+Resolution is per-field, first match wins
+([`server-rs/src/ci/resolution.rs`](../../server-rs/src/ci/resolution.rs)):
+
+| Layer | Source | Wins for |
+|---|---|---|
+| 1. Phase | `YamlPlanPhase.ci_blocking_workflows` | that phase only |
+| 2. Plan | `YamlPlan.ci_blocking_workflows` (top level) | every phase that doesn't override |
+| 3. Repo | `branchwork.toml` `[ci] blocking_workflows` | every plan in that project |
+| 4. Smart default | regex `(?i)docker\|deploy\|publish\|release\|bench\|fuzz` matches → informational, everything else → blocking | when no other layer is set |
+
+An **explicit empty list** at any layer (`ci_blocking_workflows: []`) is
+not "fall through to the next layer" — it means "nothing blocks", a
+vacuous-success configuration. `None` (the field is absent) is what
+triggers fall-through. The smart classifier in layer 4 is run **only**
+when every higher layer is `None`; an explicit list at layers 1-3 is
+returned verbatim, even if the classifier would have demoted some of
+those names.
+
+`branchwork.toml`'s sibling field `blocking_workflows_skip` is a deny-list
+alternative used at the repo layer only — see
+[branchwork-toml.md](branchwork-toml.md).
+
+### Phase-end verification
+
+`phase_verification` (top-level **and** per-phase) is a shell command run
+by the Check agent at every **phase merge** — i.e. when the last task in
+a phase merges into the project's default branch. The command runs in a
+fresh git worktree at the merge SHA
+([`server-rs/src/agents/phase_check.rs`](../../server-rs/src/agents/phase_check.rs));
+zero exit advances to the next phase, non-zero pauses the plan with
+`paused_reason: phase_verify_failed`.
+
+Resolution is the same precedence pattern as `ci_blocking_workflows`,
+minus the smart-default layer (verify is opt-in — there is no
+auto-detected fallback):
+
+| Layer | Source | Wins for |
+|---|---|---|
+| 1. Phase | `YamlPlanPhase.phase_verification` | that phase only |
+| 2. Plan | `YamlPlan.phase_verification` (top level) | every phase that doesn't override |
+| 3. Repo | `branchwork.toml` `[phase] verification` | every plan in that project |
+| 4. — | (no smart default — `None` means no-op) | — |
+
+The string is passed verbatim into the Check agent prompt and run via
+the agent's `Bash` tool. The canonical pattern is to keep the entrypoint
+trivial (`bash scripts/verify.sh`, `make verify`, `pnpm run ci`) and
+keep the real logic in a checked-in script — see the example below.
 
 ### `dependencies`
 
@@ -311,6 +382,39 @@ phases:
 
 The Merge button is hidden on this task; Discard remains.
 
+### CI filter + phase verification
+
+A plan that overrides the repo defaults — narrows the blocking-workflow
+allowlist plan-wide, then carves out one slow phase that wants a stricter
+verify suite:
+
+```yaml
+title: Cep auto-mode hardening
+project: cep
+ci_blocking_workflows: [CI, lint, typecheck]
+phase_verification: bash scripts/verify.sh
+phases:
+  - number: 0
+    title: Repro
+    tasks:
+      - number: "0.1"
+        title: Capture failing SHA
+        produces_commit: false
+  - number: 1
+    title: Fix
+    # This phase replaces the plan-level verify with a richer one.
+    phase_verification: |
+      bash scripts/verify.sh && cargo deny check && cargo audit
+    tasks:
+      - number: "1.1"
+        title: Land the fix
+```
+
+Per-phase overrides win, then plan-level, then `branchwork.toml`, then
+the smart classifier (CI filter only). See [CI workflow filter](#ci-workflow-filter)
+and [Phase-end verification](#phase-end-verification) for the full
+precedence chain.
+
 ---
 
 ## See also
@@ -320,4 +424,6 @@ The Merge button is hidden on this task; Discard remains.
 - [architecture/server.md](../architecture/server.md) — file watcher, plan listing API.
 - [architecture/persistence.md](../architecture/persistence.md) — how `task_status`, `agents`, and `ci_runs` rows back the server-only fields.
 - [reference/cli.md](cli.md) — `branchwork-server --claude-dir` and the `<claude-dir>/plans/` location.
+- [reference/branchwork-toml.md](branchwork-toml.md) — repo-level defaults for `ci_blocking_workflows` and `phase_verification`.
+- [adrs/0006-phase-verify-and-ci-filter.md](../adrs/0006-phase-verify-and-ci-filter.md) — design rationale for the four-layer precedence and the smart classifier.
 - [design-produces-commit.md](../design-produces-commit.md) — historical design note for the `produces_commit` field.

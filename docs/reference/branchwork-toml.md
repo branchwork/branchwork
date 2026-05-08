@@ -14,15 +14,24 @@ The file is loaded by
 the project-resolution path and cached in-process with mtime
 invalidation, so calling it from a hot loop is cheap. The file is
 **optional**: when absent, Branchwork falls back to its smart-default
-classifier and to the plan-level `verification` field.
+classifier (CI filter) and treats phase verification as a no-op.
 
-> **Plan layout note.** This page describes the data file. The
-> precedence rules (repo defaults < per-plan < per-phase) live in the
-> resolution helper added by task `0.3` of the
-> `branchwork-phase-verify-and-ci-filter` plan, and the consumers (CI
-> aggregate filter, phase-end Check agent) land in phases 1 and 2 of the
-> same plan. Until those phases ship, the file is parsed and cached
-> but its contents are not yet consumed.
+The values feed two consumers:
+
+- **CI aggregate filter** —
+  [`server-rs/src/ci/aggregate.rs::compute_with_filter`](../../server-rs/src/ci/aggregate.rs)
+  partitions a SHA's runs into blocking and informational, and only the
+  blocking subset can poison the verdict.
+- **Phase-end Check agent** —
+  [`server-rs/src/agents/phase_check.rs`](../../server-rs/src/agents/phase_check.rs)
+  spawns a Check agent on the phase-merge SHA, runs `[phase] verification`
+  in a fresh worktree, and pauses the plan on non-zero exit.
+
+The precedence rules (per-phase < per-plan < `branchwork.toml` < smart
+default) are owned by
+[`server-rs/src/ci/resolution.rs`](../../server-rs/src/ci/resolution.rs)
+and described in detail in
+[adrs/0006-phase-verify-and-ci-filter.md](../adrs/0006-phase-verify-and-ci-filter.md).
 
 ---
 
@@ -75,9 +84,15 @@ spelling against this page.
 
 If neither is set, Branchwork uses a regex classifier that marks any
 workflow matching `(?i)docker|deploy|publish|release|bench|fuzz` as
-non-blocking and everything else as blocking. See the consumer in
-task 1.1 for the precedence rule when both `blocking_workflows` and
-`blocking_workflows_skip` are set on the same project.
+non-blocking and everything else as blocking
+([`is_workflow_blocking_by_default`](../../server-rs/src/ci/aggregate.rs)).
+
+When **both** `blocking_workflows` and `blocking_workflows_skip` are
+set on the same `branchwork.toml`, `blocking_workflows` wins — the
+allowlist is treated as authoritative and the skip list is ignored.
+The two are alternative phrasings of the same rule, and a project that
+sets both is almost certainly mid-edit; the safer behaviour is to use
+the explicit allowlist rather than try to intersect them.
 
 ### `[phase]`
 
@@ -96,7 +111,9 @@ logic in a checked-in script.
 
 ## Precedence
 
-The full precedence chain (configured by the `0.3` resolution helper) is:
+The full precedence chain (owned by
+[`server-rs/src/ci/resolution.rs`](../../server-rs/src/ci/resolution.rs))
+is:
 
 1. **Per-phase** — `ci_blocking_workflows` / `phase_verification` set on
    a single `YamlPlanPhase` in the plan YAML. Wins for that phase only.
@@ -105,11 +122,17 @@ The full precedence chain (configured by the `0.3` resolution helper) is:
 3. **Repo defaults** — this file (`branchwork.toml`). Wins when neither
    the plan nor the phase sets the field.
 4. **Smart-default classifier** — the regex fallback described above.
-   Used only when none of the layers above set the field.
+   Applies to `ci_blocking_workflows` only — `phase_verification` has
+   **no** layer-4 fallback (verify is opt-in).
 
 Each layer is **independent per field**: setting only
 `blocking_workflows` in `branchwork.toml` doesn't suppress the
 plan-level `phase_verification`, and vice versa.
+
+An **explicit empty list** at any layer (`ci_blocking_workflows: []` in
+plan YAML, or `blocking_workflows = []` in `branchwork.toml`) is a
+"nothing blocks" configuration, **not** a fall-through. Layers below it
+are skipped. To fall through, omit the key entirely.
 
 ---
 
@@ -161,8 +184,9 @@ Now any plan in `~/cep/` will:
 - **Unknown keys** → silently dropped. `serde` is configured without
   `deny_unknown_fields`, so a typo in `blocking_workflows` will look
   identical to an absent field. Verify your config by checking the
-  resolved values surface on the plan board (Phase 3 of the
-  `branchwork-phase-verify-and-ci-filter` plan ships a UI for this).
+  resolved values surface on the plan board's **Settings** tab — it
+  reads back through the same resolution helper and shows you the
+  effective allowlist + the layer it came from.
 
 ---
 
@@ -173,3 +197,6 @@ Now any plan in `~/cep/` will:
 - [reference/configuration.md](configuration.md) — env vars and CLI
   flags. `branchwork.toml` is intentionally **not** a global config
   surface; it's a per-project file with a narrow schema.
+- [adrs/0006-phase-verify-and-ci-filter.md](../adrs/0006-phase-verify-and-ci-filter.md)
+  — design rationale for the four-layer precedence and the
+  classifier-as-fallback choice.
