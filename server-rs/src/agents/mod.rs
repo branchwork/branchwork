@@ -592,13 +592,34 @@ impl AgentRegistry {
     }
 
     /// Clear `agents.branch` for rows whose branch no longer resolves in
-    /// the project's git. Fast-path: if nothing has a branch, skip entirely.
+    /// the project's git. Called by [`cleanup_and_reattach`] on boot, so
+    /// the merge banner stops offering an action that can't succeed when
+    /// a user manually `git branch -D`'d the task branch out of band.
+    ///
+    /// Three filters keep the sweep safe:
+    /// * `mode != 'remote'` — SaaS agents live on a runner's filesystem;
+    ///   a local `git show-ref` would always fail and incorrectly clear a
+    ///   branch that's perfectly valid runner-side. Boot-sweep visibility
+    ///   into runner branches is out of scope here (the merge dispatch
+    ///   already round-trips `ListBranches` at click time).
+    /// * `status NOT IN ('running','starting')` — defensive guard for
+    ///   non-boot callers. Pass 1 of `cleanup_and_reattach` has already
+    ///   moved every running/starting row to a terminal status by the
+    ///   time this runs, but the guard makes the function safe to call
+    ///   from outside boot too. Mirrors the live-agent guard
+    ///   `purge_stale_branches` got in Task 1.2.
+    /// * `cwd` must resolve to a directory locally — if the user moved
+    ///   or renamed the project we can't tell whether the branch was
+    ///   deleted; leave the row alone so reattaching the project to the
+    ///   right path restores the merge banner.
     async fn reconcile_orphaned_branches(&self) {
         let rows: Vec<(String, String, String)> = {
             let db = self.db.lock().unwrap();
             let mut stmt = match db.prepare(
                 "SELECT id, branch, cwd FROM agents \
-                 WHERE branch IS NOT NULL AND cwd IS NOT NULL AND cwd != ''",
+                 WHERE branch IS NOT NULL AND cwd IS NOT NULL AND cwd != '' \
+                   AND mode != 'remote' \
+                   AND status NOT IN ('running', 'starting')",
             ) {
                 Ok(s) => s,
                 Err(_) => return,
@@ -615,6 +636,9 @@ impl AgentRegistry {
         };
 
         for (agent_id, branch, cwd) in rows {
+            if !std::path::Path::new(&cwd).is_dir() {
+                continue;
+            }
             let exists = std::process::Command::new("git")
                 .args([
                     "show-ref",
@@ -2719,6 +2743,251 @@ mod tests {
             task_status_of(&db, "p1", "1.7").as_deref(),
             Some("completed"),
             "most recent check-agent's verdict must win"
+        );
+    }
+
+    // ── reconcile_orphaned_branches tests (Task 2.2) ──────────────────
+    //
+    // Pins the boot-sweep contract for `agents.branch` rows whose ref no
+    // longer resolves in the project's git: clear the column and
+    // broadcast `agent_branch_cleared` so the merge banner doesn't keep
+    // offering a doomed action. Three guards keep the sweep safe:
+    // remote (SaaS) agents are skipped because the branch lives on the
+    // runner's filesystem; live (`running`/`starting`) rows are skipped
+    // defensively for non-boot callers; missing-cwd rows are skipped so
+    // a moved project directory doesn't silently strip valid branches.
+
+    /// Init a git repo at `dir` with a single empty commit on `branch`.
+    /// Mirrors `git_helpers::tests::git_init_with_commit` — kept inline
+    /// so this test module stays self-contained.
+    fn git_init_with_commit(dir: &std::path::Path, initial_branch: &str) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed in {}", dir.display());
+        };
+        run(&["init", "-b", initial_branch]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["commit", "--allow-empty", "-m", "init"]);
+    }
+
+    /// Create `branch` at the current HEAD without checking it out.
+    fn git_create_branch(dir: &std::path::Path, branch: &str) {
+        let ok = std::process::Command::new("git")
+            .args(["branch", branch])
+            .current_dir(dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git branch {branch} failed in {}", dir.display());
+    }
+
+    /// Insert an `agents` row with explicit cwd / mode / status / branch.
+    /// The shared `insert_agent` fixture hardcodes `cwd='/tmp'` which
+    /// can't host a real git repo for the show-ref probe.
+    fn insert_branched_agent(db: &Db, id: &str, cwd: &str, mode: &str, status: &str, branch: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, mode, branch) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, cwd, status, mode, branch],
+        )
+        .unwrap();
+    }
+
+    fn agent_branch(db: &Db, id: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT branch FROM agents WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_clears_branch_when_local_ref_missing() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let proj = TempDir::new().unwrap();
+        git_init_with_commit(proj.path(), "master");
+        // Branch never created (or was `git branch -D`'d out of band).
+
+        insert_branched_agent(
+            &db,
+            "agent-ghost",
+            proj.path().to_str().unwrap(),
+            "pty",
+            "completed",
+            "branchwork/p1/1.1",
+        );
+
+        registry.reconcile_orphaned_branches().await;
+
+        assert!(
+            agent_branch(&db, "agent-ghost").is_none(),
+            "missing local ref must clear the branch column"
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("agent_branch_cleared")
+                && e.contains("agent-ghost")
+                && e.contains("branchwork/p1/1.1")),
+            "expected agent_branch_cleared broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_branch_when_local_ref_resolves() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let proj = TempDir::new().unwrap();
+        git_init_with_commit(proj.path(), "master");
+        git_create_branch(proj.path(), "branchwork/p1/1.2");
+
+        insert_branched_agent(
+            &db,
+            "agent-live-branch",
+            proj.path().to_str().unwrap(),
+            "pty",
+            "completed",
+            "branchwork/p1/1.2",
+        );
+
+        registry.reconcile_orphaned_branches().await;
+
+        assert_eq!(
+            agent_branch(&db, "agent-live-branch").as_deref(),
+            Some("branchwork/p1/1.2"),
+            "resolvable branch must survive the sweep"
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.contains("agent_branch_cleared") && e.contains("agent-live-branch")),
+            "no broadcast must fire when nothing changed: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_remote_agents_branches() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // SaaS-mode agent: cwd points at a runner-side path that may not
+        // exist on the server. Local `git show-ref` would always fail
+        // and clear a branch that is perfectly valid on the runner. The
+        // mode='remote' filter prevents that.
+        insert_branched_agent(
+            &db,
+            "agent-remote",
+            "/home/runneruser/project",
+            "remote",
+            "killed",
+            "branchwork/p1/1.3",
+        );
+
+        registry.reconcile_orphaned_branches().await;
+
+        assert_eq!(
+            agent_branch(&db, "agent-remote").as_deref(),
+            Some("branchwork/p1/1.3"),
+            "remote-mode branches must not be touched by the local sweep"
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.contains("agent_branch_cleared") && e.contains("agent-remote")),
+            "remote-mode branches must not broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_live_agents_defensively() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // Live row + missing branch ref. Pass 1 of `cleanup_and_reattach`
+        // would have terminated this row before pass 3 ever sees it, but
+        // calling `reconcile_orphaned_branches` directly skips pass 1 —
+        // and the guard keeps the function safe for non-boot callers.
+        let proj = TempDir::new().unwrap();
+        git_init_with_commit(proj.path(), "master");
+
+        insert_branched_agent(
+            &db,
+            "agent-running",
+            proj.path().to_str().unwrap(),
+            "pty",
+            "running",
+            "branchwork/p1/1.4",
+        );
+        insert_branched_agent(
+            &db,
+            "agent-starting",
+            proj.path().to_str().unwrap(),
+            "pty",
+            "starting",
+            "branchwork/p1/1.5",
+        );
+
+        registry.reconcile_orphaned_branches().await;
+
+        assert_eq!(
+            agent_branch(&db, "agent-running").as_deref(),
+            Some("branchwork/p1/1.4"),
+            "running rows must not have their branch cleared"
+        );
+        assert_eq!(
+            agent_branch(&db, "agent-starting").as_deref(),
+            Some("branchwork/p1/1.5"),
+            "starting rows must not have their branch cleared"
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            !events.iter().any(|e| e.contains("agent_branch_cleared")),
+            "live rows must not broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_when_cwd_is_missing() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // cwd doesn't resolve to a directory (project was moved/renamed
+        // between runs). We can't tell whether the branch was deleted or
+        // is just out of view — leaving the row alone means reattaching
+        // the project to the right path restores the merge banner.
+        insert_branched_agent(
+            &db,
+            "agent-moved",
+            "/nonexistent/branchwork-test/missing-project",
+            "pty",
+            "completed",
+            "branchwork/p1/1.6",
+        );
+
+        registry.reconcile_orphaned_branches().await;
+
+        assert_eq!(
+            agent_branch(&db, "agent-moved").as_deref(),
+            Some("branchwork/p1/1.6"),
+            "missing cwd must not flush the branch reference"
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            !events.iter().any(|e| e.contains("agent_branch_cleared")),
+            "missing cwd must not broadcast: {events:?}"
         );
     }
 
