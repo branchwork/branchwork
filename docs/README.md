@@ -108,9 +108,12 @@ Deployment, upgrades, day-2 ops.
 
 ## Troubleshooting & glossary
 
-- [troubleshooting.md](troubleshooting.md) _(stub)_ — common failures:
-  empty-branch merge guard, stale merge banner, auto-status false
-  positives, supervisor heartbeat, MCP connection issues.
+- [troubleshooting.md](troubleshooting.md) — FAQ-shaped index of
+  common failures grouped by symptom: stale merge banner, doneCount
+  drift, auto-status false positives, blank session terminal after
+  reconnect, plan file edited on disk not picked up, runner won't
+  connect, driver auth fails. Links every existing repro/design note
+  in `docs/`.
 - [glossary.md](glossary.md) _(stub)_ — plan / phase / task / agent /
   driver / runner / org / verdict — the vocabulary used throughout.
 
