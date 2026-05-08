@@ -246,10 +246,7 @@ fn terminal(status: &str) -> bool {
 /// window must not flip rows to `unknown` just because the runner was
 /// disconnected for a few minutes. [`CiStatusError::InvalidResponse`] is
 /// programmer error / schema drift; we log and skip too.
-async fn poll_once(
-    state: &AppState,
-    project_dirs: &std::collections::HashMap<String, PathBuf>,
-) {
+async fn poll_once(state: &AppState, project_dirs: &std::collections::HashMap<String, PathBuf>) {
     let db = &state.db;
     let broadcast_tx = &state.broadcast_tx;
 
@@ -1038,12 +1035,7 @@ mod tests {
             assert!(status.success(), "git {args:?} failed");
         };
         run(&["init", "-q"]);
-        run(&[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/cep/cep.git",
-        ]);
+        run(&["remote", "add", "origin", "https://github.com/cep/cep.git"]);
 
         let url = derive_run_url(cwd, "12345").unwrap();
         assert_eq!(url, "https://github.com/cep/cep/actions/runs/12345");
@@ -1171,8 +1163,9 @@ mod tests {
         runner_id: &str,
         aggregate: CiAggregate,
     ) {
-        let pending: Arc<Mutex<std::collections::HashMap<String, oneshot::Sender<RunnerResponse>>>> =
-            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pending: Arc<
+            Mutex<std::collections::HashMap<String, oneshot::Sender<RunnerResponse>>>,
+        > = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let pending_clone = pending.clone();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
 
@@ -1258,12 +1251,7 @@ mod tests {
             .status()
             .unwrap();
         Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/cep/cep.git",
-            ])
+            .args(["remote", "add", "origin", "https://github.com/cep/cep.git"])
             .current_dir(cwd)
             .status()
             .unwrap();
