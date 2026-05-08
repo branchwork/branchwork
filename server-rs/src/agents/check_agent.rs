@@ -320,3 +320,71 @@ pub async fn start_check_agent(
 
     id
 }
+
+/// Search a check-agent's `agent_output` rows for a verdict JSON blob and
+/// return its `(status, reason)`. Returns `None` when the agent never
+/// emitted one — typically because the server died before it could.
+///
+/// `status` is the raw value from the JSON (callers do their own mapping
+/// — `start_check_agent` filters it down to `completed`/`in_progress`/
+/// `pending`; `reconcile_task_statuses` maps it to `task_status` semantics).
+/// `reason` is the verdict's free-form explanation, or empty if absent.
+pub(crate) fn extract_check_agent_verdict(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+) -> Option<(String, String)> {
+    let mut stmt = conn
+        .prepare("SELECT content FROM agent_output WHERE agent_id = ? ORDER BY id")
+        .ok()?;
+    let rows: Vec<String> = stmt
+        .query_map(params![agent_id], |row| row.get(0))
+        .ok()?
+        .flatten()
+        .collect();
+
+    for row in rows.iter().rev() {
+        if let Ok(outer) = serde_json::from_str::<serde_json::Value>(row) {
+            let mut text = String::new();
+            if let Some(result) = outer.get("result").and_then(|v| v.as_str()) {
+                text = result.to_string();
+            } else if let Some(content) = outer
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(t) = block.get("text").and_then(|t| t.as_str())
+                    {
+                        text.push_str(t);
+                    }
+                }
+            }
+
+            if let Some(start) = text.find(r#""status""#) {
+                let json_start = text[..start].rfind('{').unwrap_or(start);
+                let remainder = &text[json_start..];
+                let verdict_json = (1..=remainder.len())
+                    .filter(|&i| remainder.as_bytes().get(i - 1) == Some(&b'}'))
+                    .find_map(|i| serde_json::from_str::<serde_json::Value>(&remainder[..i]).ok());
+
+                if let Some(verdict) = verdict_json {
+                    let v_status = verdict
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let v_reason = verdict
+                        .get("reason")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !v_status.is_empty() {
+                        return Some((v_status, v_reason));
+                    }
+                }
+            }
+        }
+    }
+    None
+}

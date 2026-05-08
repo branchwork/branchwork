@@ -466,6 +466,15 @@ impl AgentRegistry {
 
     /// Revert `task_status` rows stuck in `checking` when their check-agent
     /// is no longer alive. Called by [`cleanup_and_reattach`] on boot.
+    ///
+    /// When the most recent check-agent for a stuck task already wrote a
+    /// verdict to `agent_output` (server died after the verdict reached the
+    /// stream but before `start_check_agent`'s post-exit thread persisted
+    /// it), the verdict is recovered and applied: `completed` → completed,
+    /// `failed` → failed, anything else (`in_progress`, `pending`, …) →
+    /// pending. When no verdict was ever produced the row is dropped, which
+    /// reverts the task to its prior status (or implicit `pending` when no
+    /// row remains).
     async fn reconcile_task_statuses(&self) {
         let stuck: Vec<(String, String)> = {
             let db = self.db.lock().unwrap();
@@ -498,33 +507,87 @@ impl AgentRegistry {
                 continue; // agent still alive — leave the status alone
             }
 
-            // Nothing alive. Drop the checking row so the task reverts to
-            // whatever its task_status update history implied (or pending
-            // when there's no prior row). Simpler and more honest than
-            // guessing a fallback status.
-            {
+            // Try to recover a verdict from the most recent check-agent's
+            // output. Both the agent-id lookup and the verdict scan run
+            // under a single lock acquisition — purely synchronous SQLite
+            // work, no awaits between them.
+            let recovered: Option<(String, String)> = {
                 let db = self.db.lock().unwrap();
-                db.execute(
-                    "DELETE FROM task_status \
-                     WHERE plan_name = ?1 AND task_number = ?2 AND status = 'checking'",
-                    rusqlite::params![plan_name, task_number],
-                )
-                .ok();
+                let agent_id: Option<String> = db
+                    .query_row(
+                        "SELECT id FROM agents \
+                         WHERE plan_name = ?1 AND task_id = ?2 AND mode = 'stream-json' \
+                         ORDER BY started_at DESC LIMIT 1",
+                        rusqlite::params![plan_name, task_number],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok();
+                agent_id.and_then(|id| check_agent::extract_check_agent_verdict(&db, &id))
+            };
+
+            match recovered {
+                Some((verdict_status, verdict_reason)) => {
+                    let mapped = match verdict_status.as_str() {
+                        "completed" => "completed",
+                        "failed" => "failed",
+                        _ => "pending",
+                    };
+                    {
+                        let db = self.db.lock().unwrap();
+                        db.execute(
+                            "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
+                             VALUES (?1, ?2, ?3, 'manual', datetime('now'))
+                             ON CONFLICT(plan_name, task_number)
+                             DO UPDATE SET status = excluded.status,
+                                           source = 'manual',
+                                           updated_at = datetime('now')",
+                            rusqlite::params![plan_name, task_number, mapped],
+                        )
+                        .ok();
+                    }
+                    broadcast_event(
+                        &self.broadcast_tx,
+                        "task_status_changed",
+                        serde_json::json!({
+                            "plan_name": plan_name,
+                            "task_number": task_number,
+                            "status": mapped,
+                            "reason": format!(
+                                "boot_sweep: recovered verdict ({verdict_status}): {verdict_reason}"
+                            ),
+                        }),
+                    );
+                    println!(
+                        "[Branchwork] Recovered verdict for stuck 'checking' on \
+                         {plan_name}/{task_number}: verdict={verdict_status} → status={mapped}"
+                    );
+                }
+                None => {
+                    {
+                        let db = self.db.lock().unwrap();
+                        db.execute(
+                            "DELETE FROM task_status \
+                             WHERE plan_name = ?1 AND task_number = ?2 AND status = 'checking'",
+                            rusqlite::params![plan_name, task_number],
+                        )
+                        .ok();
+                    }
+                    broadcast_event(
+                        &self.broadcast_tx,
+                        "task_status_changed",
+                        serde_json::json!({
+                            "plan_name": plan_name,
+                            "task_number": task_number,
+                            "status": serde_json::Value::Null,
+                            "reason": "boot_sweep: checking status reverted, no verdict recoverable",
+                        }),
+                    );
+                    println!(
+                        "[Branchwork] Reverted stuck 'checking' on {plan_name}/{task_number} — \
+                         no verdict recoverable"
+                    );
+                }
             }
-            broadcast_event(
-                &self.broadcast_tx,
-                "task_status_changed",
-                serde_json::json!({
-                    "plan_name": plan_name,
-                    "task_number": task_number,
-                    "status": serde_json::Value::Null,
-                    "reason": "boot_sweep: checking status reverted, check-agent not alive",
-                }),
-            );
-            println!(
-                "[Branchwork] Reverted stuck 'checking' on {plan_name}/{task_number} — \
-                 no live check-agent"
-            );
         }
     }
 
@@ -2401,6 +2464,263 @@ mod tests {
     // `git_default_branch` / `git_list_branches` tests live alongside the
     // implementations in `crate::git_helpers` — they moved out with the
     // helpers when the leaf module was carved out for the runner binary.
+
+    // ── reconcile_task_statuses tests (Task 2.1) ──────────────────────
+    //
+    // Pins the boot-sweep behaviour for `task_status` rows stuck in
+    // `checking`. When the server died mid-check, the row is wedged: the
+    // task card stays locked and no agent is alive to resolve it. The
+    // sweep either recovers a verdict from the check-agent's
+    // `agent_output` rows (server died after the verdict was streamed
+    // but before `start_check_agent`'s post-exit thread persisted it) or
+    // drops the row so the task reverts to its prior state.
+
+    /// Insert a check-agent `agents` row (mode=stream-json) for a given
+    /// (plan, task). The row is `failed` because pass 1 of
+    /// `cleanup_and_reattach` has already orphaned every stream-json row
+    /// by the time the task_status sweep runs — this fixture skips pass 1
+    /// and pre-stages the post-pass state directly.
+    fn insert_check_agent_row(db: &Db, id: &str, plan_name: &str, task_number: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, mode, plan_name, task_id) \
+             VALUES (?1, '/tmp/proj', 'failed', 'stream-json', ?2, ?3)",
+            params![id, plan_name, task_number],
+        )
+        .unwrap();
+    }
+
+    /// Append an `agent_output` row whose `content` is a stream-json
+    /// `result` envelope wrapping `text` — the simplest of the two
+    /// formats `extract_check_agent_verdict` accepts.
+    fn append_agent_output(db: &Db, agent_id: &str, text: &str) {
+        let envelope = serde_json::json!({"result": text}).to_string();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_output (agent_id, message_type, content) VALUES (?1, 'result', ?2)",
+            params![agent_id, envelope],
+        )
+        .unwrap();
+    }
+
+    fn task_status_of(db: &Db, plan_name: &str, task_number: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT status FROM task_status WHERE plan_name = ?1 AND task_number = ?2",
+            params![plan_name, task_number],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn reconcile_recovers_completed_verdict_from_agent_output() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // Stage the wedge: task at `checking`, check-agent dead with a
+        // verdict already on disk in agent_output.
+        set_task_status(&db, "p1", "1.1", "checking");
+        insert_check_agent_row(&db, "agent-c1", "p1", "1.1");
+        append_agent_output(
+            &db,
+            "agent-c1",
+            r#"Looks good. {"status": "completed", "reason": "all tests pass"}"#,
+        );
+
+        registry.cleanup_and_reattach().await;
+
+        assert_eq!(
+            task_status_of(&db, "p1", "1.1").as_deref(),
+            Some("completed"),
+            "verdict=completed must promote task_status to completed"
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("task_status_changed")
+                && e.contains("\"status\":\"completed\"")
+                && e.contains("recovered verdict")),
+            "expected task_status_changed/completed broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_recovers_in_progress_verdict_as_pending() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        set_task_status(&db, "p1", "1.2", "checking");
+        insert_check_agent_row(&db, "agent-c2", "p1", "1.2");
+        append_agent_output(
+            &db,
+            "agent-c2",
+            r#"Still working. {"status": "in_progress", "reason": "tests not run"}"#,
+        );
+
+        registry.cleanup_and_reattach().await;
+
+        assert_eq!(
+            task_status_of(&db, "p1", "1.2").as_deref(),
+            Some("pending"),
+            "verdict=in_progress must collapse to task_status=pending"
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("task_status_changed")
+                && e.contains("\"status\":\"pending\"")
+                && e.contains("in_progress")),
+            "expected task_status_changed/pending broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_recovers_failed_verdict_as_failed() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // The current check-agent vocabulary doesn't emit `failed`, but
+        // the mapping is symmetric and forward-compatible: if a verdict
+        // ever surfaces with status=failed we honour it rather than
+        // silently downgrading to pending.
+        set_task_status(&db, "p1", "1.3", "checking");
+        insert_check_agent_row(&db, "agent-c3", "p1", "1.3");
+        append_agent_output(
+            &db,
+            "agent-c3",
+            r#"Broken. {"status": "failed", "reason": "tests red"}"#,
+        );
+
+        registry.cleanup_and_reattach().await;
+
+        assert_eq!(
+            task_status_of(&db, "p1", "1.3").as_deref(),
+            Some("failed"),
+            "verdict=failed must promote task_status to failed"
+        );
+        let _ = drain_events(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn reconcile_deletes_row_when_no_verdict_was_produced() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // Check-agent died mid-stream — agent_output has assistant
+        // chatter but no verdict JSON. Falling back to a clean delete is
+        // safer than guessing.
+        set_task_status(&db, "p1", "1.4", "checking");
+        insert_check_agent_row(&db, "agent-c4", "p1", "1.4");
+        append_agent_output(&db, "agent-c4", "let me investigate the test suite");
+
+        registry.cleanup_and_reattach().await;
+
+        assert!(
+            task_status_of(&db, "p1", "1.4").is_none(),
+            "no verdict must drop the row, leaving the task at implicit pending"
+        );
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("task_status_changed")
+                && e.contains("\"status\":null")
+                && e.contains("no verdict recoverable")),
+            "expected task_status_changed/null broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_deletes_row_when_no_check_agent_row_exists() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // task_status is `checking` but no `agents` row was ever inserted
+        // (e.g. the row was pruned out-of-band). The sweep must still
+        // unstick the task — verdict lookup returns None ⇒ delete path.
+        set_task_status(&db, "p1", "1.5", "checking");
+
+        registry.cleanup_and_reattach().await;
+
+        assert!(
+            task_status_of(&db, "p1", "1.5").is_none(),
+            "missing agent row must still drop the stuck task_status"
+        );
+        let _ = drain_events(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_checking_alone_when_agent_still_alive() {
+        let (db, _dir) = fresh_db();
+        let (registry, _rx) = test_registry(db.clone());
+
+        // The full `cleanup_and_reattach` flow always orphans stream-json
+        // rows in pass 1 (IO handles are gone after a server restart), so
+        // the only way a check-agent row can be alive when pass 2 runs is
+        // if the sweep is invoked outside boot — exercised by calling
+        // `reconcile_task_statuses` directly. Defensive contract: if any
+        // agent for the task is still in the running/starting set, leave
+        // task_status alone.
+        set_task_status(&db, "p1", "1.6", "checking");
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, cwd, status, mode, plan_name, task_id) \
+                 VALUES ('agent-live', '/tmp/proj', 'running', 'stream-json', 'p1', '1.6')",
+                [],
+            )
+            .unwrap();
+        }
+
+        registry.reconcile_task_statuses().await;
+
+        assert_eq!(
+            task_status_of(&db, "p1", "1.6").as_deref(),
+            Some("checking"),
+            "live check-agent must keep task_status at checking"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_picks_most_recent_check_agent_when_multiple_exist() {
+        let (db, _dir) = fresh_db();
+        let (registry, _rx) = test_registry(db.clone());
+
+        // Two stream-json rows for the same (plan, task): the earlier one
+        // returned an in_progress verdict, the later one came back
+        // completed. ORDER BY started_at DESC must pick the later run.
+        set_task_status(&db, "p1", "1.7", "checking");
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, cwd, status, mode, plan_name, task_id, started_at) \
+                 VALUES ('agent-old', '/tmp/proj', 'failed', 'stream-json', 'p1', '1.7', '2026-01-01 00:00:00')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, cwd, status, mode, plan_name, task_id, started_at) \
+                 VALUES ('agent-new', '/tmp/proj', 'failed', 'stream-json', 'p1', '1.7', '2026-05-01 00:00:00')",
+                [],
+            )
+            .unwrap();
+        }
+        append_agent_output(
+            &db,
+            "agent-old",
+            r#"{"status": "in_progress", "reason": "stale"}"#,
+        );
+        append_agent_output(
+            &db,
+            "agent-new",
+            r#"{"status": "completed", "reason": "fresh"}"#,
+        );
+
+        registry.cleanup_and_reattach().await;
+
+        assert_eq!(
+            task_status_of(&db, "p1", "1.7").as_deref(),
+            Some("completed"),
+            "most recent check-agent's verdict must win"
+        );
+    }
 
     // ── try_auto_advance tests (Task 3.4) ─────────────────────────────
     //
