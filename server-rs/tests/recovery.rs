@@ -358,6 +358,48 @@ fn dismiss_ci_run_hides_it_from_latest() {
     );
 }
 
+/// The dismiss endpoint's docstring promises "Idempotent; dismissing twice is
+/// a no-op" and `.ok()`-swallows the UPDATE so a missing row also 200s. Both
+/// contracts are load-bearing: the UI fires DELETE without checking the row's
+/// `dismissed_at`, and a stale `ciRunId` from an out-of-date plan refresh must
+/// not surface as an error toast.
+#[test]
+fn dismiss_ci_run_is_idempotent_and_tolerates_missing_rows() {
+    let d = TestDashboard::new();
+    let plan = d.create_plan(
+        "plan-dismiss-idem",
+        &minimal_plan("plan-dismiss-idem", &d.project),
+    );
+
+    let db_path = d.dir.path().join(".claude/branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO ci_runs (plan_name, task_number, status, commit_sha, updated_at) \
+         VALUES (?1, '1.1', 'failure', 'deadbeef', datetime('now'))",
+        rusqlite::params![plan],
+    )
+    .unwrap();
+    let run_id = conn.last_insert_rowid();
+    drop(conn);
+
+    // First dismiss: 200, badge cleared.
+    let (s, _) = d.delete(&format!("/api/ci/{run_id}"));
+    assert_eq!(s, 200);
+
+    // Second dismiss against the now-already-dismissed row: still 200.
+    let (s, body) = d.delete(&format!("/api/ci/{run_id}"));
+    assert_eq!(s, 200, "{body:?}");
+    assert_eq!(body["ok"], true);
+
+    // Dismiss against a row id that never existed: still 200, plan/task
+    // fields null because the lookup found no row to broadcast about.
+    let (s, body) = d.delete("/api/ci/9999999");
+    assert_eq!(s, 200, "{body:?}");
+    assert_eq!(body["ok"], true);
+    assert!(body["plan_name"].is_null(), "{body:?}");
+    assert!(body["task_number"].is_null(), "{body:?}");
+}
+
 #[test]
 fn failure_log_serves_cached_text_and_404s_when_missing() {
     // Pre-seed a ci_runs row with a cached `failure_log` so the endpoint
