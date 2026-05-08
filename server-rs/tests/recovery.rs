@@ -202,6 +202,90 @@ fn purge_refuses_unique_commits_without_force_then_accepts() {
     assert!(!d.local_branches().contains(&full_br));
 }
 
+/// Purge must refuse while a `running` / `starting` agent still owns
+/// the branch — otherwise the next session write would land on a branch
+/// the user thinks they cleared, and the in-flight commit history would
+/// vanish out from under the agent. `force=true` does NOT bypass this:
+/// unlike the unique-commits guard (which only discards recoverable
+/// work), live-agent state is the one case where deletion would
+/// actively corrupt a session. Mirrors Task 1.1's reset-status guard.
+#[test]
+fn purge_refuses_while_agent_is_running() {
+    let d = TestDashboard::new();
+    let plan = d.create_plan(
+        "plan-running-branch",
+        &minimal_plan("plan-running-branch", &d.project),
+    );
+
+    let live_br = format!("branchwork/{plan}/1.1");
+    d.create_task_branch(&live_br, /* with_commit */ false);
+
+    // Pin a live agent at this branch. We seed agents.id directly because
+    // no public endpoint inserts a `running` row without spawning a real
+    // PTY, which the test env can't satisfy.
+    let db_path = d.dir.path().join(".claude/branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO agents (id, plan_name, task_id, cwd, status, branch, started_at) \
+         VALUES ('agent-live-1', ?1, '1.1', '/tmp/scratch', 'running', ?2, datetime('now'))",
+        rusqlite::params![plan, live_br],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Without force: refused with agent_running, branch survives.
+    let (s, body) = d.post(
+        &format!("/api/plans/{plan}/branches/stale/purge"),
+        json!({"branches": [&live_br]}),
+    );
+    assert_eq!(s, 200, "{body:?}");
+    let r = &body["results"][0];
+    assert_eq!(r["branch"], live_br);
+    assert_eq!(r["ok"], false);
+    assert_eq!(r["error"], "agent_running");
+    assert_eq!(r["agent_id"], "agent-live-1");
+    assert!(d.local_branches().contains(&live_br));
+
+    // With force: still refused — force does not lift the live-agent
+    // guard, only the unique-commits guard.
+    let (s, body) = d.post(
+        &format!("/api/plans/{plan}/branches/stale/purge"),
+        json!({"branches": [&live_br], "force": true}),
+    );
+    assert_eq!(s, 200);
+    assert_eq!(body["results"][0]["error"], "agent_running");
+    assert!(d.local_branches().contains(&live_br));
+
+    // List endpoint surfaces the live status so the UI can disable the
+    // checkbox before the user even tries.
+    let (_s, list_body) = d.get(&format!("/api/plans/{plan}/branches/stale"));
+    let entry = list_body["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == live_br)
+        .expect("entry for live branch");
+    assert_eq!(entry["agentId"], "agent-live-1");
+    assert_eq!(entry["agentStatus"], "running");
+
+    // Once the agent transitions out of running/starting, purge succeeds.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE agents SET status = 'completed' WHERE id = 'agent-live-1'",
+        rusqlite::params![],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (s, body) = d.post(
+        &format!("/api/plans/{plan}/branches/stale/purge"),
+        json!({"branches": [&live_br]}),
+    );
+    assert_eq!(s, 200, "{body:?}");
+    assert_eq!(body["results"][0]["ok"], true);
+    assert!(!d.local_branches().contains(&live_br));
+}
+
 #[test]
 fn purge_rejects_out_of_scope_branch_names() {
     let d = TestDashboard::new();

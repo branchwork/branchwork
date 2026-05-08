@@ -647,7 +647,16 @@ interface StaleBranch {
   commitsAheadOfTrunk: number | null;
   lastCommitAgeSecs: number | null;
   agentId: string | null;
+  /// Agent row's status (running, starting, completed, failed, ...).
+  /// `running` / `starting` are "live" — the modal disables the
+  /// checkbox to mirror the server-side guard in
+  /// `purge_stale_branches`, which refuses these even with `force`.
+  agentStatus: string | null;
   hasUniqueCommits: boolean;
+}
+
+function isLiveAgent(s: string | null | undefined): boolean {
+  return s === "running" || s === "starting";
 }
 
 interface StaleBranchesButtonProps {
@@ -659,7 +668,7 @@ interface StaleBranchesButtonProps {
 /// branches, then pick which to purge. Defaults to selecting only the
 /// branches with no unique commits (the "agent exited without committing"
 /// leftovers). Dangerous branches require a force opt-in.
-function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
+export function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [branches, setBranches] = useState<StaleBranch[]>([]);
@@ -675,8 +684,16 @@ function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
         `/api/plans/${planName}/branches/stale`,
       );
       setBranches(data.branches);
-      // Default selection: safe-only (no unique commits).
-      setSelected(new Set(data.branches.filter((b) => !b.hasUniqueCommits).map((b) => b.name)));
+      // Default selection: safe-only (no unique commits, no live agent).
+      // Live-agent rows are also disabled below, so this just keeps the
+      // initial state consistent with what the user can interact with.
+      setSelected(
+        new Set(
+          data.branches
+            .filter((b) => !b.hasUniqueCommits && !isLiveAgent(b.agentStatus))
+            .map((b) => b.name),
+        ),
+      );
     } catch (e) {
       toastError(e, "Load branches failed");
       setOpen(false);
@@ -746,6 +763,12 @@ function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
                 <tbody>
                   {branches.map((b) => {
                     const risky = b.hasUniqueCommits;
+                    const live = isLiveAgent(b.agentStatus);
+                    const checkboxTitle = live
+                      ? `Agent ${b.agentStatus} — kill or finish it before deleting this branch`
+                      : risky && !force
+                        ? "Branch has unique commits — toggle 'force' below to allow deletion"
+                        : undefined;
                     return (
                       <tr key={b.name} className="border-b border-gray-800/50">
                         <td className="py-1 pr-2">
@@ -753,7 +776,8 @@ function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
                             type="checkbox"
                             aria-label={`Select branch ${b.name}`}
                             checked={selected.has(b.name)}
-                            disabled={risky && !force}
+                            disabled={live || (risky && !force)}
+                            title={checkboxTitle}
                             onChange={(e) => {
                               const next = new Set(selected);
                               if (e.target.checked) next.add(b.name);
@@ -770,7 +794,21 @@ function StaleBranchesButton({ planName, onDone }: StaleBranchesButtonProps) {
                           {b.lastCommitAgeSecs != null ? formatAge(b.lastCommitAgeSecs) : "?"}
                         </td>
                         <td className="py-1 pr-2 font-mono text-gray-600">
-                          {b.agentId ? b.agentId.slice(0, 8) : "-"}
+                          {b.agentId ? (
+                            <span className="inline-flex items-center gap-1.5">
+                              <span>{b.agentId.slice(0, 8)}</span>
+                              {live && (
+                                <span
+                                  className="px-1 py-0.5 text-[10px] rounded bg-indigo-900/40 text-indigo-300 border border-indigo-700/50"
+                                  title="Agent is live — branch cannot be deleted until it stops"
+                                >
+                                  {b.agentStatus}
+                                </span>
+                              )}
+                            </span>
+                          ) : (
+                            "-"
+                          )}
                         </td>
                       </tr>
                     );

@@ -4648,6 +4648,12 @@ pub struct StaleBranch {
     pub commits_ahead_of_trunk: Option<u64>,
     pub last_commit_age_secs: Option<i64>,
     pub agent_id: Option<String>,
+    /// Status of the agent row referencing this branch, if any. The UI
+    /// uses this to disable the checkbox for live agents (`running` /
+    /// `starting`) so the user can't yank a branch out from under a
+    /// session that's still writing to it. Mirrors the live-agent guard
+    /// on the purge endpoint.
+    pub agent_status: Option<String>,
     /// When false, the branch has no unique commits and is safe to delete
     /// without the `force` flag.
     pub has_unique_commits: bool,
@@ -4700,17 +4706,24 @@ pub async fn list_stale_branches(
         }
     };
 
-    // Which agent rows still reference each branch — one query.
-    let agent_by_branch: std::collections::HashMap<String, String> = {
+    // Which agent rows still reference each branch — one query. Pull
+    // status alongside id so the UI can render a live-agent badge and
+    // the purge endpoint's matching guard reads off the same source.
+    let agent_by_branch: std::collections::HashMap<String, (String, String)> = {
         let conn = state.db.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT branch, id FROM agents WHERE branch IS NOT NULL")
-        {
-            Ok(s) => s,
-            Err(_) => return Json(serde_json::json!({"branches": []})).into_response(),
-        };
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            .map(|it| it.flatten().collect())
-            .unwrap_or_default()
+        let mut stmt =
+            match conn.prepare("SELECT branch, id, status FROM agents WHERE branch IS NOT NULL") {
+                Ok(s) => s,
+                Err(_) => return Json(serde_json::json!({"branches": []})).into_response(),
+            };
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+            ))
+        })
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default()
     };
 
     // Determine trunk — try master, then main.
@@ -4748,12 +4761,14 @@ pub async fn list_stale_branches(
                             .ok()
                     })
             });
+            let agent = agent_by_branch.get(&branch);
             StaleBranch {
                 name: branch.clone(),
                 sha: Some(sha),
                 last_commit_age_secs: ts.map(|t| now - t),
                 commits_ahead_of_trunk: commits_ahead,
-                agent_id: agent_by_branch.get(&branch).cloned(),
+                agent_id: agent.map(|(id, _)| id.clone()),
+                agent_status: agent.map(|(_, st)| st.clone()),
                 // Unknown commits_ahead = assume risky (has_unique_commits=true)
                 // so the user has to actively opt in via force=true.
                 has_unique_commits: commits_ahead.map(|c| c > 0).unwrap_or(true),
@@ -4814,6 +4829,26 @@ pub async fn purge_stale_branches(
     let prefix = format!("branchwork/{name}/");
     let prefix_fix = format!("branchwork/fix/{name}/");
 
+    // Snapshot live agent rows by branch so each per-branch decision
+    // reads off a single, consistent view. `force` does not lift this
+    // guard — a running agent is the one case where deleting the
+    // branch would corrupt an in-flight session, not just discard work
+    // the user could re-derive. Same posture as
+    // `reset_task_status_refuses_while_agent_is_running` (Task 1.1).
+    let live_agent_by_branch: std::collections::HashMap<String, String> = {
+        let conn = state.db.lock().unwrap();
+        match conn.prepare(
+            "SELECT branch, id FROM agents \
+             WHERE branch IS NOT NULL AND status IN ('running', 'starting')",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map(|it| it.flatten().collect())
+                .unwrap_or_default(),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    };
+
     let mut results = Vec::new();
     for branch in &body.branches {
         // Scope-check: only allow deletion within this plan's prefix so a
@@ -4823,6 +4858,21 @@ pub async fn purge_stale_branches(
                 "branch": branch,
                 "ok": false,
                 "error": "out_of_scope",
+            }));
+            continue;
+        }
+
+        // Live-agent guard: refuse if a running/starting agent still
+        // owns this branch. The user has to kill or finish the agent
+        // before the branch is safe to delete — `force=true` does not
+        // bypass this (unlike the unique-commits check, which only
+        // discards recoverable work).
+        if let Some(agent_id) = live_agent_by_branch.get(branch) {
+            results.push(serde_json::json!({
+                "branch": branch,
+                "ok": false,
+                "error": "agent_running",
+                "agent_id": agent_id,
             }));
             continue;
         }
