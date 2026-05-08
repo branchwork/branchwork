@@ -95,8 +95,11 @@ Deployment, upgrades, day-2 ops.
   "use this when…" guidance, every env var grouped by the file that
   passes it through, the named-volume / host-bind matrix, run and
   tear-down recipes, and the ADR 0005 e2e-fixture rule.
-- [operations/helm-terraform.md](operations/helm-terraform.md) _(stub)_ —
-  Helm chart (`sqlite` vs `postgres` modes), Terraform ECS Fargate module.
+- [operations/helm-terraform.md](operations/helm-terraform.md) —
+  Helm chart values reference (image, database mode, persistence,
+  ingress, autoscaling, SMTP) and Terraform AWS ECS Fargate module
+  variables / outputs, with pointers to `example.tfvars` and the
+  Postgres-not-yet-implemented caveat.
 - [operations/upgrades-and-migrations.md](operations/upgrades-and-migrations.md)
   _(stub)_ — upgrade path, SQLite→Postgres migration, rollback, backups.
 
