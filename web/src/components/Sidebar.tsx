@@ -10,6 +10,7 @@ import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
 import { isPlanDone } from "../lib/predicates.js";
 import { StaleDataChip } from "./StaleDataChip.js";
+import { HealthStateIndicator } from "./HealthStateIndicator.js";
 import { TouchTarget } from "./ui/TouchTarget.js";
 
 export function Sidebar() {
@@ -191,6 +192,15 @@ export function Sidebar() {
 
         {/* Driver auth status */}
         <DriverStatusList />
+
+        {/* Self-check footer indicator. Polls /api/health/state and
+            surfaces wedged states (unknown agent statuses, stuck
+            checking task_status rows, dismissed CI runs, time since
+            last orphan sweep). When warnings > 0 the pill flips amber
+            and clicking expands a popover that links each affected
+            plan to its plan board so the user can run the Phase-1
+            recovery flows directly. */}
+        <HealthStateIndicator />
 
         {/* Admin link */}
         <div className="px-2 pb-2">

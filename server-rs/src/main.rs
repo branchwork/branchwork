@@ -263,6 +263,7 @@ async fn run_server(cli: Cli) {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/health", get(health))
+        .route("/api/health/state", get(api::health::get_health_state))
         .route("/hooks", post(hooks::receive_hook))
         .route("/ws", get(ws::ws_handler))
         .route("/terminal", get(agents::terminal_ws::terminal_ws_handler))

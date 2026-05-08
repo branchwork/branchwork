@@ -635,6 +635,7 @@ impl AgentRegistry {
             .unwrap_or_default()
         };
 
+        let mut cleared = 0u32;
         for (agent_id, branch, cwd) in rows {
             if !std::path::Path::new(&cwd).is_dir() {
                 continue;
@@ -661,6 +662,7 @@ impl AgentRegistry {
                 )
                 .ok();
             }
+            cleared += 1;
             broadcast_event(
                 &self.broadcast_tx,
                 "agent_branch_cleared",
@@ -675,6 +677,26 @@ impl AgentRegistry {
                  not in project git",
                 &agent_id[..8.min(agent_id.len())]
             );
+        }
+
+        // Record sweep telemetry so /api/health/state can report
+        // "time since last orphan sweep" + "branches cleared in last sweep".
+        // Written unconditionally (cleared=0 is the steady-state, and the
+        // health endpoint needs the timestamp to know the sweep ran at all).
+        {
+            let db = self.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO settings (key, value) VALUES ('last_orphan_sweep_at', datetime('now')) \
+                 ON CONFLICT(key) DO UPDATE SET value = datetime('now')",
+                rusqlite::params![],
+            )
+            .ok();
+            db.execute(
+                "INSERT INTO settings (key, value) VALUES ('last_orphan_sweep_cleared', ?1) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![cleared.to_string()],
+            )
+            .ok();
         }
     }
 
