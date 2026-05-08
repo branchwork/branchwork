@@ -116,3 +116,58 @@ jobs:
       # of a heavy dep can't silently regress first-paint cost.
       - name: Bundle-size budget
         run: pnpm --filter @branchwork/web bundle:check
+
+  # End-to-end tests that need authenticated `gh` access (creates +
+  # deletes scratch private repos) and an Anthropic API key. Kept in a
+  # single ubuntu-latest job: the gh-backed paths are platform-neutral
+  # and the matrix multiplier on the `server` job is enough OS coverage
+  # for the rest of the suite.
+  tests-e2e:
+    name: E2E tests (gh + Claude)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server-rs
+    env:
+      # GH_TOKEN is the env name `gh` reads natively; piping the user's
+      # personal-access secret through it avoids `gh auth login` flows.
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Opt the scratch-repo harness (`tests/support/gh.rs`) into real
+      # GitHub round-trips. The default `cargo test` invocation on the
+      # `server` job leaves this unset so it stays inert there.
+      BRANCHWORK_TEST_GH_REPOS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server-rs/target
+          key: ci-e2e-${{ hashFiles('server-rs/Cargo.lock') }}
+          restore-keys: |
+            ci-e2e-
+            ci-ubuntu-latest-
+
+      # rust-embed compiles web/dist into the binary, so it must exist
+      # even though this job never serves the dashboard.
+      - name: Create web/dist placeholder
+        run: mkdir -p ../web/dist && touch ../web/dist/index.html
+
+      # `gh` is preinstalled on ubuntu-latest, but verify the binary is
+      # on PATH and that GH_TOKEN authenticates so the harness fails
+      # fast on a bad/missing secret rather than mid-test.
+      - name: Verify gh CLI + auth
+        run: |
+          gh --version
+          gh auth status
+
+      - name: cargo test --features e2e
+        run: cargo test --release --features e2e

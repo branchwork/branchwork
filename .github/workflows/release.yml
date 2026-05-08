@@ -12,7 +12,53 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Same gate as ci.yml's `tests-e2e` job — duplicated here because tag
+  # pushes (release trigger) don't reuse master-push CI runs, and
+  # release artifacts must not ship from a tag whose tip never passed
+  # the e2e suite. Kept inline rather than factored into a reusable
+  # workflow to keep the release pipeline readable in a single file.
+  tests-e2e:
+    name: E2E tests (gh + Claude)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server-rs
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      BRANCHWORK_TEST_GH_REPOS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server-rs/target
+          key: release-e2e-${{ hashFiles('server-rs/Cargo.lock') }}
+          restore-keys: |
+            release-e2e-
+            ci-e2e-
+
+      - name: Create web/dist placeholder
+        run: mkdir -p ../web/dist && touch ../web/dist/index.html
+
+      - name: Verify gh CLI + auth
+        run: |
+          gh --version
+          gh auth status
+
+      - name: cargo test --features e2e
+        run: cargo test --release --features e2e
+
   build:
+    needs: tests-e2e
     strategy:
       matrix:
         include:

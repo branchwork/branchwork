@@ -3,6 +3,15 @@ name = "branchwork-server"
 version = "0.4.0"
 edition = "2024"
 
+[features]
+# Enables tests that require external services (GitHub via `gh`, Anthropic
+# API). The e2e job in CI sets `BRANCHWORK_TEST_GH_REPOS=1` + provides
+# `ANTHROPIC_API_KEY` / `GH_TOKEN` and runs `cargo test --release
+# --features e2e`. The flag is empty today; tests exercise gh paths via
+# the existing env-var gate, but `#[cfg(feature = "e2e")]` is reserved
+# for tests that should NEVER compile in the default flow.
+e2e = []
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
