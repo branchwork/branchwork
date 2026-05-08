@@ -161,13 +161,20 @@ jobs:
       - name: Create web/dist placeholder
         run: mkdir -p ../web/dist && touch ../web/dist/index.html
 
-      # `gh` is preinstalled on ubuntu-latest, but verify the binary is
-      # on PATH and that GH_TOKEN authenticates so the harness fails
-      # fast on a bad/missing secret rather than mid-test.
+      # `gh` is preinstalled on ubuntu-latest. When GH_TOKEN is set, run
+      # `gh auth status` so a bad/expired secret fails fast rather than
+      # mid-test. When the secret is absent (fork PRs, repos that haven't
+      # provisioned `GH_PAT` yet), warn and continue: the gh harness in
+      # tests/support/gh.rs::maybe_create returns None on auth failure and
+      # tests gracefully degrade through `with_github_repo() -> Option`.
       - name: Verify gh CLI + auth
         run: |
           gh --version
-          gh auth status
+          if [ -n "$GH_TOKEN" ]; then
+            gh auth status
+          else
+            echo "::warning::GH_PAT secret not set; gh-backed e2e paths will skip via tests/support/gh.rs::maybe_create"
+          fi
 
       - name: cargo test --features e2e
         run: cargo test --release --features e2e

@@ -49,10 +49,18 @@ jobs:
       - name: Create web/dist placeholder
         run: mkdir -p ../web/dist && touch ../web/dist/index.html
 
+      # Warn-and-continue when GH_PAT is unset so a tag push from a repo
+      # that hasn't provisioned the secret still produces release
+      # artifacts. The underlying gh harness gracefully degrades. Same
+      # pattern as ci.yml's tests-e2e verify step.
       - name: Verify gh CLI + auth
         run: |
           gh --version
-          gh auth status
+          if [ -n "$GH_TOKEN" ]; then
+            gh auth status
+          else
+            echo "::warning::GH_PAT secret not set; gh-backed e2e paths will skip via tests/support/gh.rs::maybe_create"
+          fi
 
       - name: cargo test --features e2e
         run: cargo test --release --features e2e
