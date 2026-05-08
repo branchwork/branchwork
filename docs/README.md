@@ -85,9 +85,11 @@ Deployment, upgrades, day-2 ops.
   binary on a laptop or server, SQLite, local agents. Includes
   copy-pasteable systemd unit and launchd plist, Windows/NSSM notes,
   log paths, backup, and the stop-swap-start upgrade procedure.
-- [operations/saas-runner.md](operations/saas-runner.md) _(stub)_ —
-  runner token issuance, connection URL, reconnect/backoff, PATH
-  requirements, systemd unit.
+- [operations/saas-runner.md](operations/saas-runner.md) — runner
+  token issuance, install one-liner, network requirements
+  (outbound WSS only), systemd / launchd / NSSM units, log paths,
+  token rotation, multi-runner setups, and connect/reconnect
+  troubleshooting.
 - [operations/docker.md](operations/docker.md) _(stub)_ —
   `deploy/Dockerfile`, compose overlays, GHCR images.
 - [operations/helm-terraform.md](operations/helm-terraform.md) _(stub)_ —
