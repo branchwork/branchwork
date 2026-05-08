@@ -23,10 +23,11 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::db::Db;
-use crate::saas::dispatch::org_has_runner;
-use crate::saas::runner_protocol::{GhRun, WireMessage};
-use crate::saas::runner_rpc::{RunnerRpcError, runner_request_with_registry};
+use crate::saas::dispatch::{CiStatusError, get_ci_run_status_dispatch, org_has_runner};
+use crate::saas::runner_protocol::WireMessage;
+use crate::saas::runner_rpc::runner_request_with_registry;
 use crate::saas::runner_ws::{RunnerRegistry, RunnerResponse};
+use crate::state::AppState;
 use crate::ws::broadcast_event;
 
 const POLL_INTERVAL_SECS: u64 = 30;
@@ -222,76 +223,33 @@ fn terminal(status: &str) -> bool {
     matches!(status, "success" | "failure" | "cancelled" | "unknown")
 }
 
-/// Ask `gh` for the most recent workflow run against a given commit.
-/// Runs in a blocking thread because `Command` is sync.
+/// One pass: look up every pending/running `ci_runs` row, ask the
+/// aggregate-aware dispatch for the per-SHA verdict, and update rows +
+/// broadcast when status changes. Rows older than `MAX_RUN_AGE_SECS` with
+/// no success are marked `unknown` so the dashboard doesn't show a
+/// permanent spinner for a commit that never kicked off CI.
 ///
-/// Local (standalone) implementation. The SaaS path goes through
-/// [`fetch_run`] which dispatches via the runner. Implementation lives in
-/// `crate::git_helpers::gh_run_list_local` so the runner binary reuses it.
-async fn fetch_run_local(cwd: PathBuf, sha: String) -> Option<GhRun> {
-    tokio::task::spawn_blocking(move || crate::git_helpers::gh_run_list_local(&cwd, &sha))
-        .await
-        .ok()
-        .flatten()
-}
-
-/// Mode-aware dispatcher for [`fetch_run_local`].
-///
-/// - SaaS path (org has any `runners` row): dispatch
-///   [`WireMessage::GhRunList`] to a connected runner. The poll cadence
-///   is ~30s and the next pass will retry, so a longer-than-read timeout
-///   is fine.
-/// - Standalone: shell out via [`fetch_run_local`].
-///
-/// Outer `Result` is `Err` only when the SaaS path failed to reach the
-/// runner (caller logs and skips this pass — does NOT age out the row).
-/// Inner `Option<GhRun>` is `None` when no workflow has fired yet for
-/// the commit, or `gh` is unavailable on the runner.
-pub async fn fetch_run(
-    db: &Db,
-    runners: &RunnerRegistry,
-    org_id: &str,
-    cwd: &Path,
-    sha: &str,
-) -> Result<Option<GhRun>, RunnerRpcError> {
-    if org_has_runner(db, org_id) {
-        let req_id = Uuid::new_v4().to_string();
-        let msg = WireMessage::GhRunList {
-            req_id,
-            cwd: cwd.to_string_lossy().to_string(),
-            sha: sha.to_string(),
-        };
-        match runner_request_with_registry(db, runners, org_id, msg, Duration::from_secs(15))
-            .await?
-        {
-            RunnerResponse::GhRunListed(run) => Ok(run),
-            other => {
-                eprintln!("[ci] expected gh_run_listed, got {other:?}");
-                Err(RunnerRpcError::InvalidRequest)
-            }
-        }
-    } else {
-        Ok(fetch_run_local(cwd.to_path_buf(), sha.to_string()).await)
-    }
-}
-
-/// One pass: look up every pending/running `ci_runs` row, query `gh`, and
-/// update rows + broadcast when status changes. Rows older than
-/// `MAX_RUN_AGE_SECS` with no success are marked `unknown` so the dashboard
-/// doesn't show a permanent spinner for a commit that never kicked off CI.
+/// Why aggregate-aware: a SHA can have multiple workflow runs (CI, Docker,
+/// CodeQL, …). The legacy single-run path used `gh run list -L 1`, which
+/// returned whichever run gh sorted to the top — often a passing Docker
+/// build while the blocking CI run had failed. The dispatch path applies
+/// the per-plan blocking-workflow filter (levels 1-4) and returns a
+/// [`crate::saas::runner_protocol::CiAggregate`] whose `conclusion`
+/// reflects only the blocking subset and whose `failing_run_id`
+/// deep-links to the chronologically-earliest blocking failure (the
+/// root cause).
 ///
 /// SaaS-aware: each row's `org_id` is resolved by joining through
 /// `agents.id` (`ci_runs.agent_id`), and the gh shell-out is dispatched
-/// through the runner. A `RunnerRpcError::NoConnectedRunner` (or any other
-/// transport failure) logs `runner offline, retrying` and **skips the row
-/// without aging it** — a brief reconnect window must not flip rows to
-/// `unknown` just because the runner was disconnected for a few minutes.
-async fn poll_once(
-    db: &Db,
-    runners: &RunnerRegistry,
-    broadcast_tx: &broadcast::Sender<String>,
-    project_dirs: &std::collections::HashMap<String, PathBuf>,
-) {
+/// through the runner. A [`CiStatusError::Rpc`] logs `runner offline,
+/// retrying` and **skips the row without aging it** — a brief reconnect
+/// window must not flip rows to `unknown` just because the runner was
+/// disconnected for a few minutes. [`CiStatusError::InvalidResponse`] is
+/// programmer error / schema drift; we log and skip too.
+async fn poll_once(state: &AppState, project_dirs: &std::collections::HashMap<String, PathBuf>) {
+    let db = &state.db;
+    let broadcast_tx = &state.broadcast_tx;
+
     // Snapshot open rows — hold the lock only briefly. Joining through
     // agents to pick up org_id; rows with NULL agent_id (legacy/manual
     // inserts) get NULL here and we skip them.
@@ -363,9 +321,17 @@ async fn poll_once(
         // would have hit.
         let org_id = row.org_id.clone().unwrap_or_else(|| "default-org".into());
 
-        let run = match fetch_run(db, runners, &org_id, &cwd, &sha).await {
-            Ok(r) => r,
-            Err(e) => {
+        let aggregate = match get_ci_run_status_dispatch(
+            state,
+            &org_id,
+            &row.plan_name,
+            &row.task_number,
+            &sha,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(CiStatusError::Rpc(e)) => {
                 // Runner offline / timeout / disconnect — skip this pass
                 // and try again next cycle. Crucially, do NOT age out the
                 // row: the runner could be back in seconds and we'd lose
@@ -376,11 +342,25 @@ async fn poll_once(
                 );
                 continue;
             }
+            Err(CiStatusError::InvalidResponse) => {
+                // Schema drift / programmer error: skip this pass. Do not
+                // age out — the next cycle may catch up.
+                eprintln!(
+                    "[ci] dispatch returned an unexpected reply variant (plan={}, task={})",
+                    row.plan_name, row.task_number
+                );
+                continue;
+            }
         };
-        match run {
-            Some(r) => {
-                let new_status = normalize(r.status.as_deref(), r.conclusion.as_deref());
+
+        match aggregate {
+            Some(agg) => {
+                let new_status = normalize(Some(&agg.status), agg.conclusion.as_deref());
                 if new_status != row.status {
+                    let run_url = agg
+                        .failing_run_id
+                        .as_deref()
+                        .and_then(|id| derive_run_url(&cwd, id));
                     update_row(
                         db,
                         broadcast_tx,
@@ -388,9 +368,9 @@ async fn poll_once(
                         &row.plan_name,
                         &row.task_number,
                         new_status,
-                        r.conclusion.as_deref(),
-                        r.url.as_deref(),
-                        r.database_id.map(|i| i.to_string()).as_deref(),
+                        agg.conclusion.as_deref(),
+                        run_url.as_deref(),
+                        agg.failing_run_id.as_deref(),
                     );
                 }
             }
@@ -412,6 +392,55 @@ async fn poll_once(
             }
         }
     }
+}
+
+/// Build `https://github.com/<owner>/<repo>/actions/runs/<run_id>` from a
+/// local checkout's `origin` remote. Returns `None` when the remote is
+/// missing, isn't a github URL, or the cwd doesn't exist (typical SaaS
+/// path — `cwd` is the runner's filesystem, not the server's). The
+/// dashboard already handles `run_url == None` so this is a soft signal,
+/// not a hard error.
+fn derive_run_url(cwd: &Path, run_id: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(out.stdout).ok()?;
+    let (owner, repo) = parse_github_owner_repo(url.trim())?;
+    Some(format!(
+        "https://github.com/{owner}/{repo}/actions/runs/{run_id}"
+    ))
+}
+
+/// Parse `<owner>/<repo>` out of a github clone URL. Handles the common
+/// shapes: `git@github.com:o/r.git`, `https://github.com/o/r.git`,
+/// `https://github.com/o/r`, and the `git://` form. Returns `None` for
+/// non-github remotes (gitlab, self-hosted) — the run_url derivation is
+/// best-effort, and a None falls through to the existing dashboard
+/// "no link" rendering.
+fn parse_github_owner_repo(url: &str) -> Option<(&str, &str)> {
+    // Strip the host prefix in any of: git@host:, https://host/, git://host/, ssh://host/
+    let without_host = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("git://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
+
+    // Trim trailing `.git` and any trailing slashes/whitespace.
+    let trimmed = without_host
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let (owner, repo) = trimmed.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner, repo))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -459,14 +488,9 @@ fn update_row(
 /// shell-out happens on the runner, not the server, so the server's `$PATH`
 /// is irrelevant. Standalone deployments without `gh` installed still spin
 /// the poller but every dispatch returns `Ok(None)` (the runner-less branch
-/// of `fetch_run` calls `fetch_run_local` which fails fast on a missing gh
-/// binary), so there's no harm.
-pub fn spawn_poller(
-    db: Db,
-    runners: RunnerRegistry,
-    broadcast_tx: broadcast::Sender<String>,
-    plans_dir: PathBuf,
-) {
+/// of `get_ci_run_status_dispatch` shells out via `gh_run_list_full_local`
+/// which fails fast on a missing `gh` binary), so there's no harm.
+pub fn spawn_poller(state: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
@@ -474,8 +498,8 @@ pub fn spawn_poller(
             // Resolve plan_name -> project dir by re-reading plan files. Cheap
             // enough given the poll cadence, and avoids caching that could go
             // stale when the user edits a plan's `project` field.
-            let project_dirs = resolve_project_dirs(&plans_dir, &db);
-            poll_once(&db, &runners, &broadcast_tx, &project_dirs).await;
+            let project_dirs = resolve_project_dirs(&state.plans_dir, &state.db);
+            poll_once(&state, &project_dirs).await;
         }
     });
 }
@@ -954,5 +978,378 @@ mod tests {
         assert_eq!(parse_fix_attempt_suffix("1.3-fix-x", "1.3"), None);
         // No suffix: defensive None.
         assert_eq!(parse_fix_attempt_suffix("1.3", "1.3"), None);
+    }
+
+    #[test]
+    fn parse_github_owner_repo_accepts_common_url_forms() {
+        // git@host SSH alias form (default for `gh repo clone`).
+        assert_eq!(
+            parse_github_owner_repo("git@github.com:rust-lang/rust.git"),
+            Some(("rust-lang", "rust"))
+        );
+        // HTTPS clone URL with .git suffix.
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/cep/cep.git"),
+            Some(("cep", "cep"))
+        );
+        // HTTPS without .git suffix (browser address-bar copy).
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/cep/cep"),
+            Some(("cep", "cep"))
+        );
+        // git:// (read-only) form.
+        assert_eq!(
+            parse_github_owner_repo("git://github.com/cep/cep.git"),
+            Some(("cep", "cep"))
+        );
+        // Trailing slash.
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/cep/cep/"),
+            Some(("cep", "cep"))
+        );
+    }
+
+    #[test]
+    fn parse_github_owner_repo_rejects_non_github_remotes() {
+        assert_eq!(parse_github_owner_repo("https://gitlab.com/cep/cep"), None);
+        assert_eq!(
+            parse_github_owner_repo("git@bitbucket.org:cep/cep.git"),
+            None
+        );
+        // Empty owner / repo.
+        assert_eq!(parse_github_owner_repo("https://github.com//"), None);
+        assert_eq!(parse_github_owner_repo("https://github.com/cep"), None);
+    }
+
+    #[test]
+    fn derive_run_url_uses_local_origin_remote() {
+        // Set up a real-but-tiny git repo with an origin remote we control.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["remote", "add", "origin", "https://github.com/cep/cep.git"]);
+
+        let url = derive_run_url(cwd, "12345").unwrap();
+        assert_eq!(url, "https://github.com/cep/cep/actions/runs/12345");
+    }
+
+    #[test]
+    fn derive_run_url_returns_none_for_missing_remote() {
+        // Bare directory — `git remote get-url origin` exits non-zero.
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(derive_run_url(tmp.path(), "999"), None);
+    }
+
+    #[test]
+    fn derive_run_url_returns_none_for_non_github_remote() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["remote", "add", "origin", "https://gitlab.com/cep/cep.git"]);
+        assert_eq!(derive_run_url(cwd, "999"), None);
+    }
+
+    // ── Multi-workflow regression: poll_once writes the CI failure, not
+    // the Docker success. Live evidence cep sha
+    // 12d31ceb6a9a93d906a017a9a7a85b269361ab91 had Docker:success +
+    // CI:failure on the same SHA; the legacy `gh run list -L 1` path
+    // stored Docker. The aggregate-aware path stores CI.
+
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Instant;
+
+    use rusqlite::Connection;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+
+    use crate::saas::runner_protocol::{CiAggregate, CiRunSummary, Envelope};
+    use crate::saas::runner_ws::{ConnectedRunner, new_runner_registry};
+
+    /// Seed a multi-tenant SQLite DB with the schema poll_once + the
+    /// dispatch shim need: agents (org_id, cwd), ci_runs (with
+    /// commit_sha + status), runners (online row makes
+    /// org_has_runner true).
+    fn poll_test_db(org_id: &str, runner_id: &str, plan_name: &str, sha: &str) -> Db {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runners ( \
+               id TEXT PRIMARY KEY, name TEXT, org_id TEXT, status TEXT, \
+               hostname TEXT, version TEXT, last_seen_at TEXT, \
+               created_at TEXT \
+             ); \
+             CREATE TABLE agents ( \
+               id TEXT PRIMARY KEY, plan_name TEXT, task_id TEXT, \
+               org_id TEXT, cwd TEXT \
+             ); \
+             CREATE TABLE ci_runs ( \
+               id INTEGER PRIMARY KEY AUTOINCREMENT, plan_name TEXT, \
+               task_number TEXT, agent_id TEXT, provider TEXT, \
+               commit_sha TEXT, branch TEXT, status TEXT, \
+               conclusion TEXT, run_url TEXT, run_id TEXT, \
+               created_at TEXT DEFAULT (datetime('now')), \
+               updated_at TEXT DEFAULT (datetime('now')), \
+               failure_log TEXT, dismissed_at TEXT, org_id TEXT \
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runners (id, org_id, status, last_seen_at) \
+             VALUES (?1, ?2, 'online', datetime('now'))",
+            params![runner_id, org_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, plan_name, task_id, org_id, cwd) \
+             VALUES ('agent-1', ?1, '1.3', ?2, '/tmp/cwd')",
+            params![plan_name, org_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ci_runs (plan_name, task_number, agent_id, \
+                                  provider, commit_sha, branch, status, org_id) \
+             VALUES (?1, '1.3', 'agent-1', 'github', ?2, 'master', 'pending', ?3)",
+            params![plan_name, sha, org_id],
+        )
+        .unwrap();
+        Arc::new(StdMutex::new(conn))
+    }
+
+    fn poll_test_app_state(db: Db, runners: RunnerRegistry, plans_dir: PathBuf) -> AppState {
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            plans_dir.clone(),
+            PathBuf::from("/tmp/branchwork-test-claude"),
+            0,
+            true,
+        );
+        AppState {
+            db,
+            plans_dir,
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners,
+            settings_path: PathBuf::from("/tmp/branchwork-test-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Wire an in-memory runner that replies with the supplied
+    /// [`CiAggregate`] for any `GetCiRunStatus` envelope. Borrowed from
+    /// the `saas::dispatch` test pattern.
+    async fn install_aggregate_responder(
+        registry: &RunnerRegistry,
+        runner_id: &str,
+        aggregate: CiAggregate,
+    ) {
+        let pending: Arc<
+            Mutex<std::collections::HashMap<String, oneshot::Sender<RunnerResponse>>>,
+        > = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pending_clone = pending.clone();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
+
+        tokio::spawn(async move {
+            while let Some(payload) = cmd_rx.recv().await {
+                let envelope: Envelope = match serde_json::from_str(&payload) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if let WireMessage::GetCiRunStatus { req_id, .. } = envelope.message
+                    && let Some(tx) = pending_clone.lock().await.remove(&req_id)
+                {
+                    let _ = tx.send(RunnerResponse::CiRunStatusResolved(Some(aggregate.clone())));
+                }
+            }
+        });
+
+        registry.lock().await.insert(
+            runner_id.to_string(),
+            ConnectedRunner {
+                command_tx: cmd_tx,
+                hostname: None,
+                version: None,
+                drivers: None,
+                pending,
+            },
+        );
+    }
+
+    /// Build the `Docker:success + CI:failure` aggregate the way the
+    /// runner produces it for cep sha 12d31ceb6a9a93d906a017a9a7a85b269361ab91:
+    /// the CI run failed first (run id 25520540172) so it's the
+    /// `failing_run_id`; Docker's later success (25520540186) does NOT
+    /// flip the verdict.
+    fn cep_multi_workflow_aggregate() -> CiAggregate {
+        CiAggregate {
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+            failing_run_id: Some("25520540172".into()),
+            runs: vec![
+                CiRunSummary {
+                    run_id: "25520540172".into(),
+                    workflow_name: "CI".into(),
+                    status: "completed".into(),
+                    conclusion: Some("failure".into()),
+                    skipped_due_to_upstream: false,
+                    informational: false,
+                },
+                CiRunSummary {
+                    run_id: "25520540186".into(),
+                    workflow_name: "Docker".into(),
+                    status: "completed".into(),
+                    conclusion: Some("success".into()),
+                    skipped_due_to_upstream: false,
+                    informational: true,
+                },
+            ],
+        }
+    }
+
+    /// Acceptance: when dispatch reports `Docker:success + CI:failure`
+    /// for a SHA, the poller writes `conclusion=failure` (NOT success)
+    /// and the run_url + run_id point at the CI run, NOT the Docker
+    /// badge.
+    #[tokio::test]
+    async fn polls_aggregates_to_failure_when_blocking_run_fails() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "varpulis-option-b-cep";
+        let sha = "12d31ceb6a9a93d906a017a9a7a85b269361ab91";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        let runners = new_runner_registry();
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+
+        // Set up a real cwd with a github origin so derive_run_url
+        // produces the `cep/cep` deep link the regression pins.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/cep/cep.git"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+
+        let plans_dir = PathBuf::from("/tmp/branchwork-test-plans-poll");
+        let state = poll_test_app_state(db.clone(), runners, plans_dir);
+        let mut project_dirs = std::collections::HashMap::new();
+        project_dirs.insert(plan_name.to_string(), cwd.to_path_buf());
+
+        poll_once(&state, &project_dirs).await;
+
+        // Read the row back and assert the verdict + URL deep-links to
+        // the failing CI run, NOT the latest gh run.
+        let conn = db.lock().unwrap();
+        let (status, conclusion, run_url, run_id): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, conclusion, run_url, run_id FROM ci_runs WHERE plan_name = ?1",
+                params![plan_name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            status, "failure",
+            "blocking CI failure must beat Docker success"
+        );
+        assert_eq!(conclusion.as_deref(), Some("failure"));
+        assert_eq!(
+            run_url.as_deref(),
+            Some("https://github.com/cep/cep/actions/runs/25520540172"),
+            "run_url must deep-link to the failing CI run, not the Docker badge"
+        );
+        assert_eq!(run_id.as_deref(), Some("25520540172"));
+    }
+
+    /// Acceptance: success-with-no-failing_run_id (every blocking
+    /// workflow passed) writes `run_url = NULL`. The dashboard already
+    /// handles None gracefully; the existing test at
+    /// `plan_curate.rs:668` exercises the round-trip of an explicit
+    /// URL so we don't need to assert the round-trip shape here, only
+    /// that the None case is preserved.
+    #[tokio::test]
+    async fn polls_clears_run_url_on_blocking_success() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "successful-plan";
+        let sha = "0000000000000000000000000000000000000000";
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        let runners = new_runner_registry();
+        install_aggregate_responder(
+            &runners,
+            runner_id,
+            CiAggregate {
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                failing_run_id: None,
+                runs: vec![CiRunSummary {
+                    run_id: "1".into(),
+                    workflow_name: "CI".into(),
+                    status: "completed".into(),
+                    conclusion: Some("success".into()),
+                    skipped_due_to_upstream: false,
+                    informational: false,
+                }],
+            },
+        )
+        .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plans_dir = PathBuf::from("/tmp/branchwork-test-plans-poll-success");
+        let state = poll_test_app_state(db.clone(), runners, plans_dir);
+        let mut project_dirs = std::collections::HashMap::new();
+        project_dirs.insert(plan_name.to_string(), tmp.path().to_path_buf());
+
+        poll_once(&state, &project_dirs).await;
+
+        let conn = db.lock().unwrap();
+        let (status, conclusion, run_url, run_id): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, conclusion, run_url, run_id FROM ci_runs WHERE plan_name = ?1",
+                params![plan_name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(status, "success");
+        assert_eq!(conclusion.as_deref(), Some("success"));
+        assert_eq!(run_url, None);
+        assert_eq!(run_id, None);
     }
 }
