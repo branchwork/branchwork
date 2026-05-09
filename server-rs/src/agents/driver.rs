@@ -178,11 +178,14 @@ pub trait AgentDriver: Send + Sync {
     /// path via [`SpawnOpts::mcp_config_path`]. `None` (the default) means
     /// the driver has no portable MCP integration and the file is skipped.
     ///
-    /// `port` is the TCP port the dashboard's HTTP MCP endpoint is bound
-    /// to. Drivers that prefer stdio (e.g. to avoid requiring the server
-    /// to be reachable over HTTP) can ignore it and emit a stdio entry
-    /// instead.
-    fn mcp_config_json(&self, _port: u16) -> Option<String> {
+    /// `mcp_url` is the absolute URL the CLI should POST MCP traffic to.
+    /// In standalone the caller passes `http://localhost:<port>/mcp`; in
+    /// SaaS dispatch it passes the public dashboard URL
+    /// (`https://app.branchwork.dev/mcp`) since the runner sits on a
+    /// different host than the server and `127.0.0.1` would resolve to
+    /// the runner's own loopback. Drivers that prefer stdio can ignore
+    /// the argument and emit a stdio entry instead.
+    fn mcp_config_json(&self, _mcp_url: &str) -> Option<String> {
         None
     }
 
@@ -311,17 +314,18 @@ impl AgentDriver for ClaudeDriver {
             .any(|w| w == CLAUDE_PROMPT_GLYPH)
     }
 
-    fn mcp_config_json(&self, port: u16) -> Option<String> {
+    fn mcp_config_json(&self, mcp_url: &str) -> Option<String> {
         // Claude Code's `.mcp.json` schema: top-level `mcpServers` map,
         // one entry per server. We emit a streamable-HTTP entry pointing
-        // at the dashboard's `/mcp` endpoint (same transport the server
-        // already exposes at that path). Server name "branchwork" maps to
-        // tool names like `mcp__branchwork__list_plans` on the Claude side.
+        // at `mcp_url` directly — the caller has already resolved this to
+        // either `http://localhost:<port>/mcp` (standalone) or the public
+        // dashboard URL (`https://app.branchwork.dev/mcp`, SaaS), so the
+        // driver doesn't need to know which mode it is in.
         let cfg = serde_json::json!({
             "mcpServers": {
                 "branchwork": {
                     "type": "http",
-                    "url": format!("http://127.0.0.1:{port}/mcp"),
+                    "url": mcp_url,
                 }
             }
         });
@@ -848,9 +852,10 @@ impl DriverRegistry {
     /// auto-registers the Branchwork MCP server with its CLI. Callers use
     /// this to decide whether a spawned agent can reach MCP tools like
     /// `update_task_status`, or whether the prompt needs to fall back to
-    /// curl against the HTTP API.
-    pub fn injects_mcp(&self, name: Option<&str>, port: u16) -> bool {
-        self.get_or_default(name).1.mcp_config_json(port).is_some()
+    /// curl against the HTTP API. The URL is irrelevant here — only
+    /// `Some` vs `None` matters — so we pass an empty string.
+    pub fn injects_mcp(&self, name: Option<&str>) -> bool {
+        self.get_or_default(name).1.mcp_config_json("").is_some()
     }
 }
 
@@ -964,11 +969,28 @@ mod tests {
     #[test]
     fn claude_mcp_config_json_has_expected_shape() {
         let driver = ClaudeDriver::new();
-        let raw = driver.mcp_config_json(3100).unwrap();
+        let raw = driver
+            .mcp_config_json("http://127.0.0.1:3100/mcp")
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let entry = &parsed["mcpServers"]["branchwork"];
         assert_eq!(entry["type"], "http");
         assert_eq!(entry["url"], "http://127.0.0.1:3100/mcp");
+    }
+
+    /// Pins the SaaS-mode rendering: when the caller passes a public
+    /// dashboard URL (e.g. `https://app.branchwork.dev/mcp`), the driver
+    /// emits that URL verbatim — never the runner's loopback. Regression
+    /// guard for v0.5.2: a SaaS agent that gets `127.0.0.1:3100` in its
+    /// `.mcp.json` cannot reach MCP and auto-mode never advances.
+    #[test]
+    fn claude_mcp_config_json_respects_saas_url() {
+        let driver = ClaudeDriver::new();
+        let url = "https://app.branchwork.dev/mcp";
+        let raw = driver.mcp_config_json(url).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["mcpServers"]["branchwork"]["url"], url);
+        assert!(!raw.contains("127.0.0.1"), "SaaS render must not embed loopback: {raw}");
     }
 
     #[test]
@@ -1129,9 +1151,10 @@ Tokens: 200 sent, 75 received. Cost: $0.0150 message, $0.0250 session.
     fn non_claude_drivers_have_no_mcp_config() {
         // Default trait impl returns None for drivers that haven't opted
         // in to MCP injection. Only Claude ships a config today.
-        assert!(AiderDriver::new().mcp_config_json(3100).is_none());
-        assert!(CodexDriver::new().mcp_config_json(3100).is_none());
-        assert!(GeminiDriver::new().mcp_config_json(3100).is_none());
+        let url = "http://127.0.0.1:3100/mcp";
+        assert!(AiderDriver::new().mcp_config_json(url).is_none());
+        assert!(CodexDriver::new().mcp_config_json(url).is_none());
+        assert!(GeminiDriver::new().mcp_config_json(url).is_none());
     }
 
     #[test]

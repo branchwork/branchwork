@@ -1757,7 +1757,7 @@ async fn spawn_ready_tasks(
         let cross_ctx = build_cross_plan_context(&registry.db, plans_dir, plan, &task.number);
         // Auto-advance spawns use the default driver; check whether it
         // auto-registers MCP so the prompt picks MCP tool vs curl.
-        let mcp_available = registry.drivers.injects_mcp(None, port);
+        let mcp_available = registry.drivers.injects_mcp(None);
         let prompt = build_task_prompt(
             plan,
             phase,

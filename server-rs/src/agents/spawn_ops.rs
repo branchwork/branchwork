@@ -96,17 +96,29 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
     // to know about driver internals. Empty string means "driver opted out"
     // — the runner skips both the file write and the corresponding flag.
     //
-    // Hook URL deliberately points at the SaaS server's `/hooks` endpoint
-    // (loopback on the runner host). Today's SaaS deployment has the runner
-    // on a different host, so the curl POST will not reach the dashboard;
-    // ADR 0003's idle-timer fallback (Phase 4) is what actually drives
-    // unattended completion in SaaS mode. The settings file still needs to
-    // exist for byte-equality parity with standalone (acceptance bullet:
-    // `ps -ef` must show `--settings`).
-    let mcp_config = driver
-        .mcp_config_json(state.registry.port)
-        .unwrap_or_default();
-    let hook_url = format!("http://localhost:{}/hooks", state.registry.port);
+    // SaaS-aware base URL (Task 5.7 / ADR 0003 §SaaS). The runner sits on
+    // a different host than the server, so the localhost URL the
+    // standalone path uses (`http://127.0.0.1:<port>/...`) would resolve
+    // to the runner's own loopback and the agent's MCP client + Stop-hook
+    // curl would never reach the dashboard. `BRANCHWORK_PUBLIC_URL` is
+    // the prod overlay's signal for "what URL do customers see"
+    // (`saas/install_runner.rs:48`); when set, we emit it as the base.
+    // Otherwise fall back to localhost — this preserves behaviour for the
+    // local-SaaS dev loop where the runner connects to ws://localhost.
+    //
+    // The proper long-term fix is the WS back-channel (server → runner
+    // dispatches MCP/hook requests over the same WS the runner already
+    // owns); tracked under the `saas-compat-*` backlog plans. The public-
+    // URL stopgap is correct as long as `/mcp` and `/hooks` remain
+    // unauthenticated — flagged for follow-up alongside the back-channel.
+    let public_base = std::env::var("BRANCHWORK_PUBLIC_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| format!("http://localhost:{}", state.registry.port));
+    let mcp_url = format!("{public_base}/mcp");
+    let hook_url = format!("{public_base}/hooks");
+    let mcp_config = driver.mcp_config_json(&mcp_url).unwrap_or_default();
     let settings_json = crate::agents::session_settings::render_settings_json(
         &session_id,
         driver.as_ref(),

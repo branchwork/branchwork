@@ -2535,7 +2535,7 @@ pub async fn start_task(
     let mcp_available = state
         .registry
         .drivers
-        .injects_mcp(body.driver.as_deref(), port);
+        .injects_mcp(body.driver.as_deref());
     let prompt = crate::agents::build_task_prompt(
         &plan,
         phase,
@@ -2781,7 +2781,7 @@ pub async fn start_phase_tasks(
     let mcp_available = state
         .registry
         .drivers
-        .injects_mcp(body.driver.as_deref(), port);
+        .injects_mcp(body.driver.as_deref());
     let mut started = Vec::new();
 
     for task in ready {

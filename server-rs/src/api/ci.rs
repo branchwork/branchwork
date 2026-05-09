@@ -290,7 +290,7 @@ pub async fn fix_ci(
     let mcp_available = state
         .registry
         .drivers
-        .injects_mcp(body.driver.as_deref(), port);
+        .injects_mcp(body.driver.as_deref());
     let cross_ctx =
         crate::agents::build_cross_plan_context(&state.db, &state.plans_dir, &plan, &task.number);
     let base = crate::agents::build_task_prompt(

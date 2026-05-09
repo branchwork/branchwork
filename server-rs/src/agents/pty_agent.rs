@@ -121,7 +121,12 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     // file alongside the agent's socket so `--mcp-config` can point at it.
     // Failure to write is non-fatal: the agent still runs, just without
     // Branchwork tool access. Log and continue.
-    let mcp_config_path = driver.mcp_config_json(registry.port).and_then(|json| {
+    // Standalone: agent runs on the same host as the server, so loopback
+    // is the right base URL. SaaS dispatch lives in
+    // `spawn_ops::start_agent_via_runner` and uses the public dashboard
+    // URL there — see Task 5.7 / ADR 0003 §SaaS for context.
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", registry.port);
+    let mcp_config_path = driver.mcp_config_json(&mcp_url).and_then(|json| {
         let path = registry.mcp_config_for(&id);
         match std::fs::write(&path, &json) {
             Ok(()) => Some(path),
