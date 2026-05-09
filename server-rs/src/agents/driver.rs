@@ -848,6 +848,20 @@ impl DriverRegistry {
         out
     }
 
+    /// Graceful-exit byte sequence for the driver resolved from `name`
+    /// (falling back to the default). Used by the SaaS path of
+    /// `api/agents.rs::finish_agent` to ship the right bytes through
+    /// `WireMessage::AgentInput` without the registry having to expose
+    /// the underlying `Arc<dyn AgentDriver>`. Returns `None` for drivers
+    /// that have no clean exit path — the caller should reflect that as
+    /// a 400.
+    pub fn exit_sequence_for(&self, name: Option<&str>) -> Option<Vec<u8>> {
+        self.get_or_default(name)
+            .1
+            .graceful_exit_sequence()
+            .map(|s| s.to_vec())
+    }
+
     /// Whether the driver resolved from `name` (falling back to the default)
     /// auto-registers the Branchwork MCP server with its CLI. Callers use
     /// this to decide whether a spawned agent can reach MCP tools like

@@ -215,6 +215,8 @@ pub async fn finish_agent(
     auth: OptionalAuthUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Standalone fast-path: in-process registry knows how to write the
+    // driver's exit sequence into the supervisor's command_tx.
     if state.registry.graceful_exit(&id).await {
         let db = state.db.lock().unwrap();
         crate::audit::log(
@@ -227,15 +229,127 @@ pub async fn finish_agent(
             Some(&id),
             None,
         );
-        (StatusCode::OK, Json(serde_json::json!({"ok": true})))
-    } else {
-        (
+        return (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response();
+    }
+
+    // SaaS path (T5.9): the supervisor lives in the runner container so
+    // the in-process registry has nothing for `id`. Look up the agent's
+    // driver, ask the driver registry for the exit byte sequence, and
+    // ship it as a `WireMessage::AgentInput` envelope through the
+    // runner's `command_tx`. The runner's existing `AgentInput` handler
+    // forwards the bytes into the daemon's PTY; the agent then exits
+    // cleanly on its own and the runner emits `AgentStopped` shortly
+    // after — same observable behaviour as standalone, just routed.
+    let row: Option<(String, String, String)> = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT mode, COALESCE(driver, 'claude'), org_id FROM agents WHERE id = ?",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()
+    };
+    let Some((mode, driver_name, org_id)) = row else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        )
+            .into_response();
+    };
+    if mode != "remote" {
+        return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "Agent not found or driver does not support graceful exit"
             })),
         )
+            .into_response();
     }
+    let exit_seq: Vec<u8> = match state
+        .registry
+        .drivers
+        .exit_sequence_for(Some(&driver_name))
+    {
+        Some(seq) => seq,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("driver '{driver_name}' has no graceful-exit sequence")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    use base64::Engine;
+    let envelope = crate::saas::runner_protocol::Envelope::best_effort(
+        "server".to_string(),
+        crate::saas::runner_protocol::WireMessage::AgentInput {
+            agent_id: id.clone(),
+            data: base64::engine::general_purpose::STANDARD.encode(&exit_seq),
+        },
+    );
+    let json = match serde_json::to_string(&envelope) {
+        Ok(j) => j,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "envelope serialise failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Pick the most recently-seen online runner for this org — same
+    // heuristic as `pick_runner_for_org` in spawn_ops, which is what
+    // dispatched the agent in the first place.
+    let runner_id: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM runners WHERE org_id = ?1 \
+             ORDER BY (status = 'online') DESC, last_seen_at DESC LIMIT 1",
+            params![org_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+    let Some(runner_id) = runner_id else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no_runner_connected"})),
+        )
+            .into_response();
+    };
+    let runners = state.runners.lock().await;
+    let Some(runner) = runners.get(&runner_id) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no_runner_connected"})),
+        )
+            .into_response();
+    };
+    if runner.command_tx.send(json).is_err() {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({"error": "runner channel closed"})),
+        )
+            .into_response();
+    }
+    drop(runners);
+
+    let db = state.db.lock().unwrap();
+    crate::audit::log(
+        &db,
+        auth.org_id(),
+        auth.0.as_ref().map(|u| u.id.as_str()),
+        auth.0.as_ref().map(|u| u.email.as_str()),
+        crate::audit::actions::AGENT_FINISH,
+        crate::audit::resources::AGENT,
+        Some(&id),
+        None,
+    );
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
 pub async fn get_agent_diff(
