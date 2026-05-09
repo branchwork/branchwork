@@ -13,3 +13,5 @@ devto-article.md
 web/.playwright-artifacts/
 web/.playwright-runtime.json
 tests/smoke-artifacts/
+# Branchwork runner per-host runtime state (live session sockets, pidfiles, logs).
+.branchwork-runner-sessions/

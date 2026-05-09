@@ -2372,9 +2372,19 @@ async fn forward_agent_io(
                     if is_ready(&readiness_buf)
                         && let Some(prompt_bytes) = prompt
                     {
-                        // Inject prompt.
-                        let input_msg = session_protocol::Message::Input(prompt_bytes.to_vec());
-                        session_protocol::write_frame(&mut stream, &input_msg).await?;
+                        // Mirror standalone (pty_agent::inject_prompt_when_ready):
+                        // 500ms settle so claude finished rendering the prompt
+                        // line; paste; 1s settle so the bracketed-paste sequence
+                        // has fully landed; then `\r` (matches a real Enter
+                        // keystroke through a PTY) so claude actually submits.
+                        // Without the trailing `\r` SaaS agents hung forever
+                        // with the prompt visible but unsent (cbd73b92 repro).
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let paste_msg = session_protocol::Message::Input(prompt_bytes.to_vec());
+                        session_protocol::write_frame(&mut stream, &paste_msg).await?;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let enter_msg = session_protocol::Message::Input(b"\r".to_vec());
+                        session_protocol::write_frame(&mut stream, &enter_msg).await?;
                         prompt_injected = true;
                     }
                 }
@@ -4353,5 +4363,109 @@ mod tests {
             }
             other => panic!("expected AgentStopped, got {other:?}"),
         }
+    }
+
+    /// Regression for the 2026-05-09 SaaS hang (cbd73b92): when
+    /// `forward_agent_io` injects the prompt after readiness it MUST also
+    /// send a trailing `\r` Input frame, otherwise the bracketed-paste
+    /// sequence sits in the TUI forever and Claude never submits. Mirrors
+    /// `pty_agent::inject_prompt_when_ready` in standalone — single source
+    /// of truth for this behaviour, see ADR 0007.
+    #[tokio::test]
+    async fn forward_agent_io_sends_prompt_then_carriage_return() {
+        use interprocess::local_socket::tokio::prelude::*;
+        use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
+
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("inject.sock");
+
+        // Server side: bind the listener BEFORE spawning the client so the
+        // connect can't race the bind. The supervisor stand-in feeds one
+        // readiness frame, then drains Input frames the runner sends back.
+        let listener_name = socket_path
+            .clone()
+            .to_fs_name::<GenericFilePath>()
+            .unwrap()
+            .into_owned();
+        let listener = ListenerOptions::new()
+            .name(listener_name)
+            .create_tokio()
+            .expect("bind listener");
+
+        let (got_tx, mut got_rx) = mpsc::unbounded_channel::<session_protocol::Message>();
+        let server_task = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (mut read_half, mut write_half) = stream.split();
+
+            // Trigger the runner's `is_ready` check (the `❯` glyph).
+            session_protocol::write_frame(
+                &mut write_half,
+                &session_protocol::Message::Output(b"\n\xe2\x9d\xaf ".to_vec()),
+            )
+            .await
+            .expect("write readiness frame");
+
+            // Drain exactly the two Input frames the contract promises
+            // (paste, then `\r`). Bounded — once both arrive, drop the
+            // write half so the runner's read loop sees EOF and
+            // `forward_agent_io` returns. Without this, both sides park
+            // on `read_frame` forever (cargo's 60s soft-timeout flagged
+            // this when a `while let Ok(...)` drain was used here).
+            for _ in 0..2 {
+                let frame = session_protocol::read_frame(&mut read_half)
+                    .await
+                    .expect("runner sends Input frame");
+                got_tx.send(frame).expect("test rx is alive for 2 frames");
+            }
+            drop(write_half);
+        });
+
+        // Client side: invoke the runner's I/O forwarder with a prompt.
+        let (ws_tx, _ws_rx) = mpsc::unbounded_channel::<String>();
+        let prompt = b"hello-from-test";
+        let client_task = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                forward_agent_io(&socket_path, &ws_tx, "runner-test", "agent-1", Some(prompt))
+                    .await
+                    .expect("forward_agent_io");
+            }
+        });
+
+        // Collect the two expected Input frames (paste, then `\r`).
+        let first = tokio::time::timeout(Duration::from_secs(5), got_rx.recv())
+            .await
+            .expect("first frame within 5s")
+            .expect("first frame is Some");
+        let second = tokio::time::timeout(Duration::from_secs(5), got_rx.recv())
+            .await
+            .expect("second frame within 5s")
+            .expect("second frame is Some");
+
+        match first {
+            session_protocol::Message::Input(bytes) => {
+                assert_eq!(
+                    bytes, prompt,
+                    "first Input frame must be the verbatim paste",
+                );
+            }
+            other => panic!("expected Input(prompt), got {other:?}"),
+        }
+        match second {
+            session_protocol::Message::Input(bytes) => {
+                assert_eq!(
+                    bytes, b"\r",
+                    "second Input frame must be `\\r` so claude submits the prompt",
+                );
+            }
+            other => panic!("expected Input(b\"\\r\"), got {other:?}"),
+        }
+
+        // Tear down: dropping the client's stream (when forward_agent_io
+        // returns after we close the server's write half) ends the server
+        // task. Awaiting both keeps the test deterministic.
+        drop(got_rx);
+        let _ = server_task.await;
+        let _ = client_task.await;
     }
 }
