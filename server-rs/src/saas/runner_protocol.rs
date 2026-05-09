@@ -323,6 +323,40 @@ pub enum WireMessage {
         outcome: MergeOutcome,
     },
 
+    /// Dashboard asked the runner to discard an agent's task branch. Before
+    /// this pair landed `discard_agent_branch` returned 503
+    /// `discard_not_supported_for_saas_runners` whenever an org had a
+    /// runner; with the pair in place the server hands cwd+target+
+    /// task_branch to the runner, which runs the same two-step sequence
+    /// `discard_agent_branch` performs locally:
+    ///
+    ///   1. `git checkout <target>` (failure → `BranchDiscarded { ok=false }`
+    ///      with stderr in `error`).
+    ///   2. `git branch -D <task_branch>` (failure → same).
+    ///
+    /// The server-side wrapper still owns the DB write (clear
+    /// `agents.branch` for all matching rows), audit entry, and the
+    /// `agent_branch_discarded` broadcast — only the git side-effects
+    /// move to the runner. Best-effort: tied to a live HTTP caller.
+    DiscardBranch {
+        req_id: String,
+        cwd: String,
+        target: String,
+        task_branch: String,
+    },
+
+    /// Runner reply with the discard outcome. `ok=false` ⇒ `error`
+    /// carries the captured stderr (or a synthesized message for
+    /// process-spawn failures); the server reflects it back to the
+    /// dashboard as a 500. `ok=true` is the only path that triggers the
+    /// post-discard server-side bookkeeping.
+    BranchDiscarded {
+        req_id: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     /// Dashboard asked the runner to `git push origin <branch>` in `cwd`
     /// after a successful merge. Split out from `MergeBranch` because the
     /// push is gated by `should_record_ci_run` (`ci.rs`), a pure function
@@ -761,6 +795,8 @@ impl WireMessage {
                 | WireMessage::BranchesListed { .. }
                 | WireMessage::MergeBranch { .. }
                 | WireMessage::MergeResult { .. }
+                | WireMessage::DiscardBranch { .. }
+                | WireMessage::BranchDiscarded { .. }
                 | WireMessage::PushBranch { .. }
                 | WireMessage::PushResult { .. }
                 | WireMessage::GhRunList { .. }
@@ -807,6 +843,8 @@ impl WireMessage {
             WireMessage::BranchesListed { .. } => "branches_listed",
             WireMessage::MergeBranch { .. } => "merge_branch",
             WireMessage::MergeResult { .. } => "merge_result",
+            WireMessage::DiscardBranch { .. } => "discard_branch",
+            WireMessage::BranchDiscarded { .. } => "branch_discarded",
             WireMessage::PushBranch { .. } => "push_branch",
             WireMessage::PushResult { .. } => "push_result",
             WireMessage::GhRunList { .. } => "gh_run_list",

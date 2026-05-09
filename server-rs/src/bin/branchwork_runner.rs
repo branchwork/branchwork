@@ -1299,6 +1299,36 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             send_best_effort(state, WireMessage::MergeResult { req_id, outcome });
         }
 
+        WireMessage::DiscardBranch {
+            req_id,
+            cwd,
+            target,
+            task_branch,
+        } => {
+            let req_id = req_id.clone();
+            let target = target.clone();
+            let task_branch = task_branch.clone();
+            let (ok, error) = match validated_cwd(state, cwd) {
+                Ok(path) => match run_blocking_with_timeout(MERGE_TIMEOUT, move || {
+                    git_helpers::discard_branch_local(&path, &target, &task_branch)
+                })
+                .await
+                {
+                    Some(Ok(())) => (true, None),
+                    Some(Err(e)) => (false, Some(e)),
+                    None => (
+                        false,
+                        Some(format!(
+                            "discard timed out after {}s",
+                            MERGE_TIMEOUT.as_secs()
+                        )),
+                    ),
+                },
+                Err(e) => (false, Some(e)),
+            };
+            send_best_effort(state, WireMessage::BranchDiscarded { req_id, ok, error });
+        }
+
         WireMessage::PushBranch {
             req_id,
             cwd,
@@ -1596,6 +1626,7 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
         | WireMessage::DefaultBranchResolved { .. }
         | WireMessage::BranchesListed { .. }
         | WireMessage::MergeResult { .. }
+        | WireMessage::BranchDiscarded { .. }
         | WireMessage::PushResult { .. }
         | WireMessage::GhRunListed { .. }
         | WireMessage::GhFailureLogFetched { .. }

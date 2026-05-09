@@ -820,20 +820,88 @@ pub async fn discard_agent_branch(
         }
     };
 
-    // Discard's checkout + branch-delete shell-outs aren't yet wired through
-    // a runner RPC pair (out of scope for the merge-target plan; the 6 RPC
-    // pairs in T5.6 cover read/merge/push/CI but not discard). In SaaS mode
-    // we'd silently shell out on the SaaS server's filesystem and get
-    // confusing git errors; surface a clean 503 instead and revisit when
-    // the discard RPC lands.
+    // SaaS path: dispatch the discard via the runner RPC pair (T5.7).
+    // Pre-T5.7 this branch returned 503
+    // `discard_not_supported_for_saas_runners`; with the new
+    // `WireMessage::DiscardBranch` / `BranchDiscarded` pair we hand the
+    // cwd+target+task_branch to the runner, which runs the same
+    // `git checkout && git branch -D` sequence the standalone branch
+    // below performs locally. Server-side bookkeeping (DB clear, audit,
+    // broadcast) still happens here on success.
     if crate::saas::dispatch::org_has_runner(&state.db, &org_id) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "discard_not_supported_for_saas_runners"
-            })),
+        // Resolve the target branch via the runner-aware default-branch
+        // helper so we hand a real branch name to the discard RPC. A
+        // missing default falls back to `main` — same fallback
+        // `resolve_merge_target(None, None, None)` would have produced
+        // before T5.7.
+        let cwd_path = std::path::Path::new(&cwd);
+        let default = match git_ops::default_branch(
+            &state.db,
+            &state.runners,
+            &org_id,
+            cwd_path,
         )
-            .into_response();
+        .await
+        {
+            Ok(d) => d,
+            Err(_) => None,
+        };
+        let target = resolve_merge_target(None, default.as_deref(), None);
+
+        let req_id = uuid::Uuid::new_v4().to_string();
+        let msg = crate::saas::runner_protocol::WireMessage::DiscardBranch {
+            req_id: req_id.clone(),
+            cwd: cwd.clone(),
+            target: target.clone(),
+            task_branch: task_branch.clone(),
+        };
+        match crate::saas::runner_rpc::runner_request(
+            &state,
+            &org_id,
+            msg,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(crate::saas::runner_ws::RunnerResponse::BranchDiscarded { ok: true, .. }) => {
+                return discard_finalize(&state, auth, &id, &task_branch, &target).await;
+            }
+            Ok(crate::saas::runner_ws::RunnerResponse::BranchDiscarded {
+                ok: false,
+                error,
+            }) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": error.unwrap_or_else(|| "discard failed".into())
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "runner returned unexpected reply variant"
+                    })),
+                )
+                    .into_response();
+            }
+            Err(RunnerRpcError::NoConnectedRunner) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "no_runner_connected"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({"error": format!("runner RPC: {e}")})),
+                )
+                    .into_response();
+            }
+        }
     }
 
     // Discard has no `into` body field today (future "discard and switch
@@ -924,6 +992,53 @@ pub async fn discard_agent_branch(
         )
             .into_response(),
     }
+}
+
+/// Server-side bookkeeping after a successful discard (either path).
+/// Clears `agents.branch` for every agent row that was on this branch,
+/// writes the audit row, broadcasts `agent_branch_discarded`, and
+/// returns the canonical 200 body. Factored out of
+/// `discard_agent_branch` so the SaaS runner-RPC path doesn't have to
+/// inline-duplicate it from the standalone block below.
+async fn discard_finalize(
+    state: &AppState,
+    auth: OptionalAuthUser,
+    agent_id: &str,
+    task_branch: &str,
+    target: &str,
+) -> axum::response::Response {
+    {
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "UPDATE agents SET branch = NULL WHERE branch = ?",
+            params![task_branch],
+        )
+        .ok();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::BRANCH_DISCARD,
+            crate::audit::resources::AGENT,
+            Some(agent_id),
+            Some(&serde_json::json!({"branch": task_branch}).to_string()),
+        );
+    }
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "agent_branch_discarded",
+        serde_json::json!({
+            "id": agent_id,
+            "deleted": task_branch,
+        }),
+    );
+    Json(serde_json::json!({
+        "ok": true,
+        "deleted": task_branch,
+        "switched_to": target,
+    }))
+    .into_response()
 }
 
 /// Query parameters for `GET /api/drivers`. Optional `runner_id` selects

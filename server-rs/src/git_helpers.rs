@@ -212,6 +212,47 @@ pub fn merge_branch_local(cwd: &Path, target: &str, task_branch: &str) -> MergeO
     }
 }
 
+/// Discard a task branch: `git checkout <target> && git branch -D
+/// <task_branch>`. Mirrors the two-step sequence in
+/// `api/agents.rs::discard_agent_branch` so the runner-side and
+/// standalone paths produce byte-identical error strings (Task 5.7
+/// SaaS discard parity). `Err(stderr)` carries the captured stderr —
+/// the caller maps it to a `BranchDiscarded { ok=false, error }` reply
+/// or an HTTP 500.
+pub fn discard_branch_local(
+    cwd: &Path,
+    target: &str,
+    task_branch: &str,
+) -> Result<(), String> {
+    let checkout = Command::new("git")
+        .args(["checkout", target])
+        .current_dir(cwd)
+        .output();
+    match checkout {
+        Ok(out) if !out.status.success() => {
+            return Err(format!(
+                "Failed to checkout {target}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Err(e) => return Err(format!("failed to run git checkout: {e}")),
+        _ => {}
+    }
+
+    let delete = Command::new("git")
+        .args(["branch", "-D", task_branch])
+        .current_dir(cwd)
+        .output();
+    match delete {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(format!(
+            "Failed to delete branch: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        Err(e) => Err(format!("failed to run git branch -D: {e}")),
+    }
+}
+
 /// `git push origin <branch>` in `cwd`. `Err(stderr)` carries the captured
 /// error so the caller can log it.
 pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<(), String> {

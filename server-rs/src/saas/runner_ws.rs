@@ -47,6 +47,14 @@ pub enum RunnerResponse {
     /// Reply to `MergeBranch`. The outcome arm tells the dispatcher
     /// which HTTP status to map to.
     MergeResult(MergeOutcome),
+    /// Reply to `DiscardBranch`. `ok=false` ⇒ `error` carries the
+    /// captured stderr so the server reflects it as a 500. `ok=true`
+    /// triggers the post-discard server-side bookkeeping (clear branch
+    /// in DB, audit, broadcast).
+    BranchDiscarded {
+        ok: bool,
+        error: Option<String>,
+    },
     /// Reply to `PushBranch`. `ok=false` ⇒ `stderr` carries the error
     /// for logging; the dashboard does not surface push failures.
     PushResult {
@@ -823,6 +831,20 @@ async fn handle_runner_message(
             .await;
         }
 
+        WireMessage::BranchDiscarded { req_id, ok, error } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "branch_discarded",
+                RunnerResponse::BranchDiscarded {
+                    ok: *ok,
+                    error: error.clone(),
+                },
+            )
+            .await;
+        }
+
         WireMessage::PushResult { req_id, ok, stderr } => {
             resolve_pending(
                 state,
@@ -1027,6 +1049,7 @@ async fn handle_runner_message(
         | WireMessage::GetDefaultBranch { .. }
         | WireMessage::ListBranches { .. }
         | WireMessage::MergeBranch { .. }
+        | WireMessage::DiscardBranch { .. }
         | WireMessage::PushBranch { .. }
         | WireMessage::GhRunList { .. }
         | WireMessage::GhFailureLog { .. }
