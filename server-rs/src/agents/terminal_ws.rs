@@ -217,7 +217,16 @@ async fn handle_terminal_remote(mut socket: WebSocket, agent_id: String, state: 
                         if data.get("agent_id").and_then(|a| a.as_str()) != Some(agent_id.as_str()) {
                             continue;
                         }
-                        let Some(payload_b64) = data.get("data").and_then(|d| d.as_str()) else {
+                        // Field renamed `data` → `content` in T5.9 to match
+                        // the frontend's `AgentOutput` zod schema; pre-T5.9
+                        // builds emitted `data`. We accept either so a
+                        // server upgrade mid-session doesn't blank the
+                        // dashboard for already-running agents.
+                        let Some(payload_b64) = data
+                            .get("content")
+                            .or_else(|| data.get("data"))
+                            .and_then(|d| d.as_str())
+                        else {
                             continue;
                         };
                         let Ok(bytes) = b64.decode(payload_b64) else { continue; };

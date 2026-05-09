@@ -585,14 +585,27 @@ async fn handle_runner_message(
         }
 
         WireMessage::AgentOutput { agent_id, data } => {
-            // Forward to dashboard (best-effort).
+            // Forward to dashboard (best-effort). The shape MUST match the
+            // frontend's `AgentOutput` zod schema in
+            // `web/src/schemas/ws-events.ts` (`{agent_id, message_type,
+            // content}`); pre-T5.9 we emitted `{agent_id, data,
+            // runner_id}` and the frontend dropped every event with a
+            // `[ws] dropped malformed message` warning, flooding the
+            // browser console at the runner's PTY-output cadence.
+            //
+            // `message_type: "pty"` matches the standalone-mode tag so
+            // the per-agent terminal pane treats SaaS bytes the same as
+            // local-supervisor bytes; `content` carries the base64
+            // payload verbatim — the dashboard's `/terminal?agent=<id>`
+            // bridge in `terminal_ws::handle_terminal_remote` decodes it
+            // before forwarding to xterm.
             broadcast_event(
                 &state.broadcast_tx,
                 "agent_output",
                 serde_json::json!({
                     "agent_id": agent_id,
-                    "data": data,
-                    "runner_id": runner_id,
+                    "message_type": "pty",
+                    "content": data,
                 }),
             );
         }
