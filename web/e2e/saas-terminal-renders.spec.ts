@@ -100,10 +100,15 @@ async function waitForRunningAgent(
     }
     await new Promise((r) => setTimeout(r, 250));
   }
-  throw new Error(`No running agent for ${PLAN_NAME}/${TASK_NUMBER} within ${timeoutMs}ms (last=${last})`);
+  throw new Error(
+    `No running agent for ${PLAN_NAME}/${TASK_NUMBER} within ${timeoutMs}ms (last=${last})`,
+  );
 }
 
-test("agent terminal renders bytes within 5 s of start (SaaS bridge)", async ({ page, request }) => {
+test("agent terminal renders bytes within 5 s of start (SaaS bridge)", async ({
+  page,
+  request,
+}) => {
   test.setTimeout(120_000);
   await signIn(page);
   await clickStartIfPresent(page);
