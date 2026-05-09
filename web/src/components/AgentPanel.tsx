@@ -31,7 +31,11 @@ export function AgentPanel() {
   const agent = agents.find((a) => a.id === selectedAgentId);
   const planTitle = agent?.plan_name ? plans.find((p) => p.name === agent.plan_name)?.title : null;
 
-  const isPty = agent?.mode === "pty";
+  // SaaS agents (mode='remote') stream raw PTY bytes the same way standalone
+  // PTY agents do — only the transport differs (server proxies to runner via
+  // `terminal_ws.rs::handle_terminal_remote`). Both must mount xterm here;
+  // `mode='stream-json'` (check agents, plan_creator) keeps StreamJsonView.
+  const isPty = agent?.mode === "pty" || agent?.mode === "remote";
   const isActive = agent?.status === "running" || agent?.status === "starting";
   const hasBaseCommit = !!agent?.base_commit;
 

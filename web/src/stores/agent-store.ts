@@ -11,7 +11,11 @@ export interface Agent {
   task_id: string | null;
   cwd: string;
   status: string;
-  mode: "pty" | "stream-json";
+  // 'pty' = standalone supervisor on this server; 'remote' = SaaS supervisor
+  // on a runner (server proxies bytes via terminal_ws::handle_terminal_remote);
+  // 'stream-json' = check agents / plan_creator that emit newline-delimited
+  // JSON instead of raw PTY bytes (rendered by StreamJsonView, not xterm).
+  mode: "pty" | "stream-json" | "remote";
   prompt: string | null;
   started_at: string;
   finished_at: string | null;
