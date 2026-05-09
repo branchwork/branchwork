@@ -298,6 +298,27 @@ agents, kill and re-Start.
 [architecture/session-daemon.md § Reconnect / replay across server restarts](architecture/session-daemon.md#reconnect--replay-across-server-restarts) ·
 [architecture/persistence.md § Per-agent sibling files](architecture/persistence.md).
 
+### Session terminal shows garbled output / characters at wrong x-positions
+
+**Symptom.** The terminal pane renders characters in the wrong
+columns, frozen spinner frames stick in scrollback, or a cascade of
+`▀` glyphs duplicates across line breaks. Often appears after
+collapsing the sidebar or docking devtools mid-session.
+
+**Cause.** PTY-vs-viewport geometry mismatch + mid-stream join into
+a DEC 2026 (Synchronized Output) frame. The dedicated page below
+has the verbatim log evidence, the two-layer fix (server-side
+spawn-time grace + client-side reset+Ctrl+L on resize), the repro
+recipe, and the regression-checklist.
+
+**Fix.** Already mitigated by Tasks 4.1 + 4.2 in the
+`dashboard-stability` plan. If the symptom comes back, walk the
+"What to check first if it regresses" list in the deep-dive page.
+
+**See also.**
+[troubleshooting/terminal-rendering.md](troubleshooting/terminal-rendering.md) ·
+[architecture/session-daemon.md](architecture/session-daemon.md).
+
 ### Agent committed to the wrong branch (or to the source branch)
 
 **Symptom.** The agent left commits on `master` (or whatever

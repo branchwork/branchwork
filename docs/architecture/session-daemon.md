@@ -405,6 +405,7 @@ running agents to `completed`.
 
 - [overview.md](overview.md) — the three-binary diagram, the persistence table, and the end-to-end Start-task walkthroughs.
 - [server.md](server.md) — `cleanup_and_reattach`, `AgentRegistry`, and how the dashboard fits the supervisor into its lifecycle.
+- [troubleshooting/terminal-rendering.md](../troubleshooting/terminal-rendering.md) — symptom + root cause + repro for garbage scrollback / wrong-position output (PTY 120×40 default vs. dashboard viewport, mid-stream DEC 2026 join).
 - [ADR 0003](../adrs/0003-unattended-auto-mode.md) — full contract for the per-session settings file (Stop-hook payload, lifecycle, scope).
 - protocols.md _(stub)_ — full session frame format, runner WireMessage tagged union, hook POST shape, dashboard WS event vocabulary.
 - [`server-rs/src/agents/supervisor.rs`](../../server-rs/src/agents/supervisor.rs), [`session_protocol.rs`](../../server-rs/src/agents/session_protocol.rs), [`bin/session_daemon.rs`](../../server-rs/src/bin/session_daemon.rs) — the canonical implementation.
