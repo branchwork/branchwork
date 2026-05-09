@@ -85,7 +85,8 @@ impl ServerHandler for BranchworkMcp {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "Branchwork MCP server. Tools: hello, list_plans, get_plan, get_task, \
-                 get_task_context, update_task_status, report_cost, report_blocker."
+                 get_task_context, create_plan, update_task_status, report_cost, \
+                 report_blocker."
                     .to_string(),
             )
     }

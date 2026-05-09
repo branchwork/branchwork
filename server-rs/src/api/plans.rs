@@ -3145,6 +3145,55 @@ fn resolve_folder_path(folder: &str, home: &std::path::Path) -> std::path::PathB
     }
 }
 
+/// Plan-creator prompt. Host-agnostic: instructs the agent to hand the
+/// generated YAML back to the server via the `create_plan` MCP tool rather
+/// than writing a file. The agent's host (a runner box, a laptop) typically
+/// does not share a filesystem with the server, so a file write would land
+/// on the wrong machine — see dashboard-stability T5.4.
+fn build_plan_creator_prompt(folder: &str, description: &str, template_section: &str) -> String {
+    format!(
+        "You are creating an implementation plan for a project.\n\n\
+         Working directory: {folder}\n\n\
+         Request:\n{description}\n\n\
+         {template_section}\
+         Create a detailed implementation plan as YAML.\n\
+         First explore the working directory to understand the existing codebase (if any).\n\
+         Then call the `create_plan` MCP tool (from the `branchwork` server) with:\n\
+         \x20 - `name`: a short kebab-case slug derived from the plan title (lowercase \
+         letters, digits, and hyphens; e.g. `user-auth-revamp`).\n\
+         \x20 - `yaml_body`: the full plan YAML as a string.\n\
+         The server validates the YAML, persists it to its own plans directory, and \
+         broadcasts the new plan to the dashboard. Do NOT use the Write tool to save \
+         the plan file yourself — the server's plans directory may not exist on this \
+         host.\n\n\
+         Use this exact YAML structure for `yaml_body`:\n\
+         ```yaml\n\
+         title: \"Plan Title\"\n\
+         context: |\n\
+         \x20 Brief background and motivation.\n\
+         phases:\n\
+         \x20 - number: 0\n\
+         \x20   title: \"Phase Title\"\n\
+         \x20   description: \"Phase description\"\n\
+         \x20   tasks:\n\
+         \x20     - number: \"0.1\"\n\
+         \x20       title: \"Task Title\"\n\
+         \x20       description: |\n\
+         \x20         What needs to be done.\n\
+         \x20       file_paths:\n\
+         \x20         - path/to/file.rs\n\
+         \x20       acceptance: \"Success criteria\"\n\
+         \x20       dependencies: []\n\
+         ```\n\n\
+         Continue with Phase 1, 2, etc. Task numbers use phase.index format (0.1, 0.2, 1.1, etc.).\n\
+         The dependencies field lists task numbers this task depends on (e.g. [\"0.1\", \"0.2\"]).\n\n\
+         IMPORTANT: When you are finished, do NOT stop. Instead:\n\
+         1. Summarize the plan you created\n\
+         2. Ask the user if they want to adjust anything\n\
+         3. Only stop when the user explicitly says they are done",
+    )
+}
+
 pub async fn create_plan(
     State(state): State<AppState>,
     auth: OptionalAuthUser,
@@ -3277,8 +3326,6 @@ pub async fn create_plan(
         resolved
     };
 
-    let plans_dir = state.plans_dir.display();
-
     let template_section = body
         .template_id
         .as_deref()
@@ -3295,43 +3342,10 @@ pub async fn create_plan(
         })
         .unwrap_or_default();
 
-    let prompt = format!(
-        "You are creating an implementation plan for a project.\n\n\
-         Working directory: {folder}\n\n\
-         Request:\n{description}\n\n\
-         {template_section}\
-         Create a detailed implementation plan as a YAML file.\n\
-         First explore the working directory to understand the existing codebase (if any).\n\
-         Then write the plan to a file at {plans_dir}/<generated-name>.yaml using the Write tool.\n\
-         The filename should be a short kebab-case slug derived from the plan title.\n\n\
-         Use this exact YAML structure:\n\
-         ```yaml\n\
-         title: \"Plan Title\"\n\
-         context: |\n\
-         \x20 Brief background and motivation.\n\
-         phases:\n\
-         \x20 - number: 0\n\
-         \x20   title: \"Phase Title\"\n\
-         \x20   description: \"Phase description\"\n\
-         \x20   tasks:\n\
-         \x20     - number: \"0.1\"\n\
-         \x20       title: \"Task Title\"\n\
-         \x20       description: |\n\
-         \x20         What needs to be done.\n\
-         \x20       file_paths:\n\
-         \x20         - path/to/file.rs\n\
-         \x20       acceptance: \"Success criteria\"\n\
-         \x20       dependencies: []\n\
-         ```\n\n\
-         Continue with Phase 1, 2, etc. Task numbers use phase.index format (0.1, 0.2, 1.1, etc.).\n\
-         The dependencies field lists task numbers this task depends on (e.g. [\"0.1\", \"0.2\"]).\n\n\
-         IMPORTANT: When you are finished, do NOT stop. Instead:\n\
-         1. Summarize the plan you created\n\
-         2. Ask the user if they want to adjust anything\n\
-         3. Only stop when the user explicitly says they are done",
-        folder = resolved.display(),
-        description = body.description,
-        plans_dir = plans_dir,
+    let prompt = build_plan_creator_prompt(
+        &resolved.display().to_string(),
+        &body.description,
+        &template_section,
     );
 
     let effort = *state.effort.lock().unwrap();
@@ -5367,6 +5381,57 @@ mod check_prompt_tests {
         );
         assert!(prompt.contains("Done tasks: (none)"));
         assert!(prompt.contains("Pending tasks: (none)"));
+    }
+}
+
+#[cfg(test)]
+mod plan_creator_prompt_tests {
+    //! Prompt regression tests for the plan-creator agent (T5.4).
+    //! The prompt must NOT mention the server's plans directory or the Write
+    //! tool — the agent's host may not share a filesystem with the server.
+    //! Instead, it must instruct the agent to call the `create_plan` MCP tool.
+    use super::build_plan_creator_prompt;
+
+    #[test]
+    fn prompt_does_not_reference_filesystem_write() {
+        let prompt = build_plan_creator_prompt("/runner/work", "build x", "");
+        // No filesystem-write instruction.
+        assert!(
+            !prompt.contains("/data/plans"),
+            "must not bake /data/plans into the prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains(".yaml using the Write tool"),
+            "must not instruct using the Write tool: {prompt}"
+        );
+    }
+
+    #[test]
+    fn prompt_instructs_calling_create_plan_mcp_tool() {
+        let prompt = build_plan_creator_prompt("/runner/work", "build x", "");
+        assert!(
+            prompt.contains("`create_plan` MCP tool"),
+            "must mention the create_plan MCP tool: {prompt}"
+        );
+        assert!(
+            prompt.contains("`name`"),
+            "must describe the name parameter: {prompt}"
+        );
+        assert!(
+            prompt.contains("`yaml_body`"),
+            "must describe the yaml_body parameter: {prompt}"
+        );
+    }
+
+    #[test]
+    fn prompt_carries_template_section_verbatim() {
+        let prompt = build_plan_creator_prompt(
+            "/runner/work",
+            "build x",
+            "Template: foo\nskeleton-here\n\n",
+        );
+        assert!(prompt.contains("Template: foo"));
+        assert!(prompt.contains("skeleton-here"));
     }
 }
 
