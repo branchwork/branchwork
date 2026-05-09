@@ -202,12 +202,27 @@ export function Sidebar() {
             recovery flows directly. */}
         <HealthStateIndicator />
 
-        {/* Admin link */}
-        <div className="px-2 pb-2">
+        {/* Admin / Runners — secondary nav. Both are operational
+            surfaces (org settings + runner fleet) that don't belong
+            in the primary plans/agents/activity row. */}
+        <div className="px-2 pb-2 flex gap-1">
+          <NavLink
+            to="/runners"
+            title="Connected runners + enrollment install command"
+            className={({ isActive }) =>
+              `flex-1 text-left px-2 py-1 text-[10px] rounded transition ${
+                isActive
+                  ? "bg-gray-800 text-indigo-400"
+                  : "text-gray-600 hover:text-gray-300 hover:bg-gray-800/50"
+              }`
+            }
+          >
+            <span aria-hidden="true">⛯ </span>Runners
+          </NavLink>
           <NavLink
             to="/admin"
             className={({ isActive }) =>
-              `block w-full text-left px-2 py-1 text-[10px] rounded transition ${
+              `flex-1 text-left px-2 py-1 text-[10px] rounded transition ${
                 isActive
                   ? "bg-gray-800 text-indigo-400"
                   : "text-gray-600 hover:text-gray-300 hover:bg-gray-800/50"
