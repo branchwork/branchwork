@@ -1,0 +1,20 @@
+# Overlay applied on top of docker-compose.e2e.yml when running the
+# Playwright terminal-renders spec. Bind-mounts the TUI stub as
+# `/usr/local/bin/claude` inside the runner container so the SaaS
+# supervisor's `exec claude …` resolves to the stub. The image itself
+# carries no `claude` binary (alpine runtime, see deploy/Dockerfile).
+#
+# Usage (alongside docker-compose.e2e.yml):
+#   docker compose \
+#     -f deploy/docker-compose.e2e.yml \
+#     -f deploy/docker-compose.e2e-stub.yml \
+#     --profile saas up -d
+#
+# Read-only mount keeps the spec from accidentally mutating the host
+# script if it ever shells out to `chmod`/`>>` against the in-container
+# path.
+
+services:
+  branchwork-runner:
+    volumes:
+      - ../tests/e2e/stub-claude-tui.sh:/usr/local/bin/claude:ro
