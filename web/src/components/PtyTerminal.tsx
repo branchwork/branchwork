@@ -49,11 +49,25 @@ export default function PtyTerminal({ agentId }: { agentId: string }) {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${protocol}//${window.location.host}/terminal?agent=${agentId}`);
 
+    // Resync the dashboard's view with the PTY: drop xterm.js scrollback +
+    // alt-screen + SGR state, ask the TUI to repaint via Ctrl+L (form feed),
+    // then send the new geometry. Order matters — reset first so the repaint
+    // lands in a fresh buffer; resize last so the repaint happens at the new
+    // geometry. Triggered on initial connect (any in-flight DEC 2026 paint
+    // state from a mid-stream join is unknown) and on every resize.
+    const resync = () => {
+      term.reset();
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send("\x0c");
+        ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+      }
+    };
+
     ws.onopen = () => {
       // Fit after WS opens so we can send correct size
       requestAnimationFrame(() => {
         fitAddon.fit();
-        ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+        resync();
       });
     };
 
@@ -80,9 +94,7 @@ export default function PtyTerminal({ agentId }: { agentId: string }) {
     const resizeObserver = new ResizeObserver(() => {
       requestAnimationFrame(() => {
         fitAddon.fit();
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
-        }
+        resync();
       });
     });
     resizeObserver.observe(termRef.current);
