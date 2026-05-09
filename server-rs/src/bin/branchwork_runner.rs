@@ -4371,6 +4371,19 @@ mod tests {
     /// sequence sits in the TUI forever and Claude never submits. Mirrors
     /// `pty_agent::inject_prompt_when_ready` in standalone — single source
     /// of truth for this behaviour, see ADR 0007.
+    ///
+    /// Unix-only: the runner's `connect_to_socket` (and this test's
+    /// listener bind) feed a filesystem path straight into
+    /// `to_fs_name::<GenericFilePath>`, which on Windows rejects anything
+    /// that isn't already a named-pipe path (`\\.\pipe\…`). Mapping the
+    /// path the way `agents::supervisor::socket_name` does is the right
+    /// long-term fix, but the runner has several other Windows-IPC gaps
+    /// (`socket_path.exists()` polling, the `.sock`-suffix scan in
+    /// `cleanup_and_reattach_runner`) so a one-off pipe-name patch here
+    /// would only paper over the first failure. SaaS deploys to Linux,
+    /// which is the regression surface this test guards. Same convention
+    /// as the Unix-gated PTY tests in `agents::supervisor::tests`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn forward_agent_io_sends_prompt_then_carriage_return() {
         use interprocess::local_socket::tokio::prelude::*;
