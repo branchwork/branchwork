@@ -180,6 +180,8 @@ fn req_id_for(msg: &WireMessage) -> Option<&str> {
         | WireMessage::BranchesListed { req_id, .. }
         | WireMessage::MergeBranch { req_id, .. }
         | WireMessage::MergeResult { req_id, .. }
+        | WireMessage::DiscardBranch { req_id, .. }
+        | WireMessage::BranchDiscarded { req_id, .. }
         | WireMessage::PushBranch { req_id, .. }
         | WireMessage::PushResult { req_id, .. }
         | WireMessage::GhRunList { req_id, .. }
