@@ -489,6 +489,33 @@ struct AgentHandle {
     /// same directory the agent committed to (the runner's canonical
     /// `--cwd` may be a parent if multiple projects share one runner).
     cwd: PathBuf,
+    /// `--mcp-config` temp file written at spawn (T5.2). `None` when the
+    /// driver opted out (`mcp_config` empty on the wire). Removed on
+    /// graceful exit (inside the io_task) or explicit kill / shutdown
+    /// drain (here, since `io_task.abort()` skips the closure's cleanup).
+    mcp_config_path: Option<PathBuf>,
+    /// `--settings` temp file written at spawn (T5.2). Same lifecycle as
+    /// `mcp_config_path`.
+    settings_path: Option<PathBuf>,
+}
+
+/// Best-effort removal of the per-agent temp files written at spawn.
+/// Used by the kill / drain paths where `io_task.abort()` skips the
+/// closure-level cleanup. Idempotent: a missing file is not an error.
+fn cleanup_agent_temp_files(handle: &AgentHandle) {
+    for p in [
+        handle.mcp_config_path.as_deref(),
+        handle.settings_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Err(e) = std::fs::remove_file(p)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log_warn!("[runner] failed to remove {}: {e}", p.display());
+        }
+    }
 }
 
 /// Aggregate-cache TTL. ~10 s per the auto-mode brief — short enough that
@@ -957,6 +984,9 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             effort,
             max_budget_usd,
             skip_permissions,
+            session_id,
+            mcp_config,
+            settings_json,
         } => {
             log_info!(
                 "[runner] start_agent: {} plan={} task={} driver={}",
@@ -969,16 +999,30 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                 PathBuf::from(cwd)
             };
 
+            // Older servers (pre-T5.2) do not populate session_id on the
+            // wire — fall back to a runner-generated UUID so Claude still
+            // gets `--session-id <something>` and the agents row carries
+            // a non-NULL session_id (degraded vs the new path: the
+            // server's row id won't match Claude's, but the spawn works).
+            let session_id = if session_id.is_empty() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                session_id.clone()
+            };
+
             // Spawn the session daemon.
             match spawn_agent(
                 state,
                 agent_id,
+                &session_id,
                 &agent_cwd,
                 driver,
                 prompt,
                 effort.as_deref(),
                 *max_budget_usd,
                 skip_permissions.unwrap_or(false),
+                mcp_config,
+                settings_json,
             )
             .await
             {
@@ -1021,6 +1065,9 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             let mut agents = state.agents.lock().await;
             if let Some(handle) = agents.remove(agent_id) {
                 handle.io_task.abort();
+                // io_task.abort() skips the closure-level cleanup, so
+                // remove the per-agent temp files here instead.
+                cleanup_agent_temp_files(&handle);
                 // Send SIGTERM to the session daemon.
                 #[cfg(unix)]
                 unsafe {
@@ -1063,6 +1110,9 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             drop(agents);
             for handle in drained {
                 handle.io_task.abort();
+                // io_task.abort() skips the closure-level cleanup, so
+                // remove the per-agent temp files here instead.
+                cleanup_agent_temp_files(&handle);
                 // Skip kill on pid=0 — that's a sentinel value used by
                 // unit tests (seed_test_agent), and on Unix `kill(0,
                 // SIGTERM)` sends to the calling process group which
@@ -2042,21 +2092,67 @@ fn extra_env_for_driver(driver: &str) -> &'static [(&'static str, &'static str)]
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // Mirrors driver::SpawnOpts on the server side.
 async fn spawn_agent(
     state: &Arc<RunnerState>,
     agent_id: &str,
+    session_id: &str,
     cwd: &Path,
     driver: &str,
     prompt: &str,
     effort: Option<&str>,
-    _max_budget_usd: Option<f64>,
+    max_budget_usd: Option<f64>,
     skip_permissions: bool,
+    mcp_config: &str,
+    settings_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Build socket path.
     let sockets_dir = state.cwd.join(".branchwork-runner-sessions");
     std::fs::create_dir_all(&sockets_dir)?;
     let socket_path = sockets_dir.join(format!("{agent_id}.sock"));
+
+    // Materialise `--mcp-config` / `--settings` bodies the server pre-rendered
+    // for us. Empty wire field means the driver opted out — skip both the
+    // file write and the corresponding flag (matches standalone semantics
+    // in `pty_agent::start_pty_agent`).
+    //
+    // Best-effort write: a failure here means the agent runs without the
+    // optional integration but the spawn itself proceeds. The server has
+    // no way to recover if either flag is missing, so logging + degrading
+    // is the same posture standalone takes (see pty_agent.rs:124-156).
+    //
+    // File paths are deterministic so the cleanup path can resolve them
+    // from `agent_id` alone without a side-channel handle.
+    let mcp_config_path = if mcp_config.is_empty() {
+        None
+    } else {
+        let path = sockets_dir.join(format!("{agent_id}.mcp.json"));
+        match std::fs::write(&path, mcp_config) {
+            Ok(()) => Some(path),
+            Err(e) => {
+                log_warn!(
+                    "[runner] agent {agent_id}: failed to write mcp_config at {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
+    };
+    let settings_path = if settings_json.is_empty() {
+        None
+    } else {
+        let path = sockets_dir.join(format!("{agent_id}.settings.json"));
+        match std::fs::write(&path, settings_json) {
+            Ok(()) => Some(path),
+            Err(e) => {
+                log_warn!(
+                    "[runner] agent {agent_id}: failed to write settings_json at {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
+    };
 
     // Build the command to spawn. The session daemon expects:
     // branchwork-server session --socket <path> --cwd <dir> [--cols C --rows R]
@@ -2075,6 +2171,13 @@ async fn spawn_agent(
         socket_path.display().to_string(),
         "--cwd".to_string(),
         cwd.display().to_string(),
+        // Match standalone's supervisor::spawn_session_daemon defaults so
+        // the daemon's `ps -ef` shows the same `--cols/--rows` block the
+        // dashboard expects (T5.2 acceptance).
+        "--cols".to_string(),
+        "120".to_string(),
+        "--rows".to_string(),
+        "40".to_string(),
     ];
 
     // Driver-specific env vars. Mirrors `AgentDriver::extra_env` from the
@@ -2090,20 +2193,43 @@ async fn spawn_agent(
     args.push("--".to_string());
     args.push(binary.to_string());
 
-    // Add effort for Claude.
-    if binary == "claude"
-        && let Some(eff) = effort
-    {
-        args.push("--effort".to_string());
-        args.push(eff.to_string());
-    }
-
-    // Skip-permissions resolution is done server-side (per-runner override
-    // → server default) before the StartAgent envelope is built, so the
-    // runner just relays the resolved boolean into Claude's CLI flag. Other
-    // drivers don't have an equivalent toggle today.
-    if binary == "claude" && skip_permissions {
-        args.push("--dangerously-skip-permissions".to_string());
+    // Claude's full flag set (T5.2 — parity with standalone's
+    // `ClaudeDriver::spawn_args`). Order matches the standalone driver so
+    // the resulting `ps -ef` line is byte-identical except for the cwd /
+    // session_id / temp paths that necessarily differ per spawn.
+    if binary == "claude" {
+        args.push("--session-id".to_string());
+        args.push(session_id.to_string());
+        args.push("--add-dir".to_string());
+        args.push(cwd.display().to_string());
+        args.push("--verbose".to_string());
+        if let Some(eff) = effort {
+            args.push("--effort".to_string());
+            args.push(eff.to_string());
+        }
+        if skip_permissions {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+        if let Some(v) = max_budget_usd {
+            args.push("--max-budget-usd".to_string());
+            args.push(v.to_string());
+        }
+        if let Some(p) = mcp_config_path.as_deref() {
+            args.push("--mcp-config".to_string());
+            args.push(p.display().to_string());
+        }
+        if let Some(p) = settings_path.as_deref() {
+            args.push("--settings".to_string());
+            args.push(p.display().to_string());
+        }
+    } else {
+        // Non-claude drivers keep their pre-T5.2 minimal flag set — this
+        // task only widens the surface for Claude. Per-driver follow-up
+        // tasks (T5.x of `dashboard-stability`) extend the others.
+        if let Some(eff) = effort {
+            args.push("--effort".to_string());
+            args.push(eff.to_string());
+        }
     }
 
     // Spawn the session daemon.
@@ -2152,6 +2278,11 @@ async fn spawn_agent(
     let aid = agent_id.to_string();
     let sock = socket_path.clone();
     let prompt_bytes = prompt.as_bytes().to_vec();
+    // Clone the temp-file paths into the task so we can `remove_file` them
+    // after the agent's PTY closes — same lifecycle as
+    // `pty_agent::on_agent_exit` does in standalone via `session_settings::delete_for_agent`.
+    let mcp_cleanup = mcp_config_path.clone();
+    let settings_cleanup = settings_path.clone();
 
     let io_task = tokio::spawn(async move {
         if let Err(e) = forward_agent_io(
@@ -2164,6 +2295,20 @@ async fn spawn_agent(
         .await
         {
             log_warn!("[runner] agent {aid} I/O error: {e}");
+        }
+
+        // Best-effort cleanup of the two temp files written at spawn time.
+        // `remove_file` is idempotent enough — anything other than
+        // NotFound is logged and ignored, the agent is already gone.
+        for p in [mcp_cleanup, settings_cleanup].into_iter().flatten() {
+            if let Err(e) = std::fs::remove_file(&p)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log_warn!(
+                    "[runner] agent {aid}: failed to remove {}: {e}",
+                    p.display()
+                );
+            }
         }
 
         // Agent exited — report reliably so a WS flap during exit replays
@@ -2184,6 +2329,8 @@ async fn spawn_agent(
             socket_path,
             io_task,
             cwd: cwd.to_path_buf(),
+            mcp_config_path,
+            settings_path,
         },
     );
 
@@ -2334,6 +2481,15 @@ async fn cleanup_and_reattach_runner(state: &Arc<RunnerState>) {
                 // sentinel that ShutdownRequest's drain step already
                 // skips; KillAgent uses libc::kill which would treat 0 as
                 // "send to my own process group" — guard there too.
+                //
+                // Reattach can't recover the original temp-file paths from
+                // the previous runner process — they were derived from
+                // `agent_id` then, and that derivation is unchanged, so
+                // re-resolve from the same scheme used in `spawn_agent`.
+                let reattach_sockets_dir = state.cwd.join(".branchwork-runner-sessions");
+                let reattach_mcp = reattach_sockets_dir.join(format!("{agent_id}.mcp.json"));
+                let reattach_settings =
+                    reattach_sockets_dir.join(format!("{agent_id}.settings.json"));
                 state.agents.lock().await.insert(
                     agent_id.clone(),
                     AgentHandle {
@@ -2341,6 +2497,8 @@ async fn cleanup_and_reattach_runner(state: &Arc<RunnerState>) {
                         socket_path: path.clone(),
                         io_task,
                         cwd: state.cwd.clone(),
+                        mcp_config_path: reattach_mcp.exists().then_some(reattach_mcp),
+                        settings_path: reattach_settings.exists().then_some(reattach_settings),
                     },
                 );
                 log_info!(
@@ -3224,6 +3382,8 @@ mod tests {
                 socket_path: PathBuf::new(),
                 io_task,
                 cwd: cwd.to_path_buf(),
+                mcp_config_path: None,
+                settings_path: None,
             },
         );
     }
@@ -4042,6 +4202,8 @@ mod tests {
                 socket_path: sock.clone(),
                 io_task: dummy_task,
                 cwd: state.cwd.clone(),
+                mcp_config_path: None,
+                settings_path: None,
             },
         );
         let baseline = runner_health::orphans_reaped_24h();

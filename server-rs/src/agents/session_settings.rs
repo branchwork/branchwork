@@ -53,6 +53,24 @@ pub(crate) fn write_for_agent_with_home(
     Ok(Some(path))
 }
 
+/// Render the per-session settings JSON for `session_id` based on
+/// `driver`'s stop-hook contribution, but without writing it to disk.
+/// Returns `Ok(None)` when the driver has no stop-hook surface.
+///
+/// SaaS dispatch uses this to ship the body inline on `WireMessage::StartAgent`
+/// — the runner is responsible for materialising it on its own filesystem
+/// (the server can't reach the runner host's `~/.claude/sessions/`). The
+/// standalone path keeps using [`write_for_agent`].
+pub fn render_settings_json(
+    session_id: &str,
+    driver: &dyn AgentDriver,
+    hook_url: &str,
+) -> Option<String> {
+    let stop_hook = driver.stop_hook_config(session_id, hook_url)?;
+    let body = build_settings_body(stop_hook);
+    serde_json::to_string_pretty(&body).ok()
+}
+
 /// Best-effort cleanup of the per-session settings file written by
 /// [`write_for_agent`]. Called from [`crate::agents::pty_agent::on_agent_exit`].
 ///
@@ -200,5 +218,31 @@ mod tests {
         // No write — file does not exist.
         delete_for_agent_with_home(home.path(), "sess-never-existed")
             .expect("missing file should be a no-op, not an error");
+    }
+
+    /// `render_settings_json` must produce a body whose Stop hook command
+    /// embeds the session_id + hook_url — same shape as the on-disk file.
+    /// The SaaS dispatcher ships this string verbatim to the runner, so any
+    /// regression here would also break the SaaS spawn path.
+    #[test]
+    fn render_settings_json_matches_disk_shape_for_claude() {
+        let driver = ClaudeDriver::new();
+        let body = render_settings_json("sess-render", &driver, "http://localhost:3100/hooks")
+            .expect("Claude driver must produce settings JSON");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let stop_arr = json["hooks"]["Stop"].as_array().unwrap();
+        let cmd = stop_arr[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("sess-render"));
+        assert!(cmd.contains("http://localhost:3100/hooks"));
+    }
+
+    /// Drivers without a stop-hook (today: aider/codex/gemini) return None,
+    /// the dispatcher emits an empty `settings_json` field, and the runner
+    /// skips both the temp-file write and the `--settings` flag.
+    #[test]
+    fn render_settings_json_is_none_for_driver_without_stop_hook() {
+        let driver = AiderDriver::new();
+        let result = render_settings_json("sess-no-hook", &driver, "http://x/hooks");
+        assert!(result.is_none());
     }
 }

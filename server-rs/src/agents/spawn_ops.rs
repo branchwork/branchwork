@@ -85,9 +85,34 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
     } = opts;
 
     let agent_id = uuid::Uuid::new_v4().to_string();
+    let session_id = uuid::Uuid::new_v4().to_string();
     let cwd_str = cwd.to_string_lossy().to_string();
-    let (driver_name_resolved, _driver) = state.registry.drivers.get_or_default(driver_name);
+    let (driver_name_resolved, driver) = state.registry.drivers.get_or_default(driver_name);
     let driver_name_owned = driver_name_resolved.to_string();
+
+    // Pre-render the `--mcp-config` body and per-session `--settings` JSON
+    // exactly the way standalone does (see `pty_agent::start_pty_agent`),
+    // so the runner can write them to its own filesystem without needing
+    // to know about driver internals. Empty string means "driver opted out"
+    // — the runner skips both the file write and the corresponding flag.
+    //
+    // Hook URL deliberately points at the SaaS server's `/hooks` endpoint
+    // (loopback on the runner host). Today's SaaS deployment has the runner
+    // on a different host, so the curl POST will not reach the dashboard;
+    // ADR 0003's idle-timer fallback (Phase 4) is what actually drives
+    // unattended completion in SaaS mode. The settings file still needs to
+    // exist for byte-equality parity with standalone (acceptance bullet:
+    // `ps -ef` must show `--settings`).
+    let mcp_config = driver
+        .mcp_config_json(state.registry.port)
+        .unwrap_or_default();
+    let hook_url = format!("http://localhost:{}/hooks", state.registry.port);
+    let settings_json = crate::agents::session_settings::render_settings_json(
+        &session_id,
+        driver.as_ref(),
+        &hook_url,
+    )
+    .unwrap_or_default();
 
     // `source_branch` is left NULL in SaaS mode. It's informational only —
     // the merge resolver in `api/agents.rs::resolve_merge_target`
@@ -100,10 +125,11 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
     {
         let conn = state.db.lock().unwrap();
         conn.execute(
-            "INSERT INTO agents (id, cwd, status, mode, plan_name, task_id, prompt, branch, driver, org_id) \
-             VALUES (?1, ?2, 'starting', 'remote', ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt, branch, driver, org_id) \
+             VALUES (?1, ?2, ?3, 'starting', 'remote', ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 agent_id,
+                session_id,
                 cwd_str,
                 plan_name,
                 task_id,
@@ -253,6 +279,9 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
         effort: Some(effort_resolved),
         max_budget_usd,
         skip_permissions: Some(skip_resolved),
+        session_id,
+        mcp_config,
+        settings_json,
     };
     let payload = serde_json::to_string(&message).unwrap_or_default();
 
@@ -641,7 +670,7 @@ mod tests {
             .expect("channel still open");
 
         let envelope: Envelope = serde_json::from_str(&payload).unwrap();
-        match envelope.message {
+        let wire_session_id = match envelope.message {
             WireMessage::StartAgent {
                 agent_id: got_id,
                 cwd: got_cwd,
@@ -649,6 +678,9 @@ mod tests {
                 effort,
                 plan_name,
                 task_id,
+                session_id,
+                mcp_config,
+                settings_json,
                 ..
             } => {
                 assert_eq!(got_id, agent_id);
@@ -657,23 +689,51 @@ mod tests {
                 assert_eq!(effort.as_deref(), Some("high"));
                 assert_eq!(plan_name, "demo-plan");
                 assert_eq!(task_id, "0.8");
+                // T5.2 acceptance: session_id is populated server-side and
+                // shipped on the wire so the runner uses the same id Claude
+                // does. mcp_config + settings_json are non-empty for Claude.
+                assert!(
+                    !session_id.is_empty(),
+                    "session_id should be populated on StartAgent"
+                );
+                assert!(
+                    mcp_config.contains("mcpServers"),
+                    "mcp_config body should be the Claude MCP fragment: {mcp_config}"
+                );
+                assert!(
+                    settings_json.contains("\"Stop\""),
+                    "settings_json should be the Claude Stop-hook fragment: {settings_json}"
+                );
+                session_id
             }
             other => panic!("expected StartAgent variant, got {other:?}"),
-        }
+        };
 
         // Server-side row must exist with mode='remote' and status='starting'
-        // (waiting for AgentStarted to flip it to 'running').
-        let (status, mode): (String, String) = {
+        // (waiting for AgentStarted to flip it to 'running'). T5.2: the row
+        // must also persist session_id (was NULL pre-T5.2).
+        let (status, mode, row_session_id): (String, String, Option<String>) = {
             let conn = db.lock().unwrap();
             conn.query_row(
-                "SELECT status, mode FROM agents WHERE id = ?1",
+                "SELECT status, mode, session_id FROM agents WHERE id = ?1",
                 params![agent_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .unwrap()
         };
         assert_eq!(status, "starting");
         assert_eq!(mode, "remote");
+        assert_eq!(
+            row_session_id.as_deref(),
+            Some(wire_session_id.as_str()),
+            "agents.session_id must match the StartAgent wire field"
+        );
 
         // Outbox should hold the StartAgent for replay on reconnect.
         let outbox_count: i64 = {

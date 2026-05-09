@@ -178,6 +178,27 @@ pub enum WireMessage {
         max_budget_usd: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         skip_permissions: Option<bool>,
+        /// Server-generated session UUID. Runner passes this verbatim as
+        /// Claude's `--session-id` so the dashboard's `agents.session_id`
+        /// row matches what the CLI uses (Stop hook routing depends on it).
+        /// Older runners that ignore the field generate their own id and
+        /// the row stays consistent with what gets logged at the supervisor
+        /// level — degraded but functional.
+        #[serde(default)]
+        session_id: String,
+        /// Pre-rendered `.mcp.json` file body (Claude's `mcpServers` map).
+        /// Runner writes it to a temp file and points Claude at it via
+        /// `--mcp-config`. Empty string means the driver has no MCP
+        /// integration — runner skips writing and skips the flag.
+        #[serde(default)]
+        mcp_config: String,
+        /// Pre-rendered per-session settings JSON (Stop hook today, future
+        /// keys later). Runner writes it to a temp file and points Claude
+        /// at it via `--settings`. Empty string means the driver returned
+        /// `None` from `stop_hook_config` — runner skips writing and skips
+        /// the flag.
+        #[serde(default)]
+        settings_json: String,
     },
 
     /// Kill a running agent.
@@ -1011,6 +1032,69 @@ mod tests {
                 assert_eq!(req_id, "req-x");
                 assert_eq!(path, "/tmp/x");
                 assert!(!create_if_missing);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Pre-T5.2 servers and runners did not carry `session_id` /
+    /// `mcp_config` / `settings_json` on `StartAgent`. Ensure deserialising
+    /// such an envelope still works (serde_default strings → empty), so
+    /// older→newer mixes degrade rather than crash.
+    #[test]
+    fn start_agent_back_compat_default_session_mcp_settings() {
+        let json = r#"{"type":"start_agent","agent_id":"a","plan_name":"p","task_id":"t","prompt":"hi","cwd":"/x","driver":"claude"}"#;
+        let msg: WireMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WireMessage::StartAgent {
+                session_id,
+                mcp_config,
+                settings_json,
+                ..
+            } => {
+                assert_eq!(session_id, "");
+                assert_eq!(mcp_config, "");
+                assert_eq!(settings_json, "");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Round-trip the full Phase 5.2 shape: server populates session_id +
+    /// mcp_config + settings_json, runner deserialises and uses them
+    /// verbatim. Catches accidental field renames or skip_serializing
+    /// flips that would silently drop these fields on the wire.
+    #[test]
+    fn start_agent_round_trip_with_session_mcp_settings() {
+        let msg = WireMessage::StartAgent {
+            agent_id: "agent-uuid".into(),
+            plan_name: "demo-plan".into(),
+            task_id: "1.2".into(),
+            prompt: "hello".into(),
+            cwd: "/home/runner/projects/demo".into(),
+            driver: "claude".into(),
+            effort: Some("high".into()),
+            max_budget_usd: Some(2.5),
+            skip_permissions: Some(false),
+            session_id: "session-uuid".into(),
+            mcp_config:
+                r#"{"mcpServers":{"branchwork":{"type":"http","url":"http://127.0.0.1:3100/mcp"}}}"#
+                    .into(),
+            settings_json: r#"{"hooks":{"Stop":[]}}"#.into(),
+        };
+        let env = Envelope::reliable("runner-1".into(), 7, msg);
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::StartAgent {
+                session_id,
+                mcp_config,
+                settings_json,
+                ..
+            } => {
+                assert_eq!(session_id, "session-uuid");
+                assert!(mcp_config.contains("\"mcpServers\""));
+                assert!(settings_json.contains("\"Stop\""));
             }
             other => panic!("unexpected variant: {other:?}"),
         }
