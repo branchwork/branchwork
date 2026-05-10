@@ -376,23 +376,34 @@ impl AgentRegistry {
             .collect()
         };
 
-        // Collect remote agent ids so we can fan out a KillAgent to every
-        // online runner once the DB rows are flipped. Remote rows that
-        // survive a server restart are suspect: the server does not know
-        // which runner owns them (no `agents.runner_id` column today) and
-        // any runner that still has the agent in memory needs a nudge to
-        // drop it. KillAgent is idempotent on unknown ids, so a fan-out
-        // to every runner is safe.
-        let mut remote_dead: Vec<String> = Vec::new();
+        // T5.15: leave `mode='remote'` rows alone. Pre-T5.15 we marked
+        // them all as `killed/supervisor_died` and fanned out KillAgent
+        // to every runner — that was harmless when KillAgent's pid
+        // targeting was broken (T5.13 fixed it), but post-T5.13 it
+        // actively SIGTERM'd every live daemon on every prod redeploy,
+        // and the live SaaS agents the user was watching all died.
+        //
+        // Liveness for remote agents is the runner's call, not ours:
+        // - The runner sends `RunnerHello { active_agents }` on every
+        //   (re)connect (T5.14). For each id in that list whose row is
+        //   in `killed/failed`, the hello handler flips it back to
+        //   `running` — so a row that survives this cleanup pass and
+        //   gets confirmed alive by the runner stays running.
+        // - For an agent that's truly dead (runner host rebooted, etc.)
+        //   the runner will simply not list it on Hello and the row
+        //   stays at `running` until the user manually kills it OR the
+        //   runner reports `AgentStopped` for it on a later WS frame.
+        //   That's a degradation vs the pre-T5.15 "mark everything
+        //   dead" posture but the user-visible UX is far better than
+        //   the alternative — every prod redeploy was nuking live work.
+        //
+        // No `remote_dead` collection, no KillAgent fan-out: cleanup is
+        // pty-mode + stream-json only.
 
         for (id, pid, socket, mode) in rows {
             match mode.as_str() {
                 "remote" => {
-                    self.mark_supervisor_died(
-                        &id,
-                        "remote agent stale on server restart — runner ownership lost",
-                    );
-                    remote_dead.push(id);
+                    // Defer to runner's hello — see comment above.
                     continue;
                 }
                 "pty" => {}
@@ -438,17 +449,10 @@ impl AgentRegistry {
             }
         }
 
-        // Fan out KillAgent to every online runner so any survivor that still
-        // has these agents in memory drops them. Best-effort: if the runner
-        // is offline / disconnected the message is dropped; if it doesn't
-        // know the agent the handler no-ops. We do this AFTER the DB flips
-        // so the dashboard already shows the rows as terminal by the time
-        // any runner-side state changes echo back.
-        if !remote_dead.is_empty()
-            && let Some(state) = self.app_state.get()
-        {
-            crate::saas::dispatch::fan_out_kill_agents(state, &remote_dead).await;
-        }
+        // T5.15: no KillAgent fan-out for remote agents — the
+        // pre-T5.15 fanout (combined with T5.13's pid fix) was nuking
+        // every live SaaS daemon on every prod redeploy. See the
+        // comment in the loop above for the reconciliation strategy.
 
         // Second pass: normalize task_status rows. A task stuck in `checking`
         // whose check-agent is no longer running is the most common wedged
