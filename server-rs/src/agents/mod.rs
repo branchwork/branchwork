@@ -836,13 +836,75 @@ impl AgentRegistry {
         };
 
         let agents = self.agents.lock().await;
-        match agents.get(agent_id) {
-            Some(agent) => {
-                let _ = agent.command_tx.send(SessionMessage::Input(exit_bytes));
-                true
-            }
-            None => false,
+        if let Some(agent) = agents.get(agent_id) {
+            let _ = agent.command_tx.send(SessionMessage::Input(exit_bytes));
+            return true;
         }
+        drop(agents);
+
+        // T5.17: SaaS fallback. Pre-T5.17 this branch returned `false`
+        // and the caller (Finish button via `api/agents.rs::finish_agent`,
+        // auto-mode via `auto_mode.rs::run_idle_finish_loop`) gave up.
+        // For SaaS agents the in-process registry never has them — they
+        // live on the runner — so every Finish click and every auto-
+        // mode tick was a silent no-op and the dashboard sat at "ready
+        // to merge" while the daemon kept its claude alive forever.
+        //
+        // Mirror the `finish_agent` HTTP path's SaaS branch here: look
+        // up the agent's mode + org_id, find an online runner for that
+        // org, and ship the driver's exit bytes as
+        // `WireMessage::AgentInput`. The runner's existing handler
+        // forwards the bytes to the daemon's PTY; claude exits cleanly
+        // on its own and `AgentStopped` flows back through the normal
+        // channels.
+        let Some(state) = self.app_state.get() else {
+            return false;
+        };
+        let row: Option<(String, String)> = {
+            let db = self.db.lock().unwrap();
+            db.query_row(
+                "SELECT mode, org_id FROM agents WHERE id = ?",
+                rusqlite::params![agent_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .ok()
+        };
+        let Some((mode, org_id)) = row else {
+            return false;
+        };
+        if mode != "remote" {
+            return false;
+        }
+        let runner_id: Option<String> = {
+            let conn = self.db.lock().unwrap();
+            conn.query_row(
+                "SELECT id FROM runners WHERE org_id = ?1 \
+                 ORDER BY (status = 'online') DESC, last_seen_at DESC LIMIT 1",
+                rusqlite::params![org_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        };
+        let Some(runner_id) = runner_id else {
+            return false;
+        };
+
+        use base64::Engine;
+        let envelope = crate::saas::runner_protocol::Envelope::best_effort(
+            "server".to_string(),
+            crate::saas::runner_protocol::WireMessage::AgentInput {
+                agent_id: agent_id.to_string(),
+                data: base64::engine::general_purpose::STANDARD.encode(&exit_bytes),
+            },
+        );
+        let Ok(json) = serde_json::to_string(&envelope) else {
+            return false;
+        };
+        let runners = state.runners.lock().await;
+        let Some(runner) = runners.get(&runner_id) else {
+            return false;
+        };
+        runner.command_tx.send(json).is_ok()
     }
 
     pub async fn kill_agent(&self, agent_id: &str) -> bool {
