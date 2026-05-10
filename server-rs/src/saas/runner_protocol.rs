@@ -949,6 +949,7 @@ mod tests {
                     name: "claude".into(),
                     status: DriverAuthStatus::ApiKey,
                 }],
+                active_agents: vec![],
             },
         );
         let json = serde_json::to_string(&env).unwrap();

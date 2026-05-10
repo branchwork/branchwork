@@ -537,6 +537,7 @@ mod tests {
                 hostname: "test-host".into(),
                 version: "0.0.0".into(),
                 drivers: vec![],
+                active_agents: vec![],
             },
         );
         ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
