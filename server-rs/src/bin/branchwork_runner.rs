@@ -1014,6 +1014,29 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                 PathBuf::from(cwd)
             };
 
+            // T5.16: pre-spawn task-branch checkout. Standalone's
+            // `pty_agent::start_pty_agent` runs `git checkout -b
+            // branchwork/<plan>/<task>` before exec'ing claude — that's
+            // why standalone agents always commit on the right branch.
+            // SaaS skipped this (per ADR 0007's spawn-divergence audit)
+            // and trusted the prompt to nudge claude into doing the
+            // checkout itself; in practice claude does it intermittently
+            // — sometimes commits land on `master` and the merge button
+            // hits "branch X — not something we can merge". User saw
+            // this twice on `aso2-browser-homage/2.4` and `2.7`.
+            //
+            // Mirror standalone here: try `checkout` first (for an
+            // existing branch — preserves prior commits if the agent
+            // was respawned), fall back to `checkout -b` (fresh
+            // branch). Failure is logged + tolerated; the agent
+            // proceeds on whatever HEAD is, same as pre-T5.16
+            // behaviour, so cwd-not-a-git-repo cases don't fail the
+            // spawn outright.
+            if !plan_name.is_empty() && !task_id.is_empty() {
+                let branch = format!("branchwork/{plan_name}/{task_id}");
+                checkout_task_branch(&agent_cwd, &branch);
+            }
+
             // Older servers (pre-T5.2) do not populate session_id on the
             // wire — fall back to a runner-generated UUID so Claude still
             // gets `--session-id <something>` and the agents row carries
@@ -2318,6 +2341,186 @@ fn extra_env_for_driver(driver: &str) -> &'static [(&'static str, &'static str)]
     match driver {
         "claude" => &[("CLAUDE_CODE_SANDBOXED", "1")],
         _ => &[],
+    }
+}
+
+/// Pre-spawn task-branch checkout. Mirrors what
+/// `pty_agent::start_pty_agent` does in standalone — switch to (or
+/// create) `branchwork/<plan>/<task>` so anything the agent commits
+/// lands on the right branch and the merge button finds a ref to
+/// `git merge` against.
+///
+/// Two-step to preserve prior commits on a respawn:
+///   1. `git checkout <branch>` — succeeds if the branch already
+///      exists from a previous run (rare but happens when an agent
+///      is killed mid-work and re-Started later).
+///   2. on failure, `git checkout -b <branch>` — creates from
+///      current HEAD.
+///
+/// Failure is logged but doesn't abort the spawn: cwd-not-a-git-repo
+/// cases (folder created via `CreateFolder` and not yet `git
+/// init`'d) used to work pre-T5.16 because no checkout was
+/// attempted. Don't regress that — let the supervisor + claude
+/// proceed and the agent prompt will guide a `git init` if
+/// applicable.
+fn checkout_task_branch(cwd: &Path, branch: &str) {
+    // Check if cwd is a git repo at all. If not, log and skip — same
+    // posture standalone takes when `ensure_git_initialized` returns
+    // false: don't fail the spawn, just degrade.
+    let in_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output();
+    let in_repo_ok = matches!(
+        &in_repo,
+        Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true"
+    );
+    if !in_repo_ok {
+        log_warn!(
+            "[runner] checkout_task_branch: {} is not a git repo, skipping {branch} checkout",
+            cwd.display()
+        );
+        return;
+    }
+
+    // Try plain checkout first — preserves an existing branch's
+    // commits if the agent is being respawned.
+    let plain = std::process::Command::new("git")
+        .args(["checkout", branch])
+        .current_dir(cwd)
+        .output();
+    if matches!(&plain, Ok(o) if o.status.success()) {
+        log_info!("[runner] checkout_task_branch: switched to existing {branch}");
+        return;
+    }
+
+    // Branch doesn't exist — create it from current HEAD.
+    let create = std::process::Command::new("git")
+        .args(["checkout", "-b", branch])
+        .current_dir(cwd)
+        .output();
+    match create {
+        Ok(o) if o.status.success() => {
+            log_info!("[runner] checkout_task_branch: created {branch}");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            log_warn!(
+                "[runner] checkout_task_branch: `git checkout -b {branch}` failed in {}: {}",
+                cwd.display(),
+                stderr.trim()
+            );
+        }
+        Err(e) => {
+            log_warn!(
+                "[runner] checkout_task_branch: failed to run git in {}: {e}",
+                cwd.display()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod checkout_task_branch_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo(dir: &Path) {
+        Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "t@t"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+    }
+
+    fn current_branch(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// New branch case — `git checkout -b` fallback. Pre-T5.16 the
+    /// runner skipped this entirely and the agent inherited
+    /// whatever HEAD was, which intermittently meant master and
+    /// merge later 503'd with "not something we can merge".
+    #[test]
+    fn checkout_creates_branch_when_missing() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        assert_eq!(current_branch(dir.path()), "main");
+
+        checkout_task_branch(dir.path(), "branchwork/test-plan/0.1");
+        assert_eq!(current_branch(dir.path()), "branchwork/test-plan/0.1");
+    }
+
+    /// Respawn case — branch already exists, plain `git checkout`
+    /// preserves its commits. Use a sentinel commit on the branch
+    /// to prove we didn't reset it via `-B`.
+    #[test]
+    fn checkout_preserves_existing_branch_commits() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        Command::new("git")
+            .args(["checkout", "-b", "branchwork/test-plan/0.1"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("sentinel"), "x").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "sentinel"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        checkout_task_branch(dir.path(), "branchwork/test-plan/0.1");
+        assert_eq!(current_branch(dir.path()), "branchwork/test-plan/0.1");
+        assert!(
+            dir.path().join("sentinel").exists(),
+            "sentinel must survive"
+        );
+    }
+
+    /// Non-git cwd — degrade gracefully. Pre-T5.16 the runner just
+    /// didn't attempt the checkout; T5.16 must not regress that
+    /// path or `CreateFolder`-without-init flows fail spawn.
+    #[test]
+    fn checkout_skips_when_not_a_git_repo() {
+        let dir = TempDir::new().unwrap();
+        // No `git init` — function should log and return without
+        // touching anything.
+        checkout_task_branch(dir.path(), "branchwork/test-plan/0.1");
+        // Nothing to assert beyond "no panic"; the call must be
+        // infallible from the caller's perspective.
+        assert!(!dir.path().join(".git").exists());
     }
 }
 
