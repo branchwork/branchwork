@@ -219,11 +219,7 @@ pub fn merge_branch_local(cwd: &Path, target: &str, task_branch: &str) -> MergeO
 /// SaaS discard parity). `Err(stderr)` carries the captured stderr —
 /// the caller maps it to a `BranchDiscarded { ok=false, error }` reply
 /// or an HTTP 500.
-pub fn discard_branch_local(
-    cwd: &Path,
-    target: &str,
-    task_branch: &str,
-) -> Result<(), String> {
+pub fn discard_branch_local(cwd: &Path, target: &str, task_branch: &str) -> Result<(), String> {
     let checkout = Command::new("git")
         .args(["checkout", target])
         .current_dir(cwd)

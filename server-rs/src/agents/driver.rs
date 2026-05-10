@@ -983,9 +983,7 @@ mod tests {
     #[test]
     fn claude_mcp_config_json_has_expected_shape() {
         let driver = ClaudeDriver::new();
-        let raw = driver
-            .mcp_config_json("http://127.0.0.1:3100/mcp")
-            .unwrap();
+        let raw = driver.mcp_config_json("http://127.0.0.1:3100/mcp").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let entry = &parsed["mcpServers"]["branchwork"];
         assert_eq!(entry["type"], "http");
@@ -1004,7 +1002,10 @@ mod tests {
         let raw = driver.mcp_config_json(url).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["mcpServers"]["branchwork"]["url"], url);
-        assert!(!raw.contains("127.0.0.1"), "SaaS render must not embed loopback: {raw}");
+        assert!(
+            !raw.contains("127.0.0.1"),
+            "SaaS render must not embed loopback: {raw}"
+        );
     }
 
     #[test]

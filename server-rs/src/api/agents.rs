@@ -265,11 +265,7 @@ pub async fn finish_agent(
         )
             .into_response();
     }
-    let exit_seq: Vec<u8> = match state
-        .registry
-        .drivers
-        .exit_sequence_for(Some(&driver_name))
-    {
+    let exit_seq: Vec<u8> = match state.registry.drivers.exit_sequence_for(Some(&driver_name)) {
         Some(seq) => seq,
         None => {
             return (
@@ -949,17 +945,9 @@ pub async fn discard_agent_branch(
         // `resolve_merge_target(None, None, None)` would have produced
         // before T5.7.
         let cwd_path = std::path::Path::new(&cwd);
-        let default = match git_ops::default_branch(
-            &state.db,
-            &state.runners,
-            &org_id,
-            cwd_path,
-        )
-        .await
-        {
-            Ok(d) => d,
-            Err(_) => None,
-        };
+        let default = git_ops::default_branch(&state.db, &state.runners, &org_id, cwd_path)
+            .await
+            .unwrap_or_default();
         let target = resolve_merge_target(None, default.as_deref(), None);
 
         let req_id = uuid::Uuid::new_v4().to_string();
@@ -980,10 +968,7 @@ pub async fn discard_agent_branch(
             Ok(crate::saas::runner_ws::RunnerResponse::BranchDiscarded { ok: true, .. }) => {
                 return discard_finalize(&state, auth, &id, &task_branch, &target).await;
             }
-            Ok(crate::saas::runner_ws::RunnerResponse::BranchDiscarded {
-                ok: false,
-                error,
-            }) => {
+            Ok(crate::saas::runner_ws::RunnerResponse::BranchDiscarded { ok: false, error }) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({

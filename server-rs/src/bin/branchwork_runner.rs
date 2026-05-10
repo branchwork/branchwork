@@ -775,8 +775,7 @@ async fn connect_and_run(
     // (T5.14). Snapshotting under the lock is fine — Hello fires once
     // per WS connect, the lock is uncontended.
     let drivers = collect_driver_auth();
-    let active_agents: Vec<String> =
-        state.agents.lock().await.keys().cloned().collect();
+    let active_agents: Vec<String> = state.agents.lock().await.keys().cloned().collect();
     log_info!(
         "[runner] hello: {} drivers, {} active agents reattached",
         drivers.len(),
@@ -2530,9 +2529,7 @@ async fn spawn_agent(
             .unwrap_or(fork_parent_pid),
         Err(_) => fork_parent_pid,
     };
-    log_info!(
-        "[runner] session daemon real pid={pid} (fork-parent was {fork_parent_pid})"
-    );
+    log_info!("[runner] session daemon real pid={pid} (fork-parent was {fork_parent_pid})");
 
     // Connect and start I/O forwarding.
     let task_state = state.clone();
@@ -2765,8 +2762,7 @@ async fn cleanup_and_reattach_runner(state: &Arc<RunnerState>) {
                 // `agent_id` then, and that derivation is unchanged, so
                 // re-resolve from the same scheme used in `spawn_agent`.
                 let reattach_sockets_dir = state.cwd.join(".branchwork-runner-sessions");
-                let reattach_pidfile = reattach_sockets_dir
-                    .join(format!("{agent_id}.pid"));
+                let reattach_pidfile = reattach_sockets_dir.join(format!("{agent_id}.pid"));
                 let reattach_pid: u32 = std::fs::read_to_string(&reattach_pidfile)
                     .ok()
                     .and_then(|s| s.trim().parse::<u32>().ok())

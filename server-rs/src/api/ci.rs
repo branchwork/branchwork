@@ -287,10 +287,7 @@ pub async fn fix_ci(
     //    language intentionally duplicates build_task_prompt step 3 so a
     //    reader skimming the "CI is failing" section gets it in context.
     let port = state.config_port();
-    let mcp_available = state
-        .registry
-        .drivers
-        .injects_mcp(body.driver.as_deref());
+    let mcp_available = state.registry.drivers.injects_mcp(body.driver.as_deref());
     let cross_ctx =
         crate::agents::build_cross_plan_context(&state.db, &state.plans_dir, &plan, &task.number);
     let base = crate::agents::build_task_prompt(

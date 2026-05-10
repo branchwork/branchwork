@@ -360,10 +360,7 @@ pub enum WireMessage {
     /// delimited); the server appends to `agent_output` with
     /// `message_type` derived from the JSON `type` (`stdout` for
     /// regular events, `result` for terminal records). Best-effort.
-    CheckAgentOutput {
-        agent_id: String,
-        line: String,
-    },
+    CheckAgentOutput { agent_id: String, line: String },
 
     /// Dashboard asked the runner to discard an agent's task branch. Before
     /// this pair landed `discard_agent_branch` returned 503

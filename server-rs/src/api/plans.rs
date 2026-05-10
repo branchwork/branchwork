@@ -2532,10 +2532,7 @@ pub async fn start_task(
     let cross_ctx =
         crate::agents::build_cross_plan_context(&state.db, &state.plans_dir, &plan, &task.number);
     let port = state.config_port();
-    let mcp_available = state
-        .registry
-        .drivers
-        .injects_mcp(body.driver.as_deref());
+    let mcp_available = state.registry.drivers.injects_mcp(body.driver.as_deref());
     let prompt = crate::agents::build_task_prompt(
         &plan,
         phase,
@@ -2778,10 +2775,7 @@ pub async fn start_phase_tasks(
     }
 
     let port = state.config_port();
-    let mcp_available = state
-        .registry
-        .drivers
-        .injects_mcp(body.driver.as_deref());
+    let mcp_available = state.registry.drivers.injects_mcp(body.driver.as_deref());
     let mut started = Vec::new();
 
     for task in ready {
@@ -2998,13 +2992,7 @@ async fn dispatch_check_agent(
     };
     if let Some(runner_id) = saas_target {
         match check_agent::start_check_agent_via_runner(
-            state,
-            &runner_id,
-            prompt,
-            cwd,
-            plan_name,
-            task_id,
-            effort,
+            state, &runner_id, prompt, cwd, plan_name, task_id, effort,
         )
         .await
         {
@@ -3016,15 +3004,17 @@ async fn dispatch_check_agent(
                 .into_response()),
         }
     } else {
-        Ok(check_agent::start_check_agent(
-            &state.registry,
-            prompt,
-            cwd,
-            plan_name,
-            task_id,
-            effort,
+        Ok(
+            check_agent::start_check_agent(
+                &state.registry,
+                prompt,
+                cwd,
+                plan_name,
+                task_id,
+                effort,
+            )
+            .await,
         )
-        .await)
     }
 }
 
@@ -3103,19 +3093,13 @@ pub async fn check_plan(
     let prompt = build_plan_check_prompt(&plan, verification, &statuses, &project_dir);
 
     let effort = *state.effort.lock().unwrap();
-    let agent_id = match dispatch_check_agent(
-        &state,
-        prompt,
-        &project_dir,
-        Some(&plan_name),
-        None,
-        effort,
-    )
-    .await
-    {
-        Ok(id) => id,
-        Err(resp) => return resp,
-    };
+    let agent_id =
+        match dispatch_check_agent(&state, prompt, &project_dir, Some(&plan_name), None, effort)
+            .await
+        {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
 
     Json(serde_json::json!({
         "agentId": agent_id,

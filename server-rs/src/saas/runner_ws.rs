@@ -647,7 +647,11 @@ async fn handle_runner_message(
             // emitted, even when the JSON parser would reject it.
             let msg_type = serde_json::from_str::<serde_json::Value>(line)
                 .ok()
-                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                .and_then(|v| {
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                })
                 .map(|t| if t == "result" { "result" } else { "stdout" })
                 .unwrap_or("stdout")
                 .to_string();
