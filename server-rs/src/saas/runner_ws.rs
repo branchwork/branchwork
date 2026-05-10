@@ -738,6 +738,25 @@ async fn handle_runner_message(
                 )
                 .ok();
 
+                // Mark task as done in task_status when agent completes successfully.
+                // This ensures the UI shows the task as "done" even when auto-mode is
+                // disabled. Auto-mode will overwrite this with source='auto' later if
+                // enabled, but manual completion needs this immediate update.
+                if status == "completed" && stop_reason.is_none() {
+                    if let Some((ref plan, ref task)) = plan_task {
+                        conn.execute(
+                            "INSERT INTO task_status (plan_name, task_number, status, source, org_id)
+                             VALUES (?1, ?2, 'done', 'manual', ?3)
+                             ON CONFLICT(plan_name, task_number) DO UPDATE SET
+                               status = 'done',
+                               source = 'manual',
+                               updated_at = datetime('now')",
+                            params![plan, task, org_id],
+                        )
+                        .ok();
+                    }
+                }
+
                 // Org budget enforcement after cost update.
                 if cost_usd.is_some() {
                     let org_id: Option<String> = conn
