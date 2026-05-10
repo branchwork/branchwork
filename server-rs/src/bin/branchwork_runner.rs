@@ -2337,10 +2337,19 @@ fn list_home_folders() -> Vec<FolderEntry> {
 /// containerised launches: it short-circuits Claude Code's trust-workspace
 /// gate so the binary never blocks at the "Trust this folder?" dialog when
 /// the runner spawns it into a freshly-created project directory.
-fn extra_env_for_driver(driver: &str) -> &'static [(&'static str, &'static str)] {
+fn extra_env_for_driver(driver: &str) -> Vec<(String, String)> {
     match driver {
-        "claude" => &[("CLAUDE_CODE_SANDBOXED", "1")],
-        _ => &[],
+        "claude" => vec![("CLAUDE_CODE_SANDBOXED".to_string(), "1".to_string())],
+        "bob" => {
+            // Bob Shell needs ANTHROPIC_API_KEY to authenticate with the API.
+            // Pass it through from the runner's environment if available.
+            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+                vec![("ANTHROPIC_API_KEY".to_string(), key)]
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
     }
 }
 
@@ -2840,9 +2849,12 @@ async fn forward_agent_io(
                     if readiness_buf.len() > 16 * 1024 {
                         readiness_buf.drain(..readiness_buf.len() - 8 * 1024);
                     }
-                    if is_ready(&readiness_buf)
-                        && let Some(prompt_bytes) = prompt
-                    {
+                    let ready = is_ready(&readiness_buf);
+                    if ready {
+                        log_info!("[runner] agent {agent_id}: detected readiness");
+                    }
+                    if ready && let Some(prompt_bytes) = prompt {
+                        log_info!("[runner] agent {agent_id}: injecting prompt ({} bytes)", prompt_bytes.len());
                         // Mirror standalone (pty_agent::inject_prompt_when_ready):
                         // 500ms settle so claude finished rendering the prompt
                         // line; paste; 1s settle so the bracketed-paste sequence
@@ -2857,6 +2869,7 @@ async fn forward_agent_io(
                         let enter_msg = session_protocol::Message::Input(b"\r".to_vec());
                         session_protocol::write_frame(&mut stream, &enter_msg).await?;
                         prompt_injected = true;
+                        log_info!("[runner] agent {agent_id}: prompt injected successfully");
                     }
                 }
 
@@ -3145,8 +3158,10 @@ fn collect_driver_auth() -> Vec<DriverAuthInfo> {
 /// Detect when the CLI is ready for input. Checks for the Claude prompt glyph.
 fn is_ready(buf: &[u8]) -> bool {
     let s = String::from_utf8_lossy(buf);
-    // Claude prompt glyph (❯) or generic REPL prompt (\n> )
-    s.contains('❯') || s.contains("\n> ")
+    // Claude prompt glyph (❯), generic REPL prompt (\n> ), or Bob Shell prompt
+    // Bob's prompt: "│" followed by ">  Enter your prompt" (note: two spaces after >)
+    // ANSI codes appear between characters, so check for both parts separately
+    s.contains('❯') || s.contains("\n> ") || (s.contains('│') && s.contains("Enter your prompt"))
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -3293,7 +3308,7 @@ mod tests {
         let env = extra_env_for_driver("claude");
         assert!(
             env.iter()
-                .any(|(k, v)| *k == "CLAUDE_CODE_SANDBOXED" && *v == "1"),
+                .any(|(k, v)| k == "CLAUDE_CODE_SANDBOXED" && v == "1"),
             "claude driver must declare CLAUDE_CODE_SANDBOXED=1: {env:?}",
         );
     }
@@ -3301,10 +3316,34 @@ mod tests {
     #[test]
     fn extra_env_for_driver_is_empty_for_other_drivers() {
         // Aider / Codex / Gemini have no portable sandbox flag — return empty.
+        // Bob is tested separately since it conditionally passes ANTHROPIC_API_KEY.
         assert!(extra_env_for_driver("aider").is_empty());
         assert!(extra_env_for_driver("codex").is_empty());
         assert!(extra_env_for_driver("gemini").is_empty());
         assert!(extra_env_for_driver("unknown").is_empty());
+    }
+
+    #[test]
+    fn extra_env_for_driver_passes_anthropic_key_to_bob() {
+        // Bob needs ANTHROPIC_API_KEY from the runner's environment.
+        // This test only verifies the plumbing — the actual key value
+        // comes from the runner's env at runtime.
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key-123");
+        }
+        let env = extra_env_for_driver("bob");
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "test-key-123"),
+            "bob driver must pass through ANTHROPIC_API_KEY: {env:?}",
+        );
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        
+        // When ANTHROPIC_API_KEY is not set, bob should return empty.
+        let env_empty = extra_env_for_driver("bob");
+        assert!(env_empty.is_empty(), "bob without API key should return empty");
     }
 
     #[test]
