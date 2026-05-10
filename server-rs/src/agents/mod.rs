@@ -2413,30 +2413,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_marks_remote_row_as_supervisor_died() {
+    async fn cleanup_leaves_remote_row_alone_for_runner_hello_to_reconcile() {
         let (db, _dir) = fresh_db();
         let (registry, mut rx) = test_registry(db.clone());
 
-        // Remote-mode rows survive a server restart but the server has lost
-        // ownership knowledge: it doesn't know which runner originally took
-        // them, so it can't probe the daemon. Mark every survivor
-        // killed/supervisor_died and rely on dispatch::fan_out_kill_agents
-        // (best-effort, no-op when no runner is connected) to clear any
-        // leftover runner-side state.
+        // T5.15: remote rows are NOT touched by `cleanup_and_reattach`.
+        // Liveness for SaaS agents is the runner's call; the server defers
+        // to `RunnerHello.active_agents` to confirm or contradict each
+        // surviving row. Pre-T5.15 we marked them all killed and fanned
+        // out KillAgent, which post-T5.13 actively SIGTERM'd every live
+        // daemon on every prod redeploy — see the comment in
+        // `cleanup_and_reattach` for the full reasoning.
         insert_agent(&db, "remote-stale", "remote", "running", None, None);
 
         registry.cleanup_and_reattach().await;
 
         let (status, reason) = agent_status(&db, "remote-stale");
-        assert_eq!(status, "killed");
-        assert_eq!(reason.as_deref(), Some("supervisor_died"));
+        assert_eq!(status, "running", "remote row must be left at 'running'");
+        assert_eq!(reason, None, "stop_reason must NOT be set");
 
         let events = drain_events(&mut rx);
         assert!(
-            events
+            !events
                 .iter()
                 .any(|e| e.contains("remote-stale") && e.contains("supervisor_died")),
-            "missing supervisor_died broadcast: {events:?}"
+            "no supervisor_died broadcast for remote rows: {events:?}"
         );
     }
 
