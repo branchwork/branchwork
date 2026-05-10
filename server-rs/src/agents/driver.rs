@@ -769,6 +769,20 @@ impl AgentDriver for BobDriver {
         // to indicate it's authenticated without exposing any credentials.
         AuthStatus::Oauth { account: None }
     }
+
+    fn mcp_config_json(&self, mcp_url: &str) -> Option<String> {
+        // Bob Shell uses the same .mcp.json schema as Claude Code:
+        // top-level `mcpServers` map with HTTP transport entries.
+        let cfg = serde_json::json!({
+            "mcpServers": {
+                "branchwork": {
+                    "type": "http",
+                    "url": mcp_url,
+                }
+            }
+        });
+        Some(cfg.to_string())
+    }
 }
 
 /// Name that identifies the default driver in the registry and on the

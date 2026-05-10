@@ -3109,6 +3109,7 @@ fn collect_driver_auth() -> Vec<DriverAuthInfo> {
         ),
         ("codex", "codex", vec!["OPENAI_API_KEY"]),
         ("gemini", "gemini", vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+        ("bob", "bob", vec!["ANTHROPIC_API_KEY"]),
     ] {
         let status = if which(binary).is_none() {
             DriverAuthStatus::NotInstalled
