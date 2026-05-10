@@ -388,3 +388,98 @@ pub(crate) fn extract_check_agent_verdict(
     }
     None
 }
+
+/// SaaS dispatch for check agents (Task 5.12). Mirrors
+/// [`start_check_agent`] but, instead of `Command::new("claude")` on the
+/// server's filesystem, INSERTs the agents row and then ships
+/// `WireMessage::StartCheckAgent` to the runner's `command_tx`. The
+/// runner spawns claude on its own host, streams stream-json lines back
+/// as `WireMessage::CheckAgentOutput`, and emits `AgentStopped` on exit
+/// — both already handled in `saas/runner_ws.rs`.
+///
+/// Returns the agent id immediately. The HTTP caller doesn't await the
+/// claude spawn; SaaS-mode clients poll `agent_output` events / row
+/// status the same way standalone clients already do.
+///
+/// `runner_id` is resolved by the caller (typically the most-recently-
+/// seen online runner per org). If the runner disappears between
+/// resolution and the `command_tx.send`, the row stays in `starting`
+/// and the cleanup pass on next runner reconnect will mark it failed.
+pub async fn start_check_agent_via_runner(
+    state: &crate::state::AppState,
+    runner_id: &str,
+    prompt: String,
+    cwd: &Path,
+    plan_name: Option<&str>,
+    task_id: Option<&str>,
+    effort: crate::config::Effort,
+) -> Option<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    // base_commit cannot be resolved server-side in SaaS (the cwd path is a
+    // runner-host path). Leave NULL — the runner emits the verdict and the
+    // diff endpoint handles the missing base.
+    {
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt) \
+             VALUES (?1, ?2, ?3, 'starting', 'stream-json', ?4, ?5, ?6)",
+            params![
+                id,
+                session_id,
+                cwd.to_str().unwrap_or(""),
+                plan_name,
+                task_id,
+                prompt
+            ],
+        )
+        .ok();
+    }
+
+    let envelope = crate::saas::runner_protocol::Envelope::best_effort(
+        "server".to_string(),
+        crate::saas::runner_protocol::WireMessage::StartCheckAgent {
+            agent_id: id.clone(),
+            session_id,
+            prompt,
+            cwd: cwd.to_string_lossy().to_string(),
+            effort: effort.to_string(),
+        },
+    );
+    let json = match serde_json::to_string(&envelope) {
+        Ok(j) => j,
+        Err(_) => {
+            // Mark the row failed so the dashboard doesn't sit on
+            // `starting` forever.
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
+                params![id],
+            )
+            .ok();
+            return None;
+        }
+    };
+
+    let runners = state.runners.lock().await;
+    let Some(runner) = runners.get(runner_id) else {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
+            params![id],
+        )
+        .ok();
+        return None;
+    };
+    if runner.command_tx.send(json).is_err() {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
+            params![id],
+        )
+        .ok();
+        return None;
+    }
+    Some(id)
+}
+

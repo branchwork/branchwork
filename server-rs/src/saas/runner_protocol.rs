@@ -323,6 +323,33 @@ pub enum WireMessage {
         outcome: MergeOutcome,
     },
 
+    /// Server asked the runner to spawn a stream-json check agent. Mirrors
+    /// the standalone path in `agents/check_agent.rs::start_check_agent`
+    /// but routes the `Command::new("claude") -p --output-format
+    /// stream-json` invocation to the runner host where `claude` and the
+    /// project filesystem actually live. Fire-and-forget: there is no
+    /// request/response RPC pair — the runner streams `CheckAgentOutput`
+    /// per stdout line back, then emits `AgentStopped` on exit. Server-
+    /// side cleanup (UPDATE agents.status, on_check_agent_completed)
+    /// piggybacks on the existing `AgentStopped` handler.
+    StartCheckAgent {
+        agent_id: String,
+        session_id: String,
+        prompt: String,
+        cwd: String,
+        effort: String,
+    },
+
+    /// Runner forward of one stdout line from a check agent's claude
+    /// process. The line is a complete stream-json record (newline-
+    /// delimited); the server appends to `agent_output` with
+    /// `message_type` derived from the JSON `type` (`stdout` for
+    /// regular events, `result` for terminal records). Best-effort.
+    CheckAgentOutput {
+        agent_id: String,
+        line: String,
+    },
+
     /// Dashboard asked the runner to discard an agent's task branch. Before
     /// this pair landed `discard_agent_branch` returned 503
     /// `discard_not_supported_for_saas_runners` whenever an org had a
@@ -797,6 +824,8 @@ impl WireMessage {
                 | WireMessage::MergeResult { .. }
                 | WireMessage::DiscardBranch { .. }
                 | WireMessage::BranchDiscarded { .. }
+                | WireMessage::StartCheckAgent { .. }
+                | WireMessage::CheckAgentOutput { .. }
                 | WireMessage::PushBranch { .. }
                 | WireMessage::PushResult { .. }
                 | WireMessage::GhRunList { .. }
@@ -845,6 +874,8 @@ impl WireMessage {
             WireMessage::MergeResult { .. } => "merge_result",
             WireMessage::DiscardBranch { .. } => "discard_branch",
             WireMessage::BranchDiscarded { .. } => "branch_discarded",
+            WireMessage::StartCheckAgent { .. } => "start_check_agent",
+            WireMessage::CheckAgentOutput { .. } => "check_agent_output",
             WireMessage::PushBranch { .. } => "push_branch",
             WireMessage::PushResult { .. } => "push_result",
             WireMessage::GhRunList { .. } => "gh_run_list",

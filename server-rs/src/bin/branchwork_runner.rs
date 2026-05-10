@@ -1138,6 +1138,161 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             state.shutdown_requested.store(true, AtomicOrdering::Relaxed);
         }
 
+        WireMessage::StartCheckAgent {
+            agent_id,
+            session_id,
+            prompt,
+            cwd,
+            effort,
+        } => {
+            // Mirror `agents/check_agent.rs::start_check_agent` but on the
+            // runner host: spawn `claude -p --output-format stream-json`,
+            // pipe the prompt in, stream stdout back to the SaaS server one
+            // wire frame per JSON line. Same allowed-tools surface (read +
+            // git read), same `--permission-mode plan`, same `--effort`
+            // forwarding. Server-side bookkeeping (agents row, agent_output
+            // table, broadcasts) lives entirely in `runner_ws.rs`'s
+            // `CheckAgentOutput` / `AgentStopped` handlers.
+            let agent_id = agent_id.clone();
+            let session_id = session_id.clone();
+            let prompt = prompt.clone();
+            let cwd = cwd.clone();
+            let effort = effort.clone();
+            let cwd_path = match validated_cwd(state, &cwd) {
+                Ok(p) => p,
+                Err(e) => {
+                    log_warn!(
+                        "[runner] start_check_agent {agent_id}: rejected cwd: {e}"
+                    );
+                    send_best_effort(
+                        state,
+                        WireMessage::AgentStopped {
+                            agent_id: agent_id.clone(),
+                            status: "failed".into(),
+                            cost_usd: None,
+                            stop_reason: Some(format!("cwd rejected: {e}")),
+                        },
+                    );
+                    return;
+                }
+            };
+            log_info!("[runner] start_check_agent: {agent_id} cwd={}", cwd_path.display());
+
+            let mut child = match std::process::Command::new("claude")
+                .args([
+                    "-p",
+                    "--verbose",
+                    "--output-format",
+                    "stream-json",
+                    "--input-format",
+                    "stream-json",
+                    "--session-id",
+                    &session_id,
+                    "--add-dir",
+                    &cwd_path.to_string_lossy(),
+                    "--permission-mode",
+                    "plan",
+                    "--allowedTools",
+                    "Read,Glob,Grep,Bash(git:*)",
+                    "--effort",
+                    &effort,
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .current_dir(&cwd_path)
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    log_warn!(
+                        "[runner] start_check_agent {agent_id}: failed to spawn claude: {e}"
+                    );
+                    send_best_effort(
+                        state,
+                        WireMessage::AgentStopped {
+                            agent_id: agent_id.clone(),
+                            status: "failed".into(),
+                            cost_usd: None,
+                            stop_reason: Some(format!("spawn claude: {e}")),
+                        },
+                    );
+                    return;
+                }
+            };
+
+            // Pipe the prompt into stdin as a single stream-json `user`
+            // message and close stdin. Same shape the standalone path
+            // writes in `check_agent.rs:88-99`.
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let msg = serde_json::json!({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}]
+                    }
+                });
+                let _ = writeln!(stdin, "{msg}");
+                drop(stdin);
+            }
+
+            let stdout = match child.stdout.take() {
+                Some(s) => s,
+                None => {
+                    send_best_effort(
+                        state,
+                        WireMessage::AgentStopped {
+                            agent_id: agent_id.clone(),
+                            status: "failed".into(),
+                            cost_usd: None,
+                            stop_reason: Some("claude stdout was None".into()),
+                        },
+                    );
+                    return;
+                }
+            };
+
+            // Spawn a tokio blocking task to drain stdout line-by-line.
+            // Each line is a complete stream-json record; forward as
+            // `CheckAgentOutput`. When stdout closes, `child.wait()` for
+            // the exit code and emit `AgentStopped`.
+            let state_clone = state.clone();
+            let aid = agent_id.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::{BufRead, BufReader};
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    send_best_effort(
+                        &state_clone,
+                        WireMessage::CheckAgentOutput {
+                            agent_id: aid.clone(),
+                            line,
+                        },
+                    );
+                }
+                let exit = child.wait().ok();
+                let code = exit.and_then(|s| s.code()).unwrap_or(-1);
+                let status = if code == 0 { "completed" } else { "failed" };
+                send_best_effort(
+                    &state_clone,
+                    WireMessage::AgentStopped {
+                        agent_id: aid,
+                        status: status.into(),
+                        cost_usd: None,
+                        stop_reason: if code == 0 {
+                            None
+                        } else {
+                            Some(format!("claude exit code {code}"))
+                        },
+                    },
+                );
+            });
+        }
+
         WireMessage::AgentInput { agent_id, data } => {
             // Forward to the local session daemon.
             if let Ok(bytes) = base64_decode(data) {
@@ -1627,6 +1782,7 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
         | WireMessage::BranchesListed { .. }
         | WireMessage::MergeResult { .. }
         | WireMessage::BranchDiscarded { .. }
+        | WireMessage::CheckAgentOutput { .. }
         | WireMessage::PushResult { .. }
         | WireMessage::GhRunListed { .. }
         | WireMessage::GhFailureLogFetched { .. }

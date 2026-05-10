@@ -2943,15 +2943,19 @@ pub async fn check_task(
     }
 
     let effort = *state.effort.lock().unwrap();
-    let agent_id = check_agent::start_check_agent(
-        &state.registry,
+    let agent_id = match dispatch_check_agent(
+        &state,
         prompt,
         &project_dir,
         Some(&plan_name),
         Some(&task_number),
         effort,
     )
-    .await;
+    .await
+    {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
     Json(serde_json::json!({
         "agentId": agent_id,
@@ -2959,6 +2963,69 @@ pub async fn check_task(
         "taskNumber": task_number,
     }))
     .into_response()
+}
+
+/// Mode-aware spawn for stream-json check agents (Task 5.12). When the
+/// org has a runner attached, route to
+/// `check_agent::start_check_agent_via_runner` so the `claude` process
+/// runs on the runner host (only place it actually exists for SaaS).
+/// Otherwise fall through to the existing in-process spawn.
+///
+/// `Err(Response)` carries the canonical 503 / 500 envelope for callers
+/// to return as-is. The Ok arm is the new agent id.
+async fn dispatch_check_agent(
+    state: &AppState,
+    prompt: String,
+    cwd: &std::path::Path,
+    plan_name: Option<&str>,
+    task_id: Option<&str>,
+    effort: crate::config::Effort,
+) -> Result<String, axum::response::Response> {
+    // Pick any online runner across orgs — the public check-* HTTP routes
+    // don't carry an auth user today (audit §17 gap), so per-org filtering
+    // would be cargo-culted. Single-tenant deployments are the common
+    // shape and dispatch lands on the single runner regardless of
+    // `org_id`.
+    let saas_target: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM runners WHERE status = 'online' \
+             ORDER BY last_seen_at DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+    if let Some(runner_id) = saas_target {
+        match check_agent::start_check_agent_via_runner(
+            state,
+            &runner_id,
+            prompt,
+            cwd,
+            plan_name,
+            task_id,
+            effort,
+        )
+        .await
+        {
+            Some(id) => Ok(id),
+            None => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "runner_dispatch_failed"})),
+            )
+                .into_response()),
+        }
+    } else {
+        Ok(check_agent::start_check_agent(
+            &state.registry,
+            prompt,
+            cwd,
+            plan_name,
+            task_id,
+            effort,
+        )
+        .await)
+    }
 }
 
 // ── POST /api/plans/:name/check ─────────────────────────────────────────────
@@ -3036,15 +3103,19 @@ pub async fn check_plan(
     let prompt = build_plan_check_prompt(&plan, verification, &statuses, &project_dir);
 
     let effort = *state.effort.lock().unwrap();
-    let agent_id = check_agent::start_check_agent(
-        &state.registry,
+    let agent_id = match dispatch_check_agent(
+        &state,
         prompt,
         &project_dir,
         Some(&plan_name),
         None,
         effort,
     )
-    .await;
+    .await
+    {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
     Json(serde_json::json!({
         "agentId": agent_id,
@@ -5071,15 +5142,35 @@ pub async fn check_all(
                 }),
             );
 
-            let agent_id = crate::agents::check_agent::start_check_agent(
-                &state.registry,
+            let agent_id = match dispatch_check_agent(
+                &state,
                 prompt,
                 &project_dir,
                 Some(&name),
                 Some(&task.number),
                 effort,
             )
-            .await;
+            .await
+            {
+                Ok(id) => id,
+                // SaaS dispatch failure for one task in a check-all sweep
+                // is degraded but recoverable: skip this task, broadcast
+                // the row's status so the UI doesn't sit on `checking`,
+                // and continue with the rest. Pre-T5.12 this code path
+                // was infallible (in-process spawn) so the loop body
+                // didn't need any error handling — keep the rest of the
+                // sweep running rather than aborting.
+                Err(_) => {
+                    let conn = state.db.lock().unwrap();
+                    conn.execute(
+                        "UPDATE task_status SET status = 'failed', updated_at = datetime('now') \
+                         WHERE plan_name = ?1 AND task_number = ?2",
+                        params![name, task.number],
+                    )
+                    .ok();
+                    continue;
+                }
+            };
             spawned.push(agent_id);
         }
     }

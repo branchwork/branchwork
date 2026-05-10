@@ -584,6 +584,41 @@ async fn handle_runner_message(
             );
         }
 
+        WireMessage::CheckAgentOutput { agent_id, line } => {
+            // SaaS-mode equivalent of `check_agent.rs`'s in-process
+            // stdout reader: append the stream-json line to the
+            // `agent_output` table and broadcast `agent_output` so the
+            // dashboard's StreamJsonView catches each frame as it lands.
+            // `message_type` mirrors the standalone classifier — `result`
+            // for the terminal record, `stdout` otherwise — derived from
+            // the JSON `type` field. Best-effort: a malformed line is
+            // still surfaced (`stdout`) so the user sees what claude
+            // emitted, even when the JSON parser would reject it.
+            let msg_type = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                .map(|t| if t == "result" { "result" } else { "stdout" })
+                .unwrap_or("stdout")
+                .to_string();
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute(
+                    "INSERT INTO agent_output (agent_id, message_type, content) VALUES (?1, ?2, ?3)",
+                    params![agent_id, msg_type, line],
+                )
+                .ok();
+            }
+            broadcast_event(
+                &state.broadcast_tx,
+                "agent_output",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "message_type": msg_type,
+                    "content": line,
+                }),
+            );
+        }
+
         WireMessage::AgentOutput { agent_id, data } => {
             // Forward to dashboard (best-effort). The shape MUST match the
             // frontend's `AgentOutput` zod schema in
@@ -1063,6 +1098,7 @@ async fn handle_runner_message(
         | WireMessage::ListBranches { .. }
         | WireMessage::MergeBranch { .. }
         | WireMessage::DiscardBranch { .. }
+        | WireMessage::StartCheckAgent { .. }
         | WireMessage::PushBranch { .. }
         | WireMessage::GhRunList { .. }
         | WireMessage::GhFailureLog { .. }
