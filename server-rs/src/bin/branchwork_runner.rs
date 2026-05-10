@@ -766,11 +766,27 @@ async fn connect_and_run(
     let writer = tokio::spawn(ws_writer(ws_write, ws_rx));
 
     // ── Send runner_hello ────────────────────────────────────────────────
+    // `active_agents` is the snapshot of supervisors the runner is still
+    // tracking in memory — `cleanup_and_reattach_runner` already ran
+    // before this point and populated `state.agents` from any on-disk
+    // session sockets that survived the runner-process restart. The
+    // server uses this list to undo `cleanup_and_reattach`'s blanket
+    // `killed/supervisor_died` marking of remote agents on its own boot
+    // (T5.14). Snapshotting under the lock is fine — Hello fires once
+    // per WS connect, the lock is uncontended.
     let drivers = collect_driver_auth();
+    let active_agents: Vec<String> =
+        state.agents.lock().await.keys().cloned().collect();
+    log_info!(
+        "[runner] hello: {} drivers, {} active agents reattached",
+        drivers.len(),
+        active_agents.len()
+    );
     let hello = WireMessage::RunnerHello {
         hostname: hostname(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         drivers: drivers.clone(),
+        active_agents,
     };
     send_reliable(&state, hello).await;
 

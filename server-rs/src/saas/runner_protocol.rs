@@ -36,12 +36,27 @@ pub struct Envelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WireMessage {
     // ── Runner -> SaaS ──────────────────────────────────────────────────
-    /// First message after connect. Carries runner metadata and driver
-    /// capabilities so the dashboard can render the Drivers panel.
+    /// First message after connect. Carries runner metadata, driver
+    /// capabilities (so the dashboard can render the Drivers panel), and
+    /// — added in T5.14 — the in-memory agent inventory the runner is
+    /// still tracking. Pre-T5.14 every prod redeploy / WS reconnect
+    /// caused `cleanup_and_reattach` to mark all `mode='remote'` rows as
+    /// `killed`/`supervisor_died` ("runner ownership lost"); the runner
+    /// then reconnected, picked up its state from the on-disk session
+    /// dir, and kept forwarding output — but the row stayed dead and
+    /// the dashboard showed the agent as gone forever. Reporting active
+    /// ids on Hello lets the server unkill them: if a row is in
+    /// `killed`/`supervisor_died` and the runner says "still alive,"
+    /// flip it back to `running` and broadcast.
+    ///
+    /// `#[serde(default)]` keeps older runners (which don't send the
+    /// field) wire-compatible — they degrade to the pre-T5.14 behaviour.
     RunnerHello {
         hostname: String,
         version: String,
         drivers: Vec<DriverAuthInfo>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        active_agents: Vec<String>,
     },
 
     /// An agent was spawned on the runner.

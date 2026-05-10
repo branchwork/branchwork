@@ -510,6 +510,7 @@ async fn handle_runner_message(
             hostname,
             version,
             drivers,
+            active_agents,
         } => {
             let drivers_json = serde_json::to_string(drivers).ok();
 
@@ -541,9 +542,59 @@ async fn handle_runner_message(
                 }),
             );
 
+            // T5.14: undo `cleanup_and_reattach`'s blanket
+            // `killed/supervisor_died` marking of remote agents. The
+            // server runs that pass at startup before any runner has
+            // had a chance to connect; once the runner's hello arrives
+            // listing the agents it still has alive, flip those rows
+            // back to `running` and broadcast `agent_resumed` so the
+            // dashboard re-renders them as live without waiting for the
+            // first byte of output to land. Idempotent — running rows
+            // stay running, completed/failed rows stay completed/failed.
+            let mut resumed: Vec<String> = Vec::new();
+            if !active_agents.is_empty() {
+                let conn = state.db.lock().unwrap();
+                for aid in active_agents {
+                    let was_dead: bool = conn
+                        .query_row(
+                            "SELECT status FROM agents WHERE id = ?1",
+                            params![aid],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .map(|s| matches!(s.as_str(), "killed" | "failed"))
+                        .unwrap_or(false);
+                    if was_dead {
+                        let updated = conn
+                            .execute(
+                                "UPDATE agents \
+                                 SET status = 'running', \
+                                     stop_reason = NULL, \
+                                     finished_at = NULL \
+                                 WHERE id = ?1 AND mode = 'remote'",
+                                params![aid],
+                            )
+                            .unwrap_or(0);
+                        if updated > 0 {
+                            resumed.push(aid.clone());
+                        }
+                    }
+                }
+            }
+            for aid in &resumed {
+                broadcast_event(
+                    &state.broadcast_tx,
+                    "agent_resumed",
+                    serde_json::json!({
+                        "id": aid,
+                        "runner_id": runner_id,
+                    }),
+                );
+            }
+
             println!(
-                "[runner-ws] Runner {runner_id} hello: {hostname} v{version}, {} drivers",
-                drivers.len()
+                "[runner-ws] Runner {runner_id} hello: {hostname} v{version}, {} drivers, {} agents resumed",
+                drivers.len(),
+                resumed.len()
             );
         }
 
