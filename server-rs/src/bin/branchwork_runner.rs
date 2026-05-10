@@ -2504,7 +2504,7 @@ async fn spawn_agent(
     // `kill(-pid)` so the daemon AND its claude child are torn down
     // together. Same pattern as `kill_agent` in standalone uses (see
     // `agents/mod.rs:supervisor_kill`).
-    let pidfile_path = sockets_dir.join(format!("{agent_id}.sock.pid"));
+    let pidfile_path = sockets_dir.join(format!("{agent_id}.pid"));
     let pid = match std::fs::read_to_string(&pidfile_path) {
         Ok(s) => s
             .trim()
@@ -2750,7 +2750,7 @@ async fn cleanup_and_reattach_runner(state: &Arc<RunnerState>) {
                 // re-resolve from the same scheme used in `spawn_agent`.
                 let reattach_sockets_dir = state.cwd.join(".branchwork-runner-sessions");
                 let reattach_pidfile = reattach_sockets_dir
-                    .join(format!("{agent_id}.sock.pid"));
+                    .join(format!("{agent_id}.pid"));
                 let reattach_pid: u32 = std::fs::read_to_string(&reattach_pidfile)
                     .ok()
                     .and_then(|s| s.trim().parse::<u32>().ok())
