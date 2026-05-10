@@ -2594,6 +2594,7 @@ async fn spawn_agent(
         "aider" => "aider",
         "codex" => "codex",
         "gemini" => "gemini",
+        "bob" => "bob",
         _ => "claude",
     };
 
@@ -2652,6 +2653,15 @@ async fn spawn_agent(
         }
         if let Some(p) = settings_path.as_deref() {
             args.push("--settings".to_string());
+            args.push(p.display().to_string());
+        }
+    } else if binary == "bob" {
+        // Bob Shell flags (mirrors BobDriver::spawn_args from driver.rs)
+        if skip_permissions {
+            args.push("--yolo".to_string());
+        }
+        if let Some(p) = mcp_config_path.as_deref() {
+            args.push("--mcp-config".to_string());
             args.push(p.display().to_string());
         }
     } else {
