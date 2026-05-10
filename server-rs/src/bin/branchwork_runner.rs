@@ -1068,10 +1068,37 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                 // io_task.abort() skips the closure-level cleanup, so
                 // remove the per-agent temp files here instead.
                 cleanup_agent_temp_files(&handle);
-                // Send SIGTERM to the session daemon.
+                // SIGTERM the daemon's WHOLE process group (-pid) so the
+                // daemon AND its claude child both go. The supervisor
+                // calls `setsid()` after fork (`agents/supervisor.rs`)
+                // making it a session/group leader; the claude PTY child
+                // it spawns via `pty.spawn_command` joins that group.
+                // `libc::kill(-pid, ...)` is the canonical Unix call to
+                // signal the entire group.
+                //
+                // Pre-T5.13 we passed `+pid` here, which only signalled
+                // the daemon. The daemon's exit didn't propagate SIGHUP
+                // to its child fast enough (or at all on some kernels)
+                // and claude kept running orphaned off init — every
+                // Finish/Kill click leaked a claude session.
                 #[cfg(unix)]
                 unsafe {
-                    libc::kill(handle.pid as i32, libc::SIGTERM);
+                    if handle.pid == 0 {
+                        // Reattach didn't recover a real pid (no pidfile
+                        // and no fork-parent fallback). `libc::kill(0,
+                        // ...)` and `libc::kill(-0, ...)` both signal
+                        // the RUNNER's own process group — would kill
+                        // the runner. The agent is already orphaned
+                        // off init; log + skip. The session daemon
+                        // will exit on its own when the PTY child
+                        // does, or on the next host reboot.
+                        log_warn!(
+                            "[runner] kill_agent {agent_id}: no daemon pid (reattach without pidfile); skipping signal"
+                        );
+                    } else {
+                        let pgid = -(handle.pid as i32);
+                        libc::kill(pgid, libc::SIGTERM);
+                    }
                 }
                 #[cfg(windows)]
                 {
@@ -2441,10 +2468,10 @@ async fn spawn_agent(
     }
 
     let child = cmd.spawn()?;
-    let pid = child.id();
+    let fork_parent_pid = child.id();
 
     log_info!(
-        "[runner] spawned session daemon pid={pid} socket={}",
+        "[runner] spawned session daemon (fork-parent pid={fork_parent_pid}) socket={}",
         socket_path.display()
     );
 
@@ -2459,6 +2486,37 @@ async fn spawn_agent(
 
     // Small extra delay for the daemon to start listening.
     tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Resolve the actual long-lived daemon PID. `cmd.spawn()` returns
+    // the fork-parent that `_exit`s in `supervisor::run_session`'s
+    // double-fork; the daemon continues in the second-fork child after
+    // `setsid()`, and writes ITS pid to the `<socket>.pid` file early in
+    // `run_daemon`. Pre-T5.13 the runner stored `fork_parent_pid` in
+    // `AgentHandle.pid` and `KillAgent` then `libc::kill`d a defunct pid
+    // — the no-op killed nothing, the daemon kept running, and the
+    // claude child it had spawned via `pty.spawn_command` orphaned cleanly
+    // off init. Result: every Finish / Kill click left zombie claudes.
+    //
+    // Read the pidfile (best-effort — if missing, fall back to the
+    // fork-parent pid so AT LEAST we don't NPE; the kill will still be
+    // a no-op but that's the pre-T5.13 behaviour we're replacing). The
+    // KillAgent handler then signals the WHOLE process group via
+    // `kill(-pid)` so the daemon AND its claude child are torn down
+    // together. Same pattern as `kill_agent` in standalone uses (see
+    // `agents/mod.rs:supervisor_kill`).
+    let pidfile_path = sockets_dir.join(format!("{agent_id}.sock.pid"));
+    let pid = match std::fs::read_to_string(&pidfile_path) {
+        Ok(s) => s
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|p| *p != 0 && *p != fork_parent_pid)
+            .unwrap_or(fork_parent_pid),
+        Err(_) => fork_parent_pid,
+    };
+    log_info!(
+        "[runner] session daemon real pid={pid} (fork-parent was {fork_parent_pid})"
+    );
 
     // Connect and start I/O forwarding.
     let task_state = state.clone();
@@ -2673,24 +2731,38 @@ async fn cleanup_and_reattach_runner(state: &Arc<RunnerState>) {
                     send_reliable(&task_state, stopped).await;
                 });
 
-                // PID is unknown on reattach (the daemon is detached and
-                // we never had its pid in this process). 0 is the in-tree
-                // sentinel that ShutdownRequest's drain step already
-                // skips; KillAgent uses libc::kill which would treat 0 as
-                // "send to my own process group" — guard there too.
+                // PID recovery from the daemon's pidfile (T5.13). Pre-
+                // T5.13 we hard-coded `pid: 0`, which would have made
+                // `KillAgent`'s `libc::kill(-pid, SIGTERM)` signal the
+                // RUNNER's own process group ("pid 0" in `kill(2)`
+                // means "caller's group"). The previous KillAgent code
+                // happened to pass `+pid` so the bug was latent — flip
+                // the sign in T5.13 and the runner would suicide on
+                // every reattached-agent kill click. Read the pidfile
+                // (`<socket>.pid`, written by the supervisor early in
+                // `run_daemon`) so we have the real daemon pid; if it's
+                // missing, store a fresh `0` sentinel that the
+                // KillAgent handler explicitly guards against.
                 //
                 // Reattach can't recover the original temp-file paths from
                 // the previous runner process — they were derived from
                 // `agent_id` then, and that derivation is unchanged, so
                 // re-resolve from the same scheme used in `spawn_agent`.
                 let reattach_sockets_dir = state.cwd.join(".branchwork-runner-sessions");
+                let reattach_pidfile = reattach_sockets_dir
+                    .join(format!("{agent_id}.sock.pid"));
+                let reattach_pid: u32 = std::fs::read_to_string(&reattach_pidfile)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .filter(|p| *p > 0)
+                    .unwrap_or(0);
                 let reattach_mcp = reattach_sockets_dir.join(format!("{agent_id}.mcp.json"));
                 let reattach_settings =
                     reattach_sockets_dir.join(format!("{agent_id}.settings.json"));
                 state.agents.lock().await.insert(
                     agent_id.clone(),
                     AgentHandle {
-                        pid: 0,
+                        pid: reattach_pid,
                         socket_path: path.clone(),
                         io_task,
                         cwd: state.cwd.clone(),
