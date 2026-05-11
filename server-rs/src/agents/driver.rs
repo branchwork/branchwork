@@ -770,18 +770,10 @@ impl AgentDriver for BobDriver {
         AuthStatus::Oauth { account: None }
     }
 
-    fn mcp_config_json(&self, mcp_url: &str) -> Option<String> {
-        // Bob Shell uses the same .mcp.json schema as Claude Code:
-        // top-level `mcpServers` map with HTTP transport entries.
-        let cfg = serde_json::json!({
-            "mcpServers": {
-                "branchwork": {
-                    "type": "http",
-                    "url": mcp_url,
-                }
-            }
-        });
-        Some(cfg.to_string())
+    fn mcp_config_json(&self, _mcp_url: &str) -> Option<String> {
+        // Bob Shell doesn't currently support MCP config files.
+        // Return None so the spawn path doesn't try to pass --mcp-config.
+        None
     }
 }
 
