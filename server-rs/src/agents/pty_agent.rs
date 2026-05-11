@@ -71,7 +71,16 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         org_id,
         runner_id: _runner_id, // standalone path ignores it
     } = opts;
-    let (driver_name, driver) = registry.drivers.get_or_default(driver_name);
+    let default_driver = if let Some(app_state) = registry.app_state.get() {
+        crate::persisted_settings::PersistedSettings::load(&app_state.settings_path)
+            .default_driver()
+            .to_string()
+    } else {
+        "claude".to_string()
+    };
+    let (driver_name, driver) = registry
+        .drivers
+        .get_or_default_with(driver_name, Some(&default_driver));
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -493,7 +502,16 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
         .ok()
         .flatten()
     };
-    let (_, driver) = registry.drivers.get_or_default(driver_name.as_deref());
+    let default_driver = if let Some(app_state) = registry.app_state.get() {
+        crate::persisted_settings::PersistedSettings::load(&app_state.settings_path)
+            .default_driver()
+            .to_string()
+    } else {
+        "claude".to_string()
+    };
+    let (_, driver) = registry
+        .drivers
+        .get_or_default_with(driver_name.as_deref(), Some(&default_driver));
     let cost_usd = parse_cost_from_pty_output(driver.as_ref(), &registry.db, agent_id);
 
     // Pull plan/task/branch for the eventual notification before we mutate

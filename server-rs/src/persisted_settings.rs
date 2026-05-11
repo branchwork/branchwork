@@ -28,6 +28,11 @@ pub struct PersistedSettings {
     /// in plan-deletion 0.5.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_archive_retention_days: Option<i64>,
+    /// Default agent driver to use when not explicitly specified.
+    /// Falls back to "claude" if not set. Can be overridden per-task,
+    /// per-phase, per-plan, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_driver: Option<String>,
 }
 
 impl PersistedSettings {
@@ -44,6 +49,11 @@ impl PersistedSettings {
             );
             Self::default()
         })
+    }
+
+    /// Get the default driver, falling back to "claude" if not set.
+    pub fn default_driver(&self) -> &str {
+        self.default_driver.as_deref().unwrap_or("claude")
     }
 
     /// Atomic write: serialise to `<path>.tmp`, then rename over the target.

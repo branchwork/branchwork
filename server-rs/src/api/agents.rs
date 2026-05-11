@@ -240,10 +240,16 @@ pub async fn finish_agent(
     // forwards the bytes into the daemon's PTY; the agent then exits
     // cleanly on its own and the runner emits `AgentStopped` shortly
     // after — same observable behaviour as standalone, just routed.
+    let default_driver = crate::persisted_settings::PersistedSettings::load(&state.settings_path)
+        .default_driver()
+        .to_string();
     let row: Option<(String, String, String)> = {
         let db = state.db.lock().unwrap();
         db.query_row(
-            "SELECT mode, COALESCE(driver, 'claude'), org_id FROM agents WHERE id = ?",
+            &format!(
+                "SELECT mode, COALESCE(driver, '{}'), org_id FROM agents WHERE id = ?",
+                default_driver
+            ),
             params![id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )

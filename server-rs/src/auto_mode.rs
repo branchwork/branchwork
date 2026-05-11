@@ -1462,10 +1462,14 @@ async fn run_idle_pass(state: &AppState, threshold_secs: i64) {
         // its own auto-finish path (via the Claude `Stop` hook today, or
         // an equivalent surface tomorrow) and must not be double-triggered
         // by this poller.
+        let default_driver =
+            crate::persisted_settings::PersistedSettings::load(&state.settings_path)
+                .default_driver()
+                .to_string();
         let (_resolved, driver_arc) = state
             .registry
             .drivers
-            .get_or_default(driver_name.as_deref());
+            .get_or_default_with(driver_name.as_deref(), Some(&default_driver));
         if driver_arc
             .stop_hook_config(&session_id, &hook_url)
             .is_some()

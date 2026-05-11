@@ -756,7 +756,8 @@ async fn handle_runner_message(
                 // This ensures the UI shows the task as "done" even when auto-mode is
                 // disabled. Auto-mode will overwrite this with source='auto' later if
                 // enabled, but manual completion needs this immediate update.
-                if status == "completed" && stop_reason.is_none()
+                if status == "completed"
+                    && stop_reason.is_none()
                     && let Some((ref plan, ref task)) = plan_task
                 {
                     conn.execute(

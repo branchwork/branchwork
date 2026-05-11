@@ -837,21 +837,44 @@ impl DriverRegistry {
         self.drivers.get(name).cloned()
     }
 
-    /// Lookup by name, falling back to [`DEFAULT_DRIVER`] when the name is
-    /// unknown or `None`. Always returns a driver — the default is always
-    /// present in a registry built via [`Self::with_defaults`].
-    pub fn get_or_default(&self, name: Option<&str>) -> (String, Arc<dyn AgentDriver>) {
+    /// Lookup by name, falling back to the provided `default_name` (or
+    /// [`DEFAULT_DRIVER`] if not provided) when the name is unknown or `None`.
+    /// Always returns a driver — the default is always present in a registry
+    /// built via [`Self::with_defaults`].
+    pub fn get_or_default_with(
+        &self,
+        name: Option<&str>,
+        default_name: Option<&str>,
+    ) -> (String, Arc<dyn AgentDriver>) {
         if let Some(n) = name
             && let Some(d) = self.drivers.get(n)
         {
             return (n.to_string(), d.clone());
         }
+        let fallback = default_name.unwrap_or(DEFAULT_DRIVER);
         let d = self
             .drivers
-            .get(DEFAULT_DRIVER)
-            .expect("DEFAULT_DRIVER missing from registry")
+            .get(fallback)
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "[driver] default '{fallback}' not found in registry, falling back to '{DEFAULT_DRIVER}'"
+                );
+                self.drivers
+                    .get(DEFAULT_DRIVER)
+                    .expect("DEFAULT_DRIVER missing from registry")
+            })
             .clone();
-        (DEFAULT_DRIVER.to_string(), d)
+        (fallback.to_string(), d)
+    }
+
+    /// Lookup by name, falling back to [`DEFAULT_DRIVER`] when the name is
+    /// unknown or `None`. Always returns a driver — the default is always
+    /// present in a registry built via [`Self::with_defaults`].
+    ///
+    /// Deprecated: Use [`Self::get_or_default_with`] and pass the persisted
+    /// default driver from settings.
+    pub fn get_or_default(&self, name: Option<&str>) -> (String, Arc<dyn AgentDriver>) {
+        self.get_or_default_with(name, None)
     }
 
     /// Sorted list of driver names — for `GET /api/drivers` and for the

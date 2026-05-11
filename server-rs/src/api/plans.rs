@@ -2581,6 +2581,10 @@ pub async fn start_task(
     .await;
 
     {
+        let default_driver =
+            crate::persisted_settings::PersistedSettings::load(&state.settings_path)
+                .default_driver()
+                .to_string();
         let db = state.db.lock().unwrap();
         crate::audit::log(
             &db,
@@ -2594,7 +2598,7 @@ pub async fn start_task(
                 &serde_json::json!({
                     "plan": body.plan_name,
                     "task": body.task_number,
-                    "driver": body.driver.as_deref().unwrap_or("claude"),
+                    "driver": body.driver.as_deref().unwrap_or(&default_driver),
                     "mode": body.mode.as_deref().unwrap_or("start"),
                 })
                 .to_string(),

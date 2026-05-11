@@ -87,7 +87,13 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
     let agent_id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
     let cwd_str = cwd.to_string_lossy().to_string();
-    let (driver_name_resolved, driver) = state.registry.drivers.get_or_default(driver_name);
+    let default_driver = crate::persisted_settings::PersistedSettings::load(&state.settings_path)
+        .default_driver()
+        .to_string();
+    let (driver_name_resolved, driver) = state
+        .registry
+        .drivers
+        .get_or_default_with(driver_name, Some(&default_driver));
     let driver_name_owned = driver_name_resolved.to_string();
 
     // Pre-render the `--mcp-config` body and per-session `--settings` JSON

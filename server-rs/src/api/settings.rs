@@ -45,6 +45,10 @@ pub struct SettingsBody {
     /// values produce a 400. Missing means "no change" — the
     /// existing on-disk value (or the default) is preserved.
     plan_archive_retention_days: Option<i64>,
+    /// Default agent driver to use when not explicitly specified.
+    /// Falls back to "claude" if not set. Can be overridden per-task,
+    /// per-phase, per-plan, etc.
+    default_driver: Option<String>,
 }
 
 pub async fn put_settings(
@@ -119,6 +123,13 @@ pub async fn put_settings(
     if let Some(days) = body.plan_archive_retention_days {
         snap.plan_archive_retention_days = Some(days);
     }
+    if let Some(driver) = body.default_driver {
+        snap.default_driver = if driver.trim().is_empty() {
+            None
+        } else {
+            Some(driver.trim().to_string())
+        };
+    }
     if let Err(e) = snap.save(&state.settings_path) {
         eprintln!(
             "[settings] failed to persist to {}: {e}",
@@ -140,14 +151,19 @@ fn snapshot(state: &AppState) -> serde_json::Value {
     // because the only consumer (`plan_curate::snapshot_plan`) is also
     // the cold path, and reading once per admin GET keeps the source
     // of truth single.
-    let plan_archive_retention_days = PersistedSettings::load(&state.settings_path)
+    let settings = PersistedSettings::load(&state.settings_path);
+    let plan_archive_retention_days = settings
         .plan_archive_retention_days
         .unwrap_or(DEFAULT_RETENTION_DAYS);
+    let default_driver = settings
+        .default_driver
+        .unwrap_or_else(|| "claude".to_string());
     serde_json::json!({
         "effort": effort,
         "skip_permissions": skip_permissions,
         "webhook_url": webhook_url,
         "plan_archive_retention_days": plan_archive_retention_days,
+        "default_driver": default_driver,
     })
 }
 
