@@ -557,10 +557,7 @@ function VersionBadge() {
   if (!version) return null;
 
   return (
-    <span
-      className="text-[9px] text-gray-600 font-mono"
-      title={`Server version ${version}`}
-    >
+    <span className="text-[9px] text-gray-600 font-mono" title={`Server version ${version}`}>
       v{version}
     </span>
   );

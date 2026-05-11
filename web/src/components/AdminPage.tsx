@@ -262,15 +262,14 @@ function SettingsTab() {
         </div>
         <PerRunnerOverrideNote />
 
-      <Section
-        title="Default agent driver"
-        serverWide
-        description="Default AI driver used when starting agents. Can be overridden per-task, per-phase, or per-plan."
-      >
-        <DefaultDriverSelector />
-        <PerRunnerOverrideNote />
-      </Section>
-
+        <Section
+          title="Default agent driver"
+          serverWide
+          description="Default AI driver used when starting agents. Can be overridden per-task, per-phase, or per-plan."
+        >
+          <DefaultDriverSelector />
+          <PerRunnerOverrideNote />
+        </Section>
       </Section>
 
       <Section
