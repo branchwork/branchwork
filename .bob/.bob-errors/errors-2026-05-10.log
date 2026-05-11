@@ -1,0 +1,74 @@
+
+================================================================================
+ERROR LOGGED: 2026-05-10T21:24:14.977Z
+User ID: Cyril.Poder@ibm.com
+================================================================================
+Error Name: GatewayError
+Error Message: Failed to handle chat completion - HTTP 401: Unauthorized - {"error":"unauthorized","message":"Token verification failed: 'exp' claim expired at Sun, 10 May 2026 20:35:10 GMT"}
+
+
+
+Stack Trace:
+GatewayError: Failed to handle chat completion - HTTP 401: Unauthorized - {"error":"unauthorized","message":"Token verification failed: 'exp' claim expired at Sun, 10 May 2026 20:35:10 GMT"}
+
+
+    at t.fromResponse (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:765:8542)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async t.createChatCompletion (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:777:8820)
+    at async dnt.createChatCompletionWithTokenRenewal (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2152:237)
+    at async dnt.generateContentStreamInternal (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2157:52)
+    at async V6.loggingStreamWrapper (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:800:31296)
+    at async gY.processStreamResponse (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2463:81)
+    at async file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:22044
+    at async PQ.run (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2463:3153)
+    at async nwe.sendMessageStream (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2796:511)
+================================================================================
+
+
+================================================================================
+ERROR LOGGED: 2026-05-10T21:24:16.004Z
+User ID: Cyril.Poder@ibm.com
+================================================================================
+Error Name: GatewayError
+Error Message: Failed to handle chat completion - HTTP 401: Unauthorized - {"error":"unauthorized","message":"Token verification failed: 'exp' claim expired at Sun, 10 May 2026 20:35:10 GMT"}
+
+
+
+Stack Trace:
+GatewayError: Failed to handle chat completion - HTTP 401: Unauthorized - {"error":"unauthorized","message":"Token verification failed: 'exp' claim expired at Sun, 10 May 2026 20:35:10 GMT"}
+
+
+    at t.fromResponse (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:765:8542)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async t.createChatCompletion (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:777:8820)
+    at async dnt.createChatCompletionWithTokenRenewal (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2152:237)
+    at async dnt.generateContentStreamInternal (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2157:52)
+    at async V6.loggingStreamWrapper (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:800:31296)
+    at async gY.processStreamResponse (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2463:81)
+    at async file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:22044
+    at async PQ.run (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2463:3153)
+    at async nwe.sendMessageStream (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2796:511)
+================================================================================
+
+
+================================================================================
+ERROR LOGGED: 2026-05-10T21:35:03.674Z
+User ID: Cyril.Poder@ibm.com
+================================================================================
+Error Name: Error
+Error Message: Path validation failed: Attempted path "/home/cpo" resolves outside the allowed workspace directories: /home/cpo/branchwork
+
+Stack Trace:
+Error: Path validation failed: Attempted path "/home/cpo" resolves outside the allowed workspace directories: /home/cpo/branchwork
+    at yYn (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2269:35601)
+    at t.validateToolParams (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2272:3845)
+    at t.build (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:378:62268)
+    at t.buildInvocation (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:3372)
+    at file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:5220
+    at Array.map (<anonymous>)
+    at t._schedule (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:4907)
+    at file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:4237
+    at cR (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:800:17196)
+    at t.schedule (file:///home/cpo/.nvm/versions/node/v25.4.0/lib/node_modules/bobshell/bundle/bob.js:2457:3781)
+================================================================================
+

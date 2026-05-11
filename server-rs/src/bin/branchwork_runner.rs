@@ -2854,7 +2854,10 @@ async fn forward_agent_io(
                         log_info!("[runner] agent {agent_id}: detected readiness");
                     }
                     if ready && let Some(prompt_bytes) = prompt {
-                        log_info!("[runner] agent {agent_id}: injecting prompt ({} bytes)", prompt_bytes.len());
+                        log_info!(
+                            "[runner] agent {agent_id}: injecting prompt ({} bytes)",
+                            prompt_bytes.len()
+                        );
                         // Mirror standalone (pty_agent::inject_prompt_when_ready):
                         // 500ms settle so claude finished rendering the prompt
                         // line; paste; 1s settle so the bracketed-paste sequence
@@ -3340,10 +3343,13 @@ mod tests {
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
         }
-        
+
         // When ANTHROPIC_API_KEY is not set, bob should return empty.
         let env_empty = extra_env_for_driver("bob");
-        assert!(env_empty.is_empty(), "bob without API key should return empty");
+        assert!(
+            env_empty.is_empty(),
+            "bob without API key should return empty"
+        );
     }
 
     #[test]

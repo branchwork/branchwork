@@ -100,22 +100,44 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
     // a different host than the server, so the localhost URL the
     // standalone path uses (`http://127.0.0.1:<port>/...`) would resolve
     // to the runner's own loopback and the agent's MCP client + Stop-hook
-    // curl would never reach the dashboard. `BRANCHWORK_PUBLIC_URL` is
-    // the prod overlay's signal for "what URL do customers see"
-    // (`saas/install_runner.rs:48`); when set, we emit it as the base.
-    // Otherwise fall back to localhost — this preserves behaviour for the
-    // local-SaaS dev loop where the runner connects to ws://localhost.
+    // curl would never reach the dashboard.
+    //
+    // SOLUTION: Use the server_url captured when the runner connected via
+    // WebSocket. The runner connected to a specific URL (e.g.,
+    // wss://branchwork.dev or ws://localhost:3100), and we derive the
+    // HTTP(S) base from that connection. This is always correct because
+    // it's the URL the runner actually used to reach us.
     //
     // The proper long-term fix is the WS back-channel (server → runner
     // dispatches MCP/hook requests over the same WS the runner already
     // owns); tracked under the `saas-compat-*` backlog plans. The public-
     // URL stopgap is correct as long as `/mcp` and `/hooks` remain
     // unauthenticated — flagged for follow-up alongside the back-channel.
-    let public_base = std::env::var("BRANCHWORK_PUBLIC_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| format!("http://localhost:{}", state.registry.port));
+    let public_base = {
+        let runners = state.runners.lock().await;
+        let runner = resolve_runner_for_spawn(&state.db, org_id, plan_name, explicit_runner_id);
+        match runner {
+            SpawnTarget::Runner(runner_id)
+            | SpawnTarget::SiblingFailover {
+                sibling_runner_id: runner_id,
+                ..
+            } => runners
+                .get(&runner_id)
+                .map(|r| r.server_url.clone())
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "[WARN] Runner {runner_id} not found in registry, \
+                             falling back to localhost. This should not happen."
+                    );
+                    format!("http://localhost:{}", state.registry.port)
+                }),
+            SpawnTarget::PinnedRunnerOffline { .. } | SpawnTarget::NoRunner => {
+                // Plan is paused due to offline runner or no runner exists.
+                // This spawn won't actually happen, but we need to return something.
+                format!("http://localhost:{}", state.registry.port)
+            }
+        }
+    };
     let mcp_url = format!("{public_base}/mcp");
     let hook_url = format!("{public_base}/hooks");
     let mcp_config = driver.mcp_config_json(&mcp_url).unwrap_or_default();
@@ -614,6 +636,7 @@ mod tests {
                 version: None,
                 drivers: None,
                 pending,
+                server_url: "http://localhost:3100".to_string(),
             },
         );
         server_to_runner_rx

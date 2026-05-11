@@ -1,0 +1,198 @@
+[runner] id=runner-bf842289-9e31-4f87-8aff-b5f912774907 cwd=/home/cpo db=/home/cpo/.branchwork-runner/runner.db
+[runner] connecting to https://branchwork.dev
+[runner] connected
+[runner] reaped orphan session socket /home/cpo/.branchwork-runner-sessions/ef4ef93b-74a6-4fc5-9c9d-165aba7c2aa1.sock (no listener)
+[runner] hello: 5 drivers, 0 active agents reattached
+71a8b7d5d0880442edbed94469975ab7e0954ad3
+71a8b7d5d0880442edbed94469975ab7e0954ad3
+ae80c5215f1ee99866db608c6443f8d3a2bda5ec
+[runner] start_agent: c9cbf01d-05e6-402e-99c1-d4c9cc43484b plan=aso2-browser-homage task=5.2 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/5.2
+[runner] spawned session daemon (fork-parent pid=1959426) socket=/home/cpo/.branchwork-runner-sessions/c9cbf01d-05e6-402e-99c1-d4c9cc43484b.sock
+[runner] session daemon real pid=1959427 (fork-parent was 1959426)
+[runner] reaped zombie session daemon pid=1959426
+[runner] agent c9cbf01d-05e6-402e-99c1-d4c9cc43484b: detected readiness
+[runner] agent c9cbf01d-05e6-402e-99c1-d4c9cc43484b: injecting prompt (5439 bytes)
+[runner] agent c9cbf01d-05e6-402e-99c1-d4c9cc43484b: prompt injected successfully
+ae80c5215f1ee99866db608c6443f8d3a2bda5ec
+75b695cef83c5ae34f4bb8283178bda79ef1da8f
+[runner] start_agent: ebccc609-3124-49d3-86e8-ebe368c5520f plan=aso2-browser-homage task=5.3 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/5.3
+[runner] spawned session daemon (fork-parent pid=1968632) socket=/home/cpo/.branchwork-runner-sessions/ebccc609-3124-49d3-86e8-ebe368c5520f.sock
+[runner] session daemon real pid=1968633 (fork-parent was 1968632)
+[runner] reaped zombie session daemon pid=1968632
+[runner] agent ebccc609-3124-49d3-86e8-ebe368c5520f: detected readiness
+[runner] agent ebccc609-3124-49d3-86e8-ebe368c5520f: injecting prompt (5593 bytes)
+[runner] agent ebccc609-3124-49d3-86e8-ebe368c5520f: prompt injected successfully
+75b695cef83c5ae34f4bb8283178bda79ef1da8f
+351b8599548aa8127694cf860c49b53547187827
+[runner] connection error: WebSocket protocol error: Connection reset without closing handshake
+[runner] reconnecting in 1196ms
+[runner] connecting to https://branchwork.dev
+[runner] connected
+[runner] hello: 5 drivers, 0 active agents reattached
+[runner] start_agent: 98ec0715-8e89-4ce5-814b-38feec1cecea plan=aso2-browser-homage task=5.4 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/5.4
+[runner] spawned session daemon (fork-parent pid=1978093) socket=/home/cpo/.branchwork-runner-sessions/98ec0715-8e89-4ce5-814b-38feec1cecea.sock
+[runner] session daemon real pid=1978094 (fork-parent was 1978093)
+[runner] reaped zombie session daemon pid=1978093
+[runner] agent 98ec0715-8e89-4ce5-814b-38feec1cecea: detected readiness
+[runner] agent 98ec0715-8e89-4ce5-814b-38feec1cecea: injecting prompt (5703 bytes)
+[runner] agent 98ec0715-8e89-4ce5-814b-38feec1cecea: prompt injected successfully
+351b8599548aa8127694cf860c49b53547187827
+[runner] start_check_agent: 3e5e7099-b554-498f-86cd-6b33539126b2 cwd=/home/cpo/aso2
+351b8599548aa8127694cf860c49b53547187827
+[runner] start_agent: ccd94a80-19e0-485f-a041-d91494d130ec plan=aso2-browser-homage task=5.4 driver=bob
+[runner] checkout_task_branch: switched to existing branchwork/aso2-browser-homage/5.4
+[runner] spawned session daemon (fork-parent pid=1991433) socket=/home/cpo/.branchwork-runner-sessions/ccd94a80-19e0-485f-a041-d91494d130ec.sock
+[runner] session daemon real pid=1991434 (fork-parent was 1991433)
+[runner] reaped zombie session daemon pid=1991433
+[runner] agent ccd94a80-19e0-485f-a041-d91494d130ec: detected readiness
+[runner] agent ccd94a80-19e0-485f-a041-d91494d130ec: injecting prompt (5703 bytes)
+[runner] agent ccd94a80-19e0-485f-a041-d91494d130ec: prompt injected successfully
+[runner] kill_agent: ccd94a80-19e0-485f-a041-d91494d130ec
+[runner] start_agent: 64cca602-36cc-45c3-8b55-6131dfa03534 plan=aso2-browser-homage task=5.5 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/5.5
+[runner] spawned session daemon (fork-parent pid=1992277) socket=/home/cpo/.branchwork-runner-sessions/64cca602-36cc-45c3-8b55-6131dfa03534.sock
+[runner] session daemon real pid=1992278 (fork-parent was 1992277)
+[runner] reaped zombie session daemon pid=1992277
+[runner] agent 64cca602-36cc-45c3-8b55-6131dfa03534: detected readiness
+[runner] agent 64cca602-36cc-45c3-8b55-6131dfa03534: injecting prompt (5789 bytes)
+[runner] agent 64cca602-36cc-45c3-8b55-6131dfa03534: prompt injected successfully
+351b8599548aa8127694cf860c49b53547187827
+f674be69db37058d7149531506093bd3013e1ac9
+f674be69db37058d7149531506093bd3013e1ac9
+f674be69db37058d7149531506093bd3013e1ac9
+[runner] start_agent: 9885e244-bca1-496f-8b99-1b339146c8d7 plan=aso2-browser-homage task=6.1 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/6.1
+[runner] spawned session daemon (fork-parent pid=2004317) socket=/home/cpo/.branchwork-runner-sessions/9885e244-bca1-496f-8b99-1b339146c8d7.sock
+[runner] session daemon real pid=2004318 (fork-parent was 2004317)
+[runner] reaped zombie session daemon pid=2004317
+[runner] agent 9885e244-bca1-496f-8b99-1b339146c8d7: detected readiness
+[runner] agent 9885e244-bca1-496f-8b99-1b339146c8d7: injecting prompt (5883 bytes)
+[runner] agent 9885e244-bca1-496f-8b99-1b339146c8d7: prompt injected successfully
+f674be69db37058d7149531506093bd3013e1ac9
+043c2a02a2c24e7622f05c294f76411a73f03a6d
+[runner] start_agent: 471db317-46f8-4a2a-a44f-dc4ade5cbf92 plan=aso2-browser-homage task=6.2 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/6.2
+[runner] spawned session daemon (fork-parent pid=2007988) socket=/home/cpo/.branchwork-runner-sessions/471db317-46f8-4a2a-a44f-dc4ade5cbf92.sock
+[runner] session daemon real pid=2007989 (fork-parent was 2007988)
+[runner] reaped zombie session daemon pid=2007988
+[runner] agent 471db317-46f8-4a2a-a44f-dc4ade5cbf92: detected readiness
+[runner] agent 471db317-46f8-4a2a-a44f-dc4ade5cbf92: injecting prompt (6089 bytes)
+[runner] agent 471db317-46f8-4a2a-a44f-dc4ade5cbf92: prompt injected successfully
+[runner] kill_agent: 471db317-46f8-4a2a-a44f-dc4ade5cbf92
+[runner] start_agent: 4b997bd4-f3b3-40d7-81fe-07b22ab51cf9 plan=aso2-browser-homage task=6.2 driver=bob
+[runner] checkout_task_branch: switched to existing branchwork/aso2-browser-homage/6.2
+[runner] spawned session daemon (fork-parent pid=2009719) socket=/home/cpo/.branchwork-runner-sessions/4b997bd4-f3b3-40d7-81fe-07b22ab51cf9.sock
+[runner] session daemon real pid=2009720 (fork-parent was 2009719)
+[runner] reaped zombie session daemon pid=2009719
+[runner] agent 4b997bd4-f3b3-40d7-81fe-07b22ab51cf9: detected readiness
+[runner] agent 4b997bd4-f3b3-40d7-81fe-07b22ab51cf9: injecting prompt (6089 bytes)
+[runner] agent 4b997bd4-f3b3-40d7-81fe-07b22ab51cf9: prompt injected successfully
+[runner] kill_agent: 4b997bd4-f3b3-40d7-81fe-07b22ab51cf9
+[runner] start_agent: 08c890da-f17f-4bbb-9afb-af9a08879b92 plan=aso2-browser-homage task=6.2 driver=bob
+[runner] checkout_task_branch: switched to existing branchwork/aso2-browser-homage/6.2
+[runner] spawned session daemon (fork-parent pid=2012576) socket=/home/cpo/.branchwork-runner-sessions/08c890da-f17f-4bbb-9afb-af9a08879b92.sock
+[runner] session daemon real pid=2012577 (fork-parent was 2012576)
+[runner] reaped zombie session daemon pid=2012576
+[runner] agent 08c890da-f17f-4bbb-9afb-af9a08879b92: detected readiness
+[runner] agent 08c890da-f17f-4bbb-9afb-af9a08879b92: injecting prompt (6089 bytes)
+[runner] agent 08c890da-f17f-4bbb-9afb-af9a08879b92: prompt injected successfully
+043c2a02a2c24e7622f05c294f76411a73f03a6d
+7049236206ee40cb9870b716067612cecf3ef3ae
+[runner] start_agent: 884f1ff7-6c92-4d61-89a0-c9c3b96d337a plan=aso2-browser-homage task=6.3 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/6.3
+[runner] spawned session daemon (fork-parent pid=2017182) socket=/home/cpo/.branchwork-runner-sessions/884f1ff7-6c92-4d61-89a0-c9c3b96d337a.sock
+[runner] session daemon real pid=2017183 (fork-parent was 2017182)
+[runner] reaped zombie session daemon pid=2017182
+[runner] agent 884f1ff7-6c92-4d61-89a0-c9c3b96d337a: detected readiness
+[runner] agent 884f1ff7-6c92-4d61-89a0-c9c3b96d337a: injecting prompt (6094 bytes)
+[runner] agent 884f1ff7-6c92-4d61-89a0-c9c3b96d337a: prompt injected successfully
+7049236206ee40cb9870b716067612cecf3ef3ae
+3d30fba4a01ee4e6f040032062ac1300cf360c0a
+[runner] start_agent: 6ff6970b-cbf6-470e-bc43-5f5c76e25cb0 plan=aso2-browser-homage task=6.4 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/6.4
+[runner] spawned session daemon (fork-parent pid=2026344) socket=/home/cpo/.branchwork-runner-sessions/6ff6970b-cbf6-470e-bc43-5f5c76e25cb0.sock
+[runner] session daemon real pid=2026345 (fork-parent was 2026344)
+[runner] reaped zombie session daemon pid=2026344
+[runner] agent 6ff6970b-cbf6-470e-bc43-5f5c76e25cb0: detected readiness
+[runner] agent 6ff6970b-cbf6-470e-bc43-5f5c76e25cb0: injecting prompt (6192 bytes)
+[runner] agent 6ff6970b-cbf6-470e-bc43-5f5c76e25cb0: prompt injected successfully
+[runner] kill_agent: 6ff6970b-cbf6-470e-bc43-5f5c76e25cb0
+[runner] start_agent: 25e2ccfc-dbde-4006-85be-b2518027abf0 plan=aso2-browser-homage task=6.4 driver=bob
+[runner] checkout_task_branch: switched to existing branchwork/aso2-browser-homage/6.4
+[runner] spawned session daemon (fork-parent pid=2028091) socket=/home/cpo/.branchwork-runner-sessions/25e2ccfc-dbde-4006-85be-b2518027abf0.sock
+[runner] session daemon real pid=2028092 (fork-parent was 2028091)
+[runner] reaped zombie session daemon pid=2028091
+[runner] agent 25e2ccfc-dbde-4006-85be-b2518027abf0: detected readiness
+[runner] agent 25e2ccfc-dbde-4006-85be-b2518027abf0: injecting prompt (6192 bytes)
+[runner] agent 25e2ccfc-dbde-4006-85be-b2518027abf0: prompt injected successfully
+[runner] kill_agent: 25e2ccfc-dbde-4006-85be-b2518027abf0
+[runner] start_agent: 2882e907-d719-49f2-aa43-b6d3aa1b61d7 plan=aso2-browser-homage task=6.4 driver=bob
+[runner] checkout_task_branch: switched to existing branchwork/aso2-browser-homage/6.4
+[runner] spawned session daemon (fork-parent pid=2030153) socket=/home/cpo/.branchwork-runner-sessions/2882e907-d719-49f2-aa43-b6d3aa1b61d7.sock
+[runner] session daemon real pid=2030154 (fork-parent was 2030153)
+[runner] reaped zombie session daemon pid=2030153
+[runner] agent 2882e907-d719-49f2-aa43-b6d3aa1b61d7: detected readiness
+[runner] agent 2882e907-d719-49f2-aa43-b6d3aa1b61d7: injecting prompt (6192 bytes)
+[runner] agent 2882e907-d719-49f2-aa43-b6d3aa1b61d7: prompt injected successfully
+3d30fba4a01ee4e6f040032062ac1300cf360c0a
+c8ca56b32ae45aa2a3d6639028449b6d78fae23c
+[runner] start_agent: 848a2dbc-629e-490b-be07-676b5f383016 plan=aso2-browser-homage task=11.1 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/11.1
+[runner] spawned session daemon (fork-parent pid=2036569) socket=/home/cpo/.branchwork-runner-sessions/848a2dbc-629e-490b-be07-676b5f383016.sock
+[runner] session daemon real pid=2036570 (fork-parent was 2036569)
+[runner] reaped zombie session daemon pid=2036569
+[runner] agent 848a2dbc-629e-490b-be07-676b5f383016: detected readiness
+[runner] agent 848a2dbc-629e-490b-be07-676b5f383016: injecting prompt (6275 bytes)
+[runner] agent 848a2dbc-629e-490b-be07-676b5f383016: prompt injected successfully
+c8ca56b32ae45aa2a3d6639028449b6d78fae23c
+4ce5227ffcdb6248fc0f98fbdd6b5dae69fe1008
+[runner] start_agent: 36c4237c-455a-4bb9-82a9-19ff554dbb2f plan=aso2-browser-homage task=11.2 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/11.2
+[runner] spawned session daemon (fork-parent pid=2042170) socket=/home/cpo/.branchwork-runner-sessions/36c4237c-455a-4bb9-82a9-19ff554dbb2f.sock
+[runner] session daemon real pid=2042171 (fork-parent was 2042170)
+[runner] reaped zombie session daemon pid=2042170
+[runner] agent 36c4237c-455a-4bb9-82a9-19ff554dbb2f: detected readiness
+[runner] agent 36c4237c-455a-4bb9-82a9-19ff554dbb2f: injecting prompt (6283 bytes)
+[runner] agent 36c4237c-455a-4bb9-82a9-19ff554dbb2f: prompt injected successfully
+[runner] kill_agent: 36c4237c-455a-4bb9-82a9-19ff554dbb2f
+[runner] start_agent: e2c996c3-d06a-4243-9228-db7b30dc44fc plan=aso2-browser-homage task=7.1 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/7.1
+[runner] spawned session daemon (fork-parent pid=2338218) socket=/home/cpo/.branchwork-runner-sessions/e2c996c3-d06a-4243-9228-db7b30dc44fc.sock
+[runner] session daemon real pid=2338219 (fork-parent was 2338218)
+[runner] reaped zombie session daemon pid=2338218
+[runner] agent e2c996c3-d06a-4243-9228-db7b30dc44fc: detected readiness
+[runner] agent e2c996c3-d06a-4243-9228-db7b30dc44fc: injecting prompt (6530 bytes)
+[runner] agent e2c996c3-d06a-4243-9228-db7b30dc44fc: prompt injected successfully
+4ce5227ffcdb6248fc0f98fbdd6b5dae69fe1008
+44da1bdee0f5a937d42a1434fc3efda51d86f43d
+[runner] start_agent: 14f9ff58-4205-41c8-ae40-7618b6639168 plan=aso2-browser-homage task=7.2 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/7.2
+[runner] spawned session daemon (fork-parent pid=2343041) socket=/home/cpo/.branchwork-runner-sessions/14f9ff58-4205-41c8-ae40-7618b6639168.sock
+[runner] session daemon real pid=2343042 (fork-parent was 2343041)
+[runner] reaped zombie session daemon pid=2343041
+[runner] agent 14f9ff58-4205-41c8-ae40-7618b6639168: detected readiness
+[runner] agent 14f9ff58-4205-41c8-ae40-7618b6639168: injecting prompt (6523 bytes)
+[runner] agent 14f9ff58-4205-41c8-ae40-7618b6639168: prompt injected successfully
+44da1bdee0f5a937d42a1434fc3efda51d86f43d
+48d3c7417f0366094c47774060d986f309716877
+[runner] start_agent: c9da3f6b-a344-4475-9df8-4e0c12d85c70 plan=aso2-browser-homage task=7.3 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/7.3
+[runner] spawned session daemon (fork-parent pid=2346756) socket=/home/cpo/.branchwork-runner-sessions/c9da3f6b-a344-4475-9df8-4e0c12d85c70.sock
+[runner] session daemon real pid=2346757 (fork-parent was 2346756)
+[runner] reaped zombie session daemon pid=2346756
+[runner] agent c9da3f6b-a344-4475-9df8-4e0c12d85c70: detected readiness
+[runner] agent c9da3f6b-a344-4475-9df8-4e0c12d85c70: injecting prompt (6601 bytes)
+[runner] agent c9da3f6b-a344-4475-9df8-4e0c12d85c70: prompt injected successfully
+48d3c7417f0366094c47774060d986f309716877
+7cc0ae5f4c64d52b2c9ffc4c7efde1785df15993
+[runner] start_agent: 5f897109-b2e0-4670-ba41-25801c42fef6 plan=aso2-browser-homage task=7.4 driver=bob
+[runner] checkout_task_branch: created branchwork/aso2-browser-homage/7.4
+[runner] spawned session daemon (fork-parent pid=2353622) socket=/home/cpo/.branchwork-runner-sessions/5f897109-b2e0-4670-ba41-25801c42fef6.sock
+[runner] session daemon real pid=2353623 (fork-parent was 2353622)
+[runner] reaped zombie session daemon pid=2353622
+[runner] agent 5f897109-b2e0-4670-ba41-25801c42fef6: detected readiness
+[runner] agent 5f897109-b2e0-4670-ba41-25801c42fef6: injecting prompt (6728 bytes)
+[runner] agent 5f897109-b2e0-4670-ba41-25801c42fef6: prompt injected successfully

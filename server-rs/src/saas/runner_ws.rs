@@ -116,6 +116,11 @@ pub struct ConnectedRunner {
     /// matching entry when the runner's reply arrives. Late replies (after
     /// timeout or reconnect) find nothing waiting and are silently dropped.
     pub pending: Arc<Mutex<HashMap<String, oneshot::Sender<RunnerResponse>>>>,
+    /// The public server URL this runner connected to (derived from the
+    /// WebSocket connection). Used to generate correct MCP/hook URLs for
+    /// agents spawned on this runner. Format: "https://branchwork.dev" or
+    /// "http://localhost:3100" (no trailing slash).
+    pub server_url: String,
 }
 
 /// Registry of currently connected runners. Keyed by runner_id.
@@ -194,14 +199,21 @@ pub async fn runner_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Query(query): Query<RunnerWsQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let Some((runner_name, org_id, _claimed)) = validate_runner_token(&state.db, &query.token)
     else {
         return (axum::http::StatusCode::UNAUTHORIZED, "invalid_token").into_response();
     };
 
+    // Resolve the public server URL from headers so we can pass it to the
+    // runner. This is the URL agents on this runner will use for MCP/hooks.
+    let server_url = crate::saas::install_runner::effective_public_url(&headers);
+
     let token_hash = sha256_hex(&query.token);
-    ws.on_upgrade(move |socket| handle_runner_ws(socket, state, runner_name, org_id, token_hash))
+    ws.on_upgrade(move |socket| {
+        handle_runner_ws(socket, state, runner_name, org_id, token_hash, server_url)
+    })
 }
 
 /// Per-runner WebSocket event loop.
@@ -211,6 +223,7 @@ async fn handle_runner_ws(
     runner_name: String,
     org_id: String,
     token_hash: String,
+    server_url: String,
 ) {
     let (mut ws_sink, mut ws_stream) = {
         use futures_util::StreamExt;
@@ -313,6 +326,7 @@ async fn handle_runner_ws(
                             version: None,
                             drivers: None,
                             pending: Arc::new(Mutex::new(HashMap::new())),
+                            server_url: server_url.clone(),
                         },
                     );
 
@@ -742,19 +756,19 @@ async fn handle_runner_message(
                 // This ensures the UI shows the task as "done" even when auto-mode is
                 // disabled. Auto-mode will overwrite this with source='auto' later if
                 // enabled, but manual completion needs this immediate update.
-                if status == "completed" && stop_reason.is_none() {
-                    if let Some((ref plan, ref task)) = plan_task {
-                        conn.execute(
-                            "INSERT INTO task_status (plan_name, task_number, status, source, org_id)
-                             VALUES (?1, ?2, 'done', 'manual', ?3)
-                             ON CONFLICT(plan_name, task_number) DO UPDATE SET
-                               status = 'done',
-                               source = 'manual',
-                               updated_at = datetime('now')",
-                            params![plan, task, org_id],
-                        )
-                        .ok();
-                    }
+                if status == "completed" && stop_reason.is_none()
+                    && let Some((ref plan, ref task)) = plan_task
+                {
+                    conn.execute(
+                        "INSERT INTO task_status (plan_name, task_number, status, source, org_id)
+                         VALUES (?1, ?2, 'done', 'manual', ?3)
+                         ON CONFLICT(plan_name, task_number) DO UPDATE SET
+                           status = 'done',
+                           source = 'manual',
+                           updated_at = datetime('now')",
+                        params![plan, task, org_id],
+                    )
+                    .ok();
                 }
 
                 // Org budget enforcement after cost update.

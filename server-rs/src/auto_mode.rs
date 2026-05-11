@@ -1774,6 +1774,7 @@ mod tests {
                 version: None,
                 drivers: None,
                 pending,
+                server_url: "http://localhost:3100".to_string(),
             },
         );
         echo_rx

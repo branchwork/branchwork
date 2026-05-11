@@ -1,0 +1,17 @@
+{"id":"dd9d6dac-ff3e-40fd-aff9-2e3cf51173dd","ts":"2026-05-11T09:03:39.252Z","path":"/home/cpo/branchwork/server-rs/src/agents/spawn_ops.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"cf0f2c9c-c02b-4c2c-a5f8-b9f8c4350cc0","ts":"2026-05-11T09:09:12.806Z","path":"/home/cpo/branchwork/server-rs/src/agents/spawn_ops.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"ca86879c-9a2f-484a-b69f-670ee2926031","ts":"2026-05-11T09:11:57.300Z","path":"/home/cpo/branchwork/server-rs/src/agents/spawn_ops.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"072c470e-92ce-45be-baec-6042ab6d1978","ts":"2026-05-11T09:13:54.788Z","path":"/home/cpo/branchwork/server-rs/src/saas/runner_ws.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"c1c4e033-cfd2-4a66-8bc9-892870bff3ae","ts":"2026-05-11T09:14:31.575Z","path":"/home/cpo/branchwork/server-rs/src/saas/runner_ws.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"08129402-faf4-44a6-a45b-a298a13c6711","ts":"2026-05-11T09:14:38.086Z","path":"/home/cpo/branchwork/server-rs/src/saas/runner_ws.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"0ab3c21f-2913-4e24-9c40-2adf0ef1bd8c","ts":"2026-05-11T09:14:44.313Z","path":"/home/cpo/branchwork/server-rs/src/saas/runner_ws.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"a6eefb25-c675-489a-95fb-eb55bc88be78","ts":"2026-05-11T09:15:11.668Z","path":"/home/cpo/branchwork/server-rs/src/agents/spawn_ops.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"78081ab8-38e8-470b-9057-8a49f5a62ef2","ts":"2026-05-11T09:15:40.424Z","path":"/home/cpo/branchwork/server-rs/src/agents/spawn_ops.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"72cf1294-f289-400a-bc8c-720686783cb5","ts":"2026-05-11T09:18:25.648Z","path":"/home/cpo/branchwork/server-rs/src/agents/spawn_ops.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"afede527-3562-4cb9-8493-6817ce4631b8","ts":"2026-05-11T09:18:37.117Z","path":"/home/cpo/branchwork/server-rs/src/api/runners.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"14be2e69-b736-4822-9b19-dba54542e8fc","ts":"2026-05-11T09:18:47.695Z","path":"/home/cpo/branchwork/server-rs/src/auto_mode.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"ca1c86e6-0546-4313-b474-c70828ac3c4d","ts":"2026-05-11T09:18:57.955Z","path":"/home/cpo/branchwork/server-rs/src/ci.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"847e6d9a-3794-44b2-9fbc-47f9792ade38","ts":"2026-05-11T09:19:11.900Z","path":"/home/cpo/branchwork/server-rs/src/saas/dispatch.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"fbd3ac1b-9a64-4ca8-854e-6495105238ea","ts":"2026-05-11T09:19:22.591Z","path":"/home/cpo/branchwork/server-rs/src/saas/dispatch.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"4ffe2913-5c84-47f0-8b05-473f0c41b75e","ts":"2026-05-11T09:19:33.439Z","path":"/home/cpo/branchwork/server-rs/src/saas/runner_rpc.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}
+{"id":"55795c44-c067-4cee-8219-9623e6a49908","ts":"2026-05-11T09:20:12.195Z","path":"/home/cpo/branchwork/server-rs/src/saas/runner_ws.rs","version":"1.0.0","taskID":"1deedf5c-ea4a-445d-937a-443138676a07"}

@@ -793,6 +793,7 @@ mod tests {
                 version: None,
                 drivers: None,
                 pending,
+                server_url: "http://localhost:3100".to_string(),
             },
         );
     }
@@ -1356,6 +1357,7 @@ phases:
                 version: None,
                 drivers: Some(cached),
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                server_url: "http://localhost:3100".to_string(),
             },
         );
 
