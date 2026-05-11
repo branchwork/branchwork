@@ -721,6 +721,11 @@ impl AgentDriver for BobDriver {
         if opts.skip_permissions {
             cmd.push("--yolo".to_string());
         }
+        // Bob Shell requires --allowed-mcp-server-names when MCP config is provided
+        if opts.mcp_config_path.is_some() {
+            cmd.push("--allowed-mcp-server-names".to_string());
+            cmd.push("branchwork".to_string());
+        }
         cmd
     }
 
@@ -770,10 +775,19 @@ impl AgentDriver for BobDriver {
         AuthStatus::Oauth { account: None }
     }
 
-    fn mcp_config_json(&self, _mcp_url: &str) -> Option<String> {
-        // Bob Shell doesn't currently support MCP config files.
-        // Return None so the spawn path doesn't try to pass --mcp-config.
-        None
+    fn mcp_config_json(&self, mcp_url: &str) -> Option<String> {
+        // Bob Shell uses the same .mcp.json schema as Claude Code:
+        // top-level `mcpServers` map with HTTP transport entries.
+        // Requires --allowed-mcp-server-names flag in spawn_args.
+        let cfg = serde_json::json!({
+            "mcpServers": {
+                "branchwork": {
+                    "type": "http",
+                    "url": mcp_url,
+                }
+            }
+        });
+        Some(cfg.to_string())
     }
 }
 
