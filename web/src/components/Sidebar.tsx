@@ -5,7 +5,7 @@ import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
 import { useUiStore } from "../stores/ui-store.js";
-import { postJson } from "../api.js";
+import { fetchJson, postJson } from "../api.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
 import { isPlanDone } from "../lib/predicates.js";
@@ -126,7 +126,10 @@ export function Sidebar() {
           <h1 className="text-lg font-bold tracking-tight">
             Branch<span className="text-indigo-400">work</span>
           </h1>
-          <p className="text-xs text-gray-500 mt-0.5">Claude Code Dashboard</p>
+          <div className="flex items-baseline justify-between mt-0.5">
+            <p className="text-xs text-gray-500">Claude Code Dashboard</p>
+            <VersionBadge />
+          </div>
         </Link>
 
         {/* Nav */}
@@ -534,5 +537,31 @@ function DriverStatusList() {
         );
       })}
     </div>
+  );
+}
+
+/// Displays the server version from /api/health. Fetches once on mount
+/// and caches the result. Renders nothing on error so a failed fetch
+/// doesn't break the sidebar.
+function VersionBadge() {
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchJson<{ version?: string }>("/api/health")
+      .then((data) => setVersion(data.version ?? null))
+      .catch(() => {
+        // Silently ignore — version is nice-to-have, not critical
+      });
+  }, []);
+
+  if (!version) return null;
+
+  return (
+    <span
+      className="text-[9px] text-gray-600 font-mono"
+      title={`Server version ${version}`}
+    >
+      v{version}
+    </span>
   );
 }

@@ -151,12 +151,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         skip_permissions: boolean;
         webhook_url: string | null;
         plan_archive_retention_days?: number;
+        default_driver?: string;
       }>("/api/settings");
       set({
         effort: data.effort,
         skipPermissions: data.skip_permissions,
         webhookUrl: data.webhook_url ?? null,
         planArchiveRetentionDays: data.plan_archive_retention_days ?? 30,
+        defaultDriver: data.default_driver ?? "claude",
         loaded: true,
         lastSettingsFetchedAt: Date.now(),
       });

@@ -4,6 +4,7 @@ import { useSettingsStore, type EffortLevel } from "../stores/settings-store.js"
 import { useAuthStore } from "../stores/auth-store.js";
 import { useOrgStore } from "../stores/org-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
+import { putJson } from "../api.js";
 import { Banner } from "./ui/Banner.js";
 import { Button } from "./ui/Button.js";
 import { Tabs } from "./ui/Tabs.js";
@@ -260,6 +261,16 @@ function SettingsTab() {
           ))}
         </div>
         <PerRunnerOverrideNote />
+
+      <Section
+        title="Default agent driver"
+        serverWide
+        description="Default AI driver used when starting agents. Can be overridden per-task, per-phase, or per-plan."
+      >
+        <DefaultDriverSelector />
+        <PerRunnerOverrideNote />
+      </Section>
+
       </Section>
 
       <Section
@@ -556,5 +567,72 @@ function PerRunnerOverrideNote() {
       </a>
       .
     </p>
+  );
+}
+
+/// Dropdown to select the default agent driver. Reads from the settings
+/// store's `drivers` array (populated by `fetchDrivers`) and persists
+/// the selection via `PUT /api/settings`.
+function DefaultDriverSelector() {
+  const drivers = useSettingsStore((s) => s.drivers);
+  const defaultDriver = useSettingsStore((s) => s.defaultDriver);
+  const [draft, setDraft] = useState(defaultDriver);
+  const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDraft(defaultDriver);
+  }, [defaultDriver]);
+
+  const dirty = draft !== defaultDriver;
+
+  async function save() {
+    if (!dirty) return;
+    setStatus("saving");
+    setError(null);
+    try {
+      await putJson("/api/settings", { default_driver: draft });
+      useSettingsStore.setState({ defaultDriver: draft });
+      setStatus("saved");
+      setTimeout(() => setStatus("idle"), 2000);
+    } catch (e) {
+      setStatus("error");
+      setError(String(e));
+    }
+  }
+
+  return (
+    <div>
+      <div className="flex gap-2 items-center">
+        <select
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          disabled={status === "saving"}
+          className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-indigo-600 disabled:opacity-60"
+          data-testid="default-driver-select"
+        >
+          {drivers.length === 0 ? (
+            <option value="claude">claude (loading...)</option>
+          ) : (
+            drivers.map((d) => (
+              <option key={d.name} value={d.name}>
+                {d.name}
+              </option>
+            ))
+          )}
+        </select>
+        <Button
+          onClick={save}
+          disabled={!dirty || status === "saving"}
+          loading={status === "saving"}
+          variant="primary"
+          size="sm"
+        >
+          {status === "saving" ? "Saving" : "Save"}
+        </Button>
+      </div>
+      {status === "saved" && <p className="text-[11px] text-emerald-400 mt-1.5">Saved.</p>}
+      {status === "error" && error && <Banner className="mt-1.5">{error}</Banner>}
+    </div>
   );
 }
