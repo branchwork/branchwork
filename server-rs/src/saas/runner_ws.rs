@@ -743,6 +743,11 @@ async fn handle_runner_message(
                 })
             };
 
+            // Track whether the task_status flip should fire — computed
+            // once here so both the DB write (inside the lock) and the
+            // broadcast (outside) agree.
+            let task_completed_now =
+                status == "completed" && stop_reason.is_none() && plan_task.is_some();
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
@@ -752,19 +757,30 @@ async fn handle_runner_message(
                 )
                 .ok();
 
-                // Mark task as done in task_status when agent completes successfully.
-                // This ensures the UI shows the task as "done" even when auto-mode is
-                // disabled. Auto-mode will overwrite this with source='auto' later if
-                // enabled, but manual completion needs this immediate update.
-                if status == "completed"
-                    && stop_reason.is_none()
-                    && let Some((ref plan, ref task)) = plan_task
-                {
+                // Mark task as `completed` in task_status when the agent finishes
+                // cleanly. Without this the task card sticks at `in_progress`
+                // after the agent exits, even though the agent row has flipped
+                // to `completed` (bob's original fix used `'done'` here, which
+                // isn't in the schema's valid-status set — `set_task_status`
+                // validates against `['pending', 'in_progress', 'completed',
+                // 'failed', 'skipped', 'checking']`, the auto-advance
+                // `done_set` filter at `mod.rs:1123` only counts
+                // `IN ('completed', 'skipped')`, and the dashboard's
+                // STATUS_CONFIG falls through to the default badge for any
+                // unknown value. Using `'completed'` keeps the manual and
+                // auto-mode paths consistent.
+                //
+                // Auto-mode overwrites with `source='auto'` later when its
+                // own merge → CI → advance loop fires; manual completion
+                // gets this immediate write so the task card unlocks
+                // without waiting for the next /api/plans poll.
+                if task_completed_now {
+                    let (plan, task) = plan_task.as_ref().unwrap();
                     conn.execute(
                         "INSERT INTO task_status (plan_name, task_number, status, source, org_id)
-                         VALUES (?1, ?2, 'done', 'manual', ?3)
+                         VALUES (?1, ?2, 'completed', 'manual', ?3)
                          ON CONFLICT(plan_name, task_number) DO UPDATE SET
-                           status = 'done',
+                           status = 'completed',
                            source = 'manual',
                            updated_at = datetime('now')",
                         params![plan, task, org_id],
@@ -786,6 +802,22 @@ async fn handle_runner_message(
                     }
                 }
             }
+            // T5.18: notify the dashboard of the task_status flip — `agent_stopped`
+            // alone doesn't refetch /api/plans, so without this broadcast the
+            // task card stays at `in_progress` until the next plan refetch.
+            if task_completed_now {
+                let (plan, task) = plan_task.as_ref().unwrap();
+                broadcast_event(
+                    &state.broadcast_tx,
+                    "task_status_changed",
+                    serde_json::json!({
+                        "plan_name": plan,
+                        "task_number": task,
+                        "status": "completed",
+                    }),
+                );
+            }
+
             broadcast_event(
                 &state.broadcast_tx,
                 "agent_stopped",
