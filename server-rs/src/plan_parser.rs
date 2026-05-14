@@ -615,6 +615,22 @@ pub fn parse_plan_file(file_path: &Path) -> std::io::Result<ParsedPlan> {
         _ => parse_plan_markdown(&raw, name, &file_path.to_string_lossy()),
     };
 
+    // Sort tasks within each phase by their numeric components. The on-disk
+    // YAML can drift out of order when a user appends a task (e.g. `3.4`
+    // inserted at the bottom of a phase that already contained `3.5`/`3.6`);
+    // until T5.21 the dashboard rendered file order verbatim — so `3.6`
+    // shows before `3.4` — and `try_auto_advance` walked the same file
+    // order, so the "next ready task" was whichever appeared first in the
+    // YAML rather than the lowest-numbered. Sorting at parse time gives the
+    // UI a stable numeric ordering and aligns the auto-advance scan with
+    // user expectation. We do not touch on-disk order; `serialize_plan_yaml`
+    // still round-trips whatever was written.
+    for phase in &mut plan.phases {
+        phase
+            .tasks
+            .sort_by(|a, b| cmp_task_numbers(&a.number, &b.number));
+    }
+
     let meta = std::fs::metadata(file_path)?;
 
     // YAML may provide its own created_at; fall back to file metadata
@@ -624,6 +640,35 @@ pub fn parse_plan_file(file_path: &Path) -> std::io::Result<ParsedPlan> {
     plan.modified_at = file_time_iso(&meta, false);
 
     Ok(plan)
+}
+
+/// Compare two task numbers (e.g. `"3.10"` vs `"3.4"`) by their
+/// dotted-decimal components rather than lexicographically. A numeric
+/// segment beats a non-numeric one tie-broken by lex compare on the raw
+/// string; identical-length prefixes fall through to the shorter string
+/// sorting first (`"3.4"` before `"3.4.1"`). Returns the same result as
+/// `Vec::sort_by` expects.
+fn cmp_task_numbers(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut ai = a.split('.');
+    let mut bi = b.split('.');
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(av), Some(bv)) => match (av.parse::<u32>(), bv.parse::<u32>()) {
+                (Ok(x), Ok(y)) => match x.cmp(&y) {
+                    Ordering::Equal => continue,
+                    o => return o,
+                },
+                _ => match av.cmp(bv) {
+                    Ordering::Equal => continue,
+                    o => return o,
+                },
+            },
+        }
+    }
 }
 
 /// Find a plan file by name, checking yaml/yml/md extensions in priority order.
@@ -708,6 +753,79 @@ pub fn list_plans(plans_dir: &Path) -> Vec<PlanSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmp_task_numbers_natural_order() {
+        use std::cmp::Ordering;
+        // 3.4 sorts before 3.10 — the bug that motivated T5.21.
+        assert_eq!(cmp_task_numbers("3.4", "3.10"), Ordering::Less);
+        assert_eq!(cmp_task_numbers("3.10", "3.4"), Ordering::Greater);
+        // Same-level numeric compare.
+        assert_eq!(cmp_task_numbers("3.4", "3.6"), Ordering::Less);
+        assert_eq!(cmp_task_numbers("3.6", "3.4"), Ordering::Greater);
+        // Shorter prefix sorts first (`3.4` < `3.4.1`).
+        assert_eq!(cmp_task_numbers("3.4", "3.4.1"), Ordering::Less);
+        assert_eq!(cmp_task_numbers("3.4.1", "3.4"), Ordering::Greater);
+        // Equality.
+        assert_eq!(cmp_task_numbers("3.4", "3.4"), Ordering::Equal);
+        // Cross-phase.
+        assert_eq!(cmp_task_numbers("3.1", "4.1"), Ordering::Less);
+    }
+
+    #[test]
+    fn parse_plan_file_sorts_phase_tasks_naturally() {
+        // Repro of the reglyze-q2-2026-sprint phase 3 layout: tasks
+        // physically appear in the YAML as 3.6, 3.7, 3.4, 3.5, 3.3 —
+        // pre-T5.21 the parser preserved that order, so the dashboard
+        // rendered 3.6 before 3.4 and `try_auto_advance` walked 3.6 first.
+        let yaml = r#"
+title: ord test
+context: ""
+phases:
+  - number: 3
+    title: phase 3
+    description: ""
+    tasks:
+      - number: "3.6"
+        title: six
+        description: ""
+        file_paths: []
+        acceptance: ""
+        dependencies: []
+        produces_commit: true
+      - number: "3.7"
+        title: seven
+        description: ""
+        file_paths: []
+        acceptance: ""
+        dependencies: []
+        produces_commit: true
+      - number: "3.4"
+        title: four
+        description: ""
+        file_paths: []
+        acceptance: ""
+        dependencies: []
+        produces_commit: true
+      - number: "3.3"
+        title: three
+        description: ""
+        file_paths: []
+        acceptance: ""
+        dependencies: []
+        produces_commit: true
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let plan = parse_plan_file(&path).unwrap();
+        let nums: Vec<_> = plan.phases[0]
+            .tasks
+            .iter()
+            .map(|t| t.number.as_str())
+            .collect();
+        assert_eq!(nums, vec!["3.3", "3.4", "3.6", "3.7"]);
+    }
 
     #[test]
     fn phase_step_format() {
