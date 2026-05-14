@@ -1418,15 +1418,18 @@ pub async fn try_auto_advance(
         Err(_) => return,
     };
 
-    // Find the phase that owns the just-completed task.
-    let current_phase = match plan
+    // Find the phase that owns the just-completed task, and its index in
+    // `plan.phases` (T5.19 uses the index to limit the intra-phase scan
+    // to phases AT-OR-BEFORE the current one — see the scan loop below).
+    let current_phase_idx = match plan
         .phases
         .iter()
-        .find(|p| p.tasks.iter().any(|t| t.number == completed_task_number))
+        .position(|p| p.tasks.iter().any(|t| t.number == completed_task_number))
     {
-        Some(p) => p,
+        Some(i) => i,
         None => return,
     };
+    let current_phase = &plan.phases[current_phase_idx];
 
     // Snapshot all task statuses for this plan so we can decide locally.
     let status_map: HashMap<String, String> = {
@@ -1465,51 +1468,66 @@ pub async fn try_auto_advance(
             .unwrap_or_else(|| std::env::current_dir().unwrap())
     };
 
-    // Intra-phase scan: are any tasks in the *current* phase newly ready
-    // (pending/failed with all deps satisfied)? If so, spawn them and
-    // broadcast `task_advanced` — no phase boundary crossed.
-    let intra_ready: Vec<&PlanTask> = current_phase
-        .tasks
-        .iter()
-        .filter(|t| {
-            let status = status_map
-                .get(&t.number)
-                .map(String::as_str)
-                .unwrap_or("pending");
-            (status == "pending" || status == "failed")
-                && t.dependencies.iter().all(|d| done_set.contains(d))
-        })
-        .collect();
+    // Intra-phase scan: are any tasks in the current phase — OR any
+    // earlier phase — newly ready (pending/failed with all deps
+    // satisfied)? If so, spawn them and broadcast `task_advanced`.
+    //
+    // T5.19: pre-T5.19 the scan was limited to `current_phase.tasks`,
+    // so tasks the user added to an EARLIER phase after auto-mode had
+    // already advanced past it were never picked up. User saw it
+    // directly: plan in phase 3 → user adds a task to phase 2 →
+    // ignored. Walking phases `[0..=current_phase_idx]` catches the
+    // newly-pending earlier-phase tasks without spawning anything
+    // ahead of the current phase boundary (future phases are still
+    // gated by `phase_done` + `spawn_next_phase_tasks` below).
+    let mut total_spawned: Vec<String> = Vec::new();
+    for phase in &plan.phases[..=current_phase_idx] {
+        let ready: Vec<&PlanTask> = phase
+            .tasks
+            .iter()
+            .filter(|t| {
+                let status = status_map
+                    .get(&t.number)
+                    .map(String::as_str)
+                    .unwrap_or("pending");
+                (status == "pending" || status == "failed")
+                    && t.dependencies.iter().all(|d| done_set.contains(d))
+            })
+            .collect();
 
-    if !intra_ready.is_empty() {
+        if ready.is_empty() {
+            continue;
+        }
+
         let spawned = spawn_ready_tasks(
             &registry,
             &plans_dir,
             &plan,
-            current_phase,
-            &intra_ready,
+            phase,
+            &ready,
             effort,
             port,
             max_budget_usd,
             &work_dir,
         )
         .await;
+        total_spawned.extend(spawned);
+    }
 
+    if !total_spawned.is_empty() {
         // `task_advanced` only fires if we actually spawned at least one
-        // task. If every `intra_ready` candidate lost the `claim_task`
-        // race (concurrent auto-advance trigger), stay quiet — the other
-        // trigger already broadcast.
-        if !spawned.is_empty() {
-            broadcast_event(
-                &registry.broadcast_tx,
-                "task_advanced",
-                serde_json::json!({
-                    "plan": plan_name,
-                    "from_task": completed_task_number,
-                    "to_tasks": spawned,
-                }),
-            );
-        }
+        // task. If every candidate lost the `claim_task` race (concurrent
+        // auto-advance trigger), stay quiet — the other trigger already
+        // broadcast.
+        broadcast_event(
+            &registry.broadcast_tx,
+            "task_advanced",
+            serde_json::json!({
+                "plan": plan_name,
+                "from_task": completed_task_number,
+                "to_tasks": total_spawned,
+            }),
+        );
         return;
     }
 
