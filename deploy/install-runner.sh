@@ -57,7 +57,13 @@ if [ -z "$TOKEN" ]; then
     exit 2
 fi
 
-if [ "$SAAS_URL" = "__SAAS_URL__" ]; then
+# Sentinel for "the server forgot to substitute the SAAS_URL placeholder".
+# Built from three concatenated string literals so this exact value never
+# appears as a contiguous run of bytes in the on-wire script — that's how
+# we keep render_install_script's blanket `.replace("__SAAS_URL__", url)`
+# from clobbering the check itself (the T5.22 regression).
+_UNSUBSTITUTED="__""SAAS_URL""__"
+if [ "$SAAS_URL" = "$_UNSUBSTITUTED" ]; then
     err "this script was not fetched from a Branchwork dashboard"
     note "set BRANCHWORK_SAAS_URL or run the curl command from the /runners page"
     exit 2

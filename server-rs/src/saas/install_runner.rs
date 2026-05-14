@@ -230,6 +230,53 @@ mod tests {
         );
     }
 
+    /// Pre-T5.22 regression: the unsubstituted-script check on line 60
+    /// of install-runner.sh literally compared `$SAAS_URL` to
+    /// `__SAAS_URL__`, so after `render_install_script` rewrote *every*
+    /// occurrence of the placeholder, the comparison became
+    /// `"$saas_url" = "$saas_url"` — always true, and the rendered
+    /// script always errored out with "this script was not fetched from
+    /// a Branchwork dashboard". The fix splits the sentinel literal into
+    /// three concatenated shell strings (`"__""SAAS_URL""__"`) so the
+    /// contiguous placeholder appears only in the assignment on line 42,
+    /// not in the check. This test pins both halves of the invariant:
+    ///   (a) the rendered script must substitute the line-42 default to
+    ///       the configured public URL, and
+    ///   (b) the rendered script must NOT contain a literal comparison
+    ///       to that same URL value (the post-T5.22 sentinel is built at
+    ///       shell runtime from the concat'd pieces, not baked in).
+    #[test]
+    fn render_install_script_leaves_sentinel_check_intact() {
+        let url = "https://branchwork.dev";
+        let rendered = render_install_script(INSTALL_SCRIPT_TEMPLATE, url);
+        assert!(
+            rendered.contains(&format!("SAAS_URL=\"${{BRANCHWORK_SAAS_URL:-{url}}}\"")),
+            "line-42 default must be substituted to the configured URL"
+        );
+        // The post-T5.22 sentinel is built from three string literals at
+        // shell-runtime so the contiguous placeholder is NOT in the
+        // rendered output anywhere except the line-42 default value.
+        let occurrences = rendered.matches(SAAS_URL_PLACEHOLDER).count();
+        assert_eq!(
+            occurrences, 0,
+            "no contiguous {SAAS_URL_PLACEHOLDER} should remain after render — got {occurrences}"
+        );
+        // The runtime concat MUST still be present, otherwise the
+        // sentinel check is gone entirely and someone running the raw
+        // file from git would silently proceed with a literal
+        // `__SAAS_URL__` as SAAS_URL.
+        assert!(
+            rendered.contains(r#"_UNSUBSTITUTED="__""SAAS_URL""__""#),
+            "runtime-concat sentinel must survive in the rendered script"
+        );
+        // And the tautology must be gone: `"$SAAS_URL" = "<url>"` would
+        // mean we've reintroduced the original bug.
+        assert!(
+            !rendered.contains(&format!("[ \"$SAAS_URL\" = \"{url}\" ]")),
+            "rendered script must not compare $SAAS_URL to the substituted URL — that's the T5.22 bug"
+        );
+    }
+
     #[test]
     fn build_install_command_quotes_token() {
         // A future token format with shell metacharacters (& | ;) would
