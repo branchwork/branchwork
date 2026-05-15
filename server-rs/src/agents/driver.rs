@@ -573,6 +573,14 @@ impl CodexDriver {
     pub const fn new() -> Self {
         Self
     }
+
+    fn installed_auth_status(&self) -> AuthStatus {
+        // Codex handles OpenAI account auth through its interactive OAuth
+        // flow when the CLI starts. Do not gate Branchwork's Start button on
+        // OPENAI_API_KEY: users without an API key must still be able to
+        // launch Codex and complete sign-in in the task terminal.
+        AuthStatus::Oauth { account: None }
+    }
 }
 
 /// Line-anchored prompt marker for codex / gemini REPLs. Both CLIs render a
@@ -621,17 +629,7 @@ impl AgentDriver for CodexDriver {
         if !binary_on_path(self.binary()) {
             return AuthStatus::NotInstalled;
         }
-        if std::env::var("OPENAI_API_KEY")
-            .ok()
-            .is_some_and(|v| !v.trim().is_empty())
-        {
-            return AuthStatus::ApiKey;
-        }
-        AuthStatus::Unauthenticated {
-            help: "Set `OPENAI_API_KEY` and restart Branchwork, or sign in by \
-                   running `codex` once in a terminal."
-                .into(),
-        }
+        self.installed_auth_status()
     }
 }
 
@@ -1303,6 +1301,16 @@ Tokens: 200 sent, 75 received. Cost: $0.0150 message, $0.0250 session.
         assert_eq!(v.status, "completed");
         let v = GeminiDriver::new().parse_verdict(output).unwrap();
         assert_eq!(v.reason, "ok");
+    }
+
+    #[test]
+    fn codex_auth_status_does_not_require_openai_api_key_when_binary_exists() {
+        let driver = CodexDriver::new();
+        let status = driver.installed_auth_status();
+        assert!(
+            matches!(status, AuthStatus::Oauth { account: None }),
+            "codex must not report unauthenticated just because OPENAI_API_KEY is absent: {status:?}"
+        );
     }
 
     #[test]

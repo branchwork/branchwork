@@ -3133,22 +3133,11 @@ fn collect_driver_auth() -> Vec<DriverAuthInfo> {
             "aider",
             vec!["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
         ),
-        ("codex", "codex", vec!["OPENAI_API_KEY"]),
+        ("codex", "codex", vec![]),
         ("gemini", "gemini", vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
         ("bob", "bob", vec!["ANTHROPIC_API_KEY"]),
     ] {
-        let status = if which(binary).is_none() {
-            DriverAuthStatus::NotInstalled
-        } else {
-            let has_key = env_vars
-                .iter()
-                .any(|v| std::env::var(v).ok().is_some_and(|s| !s.trim().is_empty()));
-            if has_key {
-                DriverAuthStatus::ApiKey
-            } else {
-                DriverAuthStatus::Unknown
-            }
-        };
+        let status = driver_auth_status(name, binary, &env_vars);
         drivers.push(DriverAuthInfo {
             name: name.to_string(),
             status,
@@ -3156,6 +3145,32 @@ fn collect_driver_auth() -> Vec<DriverAuthInfo> {
     }
 
     drivers
+}
+
+fn driver_auth_status(name: &str, binary: &str, env_vars: &[&str]) -> DriverAuthStatus {
+    if which(binary).is_none() {
+        return DriverAuthStatus::NotInstalled;
+    }
+    installed_driver_auth_status(name, env_vars)
+}
+
+fn installed_driver_auth_status(name: &str, env_vars: &[&str]) -> DriverAuthStatus {
+    if name == "codex" {
+        // Codex authenticates through its interactive OAuth flow when the
+        // spawned agent starts. A runner with the binary installed is
+        // therefore capable of starting Codex even when OPENAI_API_KEY is
+        // intentionally unset.
+        return DriverAuthStatus::Oauth { account: None };
+    }
+
+    let has_key = env_vars
+        .iter()
+        .any(|v| std::env::var(v).ok().is_some_and(|s| !s.trim().is_empty()));
+    if has_key {
+        DriverAuthStatus::ApiKey
+    } else {
+        DriverAuthStatus::Unknown
+    }
 }
 
 /// Detect when the CLI is ready for input. Checks for the Claude prompt glyph.
@@ -3324,6 +3339,15 @@ mod tests {
         assert!(extra_env_for_driver("codex").is_empty());
         assert!(extra_env_for_driver("gemini").is_empty());
         assert!(extra_env_for_driver("unknown").is_empty());
+    }
+
+    #[test]
+    fn codex_runner_auth_status_does_not_require_openai_api_key() {
+        let status = installed_driver_auth_status("codex", &[]);
+        assert!(
+            matches!(status, DriverAuthStatus::Oauth { account: None }),
+            "codex runner capability must be based on installed CLI/OAuth start flow, not OPENAI_API_KEY: {status:?}",
+        );
     }
 
     #[test]
