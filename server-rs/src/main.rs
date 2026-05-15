@@ -373,6 +373,10 @@ async fn run_server(cli: Cli) {
             "/api/plans/{name}/phases/{phase_number}/start",
             post(api::plans::start_phase_tasks),
         )
+        .route(
+            "/api/plans/{name}/start-session",
+            post(api::plans::start_plan_session),
+        )
         // Settings
         .route(
             "/api/settings",

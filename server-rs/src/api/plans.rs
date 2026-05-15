@@ -2866,6 +2866,195 @@ pub async fn start_phase_tasks(
     .into_response()
 }
 
+// ── POST /api/plans/:name/start-session ─────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StartPlanSessionBody {
+    /// Optional working directory override. Defaults to `~/<plan.project>`,
+    /// matching `start_task`. Useful when the project lives somewhere
+    /// non-standard or for ad-hoc local testing.
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    /// Driver name (e.g. "claude"). Unknown/absent → server default.
+    #[serde(default)]
+    driver: Option<String>,
+}
+
+/// `POST /api/plans/:name/start-session` — spawn a *plan-level* agent.
+///
+/// The agent boots in the plan's project directory with the plan loaded
+/// as context, but no specific task assigned and no task branch created
+/// (it stays on whatever branch the project is on). It runs the
+/// `build_plan_session_prompt` script: greet, summarise the plan, then
+/// wait for the user's instructions instead of executing a completion
+/// contract.
+pub async fn start_plan_session(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(plan_name): Path<String>,
+    body: Option<Json<StartPlanSessionBody>>,
+) -> impl IntoResponse {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let org_id_str = auth.org_id().to_string();
+    let user_id_str = auth.0.as_ref().map(|u| u.id.clone());
+
+    // Org budget / kill switch + per-user quota — same gate as start_task.
+    {
+        let db = state.db.lock().unwrap();
+        let status = crate::saas::billing::check_org_budget(&db, &org_id_str);
+        if matches!(
+            status,
+            crate::saas::billing::BudgetStatus::Exceeded
+                | crate::saas::billing::BudgetStatus::Killed
+        ) {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({
+                    "error": "org_budget_exceeded",
+                    "message": "Organization budget exceeded. New agents are blocked.",
+                })),
+            )
+                .into_response();
+        }
+        if let Some(uid) = &user_id_str
+            && let Err((spent, max)) = crate::saas::billing::check_user_quota(&db, &org_id_str, uid)
+        {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(serde_json::json!({
+                    "error": "user_quota_exceeded",
+                    "message": format!("Your quota of ${max:.2} exceeded (spent ${spent:.2})"),
+                    "spentUsd": spent,
+                    "maxQuotaUsd": max,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &plan_name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let remaining_budget: Option<f64> = {
+        let db = state.db.lock().unwrap();
+        match plan_remaining_budget(&db, &plan_name) {
+            Ok(b) => b,
+            Err((spent, max)) => {
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({
+                        "error": "budget_exceeded",
+                        "message": format!("Plan budget of ${max:.2} exhausted (spent ${spent:.2})"),
+                        "spentUsd": spent,
+                        "maxBudgetUsd": max,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let home = dirs::home_dir().unwrap();
+    let work_dir = body.cwd.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        plan.project
+            .as_ref()
+            .map(|p| home.join(p))
+            .unwrap_or_else(|| std::env::current_dir().unwrap())
+    });
+
+    let port = state.config_port();
+    let mcp_available = state.registry.drivers.injects_mcp(body.driver.as_deref());
+    let prompt = crate::agents::build_plan_session_prompt(&plan, port, mcp_available);
+
+    let effort = body
+        .effort
+        .as_deref()
+        .and_then(|e| e.parse().ok())
+        .unwrap_or(*state.effort.lock().unwrap());
+
+    // Same git-init guard as start_task: only on the local path. SaaS dispatch
+    // ships work to the runner, which owns its own filesystem.
+    if !crate::saas::dispatch::org_has_runner(&state.db, &org_id_str) {
+        ensure_git_initialized(&work_dir);
+    }
+
+    // task_id = None and branch = None: this is the whole point of the
+    // plan session — no task to execute, no task branch to isolate work
+    // on. The agent runs on whatever branch the project is currently on.
+    let agent_id = crate::agents::spawn_ops::start_agent_dispatch(
+        &state,
+        &org_id_str,
+        pty_agent::StartPtyOpts {
+            prompt,
+            cwd: &work_dir,
+            plan_name: Some(&plan_name),
+            task_id: None,
+            effort,
+            branch: None,
+            is_continue: false,
+            max_budget_usd: remaining_budget,
+            driver: body.driver.as_deref(),
+            user_id: user_id_str.as_deref(),
+            org_id: Some(&org_id_str),
+            runner_id: None,
+        },
+    )
+    .await;
+
+    {
+        let default_driver =
+            crate::persisted_settings::PersistedSettings::load(&state.settings_path)
+                .default_driver()
+                .to_string();
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            &org_id_str,
+            user_id_str.as_deref(),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::AGENT_START,
+            crate::audit::resources::AGENT,
+            Some(&agent_id),
+            Some(
+                &serde_json::json!({
+                    "plan": plan_name,
+                    "task": serde_json::Value::Null,
+                    "driver": body.driver.as_deref().unwrap_or(&default_driver),
+                    "mode": "session",
+                })
+                .to_string(),
+            ),
+        );
+    }
+
+    Json(serde_json::json!({
+        "agentId": agent_id,
+        "planName": plan_name,
+    }))
+    .into_response()
+}
+
 // ── POST /api/plans/:name/tasks/:num/check ──────────────────────────────────
 
 pub async fn check_task(

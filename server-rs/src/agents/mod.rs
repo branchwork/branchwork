@@ -1279,6 +1279,73 @@ pub fn build_task_prompt(
     )
 }
 
+/// Build the prompt for a *plan-level* agent: the plan is loaded as
+/// context, but no specific task is selected and no completion contract
+/// applies. The agent boots, says hello, and waits for user instructions
+/// instead of pushing toward a commit + status update like a task agent
+/// would.
+///
+/// `mcp_available` mirrors `build_task_prompt`: drivers that auto-register
+/// the Branchwork MCP server get told to use the MCP tools; everyone else
+/// gets the HTTP-API fallback.
+pub fn build_plan_session_prompt(plan: &ParsedPlan, port: u16, mcp_available: bool) -> String {
+    let phase_lines = if plan.phases.is_empty() {
+        "  (no phases)".to_string()
+    } else {
+        plan.phases
+            .iter()
+            .map(|p| {
+                let total = p.tasks.len();
+                let done = p
+                    .tasks
+                    .iter()
+                    .filter(|t| t.status.as_deref() == Some("completed"))
+                    .count();
+                format!(
+                    "  Phase {n}: {title} ({done}/{total} done)",
+                    n = p.number,
+                    title = p.title,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let context_section = if plan.context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\nPlan context:\n{}\n", plan.context.trim())
+    };
+
+    let tools_section = if mcp_available {
+        "You can read and edit this plan via the `branchwork` MCP server (already \
+         registered). Useful tools include `list_tasks`, `get_task`, \
+         `update_task_status`, and `record_task_learning`."
+            .to_string()
+    } else {
+        format!(
+            "You can read and edit this plan via the Branchwork HTTP API at \
+             http://localhost:{port}/api/plans/{plan_name}/...",
+            plan_name = plan.name,
+        )
+    };
+
+    format!(
+        "You are starting an interactive session for the plan below. There is no \
+         specific task assigned and no completion contract — do NOT commit, do NOT \
+         mark anything completed, and do NOT exit on your own. Wait for the user's \
+         instructions before doing any work.\n\n\
+         Plan: {plan_title} ({plan_name})\n\
+         Phases:\n{phase_lines}\n\
+         {context_section}\n\
+         {tools_section}\n\n\
+         Greet the user briefly, summarise the plan in one or two sentences so they \
+         know you've loaded it, and then ask what they'd like to do.",
+        plan_title = plan.title,
+        plan_name = plan.name,
+    )
+}
+
 /// Whether auto-advance is enabled for `plan_name` (opt-in, default off).
 pub fn auto_advance_enabled(db: &Db, plan_name: &str) -> bool {
     let conn = db.lock().unwrap();
@@ -2315,6 +2382,61 @@ mod tests {
                 "no-ask rule missing (mcp={mcp}): {prompt}"
             );
         }
+    }
+
+    #[test]
+    fn build_plan_session_prompt_loads_plan_context_without_completion_contract() {
+        let (mut plan, _phase, _task) = sample_plan_for_prompt();
+        plan.context = "Migrate every agent to MCP-based status updates.".into();
+
+        let prompt = build_plan_session_prompt(&plan, 3100, true);
+
+        // Plan identity surfaces so the agent knows what it's been spawned for.
+        assert!(
+            prompt.contains("Portable agents") && prompt.contains("portable-agents"),
+            "plan title and slug must appear: {prompt}"
+        );
+        assert!(
+            prompt.contains("Phase 2: MCP Server"),
+            "phase summary missing: {prompt}"
+        );
+        assert!(
+            prompt.contains("Migrate every agent to MCP-based status updates."),
+            "plan context must be embedded: {prompt}"
+        );
+
+        // The "wait for instructions" framing is the whole point — no
+        // completion contract, no commit mandate, no auto-exit.
+        assert!(
+            prompt.contains("Wait for the user's instructions"),
+            "session prompt must instruct the agent to wait: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Unattended-execution contract"),
+            "plan session must NOT carry the task contract: {prompt}"
+        );
+        assert!(
+            !prompt.contains("git add -A && git commit"),
+            "plan session must NOT mandate a commit: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Mark the task status"),
+            "plan session must NOT push a status update: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_plan_session_prompt_falls_back_to_http_when_mcp_unavailable() {
+        let (plan, _phase, _task) = sample_plan_for_prompt();
+        let prompt = build_plan_session_prompt(&plan, 3100, false);
+        assert!(
+            prompt.contains("http://localhost:3100/api/plans/portable-agents/"),
+            "expected HTTP fallback hint, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("`branchwork` MCP server"),
+            "MCP hint must be absent when unavailable: {prompt}"
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ export function PlanBoard() {
   const [resetting, setResetting] = useState(false);
   const [checkingAll, setCheckingAll] = useState(false);
   const [checkingPlan, setCheckingPlan] = useState(false);
+  const [startingSession, setStartingSession] = useState(false);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<PlanBoardTab>("board");
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -115,6 +116,23 @@ export function PlanBoard() {
       toastError(e, "Check Plan failed");
     } finally {
       setCheckingPlan(false);
+    }
+  }
+
+  async function handleStartSession() {
+    if (!plan) return;
+    setStartingSession(true);
+    try {
+      const res = await postJson<{ agentId: string }>(
+        `/api/plans/${plan.name}/start-session`,
+        {},
+      );
+      selectAgent(res.agentId);
+      goToAgent(res.agentId);
+    } catch (e) {
+      toastError(e, "Start session failed");
+    } finally {
+      setStartingSession(false);
     }
   }
 
@@ -234,6 +252,14 @@ export function PlanBoard() {
               {converting ? "Converting..." : "Convert to YAML"}
             </button>
           )}
+          <button
+            onClick={handleStartSession}
+            disabled={startingSession}
+            className="flex-shrink-0 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-indigo-600 hover:text-indigo-400 disabled:opacity-50 text-gray-300 rounded transition"
+            title="Spawn an agent in the plan's project directory with the plan loaded as context. No task assigned — the agent waits for your instructions."
+          >
+            {startingSession ? "Starting..." : "Start session"}
+          </button>
           <CheckPlanButton
             plan={plan}
             agents={agents}
