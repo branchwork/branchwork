@@ -58,6 +58,17 @@ function installFetchMock(
         headers: { "Content-Type": "application/json" },
       });
     }
+    // plan-store refetches `/api/plans` after a successful restore
+    // (toast + sidebar refresh). Without this handler the fetch
+    // resolves with the catch-all 404 below and surfaces as an
+    // unhandled rejection that fails the run even when every assertion
+    // passed.
+    if (url === "/api/plans" && method === "GET") {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     const purgeMatch = url.match(/^\/api\/snapshots\/(\d+)$/);
     if (purgeMatch && method === "DELETE") {
       const id = Number(purgeMatch[1]);
@@ -82,7 +93,11 @@ function installFetchMock(
           ok: true,
           plan: "demo-plan",
           snapshotId: id,
-          restoredAt: "2026-05-05 03:00:00",
+          // formatTimestamp falls back to absolute date after 7 days
+          // (web/src/lib/time.ts), and "Restored just now|Nm ago"
+          // assertions never match an absolute date. Always serve a
+          // fresh restoredAt so the relative form renders.
+          restoredAt: new Date().toISOString(),
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );

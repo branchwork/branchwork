@@ -474,7 +474,10 @@ describe("AuditLog Undo affordance", () => {
             ok: true,
             plan: "obsolete",
             snapshotId: 7,
-            restoredAt: "2026-05-05 03:00:00",
+            // Must be < 7 days old so formatTimestamp renders the
+            // relative form ("just now"/"Nm ago"); the assertion below
+            // matches that form, not the absolute fallback.
+            restoredAt: new Date().toISOString(),
           },
         },
       },
@@ -523,7 +526,9 @@ describe("AuditLog Undo affordance", () => {
           status: 410,
           body: {
             error: "snapshot_already_restored",
-            restored_at: "2026-05-05 02:00:00",
+            // Must be < 7 days old so formatTimestamp renders the
+            // relative form (see twin test above for why).
+            restored_at: new Date().toISOString(),
           },
         },
       },

@@ -5,6 +5,7 @@ import {
   render as rtlRender,
   screen,
   waitFor,
+  within,
   type RenderOptions,
 } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -235,6 +236,17 @@ describe("AdminPage skip-permissions toggle", () => {
 });
 
 describe("AdminPage notification webhook", () => {
+  // AdminPage now renders multiple "Save" buttons (webhook section + the
+  // default-driver section added later), so a top-level `getByText(/^Save$/)`
+  // throws getMultipleElementsFoundError. Scope every Save lookup to the
+  // webhook input's containing flex row instead.
+  function webhookSave(): HTMLButtonElement {
+    const input = screen.getByPlaceholderText(/hooks\.slack\.com/i) as HTMLInputElement;
+    const row = input.parentElement;
+    if (!row) throw new Error("webhook input has no parent row");
+    return within(row).getByRole("button", { name: /^Save$/ }) as HTMLButtonElement;
+  }
+
   it("seeds the input from the store value", () => {
     useSettingsStore.setState({
       webhookUrl: "https://hooks.slack.com/services/AAA",
@@ -247,7 +259,7 @@ describe("AdminPage notification webhook", () => {
   it("Save is disabled until the input is dirty", () => {
     useSettingsStore.setState({ webhookUrl: null });
     render(<AdminPage />);
-    const save = screen.getByText(/^Save$/) as HTMLButtonElement;
+    const save = webhookSave();
     expect(save.disabled).toBe(true);
     const input = screen.getByPlaceholderText(/hooks\.slack\.com/i) as HTMLInputElement;
     fireEvent.change(input, {
@@ -264,7 +276,7 @@ describe("AdminPage notification webhook", () => {
     fireEvent.change(input, {
       target: { value: "  https://hooks.slack.com/services/xyz  " },
     });
-    fireEvent.click(screen.getByText(/^Save$/));
+    fireEvent.click(webhookSave());
     await waitFor(() =>
       expect(setWebhookUrl).toHaveBeenCalledWith("https://hooks.slack.com/services/xyz"),
     );
@@ -280,7 +292,7 @@ describe("AdminPage notification webhook", () => {
     render(<AdminPage />);
     const input = screen.getByPlaceholderText(/hooks\.slack\.com/i) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "" } });
-    fireEvent.click(screen.getByText(/^Save$/));
+    fireEvent.click(webhookSave());
     await waitFor(() => expect(setWebhookUrl).toHaveBeenCalledWith(null));
   });
 
@@ -292,7 +304,7 @@ describe("AdminPage notification webhook", () => {
     fireEvent.change(input, {
       target: { value: "https://example.invalid/hook" },
     });
-    fireEvent.click(screen.getByText(/^Save$/));
+    fireEvent.click(webhookSave());
     await waitFor(() => expect(screen.getByText(/hook url rejected/i)).toBeTruthy());
   });
 });
