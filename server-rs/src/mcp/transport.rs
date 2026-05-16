@@ -6,13 +6,15 @@
 //! identical whichever wire is used.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::{
     ServiceExt,
     transport::{
         io::stdio,
         streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+            StreamableHttpServerConfig, StreamableHttpService,
+            session::local::{LocalSessionManager, SessionConfig},
         },
     },
 };
@@ -21,12 +23,53 @@ use super::{BranchworkMcp, McpContext};
 
 pub type McpService = StreamableHttpService<BranchworkMcp, LocalSessionManager>;
 
+/// Default idle window before rmcp tears down an MCP session worker.
+///
+/// rmcp's `SessionConfig::DEFAULT_KEEP_ALIVE` is 5 minutes, which is
+/// fatal for Branchwork: a single task agent often sits between
+/// MCP calls for much longer (the model thinks, the user reads, the
+/// CI run completes). Past 5 min the session worker exits with
+/// `KeepAliveTimeout`, the spawned task in rmcp's tower calls
+/// `close_session`, the next client request 404s with
+/// "Session not found", and our spawned agents lose all their
+/// in-flight MCP state until they reinit (which not every client
+/// does cleanly).
+///
+/// Four hours is the sweet spot for current usage: long enough to
+/// cover an unattended task chain or a user-driven debugging session
+/// without losing context, short enough that a truly orphaned session
+/// (browser tab closed, runner died) is still GC'd the same day. The
+/// env override lets ops crank it further on long-running boxes
+/// without a rebuild, or shorten it on memory-tight ones.
+const DEFAULT_MCP_KEEP_ALIVE_SECS: u64 = 4 * 60 * 60;
+
 pub fn build_http_service(ctx: McpContext) -> McpService {
     StreamableHttpService::new(
         move || Ok(BranchworkMcp::new(ctx.clone())),
-        Arc::new(LocalSessionManager::default()),
+        Arc::new(build_session_manager()),
         StreamableHttpServerConfig::default().with_allowed_hosts(build_allowed_hosts()),
     )
+}
+
+/// Build a `LocalSessionManager` whose per-session idle timeout reflects
+/// Branchwork's reality (long-running task agents) instead of rmcp's
+/// browser-tab-style default. Reads
+/// `BRANCHWORK_MCP_SESSION_KEEP_ALIVE_SECS` for an integer override;
+/// invalid / unset → [`DEFAULT_MCP_KEEP_ALIVE_SECS`].
+fn build_session_manager() -> LocalSessionManager {
+    let mut session_config = SessionConfig::default();
+    session_config.keep_alive = Some(Duration::from_secs(resolve_keep_alive_secs()));
+    let mut mgr = LocalSessionManager::default();
+    mgr.session_config = session_config;
+    mgr
+}
+
+fn resolve_keep_alive_secs() -> u64 {
+    std::env::var("BRANCHWORK_MCP_SESSION_KEEP_ALIVE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MCP_KEEP_ALIVE_SECS)
 }
 
 /// rmcp 1.4 ships a DNS-rebinding defence: `StreamableHttpServerConfig`
@@ -109,6 +152,38 @@ mod tests {
         assert_eq!(extract_authority(""), None);
         assert_eq!(extract_authority("/"), None);
         assert_eq!(extract_authority("https:///"), None);
+    }
+
+    #[test]
+    fn keep_alive_defaults_to_four_hours_when_env_unset() {
+        // SAFETY: env vars are process-wide and unsafe to mutate from
+        // multiple threads. Cargo-test default is single-thread per
+        // binary, so the test serialises against the override test
+        // below by virtue of running in the same thread.
+        unsafe { std::env::remove_var("BRANCHWORK_MCP_SESSION_KEEP_ALIVE_SECS") };
+        assert_eq!(resolve_keep_alive_secs(), 4 * 60 * 60);
+    }
+
+    #[test]
+    fn keep_alive_env_override_wins() {
+        unsafe { std::env::set_var("BRANCHWORK_MCP_SESSION_KEEP_ALIVE_SECS", "60") };
+        assert_eq!(resolve_keep_alive_secs(), 60);
+        unsafe { std::env::remove_var("BRANCHWORK_MCP_SESSION_KEEP_ALIVE_SECS") };
+    }
+
+    #[test]
+    fn keep_alive_ignores_invalid_or_zero_override() {
+        // Zero and garbage both fall back to the default — zero would
+        // disable the GC entirely, garbage means the operator typoed.
+        for bad in ["0", "not-a-number", "-1"] {
+            unsafe { std::env::set_var("BRANCHWORK_MCP_SESSION_KEEP_ALIVE_SECS", bad) };
+            assert_eq!(
+                resolve_keep_alive_secs(),
+                4 * 60 * 60,
+                "expected default for {bad:?}",
+            );
+        }
+        unsafe { std::env::remove_var("BRANCHWORK_MCP_SESSION_KEEP_ALIVE_SECS") };
     }
 
     /// Pins the rmcp 1.4 default extension: loopback always present so
