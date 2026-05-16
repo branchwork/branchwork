@@ -1420,11 +1420,18 @@ async fn run_idle_pass(state: &AppState, threshold_secs: i64) {
     // epoch seconds; no timezone math needed.
     let rows: Vec<Row> = {
         let conn = state.db.lock().unwrap();
+        // Filter out plan-session agents (task_id IS NULL) for the same
+        // reason as the Stop-hook handler: their tree state reflects
+        // any parallel task agent's WIP, not their own work, so the
+        // dirty-tree pause path would mis-fire `agent_left_uncommitted_work`
+        // the moment the session sat idle past the threshold.
         let mut stmt = match conn.prepare(
             "SELECT id, session_id, plan_name, task_id, org_id, driver, \
              CAST(strftime('%s','now') - strftime('%s', last_activity_at) AS INTEGER) \
              FROM agents \
-             WHERE status = 'running' AND last_activity_at IS NOT NULL",
+             WHERE status = 'running' \
+               AND last_activity_at IS NOT NULL \
+               AND task_id IS NOT NULL",
         ) {
             Ok(s) => s,
             Err(e) => {

@@ -115,7 +115,11 @@ export function AgentTree() {
             />
             <span className="sr-only">Status: {agent.status}</span>
             <span className="text-sm font-medium truncate">
-              {agent.plan_name ? `Task ${agent.task_id}` : `Agent ${agent.id.slice(0, 8)}`}
+              {agent.task_id
+                ? `Task ${agent.task_id}`
+                : agent.plan_name
+                  ? "Plan session"
+                  : `Agent ${agent.id.slice(0, 8)}`}
             </span>
             {driverCapabilities(agent.driver).supports_cost && agent.cost_usd != null && (
               <span className="text-[10px] text-amber-500/80 font-mono flex-shrink-0">

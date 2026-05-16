@@ -125,6 +125,18 @@ async fn handle_stop_hook(state: &AppState, session_id: &str) {
         eprintln!("[hooks] auto-mode off, no auto-finish: agent {agent_id} has no plan");
         return;
     };
+    // Plan-session agents (task_id=None) attach to a plan for context but
+    // are not committing to a task. Their tree state reflects whatever
+    // the parallel task agent is doing, not their own work, so the
+    // dirty-tree pause logic below would incorrectly flag the plan as
+    // "agent left uncommitted work" the moment the session goes idle.
+    // Skip them entirely — there's nothing to auto-finish either.
+    if task_id.is_none() {
+        eprintln!(
+            "[hooks] plan-session agent {agent_id} has no task; skipping auto-mode tree check"
+        );
+        return;
+    }
     if !crate::db::auto_mode_enabled(&state.db, &plan_name) {
         eprintln!("[hooks] auto-mode off, no auto-finish: plan={plan_name}");
         return;
@@ -323,6 +335,19 @@ mod tests {
                 (id, session_id, cwd, status, mode, plan_name, task_id, org_id) \
              VALUES (?1, ?2, ?3, 'running', 'pty', ?4, ?5, 'default-org')",
             params![id, session_id, cwd.to_string_lossy(), plan, task],
+        )
+        .unwrap();
+    }
+
+    /// Plan-level session agent: `task_id` deliberately NULL. Same plan
+    /// row as `seed_running_agent` otherwise.
+    fn seed_running_session_agent(db: &Db, id: &str, session_id: &str, cwd: &Path, plan: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents \
+                (id, session_id, cwd, status, mode, plan_name, task_id, org_id) \
+             VALUES (?1, ?2, ?3, 'running', 'pty', ?4, NULL, 'default-org')",
+            params![id, session_id, cwd.to_string_lossy(), plan],
         )
         .unwrap();
     }
@@ -581,6 +606,57 @@ mod tests {
                 .any(|a| a == crate::audit::actions::AGENT_AUTO_FINISH),
             "AGENT_AUTO_FINISH must not fire when tree is dirty"
         );
+    }
+
+    /// Plan-level session agents (task_id NULL) attach to a plan for
+    /// context but don't own the tree, so a Stop hook fired while the
+    /// parallel task agent has WIP must NOT pause the plan with
+    /// `agent_left_uncommitted_work`. Without this guard, the moment a
+    /// plan-session agent went idle the dashboard surfaced a spurious
+    /// "agent left uncommitted work" banner whose true source was a
+    /// sibling task agent the user was actively driving.
+    #[tokio::test]
+    async fn stop_on_plan_session_agent_with_dirty_tree_does_not_pause_plan() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_with_clean_tree(&cwd);
+        // Sibling task agent's WIP — uncommitted change in the shared tree.
+        std::fs::write(cwd.join("README.md"), "task agent's wip, not the session's").unwrap();
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_running_session_agent(&db, "a-session", "s-session", &cwd, "p");
+        enable_auto_mode(&db, "p");
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), plans_dir);
+        handle_stop_hook(&state, "s-session").await;
+
+        // Plan must NOT be paused by the session agent's idle.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "plan-session agent must not pause the plan; got {:?}",
+            paused_reason(&db, "p"),
+        );
+
+        // No auto-mode events at all — the session agent is invisible to
+        // the auto-mode loop because it has no task to advance.
+        let events = drain_event_types(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e == "auto_mode_paused" || e == "auto_finish_triggered"),
+            "no auto-mode events expected from a plan-session Stop, got: {events:?}"
+        );
+
+        // No audit row on the plan or the session agent.
+        assert!(
+            audit_actions_for(&db, "p").is_empty(),
+            "no plan audit expected, got: {:?}",
+            audit_actions_for(&db, "p"),
+        );
+        assert!(audit_actions_for(&db, "a-session").is_empty());
     }
 
     /// Brief acceptance #1:

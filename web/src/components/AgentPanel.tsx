@@ -73,7 +73,11 @@ export function AgentPanel() {
             />
             <span className="sr-only">Status: {agent.status}</span>
             <span className="text-sm font-medium truncate">
-              {agent.task_id ? `Task ${agent.task_id}` : agent.id.slice(0, 8)}
+              {agent.task_id
+                ? `Task ${agent.task_id}`
+                : agent.plan_name
+                  ? "Plan session"
+                  : agent.id.slice(0, 8)}
             </span>
             <span className="text-[10px] text-gray-600">{agent.status}</span>
             <span className="text-[10px] text-gray-700">{agent.mode}</span>
