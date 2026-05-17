@@ -123,10 +123,7 @@ export function PlanBoard() {
     if (!plan) return;
     setStartingSession(true);
     try {
-      const res = await postJson<{ agentId: string }>(
-        `/api/plans/${plan.name}/start-session`,
-        {},
-      );
+      const res = await postJson<{ agentId: string }>(`/api/plans/${plan.name}/start-session`, {});
       selectAgent(res.agentId);
       goToAgent(res.agentId);
     } catch (e) {
