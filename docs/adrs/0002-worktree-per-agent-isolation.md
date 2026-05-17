@@ -1,6 +1,6 @@
 # ADR 0002 — Worktree-per-agent isolation + at-merge conflict resolver
 
-- **Status:** Proposed (2026-05-03)
+- **Status:** Accepted (2026-05-17)
 - **Authors:** cpo
 - **Decision driver(s):** parallel agents corrupting each other's working tree; merge-time conflicts going unhandled
 
@@ -124,7 +124,7 @@ Like worktrees but each agent gets a full `git clone` instead of a worktree. Rej
 
 ## Implementation pointer
 
-The implementation plan that derives from this ADR lives at `docs/plans/worktree-per-agent.md` (or a YAML in `~/.claude/plans/` for branchwork's own use). Phase 0 of that plan is "write this ADR" — the loop closes when this file is committed at status `Accepted`.
+The implementation plan that derives from this ADR lives at `~/.claude/plans/worktree-per-agent-isolation.yaml`. Phase 0 of that plan covers decisions, audit, and fixtures (including this status flip); Phases 1–4 cover the worktree manager, agent-spawn integration, merge-time conflict resolver, and rollout.
 
 ## References
 
