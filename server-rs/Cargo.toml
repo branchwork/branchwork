@@ -2,6 +2,7 @@
 name = "branchwork-server"
 version = "0.5.18"
 edition = "2024"
+license = "MIT"
 
 [features]
 # Enables tests that require external services (GitHub via `gh`, Anthropic

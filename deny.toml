@@ -1,0 +1,74 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Modeled on /home/cpo/cep/deny.toml. Adapted for branchwork's smaller
+# dependency surface (no wasmtime, no varpulis-*, no async-nats / sqlx).
+#
+# Branchwork has no top-level workspace today; run from the repo root:
+#
+#     cargo deny --manifest-path server-rs/Cargo.toml check
+#
+# (cargo-deny auto-discovers deny.toml in the cwd.)
+
+[graph]
+targets = []
+all-features = true
+
+# ---------------------------------------------------------------------------
+# Advisories — known vulnerabilities and unmaintained / yanked crates
+# ---------------------------------------------------------------------------
+[advisories]
+yanked = "deny"
+ignore = [
+    # atomic-polyfill: unmaintained, author archived the repo in 2023.
+    # Transitive via postcard 1.x → heapless 0.7. heapless 0.8 dropped the
+    # dependency but postcard 1.x still pins heapless 0.7. No upstream fix
+    # until postcard publishes a heapless-0.8-tracking release.
+    { id = "RUSTSEC-2023-0089", reason = "transitive via postcard → heapless 0.7, no upstream fix" },
+]
+
+# ---------------------------------------------------------------------------
+# Licenses — only allow permissive licenses
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+    # Permissive baseline (same as cep).
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    # 0BSD — added for: doctest-file, interprocess, quoted_printable, recvmsg.
+    # Equivalent to a public-domain dedication, no notice required.
+    "0BSD",
+    # CC0-1.0 — added for: notify (file watcher).
+    # Public-domain dedication, OSI/FSF-recognised for software.
+    "CC0-1.0",
+    # CDLA-Permissive-2.0 — added for: webpki-roots.
+    # Permissive data-license used by Mozilla's CA bundle.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# ---------------------------------------------------------------------------
+# Bans — duplicate-version policy + wildcard policy
+# ---------------------------------------------------------------------------
+[bans]
+# Warn (not deny) on multiple versions — branchwork's tree has tokio/serde
+# duplicates that need a separate deduplication pass. Flip to "deny" once
+# the duplicates are resolved.
+multiple-versions = "warn"
+wildcards = "allow"
+
+# ---------------------------------------------------------------------------
+# Sources — only allow crates from crates.io
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
