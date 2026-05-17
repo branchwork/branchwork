@@ -328,6 +328,134 @@ pub async fn get_plan(
     Json(value).into_response()
 }
 
+// ── GET /api/plans/{name}/export ─────────────────────────────────────────────
+//
+// Ships the plan's canonical YAML body (schema fields only — no task status,
+// agent rows, costs, or CI verdicts) with a versioned header comment so a
+// future loader can detect and migrate older exports.  YAML plans round-trip
+// verbatim from disk; markdown plans are serialized via the canonical
+// `serialize_plan_yaml` writer.  Runtime state lives in SQLite and never
+// touches the on-disk YAML, so reading the file straight off disk already
+// satisfies the "schema fields only" contract.
+
+/// Schema version of the export header. Bump when the body shape changes in a
+/// way the loader can't ingest as today's YAML — readers branch on this.
+const PLAN_EXPORT_VERSION: &str = "v1";
+
+pub async fn export_plan(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Org gate: verify the plan belongs to the caller's org.
+    {
+        let conn = state.db.lock().unwrap();
+        if !orgs::plan_belongs_to_org(&conn, &name, auth.org_id()) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    }
+
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let ext = plan_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    // YAML on disk is already schema-only — task status / costs / agents are
+    // never persisted into plan files. Stream the raw bytes through so an
+    // author's comments and key ordering survive the round-trip. Markdown
+    // plans have no on-disk YAML, so we parse and re-emit via the canonical
+    // serializer.
+    let yaml_body = match ext {
+        "yaml" | "yml" => match std::fs::read_to_string(&plan_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "read_failed",
+                        "message": format!("Failed to read plan file: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        _ => {
+            let plan = match plan_parser::parse_plan_file(&plan_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(serde_json::json!({
+                            "error": "parse_error",
+                            "message": format!("Failed to parse plan: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            match plan_parser::serialize_plan_yaml(&plan) {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "serialize_failed",
+                            "message": format!("Failed to serialize plan: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    let exported_at = chrono::Utc::now().to_rfc3339();
+    let header =
+        format!("# branchwork-plan-export: {PLAN_EXPORT_VERSION}\n# exported-at: {exported_at}\n");
+    let body = format!("{header}{yaml_body}");
+
+    // Sanitize the filename for the Content-Disposition header — plan names
+    // that reach this point came from the filesystem, but we still drop
+    // anything outside [A-Za-z0-9._-] to avoid header-value rejection on
+    // edge cases (HeaderValue refuses CR/LF and bytes outside 0x20-0x7E).
+    let safe_name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let disposition = format!("attachment; filename=\"{safe_name}.plan.yaml\"");
+
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/yaml".to_string(),
+            ),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 // ── PUT /api/plans/:name/project ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
