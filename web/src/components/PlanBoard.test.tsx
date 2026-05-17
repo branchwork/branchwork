@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
-import { StaleBranchesButton } from "./PlanBoard.js";
+import { ExportPlanButton, StaleBranchesButton } from "./PlanBoard.js";
 
 const PLAN = "demo-plan";
 
@@ -211,5 +211,36 @@ describe("StaleBranchesButton", () => {
         force: false,
       });
     });
+  });
+});
+
+describe("ExportPlanButton", () => {
+  it("renders the Export label and no hash chip before clicking", () => {
+    render(<ExportPlanButton exporting={false} exportHash={null} onExport={() => {}} />);
+    expect(screen.getByRole("button", { name: /Export/ })).toBeTruthy();
+    // No sha256: chip yet.
+    expect(screen.queryByText(/sha256:/)).toBeNull();
+  });
+
+  it("renders the short sha256 chip once a hash is provided", () => {
+    const fullHash = "abcdef0123456789".repeat(4); // 64 hex chars
+    render(<ExportPlanButton exporting={false} exportHash={fullHash} onExport={() => {}} />);
+    const chip = screen.getByText(/sha256:abcdef0/);
+    expect(chip).toBeTruthy();
+    // Tooltip carries the full hash so the user can copy/paste it.
+    expect(chip.getAttribute("title")).toContain(`sha256:${fullHash}`);
+  });
+
+  it("calls onExport when the button is clicked", () => {
+    const onExport = vi.fn();
+    render(<ExportPlanButton exporting={false} exportHash={null} onExport={onExport} />);
+    fireEvent.click(screen.getByRole("button", { name: /Export/ }));
+    expect(onExport).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables the button and shows Exporting… while in flight", () => {
+    render(<ExportPlanButton exporting={true} exportHash={null} onExport={() => {}} />);
+    const btn = screen.getByRole("button", { name: /Exporting/ }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
   });
 });

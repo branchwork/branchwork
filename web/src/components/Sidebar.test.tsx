@@ -198,4 +198,32 @@ describe("Sidebar", () => {
     // navigate batch under React 18 — sidebarOpen is back to false.
     expect(useUiStore.getState().sidebarOpen).toBe(false);
   });
+
+  it("right-clicking a plan row opens an Export context menu (Phase 1.2)", () => {
+    usePlanStore.setState({
+      plans: [
+        {
+          name: "alpha",
+          title: "Alpha plan",
+          project: "branchwork",
+          phaseCount: 1,
+          taskCount: 0,
+          doneCount: 0,
+          createdAt: new Date().toISOString(),
+          modifiedAt: new Date().toISOString(),
+        },
+      ],
+    });
+    renderSidebar();
+    act(() => {
+      useUiStore.getState().openSidebar();
+    });
+    const row = screen.getByRole("link", { name: /Alpha plan/ });
+    fireEvent.contextMenu(row);
+    const menu = screen.getByTestId("plan-row-context-menu-alpha");
+    expect(menu).toBeTruthy();
+    // The single menu item is "Export".
+    const exportItem = screen.getByRole("menuitem", { name: /Export/ });
+    expect(exportItem).toBeTruthy();
+  });
 });

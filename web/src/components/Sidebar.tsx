@@ -8,6 +8,8 @@ import { useUiStore } from "../stores/ui-store.js";
 import { fetchJson, postJson } from "../api.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
+import { exportPlan } from "../lib/plan-export.js";
+import { useToastStore } from "../stores/toast-store.js";
 import { isPlanDone } from "../lib/predicates.js";
 import { StaleDataChip } from "./StaleDataChip.js";
 import { HealthStateIndicator } from "./HealthStateIndicator.js";
@@ -336,11 +338,58 @@ interface PlanItemProps {
 
 const PlanItem = memo(function PlanItem({ plan: p, isSelected, dimmed }: PlanItemProps) {
   const pct = p.taskCount > 0 ? Math.round((p.doneCount / p.taskCount) * 100) : 0;
+  // Sidebar row right-click menu (Phase 1.2). Single-item menu today
+  // (`Export`); positioned at the cursor and dismissed on any document
+  // click or Escape. Coords are page-anchored (not row-relative) so the
+  // menu doesn't get clipped by the sidebar's `overflow-hidden` ancestor.
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const pushToast = useToastStore((s) => s.push);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenu(null);
+    };
+    // mousedown lets a click on the menu's own button fire its onClick
+    // BEFORE the document handler tears the menu down (React onClick is
+    // synthesized on click, which runs after mouseup → after this
+    // mousedown handler — the visible button still fires its onClick).
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
+
+  async function handleExport() {
+    setMenu(null);
+    setExporting(true);
+    try {
+      const { sha256Hex: hash, filename } = await exportPlan(p.name);
+      pushToast({
+        kind: "success",
+        title: `Exported ${filename}`,
+        body: `sha256:${hash.slice(0, 12)}…`,
+      });
+    } catch (e) {
+      toastError(e, "Export failed");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <li>
       <TouchTarget>
         <Link
           to={`/plans/${p.name}`}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenu({ x: e.clientX, y: e.clientY });
+          }}
           className={`block w-full text-left px-2 py-1.5 rounded text-sm transition ${
             isSelected
               ? "bg-gray-800 text-white"
@@ -373,6 +422,27 @@ const PlanItem = memo(function PlanItem({ plan: p, isSelected, dimmed }: PlanIte
           </div>
         </Link>
       </TouchTarget>
+      {menu && (
+        <div
+          role="menu"
+          tabIndex={-1}
+          aria-label={`Plan row context menu: ${p.title}`}
+          data-testid={`plan-row-context-menu-${p.name}`}
+          className="fixed z-50 min-w-[8rem] bg-gray-900 border border-gray-700 rounded shadow-lg py-1 text-xs"
+          style={{ top: menu.y, left: menu.x }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={handleExport}
+            disabled={exporting}
+            className="block w-full text-left px-3 py-1.5 text-gray-200 hover:bg-gray-800 disabled:opacity-50 transition"
+          >
+            {exporting ? "Exporting…" : "Export"}
+          </button>
+        </div>
+      )}
     </li>
   );
 });

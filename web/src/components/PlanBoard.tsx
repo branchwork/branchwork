@@ -19,6 +19,7 @@ import { Modal } from "./ui/Modal.js";
 import { Tabs } from "./ui/Tabs.js";
 import { TouchTarget } from "./ui/TouchTarget.js";
 import { toastError } from "../lib/toast.js";
+import { exportPlan } from "../lib/plan-export.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
 import { StaleDataChip } from "./StaleDataChip.js";
 import { CompletedTasksContext } from "../lib/plan-context.js";
@@ -34,6 +35,8 @@ export function PlanBoard() {
   const [checkingAll, setCheckingAll] = useState(false);
   const [checkingPlan, setCheckingPlan] = useState(false);
   const [startingSession, setStartingSession] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportHash, setExportHash] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<PlanBoardTab>("board");
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -144,6 +147,19 @@ export function PlanBoard() {
     }
   }
 
+  async function handleExport() {
+    if (!plan) return;
+    setExporting(true);
+    try {
+      const { sha256Hex: hash } = await exportPlan(plan.name);
+      setExportHash(hash);
+    } catch (e) {
+      toastError(e, "Export failed");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   async function handleConvert() {
     setConverting(true);
     try {
@@ -249,6 +265,7 @@ export function PlanBoard() {
               {converting ? "Converting..." : "Convert to YAML"}
             </button>
           )}
+          <ExportPlanButton exporting={exporting} exportHash={exportHash} onExport={handleExport} />
           <button
             onClick={handleStartSession}
             disabled={startingSession}
@@ -419,6 +436,44 @@ interface CheckPlanButtonProps {
 /// associated project — tooltip explains which. While a plan-level check
 /// agent is running it shows a spinner and the View affordance re-opens the
 /// terminal. Verdict badge is persisted server-side and survives reloads.
+interface ExportPlanButtonProps {
+  exporting: boolean;
+  exportHash: string | null;
+  onExport: () => void;
+}
+
+/// "Export" affordance for the plan detail page (Phase 1, Task 1.2).
+///
+/// Fires `GET /api/plans/:name/export` via `exportPlan()`, which downloads
+/// `<name>.plan.yaml` and surfaces the sha256 of the exact bytes that
+/// went through the browser. The hash chip stays visible after the
+/// download so a follow-up paste or re-upload can be cross-checked
+/// against `sha256sum <name>.plan.yaml`.
+export function ExportPlanButton({ exporting, exportHash, onExport }: ExportPlanButtonProps) {
+  const shortHash = exportHash ? exportHash.slice(0, 7) : null;
+  return (
+    <span className="flex-shrink-0 inline-flex items-center gap-2">
+      <button
+        type="button"
+        onClick={onExport}
+        disabled={exporting}
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs bg-gray-800 border border-gray-700 hover:border-indigo-600 hover:text-indigo-400 disabled:opacity-50 text-gray-300 rounded transition"
+        title="Download this plan's canonical YAML; the displayed hash matches `sha256sum <name>.plan.yaml`."
+      >
+        {exporting ? "Exporting..." : "Export"}
+      </button>
+      {shortHash && exportHash && (
+        <span
+          className="font-mono text-[10px] text-gray-500 bg-gray-900 border border-gray-800 px-1.5 py-0.5 rounded select-all"
+          title={`sha256:${exportHash}\nMatches the bytes downloaded as the .plan.yaml attachment.`}
+        >
+          sha256:{shortHash}&hellip;
+        </span>
+      )}
+    </span>
+  );
+}
+
 function CheckPlanButton({
   plan,
   agents,

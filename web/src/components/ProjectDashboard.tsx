@@ -1,11 +1,14 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
+import { useToastStore } from "../stores/toast-store.js";
 import { BulkDeleteModal } from "./BulkDeleteModal.js";
 import { formatRelative } from "../lib/time.js";
 import { isPlanDone } from "../lib/predicates.js";
+import { exportPlan } from "../lib/plan-export.js";
+import { toastError } from "../lib/toast.js";
 import { StaleDataChip } from "./StaleDataChip.js";
 
 /// Auto-namer shape used by the Claude Code CLI: three lowercase
@@ -526,6 +529,45 @@ function PlanRow({
     (a) => a.plan_name === plan.name && (a.status === "running" || a.status === "starting"),
   ).length;
 
+  // Right-click `Export` menu (Phase 1.2). Same shape as the sidebar
+  // PlanItem: a single-item popover anchored at the cursor, dismissed on
+  // any document click or Escape. Hidden in selection mode — bulk
+  // operations live in the toolbar, not here.
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const pushToast = useToastStore((s) => s.push);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenu(null);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
+
+  async function handleExport() {
+    setMenu(null);
+    setExporting(true);
+    try {
+      const { sha256Hex: hash, filename } = await exportPlan(plan.name);
+      pushToast({
+        kind: "success",
+        title: `Exported ${filename}`,
+        body: `sha256:${hash.slice(0, 12)}…`,
+      });
+    } catch (e) {
+      toastError(e, "Export failed");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   // Selection mode: render the row as a <label> wrapping the
   // checkbox + the same content. Clicking either the checkbox OR
   // anywhere on the row toggles selection (the label's natural
@@ -594,13 +636,40 @@ function PlanRow({
   }
 
   return (
-    <Link
-      to={`/plans/${plan.name}`}
-      onClick={onClick}
-      className={`${rowBase} ${dimmedClass} block`}
-    >
-      {inner}
-    </Link>
+    <>
+      <Link
+        to={`/plans/${plan.name}`}
+        onClick={onClick}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY });
+        }}
+        className={`${rowBase} ${dimmedClass} block`}
+      >
+        {inner}
+      </Link>
+      {menu && (
+        <div
+          role="menu"
+          tabIndex={-1}
+          aria-label={`Plan row context menu: ${plan.title}`}
+          data-testid={`plan-row-context-menu-${plan.name}`}
+          className="fixed z-50 min-w-[8rem] bg-gray-900 border border-gray-700 rounded shadow-lg py-1 text-xs"
+          style={{ top: menu.y, left: menu.x }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={handleExport}
+            disabled={exporting}
+            className="block w-full text-left px-3 py-1.5 text-gray-200 hover:bg-gray-800 disabled:opacity-50 transition"
+          >
+            {exporting ? "Exporting…" : "Export"}
+          </button>
+        </div>
+      )}
+    </>
   );
 }
 
