@@ -2,7 +2,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -342,6 +342,125 @@ pub async fn get_plan(
 /// way the loader can't ingest as today's YAML — readers branch on this.
 const PLAN_EXPORT_VERSION: &str = "v1";
 
+/// Outcome of [`build_export_body`]: the canonical YAML payload (header + body)
+/// that single-plan `GET /export` and bulk `POST /export-bundle` both emit.
+struct PlanExportBody {
+    /// Full body bytes, including the two-line `# branchwork-plan-export: v1`
+    /// and `# exported-at: <iso8601>` preamble. Identical wire shape to task
+    /// 1.1 so a single-plan export and a bundle entry round-trip through the
+    /// same loader.
+    body: String,
+    /// RFC3339 UTC timestamp from the header — surfaced so the bundle manifest
+    /// can echo it without re-parsing the body.
+    exported_at: String,
+}
+
+/// Build the canonical export body for a single plan. Reused by `export_plan`
+/// (Task 1.1) and `export_bundle` (Task 1.3) so the two endpoints emit
+/// byte-identical per-plan bytes — the bundle's manifest sha256s are computed
+/// over exactly what a single-plan GET would have returned.
+///
+/// On error returns a boxed [`Response`] (clippy::result_large_err — axum's
+/// Response is ~128 bytes, so a non-boxed `Err(Response)` would balloon every
+/// `Result<PlanExportBody, _>` on the stack). Callers `return *err`.
+fn build_export_body(
+    plans_dir: &std::path::Path,
+    name: &str,
+) -> Result<PlanExportBody, Box<Response>> {
+    let plan_path = match plan_parser::find_plan_file(plans_dir, name) {
+        Some(p) => p,
+        None => {
+            return Err(Box::new(
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Plan not found"})),
+                )
+                    .into_response(),
+            ));
+        }
+    };
+
+    let ext = plan_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    // YAML on disk is already schema-only — task status / costs / agents are
+    // never persisted into plan files. Stream the raw bytes through so an
+    // author's comments and key ordering survive the round-trip. Markdown
+    // plans have no on-disk YAML, so we parse and re-emit via the canonical
+    // serializer.
+    let yaml_body = match ext {
+        "yaml" | "yml" => match std::fs::read_to_string(&plan_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(Box::new(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "read_failed",
+                            "message": format!("Failed to read plan file: {e}"),
+                        })),
+                    )
+                        .into_response(),
+                ));
+            }
+        },
+        _ => {
+            let plan = match plan_parser::parse_plan_file(&plan_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(Box::new(
+                        (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(serde_json::json!({
+                                "error": "parse_error",
+                                "message": format!("Failed to parse plan: {e}"),
+                            })),
+                        )
+                            .into_response(),
+                    ));
+                }
+            };
+            match plan_parser::serialize_plan_yaml(&plan) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(Box::new(
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "serialize_failed",
+                                "message": format!("Failed to serialize plan: {e}"),
+                            })),
+                        )
+                            .into_response(),
+                    ));
+                }
+            }
+        }
+    };
+
+    let exported_at = chrono::Utc::now().to_rfc3339();
+    let header =
+        format!("# branchwork-plan-export: {PLAN_EXPORT_VERSION}\n# exported-at: {exported_at}\n");
+    let body = format!("{header}{yaml_body}");
+
+    Ok(PlanExportBody { body, exported_at })
+}
+
+/// Sanitize a plan name for use in `Content-Disposition` / zip entry names.
+/// HeaderValue rejects CR/LF and bytes outside 0x20-0x7E; zip readers tolerate
+/// more but the dashboard is symmetric on both wire surfaces so the same rule
+/// applies.
+fn sanitize_plan_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 pub async fn export_plan(
     State(state): State<AppState>,
     auth: OptionalAuthUser,
@@ -359,87 +478,12 @@ pub async fn export_plan(
         }
     }
 
-    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Plan not found"})),
-            )
-                .into_response();
-        }
+    let body = match build_export_body(&state.plans_dir, &name) {
+        Ok(b) => b.body,
+        Err(resp) => return *resp,
     };
 
-    let ext = plan_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-    // YAML on disk is already schema-only — task status / costs / agents are
-    // never persisted into plan files. Stream the raw bytes through so an
-    // author's comments and key ordering survive the round-trip. Markdown
-    // plans have no on-disk YAML, so we parse and re-emit via the canonical
-    // serializer.
-    let yaml_body = match ext {
-        "yaml" | "yml" => match std::fs::read_to_string(&plan_path) {
-            Ok(s) => s,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": "read_failed",
-                        "message": format!("Failed to read plan file: {e}"),
-                    })),
-                )
-                    .into_response();
-            }
-        },
-        _ => {
-            let plan = match plan_parser::parse_plan_file(&plan_path) {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Json(serde_json::json!({
-                            "error": "parse_error",
-                            "message": format!("Failed to parse plan: {e}"),
-                        })),
-                    )
-                        .into_response();
-                }
-            };
-            match plan_parser::serialize_plan_yaml(&plan) {
-                Ok(s) => s,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": "serialize_failed",
-                            "message": format!("Failed to serialize plan: {e}"),
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    };
-
-    let exported_at = chrono::Utc::now().to_rfc3339();
-    let header =
-        format!("# branchwork-plan-export: {PLAN_EXPORT_VERSION}\n# exported-at: {exported_at}\n");
-    let body = format!("{header}{yaml_body}");
-
-    // Sanitize the filename for the Content-Disposition header — plan names
-    // that reach this point came from the filesystem, but we still drop
-    // anything outside [A-Za-z0-9._-] to avoid header-value rejection on
-    // edge cases (HeaderValue refuses CR/LF and bytes outside 0x20-0x7E).
-    let safe_name: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let safe_name = sanitize_plan_filename(&name);
     let disposition = format!("attachment; filename=\"{safe_name}.plan.yaml\"");
 
     (
@@ -454,6 +498,255 @@ pub async fn export_plan(
         body,
     )
         .into_response()
+}
+
+// ── POST /api/plans/export-bundle ────────────────────────────────────────────
+//
+// Multi-plan export. Body shape: `{ "names": ["plan-a", "plan-b", ...] }`.
+// Response: a zip containing each plan's canonical export body under
+// `<safe_name>.plan.yaml` plus a top-level `manifest.yaml` listing the set
+// (names + sha256s + per-entry exported-at + bundle exported-at). Per-entry
+// bytes are byte-identical to the single-plan GET so manifest hashes survive
+// any reader that round-trips a single file through 1.1's loader.
+//
+// Validation gates (all 4xx, no partial zips):
+//  * `names` is required and must be non-empty
+//  * each name must belong to the caller's org (404 surfaces the offender)
+//  * duplicates are rejected with 400 — zip entry names must be unique
+//  * bundle is capped at MAX_BUNDLE_PLANS to keep the in-memory body bounded
+//
+// All-or-nothing: if any plan fails to export, the whole call fails and no
+// zip is sent. A partial zip would silently lose plans for the operator.
+
+#[derive(Deserialize)]
+pub struct ExportBundleBody {
+    #[serde(default)]
+    names: Vec<String>,
+}
+
+/// Manifest entry; mirror of the `entries:` list in `manifest.yaml`. Wire shape
+/// uses snake_case so the manifest stays readable as a YAML doc.
+#[derive(Serialize)]
+struct BundleEntry {
+    /// Original plan name (matches the YAML's `title` slug, pre-sanitization).
+    name: String,
+    /// `<safe_name>.plan.yaml` — the zip entry path the YAML lives at.
+    filename: String,
+    /// Hex-encoded sha256 of the per-entry body bytes (header + YAML).
+    sha256: String,
+    /// RFC3339 timestamp from this entry's `# exported-at:` header line.
+    exported_at: String,
+}
+
+/// Hard cap on plans per bundle. Generous enough that picking the whole
+/// dashboard (~50-100 plans) works, low enough that an accidental
+/// `{"names":["a"; 100_000]}` doesn't pin the server.
+const MAX_BUNDLE_PLANS: usize = 256;
+
+pub async fn export_bundle(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Json(body): Json<ExportBundleBody>,
+) -> impl IntoResponse {
+    if body.names.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "names_required",
+                "message": "Request body must include a non-empty `names` array.",
+            })),
+        )
+            .into_response();
+    }
+    if body.names.len() > MAX_BUNDLE_PLANS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "too_many_plans",
+                "message": format!(
+                    "Bundle is capped at {MAX_BUNDLE_PLANS} plans (requested {}).",
+                    body.names.len(),
+                ),
+                "max": MAX_BUNDLE_PLANS,
+            })),
+        )
+            .into_response();
+    }
+    // Reject dupes up front — zip entry names must be unique, and a second
+    // identical name almost always signals a UI bug (the multi-select toolbar
+    // shouldn't be able to commit a duplicate).
+    {
+        let mut seen = std::collections::HashSet::new();
+        for n in &body.names {
+            if !seen.insert(n.as_str()) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "duplicate_name",
+                        "message": format!("Duplicate plan name in bundle: {n}"),
+                        "name": n,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Org + existence gate (do this before any disk-read so we 404 fast and
+    // can surface WHICH plan was missing). `plan_belongs_to_org` returns true
+    // for unmapped plans on the default org, so it doesn't catch "plan name
+    // does not exist on disk" — that check happens via `find_plan_file`.
+    {
+        let conn = state.db.lock().unwrap();
+        for n in &body.names {
+            if !orgs::plan_belongs_to_org(&conn, n, auth.org_id())
+                || plan_parser::find_plan_file(&state.plans_dir, n).is_none()
+            {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Plan not found",
+                        "name": n,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Build per-entry bodies + manifest rows. All-or-nothing: any error bails
+    // before we touch the zip writer, so partial bundles never escape.
+    use sha2::Digest;
+    let mut entries_for_zip: Vec<(String, String)> = Vec::with_capacity(body.names.len());
+    let mut manifest_entries: Vec<BundleEntry> = Vec::with_capacity(body.names.len());
+    let mut entry_filenames = std::collections::HashSet::new();
+    for n in &body.names {
+        let exported = match build_export_body(&state.plans_dir, n) {
+            Ok(e) => e,
+            Err(resp) => return *resp,
+        };
+        let safe_name = sanitize_plan_filename(n);
+        let filename = format!("{safe_name}.plan.yaml");
+        if !entry_filenames.insert(filename.clone()) {
+            // Two distinct plan names sanitized to the same zip entry. Refuse
+            // rather than silently lose one — the operator picked both, both
+            // belong in the bundle.
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "filename_collision",
+                    "message": format!(
+                        "Two plan names sanitize to the same zip entry ({filename}); pick one.",
+                    ),
+                    "filename": filename,
+                })),
+            )
+                .into_response();
+        }
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(exported.body.as_bytes());
+        let sha = hex_lower(&hasher.finalize());
+        manifest_entries.push(BundleEntry {
+            name: n.clone(),
+            filename: filename.clone(),
+            sha256: sha,
+            exported_at: exported.exported_at.clone(),
+        });
+        entries_for_zip.push((filename, exported.body));
+    }
+
+    let bundle_exported_at = chrono::Utc::now().to_rfc3339();
+    let manifest_value = serde_json::json!({
+        "branchwork_plan_export": PLAN_EXPORT_VERSION,
+        "exported_at": bundle_exported_at,
+        "entries": manifest_entries,
+    });
+    let manifest_yaml = match serde_yaml::to_string(&manifest_value) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "manifest_serialize_failed",
+                    "message": format!("Failed to serialize manifest: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Build the zip in memory. Deflate keeps a 100-plan bundle small (YAML
+    // compresses ~10x) without dragging zstd/lzma in.
+    let zip_bytes = match build_zip(&entries_for_zip, &manifest_yaml) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "zip_failed",
+                    "message": format!("Failed to build zip: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Filename embeds a UTC date stamp so an operator who downloads two
+    // bundles back-to-back gets distinguishable files. Sanitize for the
+    // Content-Disposition header same as single-plan export.
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let disposition = format!("attachment; filename=\"branchwork-plans-{stamp}.zip\"");
+
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/zip".to_string(),
+            ),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        zip_bytes,
+    )
+        .into_response()
+}
+
+/// Pure helper that takes per-plan entries + the manifest body and emits a zip
+/// archive in memory. Extracted so tests can exercise the layout deterministically
+/// without standing up the full HTTP surface.
+fn build_zip(entries: &[(String, String)], manifest_yaml: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::Write;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        for (name, body) in entries {
+            zip.start_file(name, opts)
+                .map_err(|e| std::io::Error::other(format!("start_file {name}: {e}")))?;
+            zip.write_all(body.as_bytes())?;
+        }
+        zip.start_file("manifest.yaml", opts)
+            .map_err(|e| std::io::Error::other(format!("start_file manifest.yaml: {e}")))?;
+        zip.write_all(manifest_yaml.as_bytes())?;
+        zip.finish()
+            .map_err(|e| std::io::Error::other(format!("finish: {e}")))?;
+    }
+    Ok(buf)
+}
+
+/// Lower-case hex of a sha256 digest, matching the dashboard's
+/// `crypto.subtle.digest` rendering so the manifest hash equals what a
+/// browser would compute locally.
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 // ── PUT /api/plans/:name/project ─────────────────────────────────────────────

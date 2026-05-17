@@ -7,7 +7,7 @@ import { useToastStore } from "../stores/toast-store.js";
 import { BulkDeleteModal } from "./BulkDeleteModal.js";
 import { formatRelative } from "../lib/time.js";
 import { isPlanDone } from "../lib/predicates.js";
-import { exportPlan } from "../lib/plan-export.js";
+import { exportPlan, exportPlanBundle } from "../lib/plan-export.js";
 import { toastError } from "../lib/toast.js";
 import { StaleDataChip } from "./StaleDataChip.js";
 
@@ -70,6 +70,10 @@ export function ProjectDashboard() {
   const [selectionMode, setSelectionMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  // Pending state for the Export selected button. While the POST is in
+  // flight we disable both Export + Delete so a flaky network can't
+  // double-fire. Caller resets to false unconditionally in the finally.
+  const [bulkExportPending, setBulkExportPending] = useState(false);
   // Opt-in stale-plan filter. Default off so the dashboard's first
   // impression remains "every plan I have"; flipping it on filters
   // the cards and exposes a "Select all" affordance for the bulk-delete
@@ -329,7 +333,7 @@ export function ProjectDashboard() {
         ))}
       </div>
 
-      {/* Sticky bulk-delete footer */}
+      {/* Sticky bulk-selection footer (delete + export) */}
       {selectionMode && selected.size > 0 && (
         <div
           className="fixed inset-x-0 bottom-0 z-40 border-t border-gray-700 bg-gray-900/95 backdrop-blur px-6 py-3 flex items-center justify-between gap-3"
@@ -344,13 +348,42 @@ export function ProjectDashboard() {
               type="button"
               onClick={exitSelectionMode}
               className="px-3 py-1.5 text-xs text-gray-300 hover:text-gray-100 transition"
+              disabled={bulkExportPending}
             >
               Cancel
             </button>
             <button
               type="button"
+              onClick={async () => {
+                if (bulkExportPending || orderedSelected.length === 0) return;
+                setBulkExportPending(true);
+                try {
+                  const result = await exportPlanBundle(orderedSelected);
+                  useToastStore.getState().push({
+                    kind: "success",
+                    title: `Exported ${orderedSelected.length} plan${
+                      orderedSelected.length !== 1 ? "s" : ""
+                    }`,
+                    body: result.filename,
+                  });
+                } catch (e) {
+                  toastError(e, "Export failed");
+                } finally {
+                  setBulkExportPending(false);
+                }
+              }}
+              disabled={bulkExportPending}
+              className="px-3 py-1.5 text-xs bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded transition"
+              data-testid="bulk-export-button"
+              title="Download a zip of the selected plans (plus a manifest of names + sha256s)"
+            >
+              {bulkExportPending ? "Exporting…" : `Export ${selected.size}`}
+            </button>
+            <button
+              type="button"
               onClick={() => setBulkDeleteOpen(true)}
-              className="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-600 text-white rounded transition"
+              disabled={bulkExportPending}
+              className="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded transition"
             >
               Delete {selected.size}
             </button>

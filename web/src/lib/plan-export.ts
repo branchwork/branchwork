@@ -60,6 +60,21 @@ function triggerDownload(filename: string, body: string): void {
   URL.revokeObjectURL(url);
 }
 
+/// Trigger a browser download of a `Blob` as `filename`. Distinct from
+/// `triggerDownload` so callers don't pay the implicit `TextEncoder`
+/// pass for binary bodies (zips, etc.) — same DOM dance otherwise.
+function triggerBlobDownload(filename: string, blob: Blob): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 /// Fetch the YAML export for `planName` from `GET /api/plans/:name/export`,
 /// compute its sha256, trigger a browser download, and return both.
 ///
@@ -95,4 +110,70 @@ export async function exportPlan(planName: string): Promise<PlanExportResult> {
   const hash = await sha256Hex(text);
   triggerDownload(filename, text);
   return { filename, body: text, sha256Hex: hash };
+}
+
+/// Result of a successful bulk export. `filename` is the canonical zip name
+/// the server suggested (or a UTC-stamped fallback), `byteLength` is the
+/// raw zip size so callers can surface a toast like "exported 3 plans (8.2 KB)".
+export interface PlanBundleExportResult {
+  filename: string;
+  byteLength: number;
+}
+
+/// Fetch a zip bundle of the named plans from `POST /api/plans/export-bundle`,
+/// then trigger a browser download. Matches `exportPlan` on auth + org
+/// plumbing: sends `credentials: "same-origin"` and `X-Org-Id` from the
+/// active-org storage helper.
+///
+/// Throws `HttpError` on non-2xx so callers can `toastError(e, "Export failed")`.
+/// The response is `application/zip` — kept off `fetchJson` for the same
+/// reason as `exportPlan`.
+export async function exportPlanBundle(
+  planNames: readonly string[],
+): Promise<PlanBundleExportResult> {
+  if (planNames.length === 0) {
+    throw new Error("exportPlanBundle: planNames must be non-empty");
+  }
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const activeOrg = readActiveOrgFromStorage();
+  if (activeOrg) headers["X-Org-Id"] = activeOrg;
+
+  const res = await fetch(`/api/plans/export-bundle`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers,
+    body: JSON.stringify({ names: planNames }),
+  });
+  if (!res.ok) {
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      body = undefined;
+    }
+    throw new HttpError(res.status, res.statusText, body);
+  }
+  const blob = await res.blob();
+  const filename = bundleFilenameFromDisposition(res.headers.get("content-disposition"));
+  triggerBlobDownload(filename, blob);
+  return { filename, byteLength: blob.size };
+}
+
+/// Pull the zip filename from the server's Content-Disposition. Distinct
+/// from `filenameFromDisposition` because the single-plan path appends
+/// `.plan.yaml` to its fallback, which is wrong for a bundle. Falls back
+/// to `branchwork-plans-<utc-stamp>.zip` whose stamp shape mirrors the
+/// server's `%Y%m%dT%H%M%SZ` so downloaded bundles sort lexicographically
+/// regardless of which side picked the name.
+function bundleFilenameFromDisposition(header: string | null): string {
+  if (header) {
+    const m = FILENAME_RE.exec(header);
+    if (m && m[1]) return m[1];
+  }
+  const d = new Date();
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  const stamp = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+  return `branchwork-plans-${stamp}.zip`;
 }

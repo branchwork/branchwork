@@ -299,6 +299,7 @@ async fn run_server(cli: Cli) {
                 .delete(api::plans::delete_plan),
         )
         .route("/api/plans/{name}/export", get(api::plans::export_plan))
+        .route("/api/plans/export-bundle", post(api::plans::export_bundle))
         .route("/api/snapshots", get(api::plans::list_snapshots))
         .route("/api/snapshots/{id}", delete(api::plans::delete_snapshot))
         .route(
