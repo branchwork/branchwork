@@ -22,11 +22,23 @@ env:
 
 jobs:
   build:
-    # Only publish if either we weren't triggered by workflow_run (tag push or
-    # manual dispatch), or the CI run that triggered us was green.
+    # Two gates for the workflow_run case:
+    #   1. The triggering CI run must have been green.
+    #   2. The commit at the tip must be an auto-bump commit (subject
+    #      starts with `chore: auto-bump to v`).
+    # The second gate exists because ci.yml's bump-version job pushes a
+    # bump commit *for every* human master push. The human commit's
+    # CI run succeeds (only the bump job ran), but we only want to
+    # build the image for the *bump commit* — that one carries the
+    # new version, and the version progression depends on each deploy
+    # being tied to a distinct patch number.
+    #
+    # Tag pushes (`push: tags: v*`) and manual dispatches bypass both
+    # gates — releases are explicit and don't go through the bump path.
     if: >
       github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_commit.message, 'chore: auto-bump to v'))
     strategy:
       # Keep both arches running even if one fails so the failure mode is
       # visible (e.g. arm64 zigbuild regression) rather than masked by

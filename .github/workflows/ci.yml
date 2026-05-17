@@ -10,7 +10,88 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # On every master push, bump the patch version of server-rs/Cargo.toml
+  # (and the matching Cargo.lock entry) and push the bump back as a fresh
+  # commit. The downstream build / docker / deploy chain picks up that
+  # bump commit, so every deploy lands on a distinct version number — a
+  # human-visible "which build is in prod" signal.
+  #
+  # The job is self-idempotent: if the current commit is *itself* a bump
+  # commit (recognised by its `chore: auto-bump to v…` subject), the
+  # bump is skipped and the downstream jobs proceed normally. This is
+  # what breaks the loop: human push A → bump pushes B → CI fires on B
+  # with is_bump_commit=true → no further bump, full pipeline runs.
+  #
+  # Docker's workflow_run trigger (docker.yml) also filters on the bump
+  # commit subject, so the build/publish only happens for the bump
+  # commit, not the human commit underneath it.
+  bump-version:
+    name: Auto-bump patch on master push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    outputs:
+      is_bump_commit: ${{ steps.classify.outputs.is_bump_commit }}
+      new_version: ${{ steps.bump.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # GH_PAT is used so the resulting push *triggers* a follow-up
+          # CI run on the bump commit. Pushes made with the default
+          # GITHUB_TOKEN do not trigger downstream workflows.
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 2
+
+      - name: Classify current commit
+        id: classify
+        run: |
+          msg=$(git log -1 --format=%s)
+          if [[ "$msg" == "chore: auto-bump to v"* ]]; then
+            echo "is_bump_commit=true" >> "$GITHUB_OUTPUT"
+            echo "Already a bump commit ($msg) — skipping bump, downstream jobs run."
+          else
+            echo "is_bump_commit=false" >> "$GITHUB_OUTPUT"
+            echo "Human commit ($msg) — will bump patch and push."
+          fi
+
+      - name: Bump Cargo.toml + Cargo.lock and push
+        if: steps.classify.outputs.is_bump_commit == 'false'
+        id: bump
+        run: |
+          set -euo pipefail
+          cur=$(grep -m1 '^version' server-rs/Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          IFS=. read -r maj min pat <<<"$cur"
+          new="$maj.$min.$((pat + 1))"
+          echo "Bumping $cur -> $new"
+          # Cargo.toml: only one [package] version line.
+          sed -i "s/^version = \"$cur\"$/version = \"$new\"/" server-rs/Cargo.toml
+          # Cargo.lock: the version line *immediately following* the
+          # `name = "branchwork-server"` line. The `n;s/.../.../` pair
+          # reads the next line into the pattern space, then substitutes.
+          sed -i '/^name = "branchwork-server"$/{n;s/^version = "'"$cur"'"$/version = "'"$new"'"/}' server-rs/Cargo.lock
+          # Confirm both files actually moved — `set -e` won't catch a
+          # silently-non-matching sed.
+          grep -q "^version = \"$new\"$" server-rs/Cargo.toml
+          grep -A1 '^name = "branchwork-server"$' server-rs/Cargo.lock | grep -q "version = \"$new\""
+          git config user.name "branchwork-bot"
+          git config user.email "bot@branchwork.dev"
+          git add server-rs/Cargo.toml server-rs/Cargo.lock
+          git commit -m "chore: auto-bump to v$new"
+          git push origin HEAD:master
+          echo "new_version=$new" >> "$GITHUB_OUTPUT"
+
   server:
+    needs: bump-version
+    # Run on PRs (where bump-version is skipped) and on bump commits
+    # (where bump-version ran with is_bump_commit=true). Skip on the
+    # original human master push (bump-version=false): the bump commit
+    # it produced will get its own full CI run a moment later.
+    if: |
+      always() && (
+        github.event_name != 'push' ||
+        needs.bump-version.outputs.is_bump_commit == 'true'
+      )
     name: Rust — ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -78,6 +159,12 @@ jobs:
         run: cargo audit
 
   web:
+    needs: bump-version
+    if: |
+      always() && (
+        github.event_name != 'push' ||
+        needs.bump-version.outputs.is_bump_commit == 'true'
+      )
     name: Web — typecheck, build
     runs-on: ubuntu-latest
 
@@ -123,6 +210,12 @@ jobs:
   # and the matrix multiplier on the `server` job is enough OS coverage
   # for the rest of the suite.
   tests-e2e:
+    needs: bump-version
+    if: |
+      always() && (
+        github.event_name != 'push' ||
+        needs.bump-version.outputs.is_bump_commit == 'true'
+      )
     name: E2E tests (gh + Claude)
     runs-on: ubuntu-latest
     defaults:
