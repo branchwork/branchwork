@@ -1013,6 +1013,7 @@ fn plan_project(db: &Db, plan_name: &str, parsed_project: Option<&str>) -> Optio
 /// status change with a helpful error), or we couldn't tell (missing
 /// project dir, no git, git errored — treat as clean; the merge-time
 /// empty-branch guard is the backstop).
+#[derive(Debug)]
 pub enum TreeState {
     Clean,
     Dirty { files: Vec<String> },
@@ -1024,11 +1025,22 @@ pub enum TreeState {
 /// calls `update_task_status(completed)`, and exits — leaving the changes
 /// to be silently stepped on by the next agent.
 ///
+/// The project's `branchwork.toml` may opt specific paths out of the
+/// pause via `[auto_mode.dirty_tree] ignore = [...]` (gitignore-style
+/// globs). Those paths still show up in `git status` but the check
+/// pretends they're clean — intended for known-operational files
+/// (build logs, scratch notes, generated config) so noise doesn't
+/// pause plans. Agent code paths must NOT be ignored: the merge-time
+/// empty-branch guard is the backstop but the dirty-tree check is the
+/// primary signal for "agent left work uncommitted".
+///
 /// Returns `Dirty` with the first few changed paths for a useful error
-/// message, `Clean` when it's safe to proceed, and `Unknown` when we
-/// can't introspect (no project dir, not a git repo, etc) — the caller
-/// should treat that as permissive because the merge-time empty-branch
-/// guard still catches the case where nothing was ever committed.
+/// message, `Clean` when it's safe to proceed (either nothing dirty
+/// or everything dirty matched the ignore list), and `Unknown` when
+/// we can't introspect (no project dir, not a git repo, etc) — the
+/// caller should treat that as permissive because the merge-time
+/// empty-branch guard still catches the case where nothing was ever
+/// committed.
 pub fn check_tree_clean_for_completion(
     db: &Db,
     plans_dir: &std::path::Path,
@@ -1052,15 +1064,38 @@ pub fn check_tree_clean_for_completion(
         _ => return TreeState::Unknown,
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-    if lines.is_empty() {
+    // Porcelain lines are "XY path" with a 3-char prefix; slice past it.
+    // Empty lines (trailing newline etc) are dropped.
+    let all_paths: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.get(3..).unwrap_or(l))
+        .collect();
+    if all_paths.is_empty() {
         return TreeState::Clean;
     }
-    // Porcelain lines are "XY path" with a 3-char prefix; slice past it.
-    let files: Vec<String> = lines
+    // Per-project allowlist: known-operational files (e.g. `*.log`,
+    // `.bob/**`) shouldn't trip the pause. The list lives in
+    // `<project>/branchwork.toml`. Falls back to "no filter" when the
+    // file is absent or malformed — the warn-and-skip path inside
+    // `repo_config` keeps us from making noisy plans noisier.
+    let repo_cfg = crate::repo_config::load_for_project_dir(&cwd);
+    let dirty_tree_cfg = repo_cfg
+        .as_ref()
+        .map(|c| &c.auto_mode.dirty_tree)
+        .cloned()
+        .unwrap_or_default();
+    let dirty_paths: Vec<&str> = all_paths
+        .into_iter()
+        .filter(|path| !dirty_tree_cfg.path_matches_ignore(path))
+        .collect();
+    if dirty_paths.is_empty() {
+        return TreeState::Clean;
+    }
+    let files: Vec<String> = dirty_paths
         .iter()
         .take(10)
-        .map(|l| l.get(3..).unwrap_or(l).to_string())
+        .map(|p| (*p).to_string())
         .collect();
     TreeState::Dirty { files }
 }
@@ -4744,5 +4779,234 @@ mod tests {
             has_phase_advanced(&events, plan),
             "phase_advanced MUST fire when no verification is configured: {events:?}",
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // check_tree_clean_for_completion: per-project ignore allowlist
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Init a git repo at `cwd`, commit `tracked_files` (each path is
+    /// pre-populated with `"init\n"` and then committed). Returns the
+    /// repo path. Mirrors `hooks::tests::git_init_with_clean_tree` but
+    /// lets the caller seed nested tracked files for porcelain testing.
+    fn git_init_with_tracked_files(cwd: &std::path::Path, tracked_files: &[&str]) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir_all(cwd).unwrap();
+        run(&["init", "-q", "-b", "master"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "Test"]);
+        for path in tracked_files {
+            let full = cwd.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, "init\n").unwrap();
+            run(&["add", path]);
+        }
+        run(&["commit", "-q", "-m", "initial"]);
+    }
+
+    fn map_plan_to_project_path(db: &Db, plan: &str, project: &std::path::Path) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO plan_project (plan_name, project) VALUES (?1, ?2) \
+             ON CONFLICT(plan_name) DO UPDATE SET project = excluded.project",
+            params![plan, project.to_string_lossy()],
+        )
+        .unwrap();
+    }
+
+    /// Acceptance criterion: `[auto_mode.dirty_tree] ignore = ["*.log"]`
+    /// in `branchwork.toml` plus a dirty `server.log` returns `Clean`.
+    #[test]
+    fn dirty_log_alone_is_clean_when_ignored_by_branchwork_toml() {
+        crate::repo_config::clear_cache_for_tests();
+        let (db, _holder) = fresh_db();
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("project");
+        git_init_with_tracked_files(&cwd, &["server.log"]);
+        // Make server.log dirty by writing modified content.
+        std::fs::write(cwd.join("server.log"), "modified noise\n").unwrap();
+        std::fs::write(
+            cwd.join("branchwork.toml"),
+            "[auto_mode.dirty_tree]\nignore = [\"*.log\"]\n",
+        )
+        .unwrap();
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        map_plan_to_project_path(&db, "p1", &cwd);
+
+        match check_tree_clean_for_completion(&db, &plans_dir, "p1") {
+            TreeState::Clean => {}
+            other => panic!("expected Clean (server.log filtered), got {other:?}"),
+        }
+    }
+
+    /// Acceptance criterion: a dirty agent-code path (`server-rs/src/foo.rs`)
+    /// still returns `Dirty` even with the `*.log` allowlist active.
+    #[test]
+    fn dirty_agent_code_file_remains_dirty_with_log_ignore() {
+        crate::repo_config::clear_cache_for_tests();
+        let (db, _holder) = fresh_db();
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("project");
+        git_init_with_tracked_files(&cwd, &["server-rs/src/foo.rs"]);
+        std::fs::write(
+            cwd.join("server-rs/src/foo.rs"),
+            "fn changed_but_not_committed() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("branchwork.toml"),
+            "[auto_mode.dirty_tree]\nignore = [\"*.log\"]\n",
+        )
+        .unwrap();
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        map_plan_to_project_path(&db, "p2", &cwd);
+
+        match check_tree_clean_for_completion(&db, &plans_dir, "p2") {
+            TreeState::Dirty { files } => {
+                assert!(
+                    files.iter().any(|f| f.ends_with("foo.rs")),
+                    "expected foo.rs in dirty files, got {files:?}"
+                );
+            }
+            other => panic!("expected Dirty (foo.rs not ignored), got {other:?}"),
+        }
+    }
+
+    /// Mixed dirty set: one operational + one code file, with only the
+    /// operational glob in the allowlist. The code file alone is what
+    /// flips the verdict to Dirty; `files` must contain ONLY the code
+    /// file (not the filtered log), so dashboards don't show noise.
+    #[test]
+    fn mixed_dirty_set_filters_log_keeps_code_file() {
+        crate::repo_config::clear_cache_for_tests();
+        let (db, _holder) = fresh_db();
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("project");
+        git_init_with_tracked_files(&cwd, &["server.log", "server-rs/src/foo.rs"]);
+        std::fs::write(cwd.join("server.log"), "modified\n").unwrap();
+        std::fs::write(cwd.join("server-rs/src/foo.rs"), "modified\n").unwrap();
+        std::fs::write(
+            cwd.join("branchwork.toml"),
+            "[auto_mode.dirty_tree]\nignore = [\"*.log\"]\n",
+        )
+        .unwrap();
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        map_plan_to_project_path(&db, "p3", &cwd);
+
+        match check_tree_clean_for_completion(&db, &plans_dir, "p3") {
+            TreeState::Dirty { files } => {
+                assert!(
+                    files.iter().any(|f| f.ends_with("foo.rs")),
+                    "expected foo.rs in dirty files, got {files:?}"
+                );
+                assert!(
+                    files.iter().all(|f| !f.ends_with("server.log")),
+                    "server.log must be filtered out of dirty list, got {files:?}"
+                );
+            }
+            other => panic!("expected Dirty (mixed set), got {other:?}"),
+        }
+    }
+
+    /// `.bob/**` and `.mcp.json` patterns from the task description.
+    #[test]
+    fn ignores_bob_directory_and_mcp_json() {
+        crate::repo_config::clear_cache_for_tests();
+        let (db, _holder) = fresh_db();
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("project");
+        git_init_with_tracked_files(&cwd, &[".bob/notes.txt", ".mcp.json"]);
+        std::fs::write(cwd.join(".bob/notes.txt"), "scratch\n").unwrap();
+        std::fs::write(cwd.join(".mcp.json"), "{}\n").unwrap();
+        std::fs::write(
+            cwd.join("branchwork.toml"),
+            "[auto_mode.dirty_tree]\nignore = [\".bob/**\", \".mcp.json\"]\n",
+        )
+        .unwrap();
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        map_plan_to_project_path(&db, "p4", &cwd);
+
+        match check_tree_clean_for_completion(&db, &plans_dir, "p4") {
+            TreeState::Clean => {}
+            other => panic!(
+                "expected Clean (both files filtered by .bob/** and .mcp.json), got {other:?}"
+            ),
+        }
+    }
+
+    /// No `branchwork.toml` at all: behaviour unchanged from pre-task —
+    /// any dirty tracked path produces `Dirty`.
+    #[test]
+    fn absent_branchwork_toml_falls_back_to_unfiltered_behaviour() {
+        crate::repo_config::clear_cache_for_tests();
+        let (db, _holder) = fresh_db();
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("project");
+        git_init_with_tracked_files(&cwd, &["server.log"]);
+        std::fs::write(cwd.join("server.log"), "modified\n").unwrap();
+        // no branchwork.toml
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        map_plan_to_project_path(&db, "p5", &cwd);
+
+        match check_tree_clean_for_completion(&db, &plans_dir, "p5") {
+            TreeState::Dirty { files } => {
+                assert!(
+                    files.iter().any(|f| f.ends_with("server.log")),
+                    "expected server.log in dirty files (no allowlist), got {files:?}"
+                );
+            }
+            other => panic!("expected Dirty without branchwork.toml, got {other:?}"),
+        }
+    }
+
+    /// `branchwork.toml` exists but is missing the `[auto_mode.dirty_tree]`
+    /// section — fall back to "no filter" without panicking.
+    #[test]
+    fn branchwork_toml_without_dirty_tree_section_falls_back_to_unfiltered() {
+        crate::repo_config::clear_cache_for_tests();
+        let (db, _holder) = fresh_db();
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("project");
+        git_init_with_tracked_files(&cwd, &["server.log"]);
+        std::fs::write(cwd.join("server.log"), "modified\n").unwrap();
+        std::fs::write(
+            cwd.join("branchwork.toml"),
+            "[ci]\nblocking_workflows = [\"CI\"]\n",
+        )
+        .unwrap();
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        map_plan_to_project_path(&db, "p6", &cwd);
+
+        match check_tree_clean_for_completion(&db, &plans_dir, "p6") {
+            TreeState::Dirty { files } => {
+                assert!(files.iter().any(|f| f.ends_with("server.log")));
+            }
+            other => panic!("expected Dirty (no dirty_tree section), got {other:?}"),
+        }
     }
 }

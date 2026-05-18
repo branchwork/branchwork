@@ -1,7 +1,7 @@
-//! Per-repo `branchwork.toml` config: blocking-workflows allowlist + the
-//! phase-verification command. Loaded from `~/<project>/branchwork.toml`
-//! during project resolution (the `infer_project` path in
-//! [`crate::plan_parser`]).
+//! Per-repo `branchwork.toml` config: blocking-workflows allowlist, the
+//! phase-verification command, and the dirty-tree-check ignore list.
+//! Loaded from `~/<project>/branchwork.toml` during project resolution
+//! (the `infer_project` path in [`crate::plan_parser`]).
 //!
 //! Phase 0 of the `branchwork-phase-verify-and-ci-filter` plan: this module
 //! parses + caches the file. The resolution-order helper that combines
@@ -20,10 +20,15 @@
 //! [phase]
 //! # Shell command run by the phase-end Check agent.
 //! verification = "bash scripts/verify.sh"
+//!
+//! [auto_mode.dirty_tree]
+//! # Paths whose dirty state should NOT trigger the
+//! # "agent_left_uncommitted_work" pause. Globs supported.
+//! ignore = ["*.log", ".bob/**", ".mcp.json"]
 //! ```
 //!
-//! Both sections are optional. Unknown top-level keys are silently
-//! dropped; unknown keys *inside* `[ci]` / `[phase]` are also dropped, so
+//! All sections are optional. Unknown top-level keys are silently
+//! dropped; unknown keys *inside* known sections are also dropped, so
 //! typos won't crash the parser.
 //!
 //! # Failure modes
@@ -67,12 +72,55 @@ pub struct PhaseConfig {
     pub verification: Option<String>,
 }
 
+/// `[auto_mode]` table — auto-mode loop tuning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AutoModeConfig {
+    pub dirty_tree: DirtyTreeConfig,
+}
+
+/// `[auto_mode.dirty_tree]` table — controls the dirty-tree check that
+/// gates auto-mode's pause-on-uncommitted-work behaviour
+/// (see [`crate::agents::check_tree_clean_for_completion`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DirtyTreeConfig {
+    /// Glob patterns for tracked file paths whose dirty state should
+    /// NOT trigger the `agent_left_uncommitted_work` pause. Intended
+    /// for known-operational files an agent might rewrite as a side
+    /// effect (build logs, scratch notes, generated config) — the
+    /// filter exists so noise doesn't pause plans, NOT to mask the
+    /// agent forgetting to commit real code changes; agent code paths
+    /// like `server-rs/`, `web/src/` still trip the pause.
+    ///
+    /// Matching is gitignore-style: a pattern without `/` matches the
+    /// basename of a path at any depth; a pattern with `/` matches
+    /// the full path. `*` matches any chars except `/`; `**` matches
+    /// any chars including `/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<Vec<String>>,
+}
+
+impl DirtyTreeConfig {
+    /// Returns `true` when `path` (as emitted by
+    /// `git status --porcelain`, i.e. forward-slash relative to repo
+    /// root) matches any pattern in [`Self::ignore`]. Empty / absent
+    /// ignore list returns `false` (no path is filtered).
+    pub fn path_matches_ignore(&self, path: &str) -> bool {
+        let Some(patterns) = self.ignore.as_deref() else {
+            return false;
+        };
+        patterns.iter().any(|pat| matches_ignore_pattern(pat, path))
+    }
+}
+
 /// Top-level `branchwork.toml` content.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RepoConfig {
     pub ci: CiConfig,
     pub phase: PhaseConfig,
+    pub auto_mode: AutoModeConfig,
 }
 
 impl RepoConfig {
@@ -83,6 +131,89 @@ impl RepoConfig {
         self.ci.blocking_workflows.is_none()
             && self.ci.blocking_workflows_skip.is_none()
             && self.phase.verification.is_none()
+            && self.auto_mode.dirty_tree.ignore.is_none()
+    }
+}
+
+/// Gitignore-style pattern matcher, slim subset.
+///
+/// - If `pattern` contains no `/`, it matches the basename of `path`
+///   at any depth (gitignore behaviour for path-less patterns like
+///   `*.log` or `.mcp.json`).
+/// - Otherwise, it matches the full path.
+/// - `*` matches any sequence of chars NOT including `/`.
+/// - `**` matches any sequence of chars including `/`. Following the
+///   common convention, a trailing `/` after `**` is consumed greedily
+///   so e.g. `.bob/**` matches both `.bob/foo` and `.bob/foo/bar`.
+///
+/// Anchored at both ends (no implicit prefix or suffix). Backslash is
+/// treated as a literal — paths from `git status --porcelain` use
+/// forward slashes regardless of platform.
+fn matches_ignore_pattern(pattern: &str, path: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern.contains('/') {
+        return glob_match(pattern.as_bytes(), path.as_bytes());
+    }
+    // No-slash patterns apply to the basename at any depth.
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    glob_match(pattern.as_bytes(), basename.as_bytes())
+}
+
+fn glob_match(pat: &[u8], s: &[u8]) -> bool {
+    // Recursive descent. Fast enough for the handful of patterns +
+    // dozens of path lines we expect to see in practice.
+    match (pat.first(), s.first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(&b'*'), _) => {
+            // Lookahead: ** matches across `/`, single * does not.
+            if pat.get(1) == Some(&b'*') {
+                // Consume `**` and an optional trailing `/`.
+                let rest: &[u8] = if pat.get(2) == Some(&b'/') {
+                    &pat[3..]
+                } else {
+                    &pat[2..]
+                };
+                // Try the rest at every offset, including the end.
+                // `**` is allowed to match zero chars.
+                let mut k = 0;
+                loop {
+                    if glob_match(rest, &s[k..]) {
+                        return true;
+                    }
+                    if k >= s.len() {
+                        return false;
+                    }
+                    k += 1;
+                }
+            } else {
+                // Single `*` matches any sequence not including `/`.
+                let rest = &pat[1..];
+                let mut k = 0;
+                loop {
+                    if glob_match(rest, &s[k..]) {
+                        return true;
+                    }
+                    if k >= s.len() {
+                        return false;
+                    }
+                    if s[k] == b'/' {
+                        return false;
+                    }
+                    k += 1;
+                }
+            }
+        }
+        (Some(_), None) => false,
+        (Some(&p), Some(&c)) => {
+            if p == c {
+                glob_match(&pat[1..], &s[1..])
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -381,5 +512,115 @@ blocking_workflows = ["CI"]
             ..Default::default()
         };
         assert!(!with_phase.is_empty());
+
+        let with_auto_mode = RepoConfig {
+            auto_mode: AutoModeConfig {
+                dirty_tree: DirtyTreeConfig {
+                    ignore: Some(vec!["*.log".into()]),
+                },
+            },
+            ..Default::default()
+        };
+        assert!(!with_auto_mode.is_empty());
+    }
+
+    #[test]
+    fn parses_auto_mode_dirty_tree_ignore() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            r#"
+[auto_mode.dirty_tree]
+ignore = ["*.log", ".bob/**", ".mcp.json"]
+"#,
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert_eq!(
+            cfg.auto_mode.dirty_tree.ignore.as_deref(),
+            Some(
+                &[
+                    "*.log".to_string(),
+                    ".bob/**".to_string(),
+                    ".mcp.json".to_string()
+                ][..]
+            )
+        );
+    }
+
+    // ---- glob matcher --------------------------------------------
+
+    #[test]
+    fn glob_star_matches_basename_anywhere() {
+        assert!(matches_ignore_pattern("*.log", "server.log"));
+        assert!(matches_ignore_pattern("*.log", "nested/dir/server.log"));
+    }
+
+    #[test]
+    fn glob_star_rejects_non_matching_suffix() {
+        assert!(!matches_ignore_pattern("*.log", "server-rs/src/foo.rs"));
+        assert!(!matches_ignore_pattern("*.log", "server.txt"));
+    }
+
+    #[test]
+    fn glob_exact_filename_matches_at_any_depth() {
+        assert!(matches_ignore_pattern(".mcp.json", ".mcp.json"));
+        assert!(matches_ignore_pattern(".mcp.json", "subdir/.mcp.json"));
+        assert!(!matches_ignore_pattern(".mcp.json", "mcp.json"));
+        assert!(!matches_ignore_pattern(".mcp.json", "x.mcp.json"));
+    }
+
+    #[test]
+    fn glob_dir_doublestar_matches_recursively() {
+        assert!(matches_ignore_pattern(".bob/**", ".bob/foo"));
+        assert!(matches_ignore_pattern(".bob/**", ".bob/foo/bar"));
+        assert!(matches_ignore_pattern(".bob/**", ".bob/foo/bar/baz.txt"));
+        // `**` doesn't have to match anything, but the trailing `/`
+        // does — gitignore-wise this is the "match everything under
+        // .bob/" idiom, not the bare directory itself.
+        assert!(!matches_ignore_pattern(".bob/**", ".bob"));
+        assert!(!matches_ignore_pattern(".bob/**", "other/.bob/foo"));
+    }
+
+    #[test]
+    fn glob_full_path_pattern_anchors_at_root() {
+        // Pattern containing `/` is matched against the FULL path, not
+        // basename-at-any-depth.
+        assert!(matches_ignore_pattern("docs/*.log", "docs/build.log"));
+        assert!(!matches_ignore_pattern("docs/*.log", "src/docs/build.log"));
+        // Single * does not cross `/`.
+        assert!(!matches_ignore_pattern(
+            "docs/*.log",
+            "docs/build/output.log"
+        ));
+    }
+
+    #[test]
+    fn glob_empty_pattern_matches_nothing() {
+        assert!(!matches_ignore_pattern("", "anything"));
+        assert!(!matches_ignore_pattern("", ""));
+    }
+
+    #[test]
+    fn dirty_tree_path_matches_ignore_walks_every_pattern() {
+        let cfg = DirtyTreeConfig {
+            ignore: Some(vec![
+                "*.log".to_string(),
+                ".bob/**".to_string(),
+                ".mcp.json".to_string(),
+            ]),
+        };
+        assert!(cfg.path_matches_ignore("server.log"));
+        assert!(cfg.path_matches_ignore(".bob/scratch.txt"));
+        assert!(cfg.path_matches_ignore(".mcp.json"));
+        assert!(!cfg.path_matches_ignore("server-rs/src/foo.rs"));
+        assert!(!cfg.path_matches_ignore("web/src/App.tsx"));
+    }
+
+    #[test]
+    fn dirty_tree_path_matches_ignore_returns_false_when_no_patterns() {
+        let cfg = DirtyTreeConfig::default();
+        assert!(!cfg.path_matches_ignore("server.log"));
     }
 }
