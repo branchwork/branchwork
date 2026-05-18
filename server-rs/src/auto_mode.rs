@@ -1910,6 +1910,159 @@ mod tests {
         );
     }
 
+    /// Task 1.2 of auto-push-rebase-on-non-fast-forward: a non-FF push
+    /// that succeeds on rebase-then-retry must emit one
+    /// `auto_push_rebase_retry` audit row + one `auto_push_rebased`
+    /// broadcast event. Pins the wiring in `ci::trigger_after_merge`
+    /// against the `PushReport.retries` slice returned by
+    /// `push_branch_local`.
+    #[tokio::test]
+    async fn standalone_post_merge_rebase_retry_audits_and_broadcasts() {
+        let (db, dir) = fresh_db();
+
+        // ─── Set up a bare origin and TWO clones that will race ─────────
+        let origin = dir.path().join("origin.git");
+        let init = Command::new("git")
+            .args(["init", "--bare", "-q", "-b", "master"])
+            .arg(&origin)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        // Clone A: the "local" agent workspace. Add a workflow + the
+        // initial commit, then push so origin has a HEAD.
+        let cwd = dir.path().join("local-a");
+        let ok = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                cwd.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "clone to local-a failed");
+        run_git(&cwd, &["config", "user.email", "a@t.test"]);
+        run_git(&cwd, &["config", "user.name", "agent-a"]);
+        std::fs::create_dir_all(cwd.join(".github").join("workflows")).unwrap();
+        std::fs::write(
+            cwd.join(".github").join("workflows").join("ci.yml"),
+            "name: ci\non: [push]\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n",
+        )
+        .unwrap();
+        run_git(&cwd, &["add", ".github/workflows/ci.yml"]);
+        run_git(&cwd, &["commit", "-q", "-m", "add ci"]);
+        run_git(&cwd, &["push", "-q", "-u", "origin", "master"]);
+
+        // Clone B: a "sibling" workspace that races by pushing first.
+        let local_b = dir.path().join("local-b");
+        let ok = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                local_b.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "clone to local-b failed");
+        run_git(&local_b, &["config", "user.email", "b@t.test"]);
+        run_git(&local_b, &["config", "user.name", "agent-b"]);
+        std::fs::write(local_b.join("sibling.txt"), "from B\n").unwrap();
+        run_git(&local_b, &["add", "sibling.txt"]);
+        run_git(&local_b, &["commit", "-q", "-m", "sibling commit"]);
+        run_git(&local_b, &["push", "-q", "origin", "master"]);
+        // Origin now ahead of local-a's view: A's `origin/master` is
+        // stale until the post-merge push attempt fetches it.
+
+        // local-a creates a task branch, commits, and is about to merge.
+        // The merge runs locally and produces a non-FF push attempt.
+        git_create_task_branch(&cwd, "branchwork/p/1.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        seed_agent(&db, "agent-1", &cwd, "p", "1.1", "branchwork/p/1.1");
+        enable_auto_mode(&db, "p");
+
+        run_merge_step(&state, "default-org", "agent-1", "p", "1.1").await;
+
+        // Master moved (merge happened locally) and the spawned
+        // `trigger_after_merge` ran the rebase-then-retry path. Poll for
+        // both the ci_runs row (proves push succeeded) and the audit row
+        // (proves the retry was recorded).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut ci_run_count: i64 = 0;
+        let mut retry_audit_count: i64 = 0;
+        while std::time::Instant::now() < deadline {
+            {
+                let conn = db.lock().unwrap();
+                ci_run_count = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM ci_runs WHERE plan_name = ?1",
+                        params!["p"],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0);
+                retry_audit_count = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM audit_logs \
+                         WHERE action = ?1 AND resource_id = ?2",
+                        params![crate::audit::actions::AUTO_PUSH_REBASE_RETRY, "p"],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0);
+            }
+            if ci_run_count > 0 && retry_audit_count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            ci_run_count, 1,
+            "expected the post-rebase retry push to succeed and write a ci_runs row"
+        );
+        assert_eq!(
+            retry_audit_count, 1,
+            "expected exactly one auto_push_rebase_retry audit row for the single retry"
+        );
+
+        // Broadcast: at least one `auto_push_rebased` event landed.
+        let events = drain_event_types(&mut rx);
+        assert!(
+            events.contains(&"auto_push_rebased".to_string()),
+            "expected auto_push_rebased in {events:?}"
+        );
+
+        // Audit row body: parse the diff and verify the canonical fields.
+        let diff_json: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT diff FROM audit_logs WHERE action = ?1 AND resource_id = ?2",
+                params![crate::audit::actions::AUTO_PUSH_REBASE_RETRY, "p"],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        let diff: serde_json::Value = serde_json::from_str(&diff_json).unwrap();
+        assert_eq!(diff["kind"], "auto_push_rebase_retry");
+        assert_eq!(diff["branch"], "master");
+        assert_eq!(diff["attempt"], 1);
+        assert_eq!(
+            diff["last_rebase_sha"].as_str().unwrap().len(),
+            40,
+            "last_rebase_sha must be a full SHA"
+        );
+        assert_eq!(
+            diff["prior_remote_sha"].as_str().unwrap().len(),
+            40,
+            "prior_remote_sha must be a full SHA"
+        );
+    }
+
     #[tokio::test]
     async fn standalone_no_commit_pauses_with_merge_failed_reason() {
         let (db, dir) = fresh_db();

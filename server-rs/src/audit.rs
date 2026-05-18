@@ -75,6 +75,17 @@ pub mod actions {
     /// row is soft-deleted via `removed_at`. Diff carries
     /// `{runner_id, runner_name, tokens_revoked: usize}`.
     pub const RUNNER_REVOKED: &str = "runner.revoked";
+    /// `git_helpers::push_branch_local` was rejected as non-fast-forward
+    /// and successfully rebased + retried. One row per retry attempt
+    /// (so a 3-attempt push that succeeds on attempt 2 produces one
+    /// row; a 3-attempt push that succeeds on attempt 3 produces two
+    /// rows). Diff carries
+    /// `{branch, attempt, last_rebase_sha, prior_remote_sha}`. Resource
+    /// is the merged plan (`PLAN`) so the row groups with the
+    /// `auto_mode.merged` event that triggered the push. Operator
+    /// visibility — silent retries that succeed are fine, but a retry
+    /// burst means the race window is widening and we should know.
+    pub const AUTO_PUSH_REBASE_RETRY: &str = "auto_push_rebase_retry";
     pub const ORG_MEMBER_ADD: &str = "org.member_add";
     pub const ORG_MEMBER_REMOVE: &str = "org.member_remove";
     pub const ORG_MEMBER_ROLE_CHANGE: &str = "org.member_role_change";

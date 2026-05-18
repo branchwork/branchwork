@@ -312,6 +312,27 @@ const RunnerLog = v.object({
   }),
 });
 
+/// `auto_mode` rebased the local branch onto origin after a non-FF
+/// rejection and retried the push (see Phase 1 of the auto-push-rebase-
+/// on-non-fast-forward plan). One event per rebase retry — operator
+/// visibility for the race between sibling-agent / auto-bump pushes
+/// landing on the canonical default branch. The dashboard surfaces a
+/// transient "rebased on origin (n)" pill next to the auto-mode
+/// indicator for ~10 s and then auto-clears.
+const AutoPushRebased = v.object({
+  type: v.literal("auto_push_rebased"),
+  data: v.object({
+    plan: v.string(),
+    task: v.string(),
+    branch: v.string(),
+    attempt: v.number(),
+    /// 40-char SHA — empty string when git rev-parse failed (the
+    /// retry helper falls back to "" rather than failing the push).
+    last_rebase_sha: v.string(),
+    prior_remote_sha: v.string(),
+  }),
+});
+
 /// Per-runner health snapshot — outbox depth, 24-hour reconnect count,
 /// CI-poll latency percentiles, version-mismatch verdict. Pushed on a
 /// ~30 s tick by the runner via the `RunnerHealth` wire variant; the
@@ -383,6 +404,7 @@ export const WsMessageSchema = v.variant("type", [
   RunnerLog,
   RunnerHealth,
   PlanRunnerAffinityChanged,
+  AutoPushRebased,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;

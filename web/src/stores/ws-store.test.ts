@@ -15,6 +15,7 @@ afterEach(() => {
   const agentInitial = useAgentStore.getInitialState();
   usePlanStore.setState({
     autoModeRuntimes: {},
+    autoPushRebases: {},
     toasts: [],
     plans: [],
     selectedPlan: null,
@@ -762,5 +763,76 @@ describe("ws-store handleWsMessage", () => {
     expect(fetchCount).toBe(1);
 
     vi.unstubAllGlobals();
+  });
+});
+
+describe("auto_push_rebased pill", () => {
+  it("records the retry and bumps the pill expiry on a single event", () => {
+    handleWsMessage({
+      type: "auto_push_rebased",
+      data: {
+        plan: "auto-push-rebase-on-non-fast-forward",
+        task: "1.2",
+        branch: "master",
+        attempt: 1,
+        last_rebase_sha: "a".repeat(40),
+        prior_remote_sha: "b".repeat(40),
+      },
+    });
+    const entry = usePlanStore.getState().autoPushRebases["auto-push-rebase-on-non-fast-forward"];
+    expect(entry).toBeTruthy();
+    expect(entry!.count).toBe(1);
+    expect(entry!.branch).toBe("master");
+    // Expiry must be in the future (the 10 s TTL window).
+    expect(entry!.expiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it("increments the running count when retries land in quick succession", () => {
+    for (let i = 1; i <= 3; i += 1) {
+      handleWsMessage({
+        type: "auto_push_rebased",
+        data: {
+          plan: "p",
+          task: "1.2",
+          branch: "master",
+          attempt: i,
+          last_rebase_sha: "a".repeat(40),
+          prior_remote_sha: "b".repeat(40),
+        },
+      });
+    }
+    const entry = usePlanStore.getState().autoPushRebases["p"];
+    expect(entry).toBeTruthy();
+    expect(entry!.count).toBe(3);
+  });
+
+  it("scopes the running count per plan", () => {
+    handleWsMessage({
+      type: "auto_push_rebased",
+      data: {
+        plan: "plan-a",
+        task: "1.2",
+        branch: "master",
+        attempt: 1,
+        last_rebase_sha: "a".repeat(40),
+        prior_remote_sha: "b".repeat(40),
+      },
+    });
+    handleWsMessage({
+      type: "auto_push_rebased",
+      data: {
+        plan: "plan-b",
+        task: "2.3",
+        branch: "main",
+        attempt: 1,
+        last_rebase_sha: "c".repeat(40),
+        prior_remote_sha: "d".repeat(40),
+      },
+    });
+    const state = usePlanStore.getState().autoPushRebases;
+    expect(state["plan-a"]!.count).toBe(1);
+    expect(state["plan-b"]!.count).toBe(1);
+    expect(state["plan-a"]!.branch).toBe("master");
+    expect(state["plan-b"]!.branch).toBe("main");
   });
 });

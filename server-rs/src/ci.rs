@@ -151,8 +151,50 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
     let push =
         crate::agents::git_ops::push_branch(&db, &runners, &org_id, &cwd, &source_branch).await;
     match push {
-        Ok(Ok(())) => {
+        Ok(Ok(report)) => {
             println!("[ci] pushed {source_branch} ({merged_sha}) to origin");
+            // One audit row + one WS broadcast per rebase retry. Empty
+            // `retries` means the very first push attempt landed cleanly
+            // (the common case); a non-empty list means a sibling
+            // agent / auto-bump won the race and we rebased to absorb it.
+            // SaaS-mode runners discard `retries` today (see
+            // `agents::git_ops::push_branch` docstring) — only standalone
+            // produces this trail.
+            for retry in &report.retries {
+                let diff = serde_json::json!({
+                    "kind": "auto_push_rebase_retry",
+                    "branch": source_branch,
+                    "attempt": retry.attempt,
+                    "last_rebase_sha": retry.last_rebase_sha,
+                    "prior_remote_sha": retry.prior_remote_sha,
+                })
+                .to_string();
+                {
+                    let conn = db.lock().unwrap();
+                    crate::audit::log(
+                        &conn,
+                        &org_id,
+                        None,
+                        Some("branchwork-auto-mode"),
+                        crate::audit::actions::AUTO_PUSH_REBASE_RETRY,
+                        crate::audit::resources::PLAN,
+                        Some(&plan_name),
+                        Some(&diff),
+                    );
+                }
+                broadcast_event(
+                    &broadcast_tx,
+                    "auto_push_rebased",
+                    serde_json::json!({
+                        "plan": plan_name,
+                        "task": task_number,
+                        "branch": source_branch,
+                        "attempt": retry.attempt,
+                        "last_rebase_sha": retry.last_rebase_sha,
+                        "prior_remote_sha": retry.prior_remote_sha,
+                    }),
+                );
+            }
         }
         Ok(Err(stderr)) => {
             eprintln!("[ci] push failed for {source_branch}: {stderr}");

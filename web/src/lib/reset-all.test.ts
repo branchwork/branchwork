@@ -59,6 +59,13 @@ function seedAllStores() {
       },
     },
     autoModeRuntimes: { "user-a-plan": { state: "merging", task: "1.1" } },
+    autoPushRebases: {
+      "user-a-plan": {
+        count: 2,
+        branch: "master",
+        expiresAt: Date.now() + 10_000,
+      },
+    },
     toasts: [{ id: "t-1", kind: "info", message: "stale" }],
     warnings: [{ name: "user-a-plan", file: "f", error: "boom", timestamp: 1 }],
   });
@@ -132,6 +139,7 @@ describe("resetAllStores", () => {
     expect(plan.lastPlansFetchedAt).toBeNull();
     expect(plan.planConfigs).toEqual({});
     expect(plan.autoModeRuntimes).toEqual({});
+    expect(plan.autoPushRebases).toEqual({});
     expect(plan.toasts).toEqual([]);
     expect(plan.warnings).toEqual([]);
 

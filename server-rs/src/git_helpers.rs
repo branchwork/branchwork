@@ -249,6 +249,39 @@ pub fn discard_branch_local(cwd: &Path, target: &str, task_branch: &str) -> Resu
     }
 }
 
+/// One non-fast-forward retry cycle: the SHA we rebased onto (origin's
+/// winner of the race) and our new local HEAD after the rebase. The
+/// caller (server-side `trigger_after_merge`) writes one
+/// `audit::actions::AUTO_PUSH_REBASE_RETRY` row per entry and
+/// broadcasts `auto_push_rebased` so the dashboard can render a small
+/// "rebased on origin (n)" pill.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RebaseRetry {
+    /// 1-indexed retry number: 1 is the first rebase-then-retry after the
+    /// initial push failed. A push that succeeds on attempt 2 produces
+    /// `attempt: 1`; a push that succeeds on attempt 3 produces both
+    /// `attempt: 1` and `attempt: 2`.
+    pub attempt: usize,
+    /// `git rev-parse HEAD` AFTER `git pull --rebase --autostash` — the
+    /// local SHA we will retry-push. Diagnostic only.
+    pub last_rebase_sha: String,
+    /// `git rev-parse refs/remotes/origin/<branch>` AFTER the rebase — the
+    /// origin HEAD that beat us in the race (i.e. the SHA we rebased
+    /// onto). Used to surface the racing commit in the audit trail.
+    pub prior_remote_sha: String,
+}
+
+/// Outcome of a successful `push_branch_local` call. `retries` is empty
+/// when the very first push attempt succeeded; otherwise it carries one
+/// `RebaseRetry` entry per rebase-then-retry cycle the helper performed.
+/// Returned as part of `Result::Ok` so a successful push always reports
+/// its retry history, even if the dashboard / audit layer ignores it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct PushReport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retries: Vec<RebaseRetry>,
+}
+
 /// `git push origin <branch>` in `cwd`. On non-fast-forward rejection (a
 /// sibling agent / parallel CI run pushed to the same branch first), runs
 /// `git pull --rebase --autostash origin <branch>` and retries. Caps at
@@ -256,11 +289,19 @@ pub fn discard_branch_local(cwd: &Path, target: &str, task_branch: &str) -> Resu
 /// permission denied) return immediately without retry. `Err(stderr)`
 /// carries the captured error so the caller can log it.
 ///
+/// On success, the returned `PushReport` describes every rebase-then-retry
+/// cycle the helper performed (empty `retries` for a clean first-attempt
+/// push). The caller is responsible for emitting `audit_log` rows +
+/// `auto_push_rebased` broadcasts from those entries — `git_helpers` is
+/// a leaf module and intentionally does not depend on the audit / WS
+/// crates.
+///
 /// Caller assumption: HEAD is on `branch`. All current callers either ran
 /// `git checkout <branch>` first (`merge_branch_local`) or are operating
 /// on the branch they just merged. Pulling --rebase on a different branch
 /// would silently rebase the wrong ref.
-pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<(), String> {
+pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<PushReport, String> {
+    let mut report = PushReport::default();
     let mut last_err = String::new();
     for attempt in 1..=MAX_PUSH_ATTEMPTS {
         match try_push_once(cwd, branch) {
@@ -270,7 +311,7 @@ pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<(), String> {
                         "[push-retry] push of {branch} succeeded on attempt {attempt} after rebase"
                     );
                 }
-                return Ok(());
+                return Ok(report);
             }
             Err(stderr) => {
                 last_err = stderr.clone();
@@ -287,19 +328,31 @@ pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<(), String> {
                 eprintln!(
                     "[push-retry] push of {branch} rejected as non-fast-forward (attempt {attempt}); rebasing against origin/{branch}"
                 );
-                if let Err(rebase_err) = rebase_against_origin(cwd, branch) {
-                    // Best-effort abort so we leave a clean tree behind.
-                    // `--autostash` keeps the stash on rebase conflict;
-                    // `git rebase --abort` will not unstash either, but
-                    // leaves the rebase in a non-conflicted state so the
-                    // operator can inspect.
-                    let _ = Command::new("git")
-                        .args(["rebase", "--abort"])
-                        .current_dir(cwd)
-                        .output();
-                    return Err(format!(
-                        "push rejected as non-fast-forward; rebase against origin/{branch} failed: {rebase_err}"
-                    ));
+                match rebase_against_origin(cwd, branch) {
+                    Ok((last_rebase_sha, prior_remote_sha)) => {
+                        // 1-indexed retry counter (the retry that happens
+                        // AFTER `attempt` failed). A push that succeeds on
+                        // attempt=2 reports a single retry with attempt=1.
+                        report.retries.push(RebaseRetry {
+                            attempt,
+                            last_rebase_sha,
+                            prior_remote_sha,
+                        });
+                    }
+                    Err(rebase_err) => {
+                        // Best-effort abort so we leave a clean tree behind.
+                        // `--autostash` keeps the stash on rebase conflict;
+                        // `git rebase --abort` will not unstash either, but
+                        // leaves the rebase in a non-conflicted state so the
+                        // operator can inspect.
+                        let _ = Command::new("git")
+                            .args(["rebase", "--abort"])
+                            .current_dir(cwd)
+                            .output();
+                        return Err(format!(
+                            "push rejected as non-fast-forward; rebase against origin/{branch} failed: {rebase_err}"
+                        ));
+                    }
                 }
             }
         }
@@ -350,15 +403,51 @@ fn is_non_fast_forward_error(stderr: &str) -> bool {
 /// modifications during the merge step — the dirty-tree check upstream
 /// should have caught that, but if it didn't, we don't want a clean push
 /// to fail just because of stray writes.
-fn rebase_against_origin(cwd: &Path, branch: &str) -> Result<(), String> {
+///
+/// On success, returns `(last_rebase_sha, prior_remote_sha)`:
+/// - `last_rebase_sha` = `git rev-parse HEAD` after the rebase (the new
+///   local SHA we will retry-push).
+/// - `prior_remote_sha` = `git rev-parse refs/remotes/origin/<branch>`
+///   after the rebase (the origin HEAD that won the race — the SHA we
+///   rebased onto). `git pull --rebase` updates this remote-tracking ref
+///   as part of the fetch phase, so it captures the winner regardless of
+///   whether the local `origin/<branch>` was stale before the call.
+///
+/// If either rev-parse fails (corrupt repo, missing ref) we fall back to
+/// the empty string in the corresponding slot rather than failing the
+/// retry — the push itself already succeeded; the diagnostic SHAs are
+/// nice-to-have, not load-bearing.
+fn rebase_against_origin(cwd: &Path, branch: &str) -> Result<(String, String), String> {
     let pull = Command::new("git")
         .args(["pull", "--rebase", "--autostash", "origin", branch])
         .current_dir(cwd)
         .output();
     match pull {
-        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) if out.status.success() => {
+            let last_rebase_sha = git_head_sha(cwd).unwrap_or_default();
+            let prior_remote_sha =
+                git_rev_parse(cwd, &format!("refs/remotes/origin/{branch}")).unwrap_or_default();
+            Ok((last_rebase_sha, prior_remote_sha))
+        }
         Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
         Err(e) => Err(format!("failed to run git pull --rebase: {e}")),
+    }
+}
+
+/// `git rev-parse <ref>` — resolve a refname to a 40-char SHA. Returns
+/// `None` if the ref is missing or git fails. Private helper used by
+/// `rebase_against_origin` to capture `origin/<branch>` after the
+/// fetch+rebase.
+fn git_rev_parse(cwd: &Path, refname: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", refname])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
     }
 }
 
@@ -743,9 +832,10 @@ mod tests {
         assert!(ok, "clone to local-a failed");
         configure_identity(&local_a, "a@t", "agent-a");
         commit_file(&local_a, "a.txt", "A\n", "A");
+        let first = push_branch_local(&local_a, "master").expect("first push (A) should succeed");
         assert!(
-            push_branch_local(&local_a, "master").is_ok(),
-            "first push (A) should succeed"
+            first.retries.is_empty(),
+            "first push (clean A) should have no retries: {first:?}"
         );
 
         // Clone to local-b (parallel agent), commit B, push.
@@ -761,9 +851,11 @@ mod tests {
         assert!(ok, "clone to local-b failed");
         configure_identity(&local_b, "b@t", "agent-b");
         commit_file(&local_b, "b.txt", "B\n", "B");
+        let second = push_branch_local(&local_b, "master")
+            .expect("second push (B from parallel clone) should succeed");
         assert!(
-            push_branch_local(&local_b, "master").is_ok(),
-            "second push (B from parallel clone) should succeed"
+            second.retries.is_empty(),
+            "second push (clean B) should have no retries: {second:?}"
         );
         // Origin now at A -> B; local-a still at A.
 
@@ -771,9 +863,45 @@ mod tests {
         // non-FF, rebase onto origin/master (= B), and push cleanly.
         commit_file(&local_a, "c.txt", "C\n", "C");
         let result = push_branch_local(&local_a, "master");
-        assert!(
-            result.is_ok(),
-            "third push (C, with rebase) should succeed: {result:?}"
+        let report = result
+            .as_ref()
+            .expect("third push (C, with rebase) should succeed");
+
+        // Exactly one rebase retry recorded: attempt 1 failed, we rebased
+        // onto B, attempt 2 succeeded. SHAs are diagnostic but must be
+        // present.
+        assert_eq!(
+            report.retries.len(),
+            1,
+            "expected one retry entry, got {report:?}"
+        );
+        let r = &report.retries[0];
+        assert_eq!(r.attempt, 1, "first retry should be attempt=1");
+        assert_eq!(
+            r.last_rebase_sha.len(),
+            40,
+            "last_rebase_sha must be a full SHA"
+        );
+        assert_eq!(
+            r.prior_remote_sha.len(),
+            40,
+            "prior_remote_sha must be a full SHA"
+        );
+        // prior_remote_sha must be the SHA of commit B (the winner of the
+        // race — local-b's HEAD at the time of its push).
+        let b_sha = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&local_b)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(
+            r.prior_remote_sha, b_sha,
+            "prior_remote_sha must be commit B (origin HEAD that beat us)"
         );
 
         // Origin should now see A -> B -> C-after-rebase in linear history.

@@ -146,6 +146,31 @@ export interface AutoModeRuntime {
   attempt?: number;
 }
 
+/// Transient pill state for the `auto_push_rebased` WS event (Phase 1.2
+/// of auto-push-rebase-on-non-fast-forward). One event fires per rebase
+/// retry; the pill aggregates them with a running count and auto-clears
+/// 10 s after the most recent retry. Lives next to the auto-mode
+/// indicator so a retry burst visually shows up as `rebased on origin
+/// (n)` for ~10 s.
+export interface AutoPushRebasedPillState {
+  /// Cumulative retry count since the pill first appeared in this
+  /// streak (i.e. since the last clear). Increments on every
+  /// `auto_push_rebased` event while the pill is live; reset to 1
+  /// after the 10 s clear timer fires.
+  count: number;
+  /// `branch` from the most recent event — surfaced in the title
+  /// attribute for operators inspecting a retry burst.
+  branch: string;
+  /// ms-since-epoch when the pill should disappear. Bumped to
+  /// `Date.now() + AUTO_PUSH_REBASED_PILL_TTL_MS` on every retry, so a
+  /// burst of N rebases over 8 s shows the pill for ~18 s total.
+  expiresAt: number;
+}
+
+/// How long the `auto_push_rebased` pill stays visible after the most
+/// recent retry, in ms. The brief asks for ~10 s.
+export const AUTO_PUSH_REBASED_PILL_TTL_MS = 10_000;
+
 export type ToastKind = "info" | "error" | "success";
 
 /// Optional inline action attached to a toast. When `snapshotId` is set
@@ -241,6 +266,11 @@ interface PlanStore {
   /// not persisted across page reloads. The persistent slice (paused vs
   /// not) lives in `planConfigs[plan].pausedReason`.
   autoModeRuntimes: Record<string, AutoModeRuntime | null>;
+  /// Per-plan transient state for the `auto_push_rebased` pill. Driven
+  /// by the WS event of the same name; auto-clears 10 s after the most
+  /// recent retry. A burst of N rebases over 8 s renders the pill for
+  /// ~18 s total with the count climbing as events arrive.
+  autoPushRebases: Record<string, AutoPushRebasedPillState | null>;
   /// Transient toast queue. Driven by ws-store on destructive
   /// operations (e.g. `plan_deleted` pushes an "Undo" toast). The
   /// renderer reads this slice; auto-dismiss is wired into `pushToast`
@@ -273,6 +303,15 @@ interface PlanStore {
   setPlanConfig: (planName: string, config: PlanConfig) => void;
   patchPlanConfig: (planName: string, patch: Partial<PlanConfig>) => void;
   setAutoModeRuntime: (planName: string, runtime: AutoModeRuntime | null) => void;
+  /// Bump the auto-push-rebased pill for `planName`: increment the
+  /// running count (or start at 1) and bump `expiresAt` to now +
+  /// `AUTO_PUSH_REBASED_PILL_TTL_MS`. Caller schedules the timer that
+  /// clears the entry via `clearAutoPushRebased(planName)`.
+  recordAutoPushRebase: (planName: string, branch: string) => void;
+  /// Drop the auto-push-rebased pill for `planName`. Called from the
+  /// setTimeout the ws-store handler schedules after the TTL elapses
+  /// (and from `reset()`). Idempotent — safe to call with no entry.
+  clearAutoPushRebased: (planName: string) => void;
   pushToast: (toast: PushToastInput) => string;
   dismissToast: (id: string) => void;
   /// DELETE /api/plans/:name (with `?hard=true` when `opts.hard`).
@@ -319,6 +358,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   warnings: [],
   planConfigs: {},
   autoModeRuntimes: {},
+  autoPushRebases: {},
   toasts: [],
 
   fetchPlans: () => {
@@ -595,6 +635,35 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     }));
   },
 
+  recordAutoPushRebase: (planName, branch) => {
+    set((s) => {
+      const prev = s.autoPushRebases[planName];
+      const next: AutoPushRebasedPillState = {
+        // Increment if the previous streak hasn't been cleared yet,
+        // otherwise start a fresh streak at 1. We don't gate on `expiresAt`
+        // here because the ws-store schedules a setTimeout that calls
+        // clearAutoPushRebased — by the time the next event arrives the
+        // entry is either still present (running streak) or has been
+        // explicitly cleared (new streak).
+        count: prev ? prev.count + 1 : 1,
+        branch,
+        expiresAt: Date.now() + AUTO_PUSH_REBASED_PILL_TTL_MS,
+      };
+      return {
+        autoPushRebases: { ...s.autoPushRebases, [planName]: next },
+      };
+    });
+  },
+
+  clearAutoPushRebased: (planName) => {
+    set((s) => {
+      if (!s.autoPushRebases[planName]) return s;
+      const next = { ...s.autoPushRebases };
+      delete next[planName];
+      return { autoPushRebases: next };
+    });
+  },
+
   pushToast: ({ id, kind, message, action, ttlMs }) => {
     const toastId = id ?? `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     set((s) => ({
@@ -644,6 +713,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       warnings: [],
       planConfigs: {},
       autoModeRuntimes: {},
+      autoPushRebases: {},
       toasts: [],
     });
   },

@@ -1563,7 +1563,12 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                     })
                     .await;
                     match result {
-                        Some(Ok(())) => (true, None),
+                        // SaaS-mode retry visibility is a follow-up: the
+                        // runner discards the `PushReport`, so any rebase
+                        // retries the runner performed don't propagate to
+                        // the server's audit log / WS broadcast. Phase 1.2
+                        // wires the standalone path only.
+                        Some(Ok(_report)) => (true, None),
                         Some(Err(e)) => (false, Some(e)),
                         None => (
                             false,

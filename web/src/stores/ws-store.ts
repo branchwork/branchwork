@@ -1,5 +1,9 @@
 import { create } from "zustand";
-import { getInFlightPlansFetch, usePlanStore } from "./plan-store.js";
+import {
+  AUTO_PUSH_REBASED_PILL_TTL_MS,
+  getInFlightPlansFetch,
+  usePlanStore,
+} from "./plan-store.js";
 import { getInFlightAgentsFetch, useAgentStore } from "./agent-store.js";
 import { useSettingsStore } from "./settings-store.js";
 import { useRunnerStore, type RunnerDriverInfo } from "./runner-store.js";
@@ -494,6 +498,28 @@ function dispatch(msg: WsMessage) {
       // new state without a refetch.
       const d = msg.data;
       planStore.patchPlanConfig(d.plan, { runnerId: d.runner_id ?? null });
+      break;
+    }
+    case "auto_push_rebased": {
+      // Phase 1.2 of auto-push-rebase-on-non-fast-forward: one event per
+      // rebase retry. The pill aggregates them with a running count and
+      // auto-clears 10 s after the most recent retry. Burst of N retries
+      // bumps `expiresAt` on each event, so the pill stays visible for
+      // ~10 s after the LAST retry, not the first.
+      const d = msg.data;
+      planStore.recordAutoPushRebase(d.plan, d.branch);
+      // Clear timer: fire-and-forget setTimeout. Re-arming on every
+      // event is intentional — if a second retry lands while the first
+      // timer is still pending, both timers will fire (idempotent
+      // clearAutoPushRebased). The clear only actually drops the entry
+      // if `expiresAt <= now`, so an in-flight streak keeps showing
+      // the pill until the FINAL clear fires past the bumped expiry.
+      setTimeout(() => {
+        const entry = usePlanStore.getState().autoPushRebases[d.plan];
+        if (!entry || entry.expiresAt <= Date.now()) {
+          usePlanStore.getState().clearAutoPushRebased(d.plan);
+        }
+      }, AUTO_PUSH_REBASED_PILL_TTL_MS + 100);
       break;
     }
     case "task_advanced": {

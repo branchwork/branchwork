@@ -242,6 +242,7 @@ export function PlanBoard() {
             )}
           <BudgetBadge plan={plan} />
           <AutoModeStatusPill planName={plan.name} />
+          <AutoPushRebasedPill planName={plan.name} />
         </div>
         <div className="flex items-center gap-3 mt-2">
           <div className="text-sm text-gray-400 max-w-3xl flex-1">
@@ -1412,6 +1413,47 @@ export function AutoModeStatusPill({ planName }: { planName: string }) {
     >
       <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
       auto: idle
+    </span>
+  );
+}
+
+/// Transient pill that surfaces an auto-push rebase retry burst. Renders
+/// for ~10 s after the most recent `auto_push_rebased` WS event;
+/// re-renders on every event so a streak of N retries shows the count
+/// climbing in real time. Sits next to `AutoModeStatusPill` so operators
+/// see "the loop is racing the auto-bump" without needing to crack the
+/// audit log open. Phase 1.2 of auto-push-rebase-on-non-fast-forward.
+export function AutoPushRebasedPill({ planName }: { planName: string }) {
+  const entry = usePlanStore((s) => s.autoPushRebases[planName] ?? null);
+  // Local tick so the pill clears itself when `expiresAt` elapses
+  // without needing another WS event to trigger a re-render. The
+  // ws-store also schedules a setTimeout that explicitly clears the
+  // store entry — this useEffect just guarantees the pill disappears
+  // immediately when the user navigates back to a stale plan whose
+  // expiresAt is already in the past.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!entry) return;
+    const remaining = entry.expiresAt - Date.now();
+    if (remaining <= 0) {
+      setNow(Date.now());
+      return;
+    }
+    const t = setTimeout(() => setNow(Date.now()), remaining + 50);
+    return () => clearTimeout(t);
+  }, [entry]);
+
+  if (!entry) return null;
+  if (entry.expiresAt <= now) return null;
+
+  const label = entry.count === 1 ? `rebased on origin` : `rebased on origin (${entry.count})`;
+  return (
+    <span
+      className="flex-shrink-0 inline-flex items-center gap-1.5 px-2 py-0.5 text-xs rounded border border-sky-700/40 bg-sky-900/20 text-sky-300"
+      title={`Auto-mode rebased ${entry.branch} on origin after a non-fast-forward push (${entry.count} retr${entry.count === 1 ? "y" : "ies"})`}
+    >
+      <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
+      {label}
     </span>
   );
 }
