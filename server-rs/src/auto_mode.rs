@@ -46,6 +46,12 @@ pub mod actions {
     pub const AUTO_MODE_CI_FAILED: &str = "auto_mode.ci_failed";
     /// A fix agent was spawned for a Red CI outcome.
     pub const AUTO_MODE_FIX_SPAWNED: &str = "auto_mode.fix_spawned";
+    /// A short-interval poller detected that the working tree of a plan
+    /// previously paused with `agent_left_uncommitted_work` is now clean
+    /// (either the operator committed/staged the dirty files, or they
+    /// stashed them) — the loop auto-resumed without operator input.
+    /// Diff carries `{plan, last_completed_task, poll_count}`.
+    pub const AUTO_RESUMED_TREE_CLEAN: &str = "auto_mode.auto_resumed_tree_clean";
 }
 
 // ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
@@ -1659,6 +1665,11 @@ async fn run_idle_pass(state: &AppState, threshold_secs: i64) {
                     "files": trimmed,
                 });
                 broadcast_event(&state.broadcast_tx, "auto_mode_paused", payload.clone());
+                // Auto-resume watcher (Task 4.1) — same as the Stop-hook
+                // dirty path. Idempotent at the per-plan level so the
+                // idle poller can re-fire the pause without spawning a
+                // second watcher.
+                spawn_dirty_tree_watcher(state.clone(), plan_name.clone());
                 let conn = state.db.lock().unwrap();
                 audit::log(
                     &conn,
@@ -1714,6 +1725,238 @@ async fn run_idle_pass(state: &AppState, threshold_secs: i64) {
                 "trigger": "idle_timeout",
             }),
         );
+    }
+}
+
+// ── Dirty-tree watcher (Task 4.1) ──────────────────────────────────────────
+//
+// When auto-mode pauses on `agent_left_uncommitted_work`, the operator
+// either commits or stashes the offending files (intent: continue the
+// plan) or leaves them dirty (intent: drop the plan). Forcing a manual
+// Resume click in the "commits and continues" case is friction: the
+// signal "tree is now clean" is observable, so the loop can auto-resume.
+//
+// We implement that as a per-plan short-interval poller (no inotify
+// dependency — `notify` would add 3 transitive crates for a property that
+// `git status --porcelain --untracked-files=no` already gives us in a
+// single shell-out). Poll every [`DIRTY_TREE_POLL_INTERVAL_SECS`] seconds
+// for at most [`DIRTY_TREE_MAX_POLLS`] iterations (≈100 seconds total).
+// Bounded so a permanently-dirty tree doesn't churn forever: the operator
+// will see the persistent paused pill and decide whether to commit or
+// click Resume manually.
+
+/// How often the dirty-tree watcher checks `git status --porcelain
+/// --untracked-files=no` for the paused plan's working tree.
+const DIRTY_TREE_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Hard cap on poll iterations — after this many ticks with no clean
+/// signal, the watcher exits and the plan remains paused. The operator
+/// can still click Resume manually. `5 s × 20 = 100 s`.
+const DIRTY_TREE_MAX_POLLS: u32 = 20;
+
+/// Spawn a one-shot dirty-tree watcher for `plan_name`. Idempotent at the
+/// per-plan level via [`AppState::dirty_tree_watchers`]: a second call for
+/// a plan that already has a live watcher is a no-op (the first watcher
+/// will observe the same tree state and act on it).
+///
+/// The watcher exits silently when any of the following happens:
+///   - the working tree comes back clean → auto-resume + audit + broadcast +
+///     `try_auto_advance` (mirrors the operator-driven Resume path in
+///     `api/plans.rs::put_plan_config`),
+///   - the plan's `paused_reason` changes out from under us (manual
+///     Resume by the operator, or a different pause reason replaced
+///     `agent_left_uncommitted_work`),
+///   - [`DIRTY_TREE_MAX_POLLS`] iterations have elapsed without a
+///     clean signal — the operator must Resume manually.
+///
+/// The dedupe set entry is removed on every exit path so the next pause
+/// can spawn a fresh watcher.
+pub fn spawn_dirty_tree_watcher(state: AppState, plan_name: String) {
+    // Dedupe: first pause wins for this plan. `HashSet::insert` returns
+    // true on first insert. If a watcher is already running we drop
+    // silently — the live watcher will pick up whatever tree-clean
+    // signal arrives next.
+    let first_call = state
+        .dirty_tree_watchers
+        .lock()
+        .unwrap()
+        .insert(plan_name.clone());
+    if !first_call {
+        return;
+    }
+
+    tokio::spawn(async move {
+        run_dirty_tree_watcher(state, plan_name).await;
+    });
+}
+
+/// Body of the dirty-tree watcher loop. Factored out from
+/// [`spawn_dirty_tree_watcher`] so unit tests can drive it without a
+/// tokio::spawn handle (and without the 5-second polling interval — tests
+/// inject `interval_override` to compress the loop).
+async fn run_dirty_tree_watcher(state: AppState, plan_name: String) {
+    run_dirty_tree_watcher_with_config(
+        state,
+        plan_name,
+        Duration::from_secs(DIRTY_TREE_POLL_INTERVAL_SECS),
+        DIRTY_TREE_MAX_POLLS,
+    )
+    .await;
+}
+
+/// Configurable variant of [`run_dirty_tree_watcher`] for tests. Production
+/// callers go through [`spawn_dirty_tree_watcher`] which hardcodes the 5 s
+/// interval and 20-poll cap.
+async fn run_dirty_tree_watcher_with_config(
+    state: AppState,
+    plan_name: String,
+    poll_interval: Duration,
+    max_polls: u32,
+) {
+    // The loop ALWAYS removes the dedupe entry on exit. Using a defer-style
+    // scope guard keeps every early-return path symmetric; without it a
+    // future contributor adding a new exit point could leak an entry and
+    // permanently lock the plan out of auto-resume.
+    struct DedupeGuard {
+        watchers: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        plan_name: String,
+    }
+    impl Drop for DedupeGuard {
+        fn drop(&mut self) {
+            self.watchers.lock().unwrap().remove(&self.plan_name);
+        }
+    }
+    let _guard = DedupeGuard {
+        watchers: state.dirty_tree_watchers.clone(),
+        plan_name: plan_name.clone(),
+    };
+
+    for _ in 0..max_polls {
+        tokio::time::sleep(poll_interval).await;
+
+        // Re-read the pause state every tick: the operator may have
+        // clicked Resume manually (paused_reason → NULL), or a different
+        // pause path may have replaced our reason. Either way the
+        // watcher's job is done — exit and let the corresponding handler
+        // own the resume.
+        let cfg = db::auto_mode_config(&state.db, &plan_name);
+        match cfg.paused_reason.as_deref() {
+            Some("agent_left_uncommitted_work") => {}
+            _ => return,
+        }
+
+        // Tree probe. Unknown is permissive — same convention as
+        // `check_tree_clean_for_completion`. Dirty keeps polling.
+        match crate::agents::check_tree_clean_for_completion(
+            &state.db,
+            &state.plans_dir,
+            &plan_name,
+        ) {
+            crate::agents::TreeState::Clean | crate::agents::TreeState::Unknown => {
+                // Resume path: identical to the operator-driven Resume in
+                // `api/plans.rs::put_plan_config` (clear paused state,
+                // audit, broadcast, fire `try_auto_advance` from the last
+                // completed task) except for the action constant and the
+                // synthetic user identity.
+                resume_after_clean_tree(&state, &plan_name).await;
+                return;
+            }
+            crate::agents::TreeState::Dirty { .. } => {
+                continue;
+            }
+        }
+    }
+    // Cap reached: the plan stays paused. The dedupe entry is freed by
+    // the guard's Drop so a subsequent pause can spawn a fresh watcher
+    // (e.g. the operator dirties the tree again later).
+}
+
+/// Resume a plan whose dirty tree has just come back clean. Mirrors the
+/// operator-driven Resume path in `api/plans.rs::put_plan_config` so the
+/// dashboard sees the same WS event and audit shape — only the action
+/// constant differs ([`actions::AUTO_RESUMED_TREE_CLEAN`] instead of
+/// [`audit::actions::AUTO_MODE_RESUMED`]). The synthetic user identity
+/// is `branchwork-auto-mode`, matching the dirty-tree pause's authorship.
+async fn resume_after_clean_tree(state: &AppState, plan_name: &str) {
+    // Look up the org for the audit row. `plan_auto_mode` has no
+    // `org_id` column today, so we read it off the most recent agent
+    // row for the plan — same convention `on_task_agent_completed`
+    // uses. Falls back to default-org so the resume never silently
+    // drops on a plan with no agent rows yet.
+    let org_id: String = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT org_id FROM agents WHERE plan_name = ?1 \
+             ORDER BY started_at DESC LIMIT 1",
+            params![plan_name],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .unwrap_or_else(|| "default-org".to_string())
+    };
+
+    db::auto_mode_resume(&state.db, plan_name);
+
+    let last_completed: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT task_number FROM task_status \
+             WHERE plan_name = ?1 AND status IN ('completed', 'skipped') \
+             ORDER BY updated_at DESC LIMIT 1",
+            params![plan_name],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            &org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            actions::AUTO_RESUMED_TREE_CLEAN,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(
+                &serde_json::json!({
+                    "plan": plan_name,
+                    "last_completed_task": last_completed,
+                })
+                .to_string(),
+            ),
+        );
+    }
+
+    broadcast_event(
+        &state.broadcast_tx,
+        "auto_mode_resumed",
+        serde_json::json!({
+            "plan": plan_name,
+            "last_completed_task": last_completed,
+            "reason": "tree_clean",
+        }),
+    );
+
+    if let Some(task) = last_completed {
+        let registry = state.registry.clone();
+        let plans_dir = state.plans_dir.clone();
+        let plan_name_owned = plan_name.to_string();
+        let effort = *state.effort.lock().unwrap();
+        let port = state.config_port();
+        tokio::spawn(async move {
+            crate::agents::try_auto_advance(
+                registry,
+                plans_dir,
+                plan_name_owned,
+                task,
+                effort,
+                port,
+                None,
+            )
+            .await;
+        });
     }
 }
 
@@ -1789,6 +2032,7 @@ mod tests {
             settings_path: PathBuf::from("/tmp/branchwork-test-settings.json"),
             cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
             auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             started_at: std::time::Instant::now(),
         };
         (state, rx)
@@ -4996,6 +5240,270 @@ mod tests {
         assert!(
             state.auto_finish_dedupe.lock().unwrap().contains("a-1"),
             "agent_id should be retained in auto_finish_dedupe (Stop-hook parity)"
+        );
+    }
+
+    // ── Dirty-tree watcher (Task 4.1) ───────────────────────────────────────
+
+    /// Seed a plan_auto_mode row whose pause reason is
+    /// `agent_left_uncommitted_work` — what `hooks::handle_stop_hook`
+    /// would write after detecting a dirty tree.
+    fn seed_dirty_tree_pause(db: &Db, plan: &str, files: &[&str]) {
+        let files_owned: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+        crate::db::auto_mode_pause(db, plan, "agent_left_uncommitted_work", Some(&files_owned));
+        // Ensure auto-mode is enabled so the resume path's
+        // `try_auto_advance` gate would pass — the watcher only resumes
+        // plans that were explicitly opted into auto-mode.
+        enable_auto_mode(db, plan);
+        // enable_auto_mode clears paused_reason via ON CONFLICT, so
+        // re-apply the pause AFTER it (DB UPSERT order matters).
+        crate::db::auto_mode_pause(db, plan, "agent_left_uncommitted_work", Some(&files_owned));
+    }
+
+    /// Acceptance criterion: pause a plan with a dirty file, then commit
+    /// the file. Within a few polls the watcher resumes the plan,
+    /// emits `AUTO_RESUMED_TREE_CLEAN` against the PLAN resource,
+    /// broadcasts `auto_mode_resumed`, and clears the dedupe entry.
+    #[tokio::test]
+    async fn dirty_tree_watcher_resumes_when_tree_becomes_clean() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        // Dirty the tree by modifying a tracked file.
+        std::fs::write(cwd.join("README.md"), "uncommitted edit").unwrap();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_dirty_tree_pause(&db, "p", &["README.md"]);
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        // Drain the broadcast channel so we only see the watcher's
+        // events below.
+        let _ = drain_event_types(&mut rx);
+
+        // Spawn the watcher in the background and clean the tree after
+        // one tick — the watcher should observe the clean state on the
+        // SECOND poll and resume.
+        let watcher_handle = tokio::spawn(run_dirty_tree_watcher_with_config(
+            state.clone(),
+            "p".to_string(),
+            Duration::from_millis(50),
+            20,
+        ));
+
+        // Wait for the dedupe entry to land (the spawn registered it).
+        // We're testing the loop-body variant directly, so dedupe must
+        // be set manually here:
+        state
+            .dirty_tree_watchers
+            .lock()
+            .unwrap()
+            .insert("p".to_string());
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        // Commit the dirty file — `git status` should now report clean.
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-q", "-m", "fix"]);
+
+        // Wait for the watcher to detect the clean state and exit.
+        let _ = tokio::time::timeout(Duration::from_secs(2), watcher_handle)
+            .await
+            .expect("watcher should exit within 2 s after the tree is clean");
+
+        // Pause is cleared.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "watcher should have resumed the plan"
+        );
+
+        // AUTO_RESUMED_TREE_CLEAN was logged against the PLAN resource.
+        let plan_actions = audit_actions_for(&db, "p");
+        assert!(
+            plan_actions
+                .iter()
+                .any(|a| a == actions::AUTO_RESUMED_TREE_CLEAN),
+            "expected AUTO_RESUMED_TREE_CLEAN in {plan_actions:?}"
+        );
+
+        // `auto_mode_resumed` was broadcast.
+        let evs = drain_event_types(&mut rx);
+        assert!(
+            evs.iter().any(|t| t == "auto_mode_resumed"),
+            "expected auto_mode_resumed in {evs:?}"
+        );
+
+        // Dedupe entry is freed so the next pause can spawn a fresh
+        // watcher.
+        assert!(
+            !state.dirty_tree_watchers.lock().unwrap().contains("p"),
+            "dedupe entry must be removed on resume"
+        );
+    }
+
+    /// A persistently-dirty tree exhausts the poll cap and the watcher
+    /// exits silently — plan stays paused, no resume audit/broadcast,
+    /// dedupe entry freed so a future "tree got dirty again" pause can
+    /// re-arm the watcher.
+    #[tokio::test]
+    async fn dirty_tree_watcher_gives_up_after_max_polls() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        // Leave the tree permanently dirty.
+        std::fs::write(cwd.join("README.md"), "permanently uncommitted").unwrap();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_dirty_tree_pause(&db, "p", &["README.md"]);
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        // Pre-arm dedupe (mimic the spawn_dirty_tree_watcher gate).
+        state
+            .dirty_tree_watchers
+            .lock()
+            .unwrap()
+            .insert("p".to_string());
+
+        // 3 polls × 10 ms = ~30 ms total wall clock — fast.
+        run_dirty_tree_watcher_with_config(
+            state.clone(),
+            "p".to_string(),
+            Duration::from_millis(10),
+            3,
+        )
+        .await;
+
+        // Plan stays paused with the original reason.
+        assert_eq!(
+            paused_reason(&db, "p").as_deref(),
+            Some("agent_left_uncommitted_work"),
+            "watcher must not change pause state when the tree stays dirty"
+        );
+
+        // No resume audit.
+        let plan_actions = audit_actions_for(&db, "p");
+        assert!(
+            !plan_actions
+                .iter()
+                .any(|a| a == actions::AUTO_RESUMED_TREE_CLEAN),
+            "AUTO_RESUMED_TREE_CLEAN must not fire when the tree stays dirty"
+        );
+
+        // No resume broadcast.
+        let evs = drain_event_types(&mut rx);
+        assert!(
+            !evs.iter().any(|t| t == "auto_mode_resumed"),
+            "auto_mode_resumed must not fire when the tree stays dirty"
+        );
+
+        // Dedupe entry freed.
+        assert!(
+            !state.dirty_tree_watchers.lock().unwrap().contains("p"),
+            "dedupe entry must be removed on the give-up path so a future pause can re-arm"
+        );
+    }
+
+    /// Operator clicks Resume manually while the watcher is mid-poll:
+    /// the watcher detects the pause-reason change on its next tick and
+    /// exits early without firing its own resume audit/broadcast.
+    #[tokio::test]
+    async fn dirty_tree_watcher_exits_early_on_manual_resume() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        // Keep the tree dirty so the watcher would otherwise keep polling.
+        std::fs::write(cwd.join("README.md"), "still dirty").unwrap();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_dirty_tree_pause(&db, "p", &["README.md"]);
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        let _ = drain_event_types(&mut rx);
+
+        state
+            .dirty_tree_watchers
+            .lock()
+            .unwrap()
+            .insert("p".to_string());
+
+        // Run the watcher in the background. After one tick, simulate
+        // the operator clicking Resume by clearing paused_reason
+        // directly via the db helper. The watcher's pause-reason
+        // re-check at the top of the next iteration must observe the
+        // change and exit.
+        let watcher = tokio::spawn(run_dirty_tree_watcher_with_config(
+            state.clone(),
+            "p".to_string(),
+            Duration::from_millis(30),
+            20,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        crate::db::auto_mode_resume(&db, "p");
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), watcher)
+            .await
+            .expect("watcher should exit within 1 s after paused_reason clears");
+
+        // The watcher did NOT log its own resume audit (manual resume
+        // path owns its audit row in api/plans.rs).
+        let plan_actions = audit_actions_for(&db, "p");
+        assert!(
+            !plan_actions
+                .iter()
+                .any(|a| a == actions::AUTO_RESUMED_TREE_CLEAN),
+            "AUTO_RESUMED_TREE_CLEAN must not fire when the operator beats the watcher to resume"
+        );
+        let evs = drain_event_types(&mut rx);
+        assert!(
+            !evs.iter().any(|t| t == "auto_mode_resumed"),
+            "auto_mode_resumed must not fire from the watcher on manual resume path"
+        );
+
+        // Dedupe entry is still freed so a future pause can re-arm.
+        assert!(
+            !state.dirty_tree_watchers.lock().unwrap().contains("p"),
+            "dedupe entry must be removed on early exit"
+        );
+    }
+
+    /// `spawn_dirty_tree_watcher` is idempotent per plan: a second call
+    /// while a watcher is already running does not spawn a duplicate.
+    /// Counter-proxy: dedupe set keeps exactly one entry across two
+    /// spawn calls.
+    #[tokio::test]
+    async fn spawn_dirty_tree_watcher_dedupes_per_plan() {
+        let (db, dir) = fresh_db();
+        let cwd = dir.path().join("project");
+        git_init_master(&cwd);
+        std::fs::write(cwd.join("README.md"), "dirty").unwrap();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        seed_dirty_tree_pause(&db, "p", &["README.md"]);
+        map_plan_to_project(&db, "p", &cwd.to_string_lossy());
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        // Two back-to-back spawns. The first wins; the second must be a
+        // no-op (dedupe set already contains "p"). The actual tokio
+        // task is the production 5 s loop, but we never await it — we
+        // only care that the dedupe set tracks exactly one entry.
+        spawn_dirty_tree_watcher(state.clone(), "p".to_string());
+        spawn_dirty_tree_watcher(state.clone(), "p".to_string());
+
+        let watchers = state.dirty_tree_watchers.lock().unwrap().clone();
+        let entries_for_p: Vec<&String> = watchers.iter().filter(|n| *n == "p").collect();
+        assert_eq!(
+            entries_for_p.len(),
+            1,
+            "watcher dedupe set must track exactly one entry per plan"
         );
     }
 

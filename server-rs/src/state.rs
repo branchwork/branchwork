@@ -47,6 +47,16 @@ pub struct AppState {
     /// per agent for the process lifetime, which is bounded by total
     /// agent count.
     pub auto_finish_dedupe: Arc<StdMutex<HashSet<String>>>,
+    /// Set of plan names that currently have a dirty-tree watcher
+    /// running (Task 4.1). When auto-mode pauses on
+    /// `agent_left_uncommitted_work`, we spawn a short-interval poller
+    /// to detect when the operator commits or stashes the offending
+    /// files and auto-resume. The set deduplicates: a second pause for
+    /// the same plan (e.g. another Stop hook firing before the first
+    /// watcher exits) skips spawning a second poller. Entries are
+    /// removed when the watcher exits — auto-resume, manual resume,
+    /// pause reason changed out from under it, or 20-iteration cap.
+    pub dirty_tree_watchers: Arc<StdMutex<HashSet<String>>>,
     /// Process-start instant, captured once at `AppState::new`. Used by
     /// `/api/health` to compute `uptime_seconds` for the diagnostics tab.
     /// Monotonic — survives wall-clock skew. Cloned cheaply via `Copy`.
@@ -71,6 +81,7 @@ impl AppState {
             settings_path: config.settings_path.clone(),
             cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
             auto_finish_dedupe: Arc::new(StdMutex::new(HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(HashSet::new())),
             started_at: Instant::now(),
         }
     }

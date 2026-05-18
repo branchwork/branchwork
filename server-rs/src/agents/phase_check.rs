@@ -1142,6 +1142,7 @@ mod tests {
             settings_path: PathBuf::from("/tmp/branchwork-test-phase-check-settings.json"),
             cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
             auto_finish_dedupe: Arc::new(StdMutex::new(HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(HashSet::new())),
             started_at: std::time::Instant::now(),
         };
         (state, rx)

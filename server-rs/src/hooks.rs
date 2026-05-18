@@ -170,17 +170,26 @@ async fn handle_stop_hook(state: &AppState, session_id: &str) {
                 "files": trimmed,
             });
             broadcast_event(&state.broadcast_tx, "auto_mode_paused", payload.clone());
-            let conn = state.db.lock().unwrap();
-            crate::audit::log(
-                &conn,
-                &org_id,
-                None,
-                Some("branchwork-auto-mode"),
-                crate::auto_mode::actions::AUTO_MODE_PAUSED,
-                crate::audit::resources::PLAN,
-                Some(&plan_name),
-                Some(&payload.to_string()),
-            );
+            {
+                let conn = state.db.lock().unwrap();
+                crate::audit::log(
+                    &conn,
+                    &org_id,
+                    None,
+                    Some("branchwork-auto-mode"),
+                    crate::auto_mode::actions::AUTO_MODE_PAUSED,
+                    crate::audit::resources::PLAN,
+                    Some(&plan_name),
+                    Some(&payload.to_string()),
+                );
+            }
+            // Auto-resume watcher (Task 4.1): when the operator commits
+            // or stashes the dirty files, the loop should pick the plan
+            // back up without requiring a Resume click. Idempotent at
+            // the per-plan level via `state.dirty_tree_watchers` — a
+            // second Stop while a watcher is already running drops
+            // silently.
+            crate::auto_mode::spawn_dirty_tree_watcher(state.clone(), plan_name.clone());
             return;
         }
         crate::agents::TreeState::Clean | crate::agents::TreeState::Unknown => {}
@@ -287,6 +296,7 @@ mod tests {
             settings_path: PathBuf::from("/tmp/branchwork-test-hooks-settings.json"),
             cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
             auto_finish_dedupe: Arc::new(StdMutex::new(HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(HashSet::new())),
             started_at: std::time::Instant::now(),
         };
         (state, rx)
