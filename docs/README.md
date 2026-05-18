@@ -105,6 +105,11 @@ Deployment, upgrades, day-2 ops.
   binary version skew (server / runner / session daemon), explicit
   list of what does **not** work after a downgrade, and the
   SQLite→Postgres caveat (Helm stub only — Rust still SQLite-only).
+- [operations/local-dev.md](operations/local-dev.md) — conventions
+  for working **on** Branchwork inside this repo: the
+  tracked-and-frozen status of the root `.mcp.json`, where it points,
+  and how to override on non-default ports without dirtying the
+  tracked file.
 
 ## Troubleshooting & glossary
 
