@@ -1,0 +1,34 @@
+# Branchwork repo-level config. See docs/reference/branchwork-toml.md.
+#
+# This file ships as the **default allowlist for branchwork-on-branchwork**:
+# when an agent is working on Branchwork itself, the dirty-tree check
+# loads this file and uses [auto_mode.dirty_tree].ignore below to filter
+# out known operational-noise paths before deciding whether to pause the
+# plan with `agent_left_uncommitted_work`.
+#
+# Why ship a default file even after Phase 1 (untrack server.log /
+# runner.log / .bob/ / web-dev.log) landed:
+# - Existing checkouts that did NOT pull Phase 1 still carry tracked
+#   logs; without this allowlist any `cargo run` would dirty them and
+#   pause the active plan.
+# - Operational files written by the dev server / runner / scratch
+#   tooling (`*.log`, `.bob/**`) are noise the agent can't reason
+#   about — git status surfacing them isn't a signal that the agent
+#   forgot to commit real code. The allowlist makes that explicit.
+# - Real code-path drift (server-rs/, web/src/, ...) is NOT ignored:
+#   any tracked file outside the patterns below still trips the pause.
+#
+# Keep this list minimum-viable. Extend on a per-file-family basis with
+# a short comment naming the source of the noise so future contributors
+# know which entry came from which production code path.
+
+[auto_mode.dirty_tree]
+ignore = [
+    # Local-dev server/runner stdout redirect targets (Makefile dev-server
+    # / dev-web targets, server-rs/cargo run). Phase 1 untracked these
+    # via .gitignore but agents on stale checkouts may still see them.
+    "*.log",
+    # Operator scratch dir (per-checkout notes, transient error logs).
+    # Only .bob/README.md is tracked — the rest is per-host state.
+    ".bob/**",
+]
