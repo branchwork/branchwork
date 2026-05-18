@@ -1,13 +1,12 @@
 name: Tag build
 
-# Multi-arch Docker image build for git tag pushes (`v*`). Master
-# pushes are handled by `pipeline.yml`'s `docker-build` /
-# `docker-manifest` jobs — this file only exists because the tag
-# trigger has different semantics (immutable semver tags +
-# `:latest`) and shouldn't share concurrency with the master path.
+# amd64-only Docker image build for git tag pushes (`v*`). Master
+# pushes are handled by `pipeline.yml`'s `docker` job — this file
+# only exists because the tag trigger uses a different image-tagging
+# scheme (immutable semver + `:latest`).
 #
-# Manual workflow_dispatch is also supported so we can rebuild a
-# tag image without re-tagging the git ref.
+# Manual workflow_dispatch supported so we can rebuild a tag image
+# without re-tagging the git ref.
 
 on:
   push:
@@ -24,55 +23,10 @@ env:
 
 jobs:
   build:
-    name: Docker build (${{ matrix.arch.docker }})
-    runs-on: ${{ matrix.arch.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          - { docker: amd64, runner: ubuntu-latest, suffix: amd64 }
-          - { docker: arm64, runner: ubuntu-latest, suffix: arm64 }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/Dockerfile
-          platforms: linux/${{ matrix.arch.docker }}
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          outputs: type=image,push-by-digest=true,name-canonical=true
-          cache-from: type=gha,scope=${{ matrix.arch.suffix }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch.suffix }}
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          echo -n "${{ steps.build.outputs.digest }}" > /tmp/digests/${{ matrix.arch.suffix }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.arch.suffix }}
-          path: /tmp/digests/*
-          retention-days: 1
-          if-no-files-found: error
-
-  manifest:
-    needs: build
-    name: Manifest (multi-arch)
+    name: Docker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: digests-*
-          path: /tmp/digests
-          merge-multiple: true
+      - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -90,12 +44,14 @@ jobs:
             type=sha
             type=raw,value=latest
             type=sha,prefix=,format=short
-      - name: Create manifest
-        working-directory: /tmp/digests
-        run: |
-          set -euo pipefail
-          tags=$(echo '${{ steps.meta.outputs.tags }}' | sed 's|^|--tag |' | tr '\n' ' ')
-          refs=$(for f in *; do
-            echo -n "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$(cat $f) "
-          done)
-          docker buildx imagetools create $tags $refs
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64

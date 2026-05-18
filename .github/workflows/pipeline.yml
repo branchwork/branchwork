@@ -278,56 +278,40 @@ jobs:
           fi
           echo "::notice::Push lock released."
 
-  # ── server (Rust matrix) ─────────────────────────────────────────
+  # ── server (Rust) ────────────────────────────────────────────────
+  # ubuntu-latest only. Branchwork's binaries ship as Linux containers
+  # via deploy/Dockerfile (musl/linux/amd64). There are no Windows
+  # operators in the actual deployment model, so the windows-latest
+  # half of the old matrix was paying CI minutes for surface area
+  # nobody uses.
   server:
     needs: classify
     if: needs.classify.outputs.should_test == 'true'
-    name: Rust — ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    name: Rust
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: server-rs
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             server-rs/target
-          key: ci-${{ matrix.os }}-${{ hashFiles('server-rs/Cargo.lock') }}
-          restore-keys: ci-${{ matrix.os }}-
-      - name: Create web/dist placeholder (Unix)
-        if: runner.os != 'Windows'
+          key: ci-ubuntu-${{ hashFiles('server-rs/Cargo.lock') }}
+          restore-keys: ci-ubuntu-
+      - name: Create web/dist placeholder
         run: mkdir -p ../web/dist && touch ../web/dist/index.html
-      - name: Create web/dist placeholder (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path ../web/dist | Out-Null
-          New-Item -ItemType File -Force -Path ../web/dist/index.html | Out-Null
-      - name: cargo fmt --check
-        if: runner.os != 'Windows'
-        run: cargo fmt --check
-      - name: cargo clippy
-        run: cargo clippy --release --all-targets -- -D warnings
-      - name: cargo test (unit + e2e)
-        run: cargo test --release
-      - name: Install cargo-audit
-        if: runner.os != 'Windows'
-        run: cargo install cargo-audit --locked
-      - name: cargo audit
-        if: runner.os != 'Windows'
-        run: cargo audit
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
 
   # ── web ──────────────────────────────────────────────────────────
   web:
@@ -392,61 +376,23 @@ jobs:
       - name: cargo test --features e2e
         run: cargo test --release --features e2e
 
-  # ── docker-build (matrix per arch) ───────────────────────────────
-  docker-build:
+  # ── docker (amd64 only, single job) ──────────────────────────────
+  # Single arch, single job: builds the image and pushes all the
+  # human-readable tags (`:edge`, `:latest`, `:<sha7>`, `:sha-<long>`)
+  # in one go via docker/metadata-action + docker/build-push-action.
+  # No separate digest-upload + manifest dance — that pattern was
+  # only justified when we needed to fan-in two arch builds.
+  #
+  # Prod runs amd64 (Hetzner box is x86_64); deploy/Dockerfile's
+  # CMD is the linux/amd64 binary. arm64 was a future-proofing bet
+  # that hasn't paid out in actual deployment.
+  docker:
     needs: [classify, server, web, e2e]
     if: needs.classify.outputs.should_build == 'true'
-    name: Docker build (${{ matrix.arch.docker }})
-    runs-on: ${{ matrix.arch.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          - { docker: amd64, runner: ubuntu-latest, suffix: amd64 }
-          - { docker: arm64, runner: ubuntu-latest, suffix: arm64 }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/Dockerfile
-          platforms: linux/${{ matrix.arch.docker }}
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          outputs: type=image,push-by-digest=true,name-canonical=true
-          cache-from: type=gha,scope=${{ matrix.arch.suffix }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch.suffix }}
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          echo -n "${{ steps.build.outputs.digest }}" > /tmp/digests/${{ matrix.arch.suffix }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.arch.suffix }}
-          path: /tmp/digests/*
-          retention-days: 1
-          if-no-files-found: error
-
-  # ── docker-manifest ──────────────────────────────────────────────
-  docker-manifest:
-    needs: [classify, docker-build]
-    if: needs.classify.outputs.should_build == 'true'
-    name: Docker manifest (multi-arch)
+    name: Docker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: digests-*
-          path: /tmp/digests
-          merge-multiple: true
+      - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -464,19 +410,21 @@ jobs:
             type=ref,event=branch
             type=raw,value=edge,enable={{is_default_branch}}
             type=sha,prefix=,format=short
-      - name: Create manifest
-        working-directory: /tmp/digests
-        run: |
-          set -euo pipefail
-          tags=$(echo '${{ steps.meta.outputs.tags }}' | sed 's|^|--tag |' | tr '\n' ' ')
-          refs=$(for f in *; do
-            echo -n "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$(cat $f) "
-          done)
-          docker buildx imagetools create $tags $refs
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
 
   # ── deploy ───────────────────────────────────────────────────────
   deploy:
-    needs: [classify, docker-manifest]
+    needs: [classify, docker]
     if: needs.classify.outputs.should_deploy == 'true'
     name: Deploy to Hetzner
     runs-on: ubuntu-latest
