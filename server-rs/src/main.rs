@@ -10,6 +10,7 @@ mod file_watcher;
 mod git_helpers;
 mod hooks;
 mod mcp;
+mod migrations;
 mod notifications;
 mod persisted_settings;
 mod plan_curate;
@@ -228,6 +229,17 @@ async fn run_server(cli: Cli) {
     // Idempotent at the row level (keyed on plan/task/SHA); no settings
     // gate needed.
     ci::spawn_backfill_missing_ci_runs(state.clone());
+
+    // One-shot YAML migration (CI-split Phase 3.1): rewrite
+    // `ci_blocking_workflows: [..., Pipeline, ...]` to
+    // `ci_blocking_workflows: [..., task-tests, ...]` across every plan
+    // YAML in `<plans_dir>`. Plans authored before the
+    // `tests.yml` / `task-tests.yml` split block on a workflow that no
+    // longer fires for task branches; this brings them onto the new
+    // workflow without operator action. Settings-gated
+    // (`pipeline_to_task_tests_rename_v1_done`) so subsequent boots
+    // skip the directory walk.
+    migrations::spawn_pipeline_to_task_tests_rename(state.clone());
 
     // Start the auto-mode idle poller (drivers without a Stop hook fall
     // back to a 60 s tick + idle threshold). Off by default; set

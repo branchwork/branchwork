@@ -1855,7 +1855,7 @@ pub async fn put_plan_settings(
 /// list item) are not preserved — `serde_yaml::Value` doesn't carry
 /// them. Everything else (leading comments, trailing comments, blank
 /// lines, other top-level keys) survives byte-for-byte.
-fn update_yaml_top_level_key(
+pub(crate) fn update_yaml_top_level_key(
     yaml: &str,
     key: &str,
     value: Option<&serde_yaml::Value>,
