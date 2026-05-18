@@ -1,0 +1,115 @@
+name: Tests
+
+# Reusable workflow that runs the three test jobs (server, web, e2e)
+# extracted from pipeline.yml. The caller decides whether to invoke
+# this workflow — there is no `classify` job here; the per-event
+# logic lives in the parent workflow.
+#
+# Phase 1.1 of the CI split (plan
+# `ci-split-task-tests-from-master-pipeline`). Job bodies are
+# byte-for-byte copies of pipeline.yml::server / web / e2e minus
+# their `needs:` / `if:` lines. Update the source job in pipeline.yml
+# AND this file together until pipeline.yml is collapsed onto this
+# workflow in a later phase.
+
+on:
+  workflow_call:
+    secrets:
+      GH_PAT: { required: false }
+      ANTHROPIC_API_KEY: { required: false }
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── server (Rust) ────────────────────────────────────────────────
+  # ubuntu-latest only. Branchwork's binaries ship as Linux containers
+  # via deploy/Dockerfile (musl/linux/amd64). There are no Windows
+  # operators in the actual deployment model, so the windows-latest
+  # half of the old matrix was paying CI minutes for surface area
+  # nobody uses.
+  server:
+    name: Rust
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server-rs/target
+          key: ci-ubuntu-${{ hashFiles('server-rs/Cargo.lock') }}
+          restore-keys: ci-ubuntu-
+      - name: Create web/dist placeholder
+        run: mkdir -p ../web/dist && touch ../web/dist/index.html
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  # ── web ──────────────────────────────────────────────────────────
+  web:
+    name: Web — typecheck, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Lint (ESLint)
+        run: pnpm --filter @branchwork/web lint
+      - name: Format (Prettier)
+        run: pnpm --filter @branchwork/web format:check
+      - name: Build
+        run: pnpm --filter @branchwork/web build
+      - name: Bundle-size budget
+        run: pnpm --filter @branchwork/web bundle:check
+
+  # ── e2e ──────────────────────────────────────────────────────────
+  e2e:
+    name: E2E tests (gh + Claude)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server-rs
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      BRANCHWORK_TEST_GH_REPOS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server-rs/target
+          key: ci-e2e-${{ hashFiles('server-rs/Cargo.lock') }}
+          restore-keys: |
+            ci-e2e-
+            ci-ubuntu-latest-
+      - run: mkdir -p ../web/dist && touch ../web/dist/index.html
+      - name: Verify gh CLI + auth
+        run: |
+          gh --version
+          if [ -n "$GH_TOKEN" ]; then
+            gh auth status
+          else
+            echo "::warning::GH_PAT not set; gh-backed paths will skip via tests/support/gh.rs::maybe_create"
+          fi
+      - name: cargo test --features e2e
+        run: cargo test --release --features e2e
