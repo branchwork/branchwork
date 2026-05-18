@@ -1841,6 +1841,168 @@ pub async fn put_plan_settings(
     (StatusCode::OK, Json(response)).into_response()
 }
 
+// ── GET /api/plans/:name/blocking-workflow-status (Task 3.2) ─────────────────
+//
+// Dashboard hint: when a plan's `ciBlockingWorkflows` lists a workflow
+// name that does NOT exist in the repo's `.github/workflows/` directory,
+// surface a stalled-list so the plan page can show a yellow banner
+// before the 20-min `wait_for_ci` timeout fires `ci_stalled`.
+//
+// The brief acceptance test ("configure a plan to block on a non-existent
+// workflow name; push to the task branch; within 10 minutes the banner
+// appears") is satisfied by checking `availableWorkflows` (already
+// enumerated server-side from `.github/workflows/*.yml`) against the
+// plan's explicitly configured blocking workflow names (phase-level →
+// plan-level → repo `branchwork.toml`). A workflow that does not exist
+// on disk cannot fire on the task branch, so it is by definition stalled
+// — no time window required, no `gh` shell-out required.
+//
+// We DO require a running agent for the plan (`status IN
+// (running, starting)` + `branch IS NOT NULL`) so the banner only fires
+// while a task is actually in flight. Without that gate the banner
+// would render on every plan with a misconfigured workflow gate, even
+// when no work is happening — noisier than helpful.
+//
+// Phase-level overrides are honoured per agent: an agent on task `2.1`
+// gets phase 2's `ciBlockingWorkflows` (if set), falling back to
+// plan-level then repo-level. The classifier (level 4) is intentionally
+// excluded — that path only kicks in when there is no explicit
+// configuration, and missing-from-`availableWorkflows` is only
+// actionable for EXPLICITLY named workflows.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StalledBlockingWorkflow {
+    /// The workflow name that was configured in `ciBlockingWorkflows`
+    /// but is not present in `.github/workflows/`.
+    workflow: String,
+    /// The task branch the agent is operating on (e.g.
+    /// `branchwork/<plan>/<task>`).
+    branch: String,
+    /// The task number the agent is working on (e.g. `"3.2"`).
+    task_id: String,
+    /// The id of the running agent — lets the UI deep-link to the
+    /// agent panel.
+    agent_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockingWorkflowStatus {
+    stalled: Vec<StalledBlockingWorkflow>,
+}
+
+pub async fn get_blocking_workflow_status(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    {
+        let conn = state.db.lock().unwrap();
+        if !orgs::plan_belongs_to_org(&conn, &name, auth.org_id()) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    }
+
+    let plan_path = match plan_parser::find_plan_file(&state.plans_dir, &name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let plan = match plan_parser::parse_plan_file(&plan_path) {
+        Ok(p) => p,
+        // Malformed YAML never 5xx — return empty list so the banner is
+        // simply hidden until the plan parses again.
+        Err(_) => {
+            return Json(BlockingWorkflowStatus { stalled: vec![] }).into_response();
+        }
+    };
+
+    let project_dir = crate::ci::project_dir_for(&state.plans_dir, &state.db, &name);
+    let available_workflows: std::collections::HashSet<String> = project_dir
+        .as_deref()
+        .map(enumerate_available_workflows)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let repo_config = project_dir
+        .as_deref()
+        .and_then(crate::repo_config::load_for_project_dir);
+
+    // Pull running agents (with branch + task_id) for this plan in a
+    // single query so we don't lock the DB per-agent.
+    let running: Vec<(String, String, String)> = {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, task_id, branch FROM agents \
+             WHERE plan_name = ?1 \
+             AND status IN ('running', 'starting') \
+             AND branch IS NOT NULL AND branch != '' \
+             AND task_id IS NOT NULL AND task_id != ''",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Json(BlockingWorkflowStatus { stalled: vec![] }).into_response(),
+        };
+        match stmt.query_map(params![name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => return Json(BlockingWorkflowStatus { stalled: vec![] }).into_response(),
+        }
+    };
+
+    let mut stalled: Vec<StalledBlockingWorkflow> = Vec::new();
+    for (agent_id, task_id, branch) in running {
+        // Phase-aware explicit-only resolution (levels 1-3 from the
+        // resolution helper). Classifier is excluded — see module
+        // comment.
+        let configured = match crate::ci::resolution::phase_for_task(&plan, &task_id) {
+            Some(phase) => crate::ci::resolution::resolve_explicit_blocking_workflows(
+                &plan,
+                phase,
+                repo_config.as_ref(),
+            ),
+            // Task number not found in any phase (orphaned agent row)
+            // — fall back to plan-level + repo-level only.
+            None => plan.ci_blocking_workflows.clone().or_else(|| {
+                repo_config
+                    .as_ref()
+                    .and_then(|c| c.ci.blocking_workflows.clone())
+            }),
+        };
+        let Some(configured) = configured else {
+            continue;
+        };
+        for workflow in configured {
+            if !available_workflows.contains(&workflow) {
+                stalled.push(StalledBlockingWorkflow {
+                    workflow,
+                    branch: branch.clone(),
+                    task_id: task_id.clone(),
+                    agent_id: agent_id.clone(),
+                });
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(BlockingWorkflowStatus { stalled })).into_response()
+}
+
 /// Update a single top-level key in a YAML document while preserving
 /// every comment, blank line, and indentation outside the modified
 /// key's range.

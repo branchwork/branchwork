@@ -355,6 +355,7 @@ export function PlanBoard() {
       <UncommittedWorkBanner planName={plan.name} />
       <RunnerOfflineBanner planName={plan.name} />
       <AutoPushRebaseConflictBanner planName={plan.name} />
+      <BlockingWorkflowStalledBanner planName={plan.name} />
 
       {/* Tabs: Board (phase cards + filter) vs Settings (per-plan
           ci_blocking_workflows + phase_verification overrides + repo
@@ -1505,6 +1506,87 @@ export function AutoPushRebaseConflictBanner({ planName }: { planName: string })
           Resolve the overlap on the merge target (origin moved while the agent's branch was being
           merged), then click Resume.
         </div>
+      </div>
+    </div>
+  );
+}
+
+/// Banner above the board that fires when a plan's
+/// `ciBlockingWorkflows` lists a workflow name that does NOT exist as a
+/// file in `.github/workflows/`. Without this hint the operator
+/// discovers the misconfiguration only after `wait_for_ci` times out
+/// (~20 min) and pauses the plan with `ci_stalled` — by then they have
+/// already burned compute on an agent that was never going to merge.
+///
+/// Detection: polls
+/// `GET /api/plans/:name/blocking-workflow-status` every 30 seconds.
+/// The server returns `{ stalled: [{ workflow, branch, taskId, agentId }] }`
+/// — one entry per (configured-but-missing workflow × running task
+/// agent). Empty list → banner hidden.
+///
+/// Reuses the amber palette of `RunnerOfflineBanner` /
+/// `AutoPushRebaseConflictBanner` since this is the same class of
+/// operator-recoverable warning (fix the gate or the workflow trigger,
+/// then push again).
+export const BLOCKING_WORKFLOW_POLL_MS = 30_000;
+
+type BlockingWorkflowEntry = {
+  workflow: string;
+  branch: string;
+  taskId: string;
+  agentId: string;
+};
+
+export function BlockingWorkflowStalledBanner({ planName }: { planName: string }) {
+  const [stalled, setStalled] = useState<BlockingWorkflowEntry[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await fetchJson<{ stalled: BlockingWorkflowEntry[] }>(
+          `/api/plans/${encodeURIComponent(planName)}/blocking-workflow-status`,
+        );
+        if (!cancelled) setStalled(res.stalled);
+      } catch {
+        // Silent failure: a transient 5xx or auth blip shouldn't make
+        // the banner flap. The next tick will retry.
+        if (!cancelled) setStalled([]);
+      }
+    };
+    load();
+    const handle = setInterval(load, BLOCKING_WORKFLOW_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [planName]);
+
+  if (stalled.length === 0) return null;
+
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-start gap-3 rounded border border-amber-700/50 bg-amber-900/20 px-4 py-3 text-sm"
+    >
+      <span
+        aria-hidden="true"
+        className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-amber-700/60 text-xs font-bold text-amber-100"
+      >
+        !
+      </span>
+      <div className="flex-1 text-amber-100">
+        <div className="font-medium">Blocking workflow has no matching file in the repo.</div>
+        <ul className="mt-1 space-y-1 text-amber-200/90">
+          {stalled.map((s) => (
+            <li key={`${s.agentId}-${s.workflow}`}>
+              Blocking workflow <span className="font-mono">{s.workflow}</span> hasn't run on{" "}
+              <span className="font-mono">{s.branch}</span>. The plan will pause with{" "}
+              <span className="font-mono">ci_stalled</span> — either fix the workflow trigger or
+              change the gate in plan settings.
+            </li>
+          ))}
+        </ul>
       </div>
     </div>
   );

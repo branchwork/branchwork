@@ -347,6 +347,10 @@ async fn run_server(cli: Cli) {
             get(api::plans::get_plan_settings).put(api::plans::put_plan_settings),
         )
         .route(
+            "/api/plans/{name}/blocking-workflow-status",
+            get(api::plans::get_blocking_workflow_status),
+        )
+        .route(
             "/api/plans/{name}/phases/{phase_number}/settings",
             get(api::plans::get_phase_settings).put(api::plans::put_phase_settings),
         )
