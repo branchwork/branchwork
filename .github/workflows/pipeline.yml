@@ -14,16 +14,21 @@ name: Pipeline
 #
 # Per-event behaviour:
 #   - PR (any commit on the PR branch):
-#       classify → server (matrix) + web + e2e
+#       classify → tests (via workflow_call → tests.yml)
 #   - Master push, *non*-bump commit (i.e. a human push):
 #       classify → bump
 #       (bump pushes a `chore: auto-bump to vX.Y.Z` commit using a PAT,
 #        which fires this workflow again on that commit.)
 #   - Master push, bump commit:
-#       classify → server (matrix) + web + e2e → docker-build → docker-manifest → deploy
+#       classify → tests → docker → deploy
 #   - workflow_dispatch:
-#       classify → server (matrix) + web + e2e → docker-build → docker-manifest → deploy
+#       classify → tests → docker → deploy
 #       (manual full-pipeline override; deploys whatever HEAD is on master.)
+#
+# The server / web / e2e jobs live in `.github/workflows/tests.yml`
+# (Phase 1.1 of the CI split). Calling that workflow via `uses:` keeps
+# the per-job rows nested under this Pipeline run in the Actions tab
+# instead of spawning a sibling top-level run.
 #
 # Tag pushes (`v*`) are handled by `tag-build.yml`, which is a
 # separate workflow because its trigger surface and image tagging
@@ -300,103 +305,25 @@ jobs:
           fi
           echo "::notice::Push lock released."
 
-  # ── server (Rust) ────────────────────────────────────────────────
-  # ubuntu-latest only. Branchwork's binaries ship as Linux containers
-  # via deploy/Dockerfile (musl/linux/amd64). There are no Windows
-  # operators in the actual deployment model, so the windows-latest
-  # half of the old matrix was paying CI minutes for surface area
-  # nobody uses.
-  server:
+  # ── tests ────────────────────────────────────────────────────────
+  # Delegates to the reusable `tests.yml` workflow which carries the
+  # server / web / e2e jobs (Phase 1.1 of the CI split). Calling it
+  # via `uses:` keeps the per-job rows nested under this Pipeline run
+  # in the Actions tab — they do NOT spawn a sibling top-level run.
+  #
+  # `secrets: inherit` forwards GH_PAT + ANTHROPIC_API_KEY from this
+  # workflow's environment to `tests.yml`, matching the previous
+  # `${{ secrets.X }}` references in the inline e2e job.
+  #
+  # When `should_test=false`, this job is skipped; `docker` is also
+  # skipped by its own `if: should_build == 'true'`, so the `needs:`
+  # graph stays consistent without `always()` / `success()` gymnastics.
+  tests:
     needs: classify
     if: needs.classify.outputs.should_test == 'true'
-    name: Rust
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: server-rs
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            server-rs/target
-          key: ci-ubuntu-${{ hashFiles('server-rs/Cargo.lock') }}
-          restore-keys: ci-ubuntu-
-      - name: Create web/dist placeholder
-        run: mkdir -p ../web/dist && touch ../web/dist/index.html
-      - run: cargo fmt --check
-      - run: cargo clippy --release --all-targets -- -D warnings
-      - run: cargo test --release
-      - run: cargo install cargo-audit --locked
-      - run: cargo audit
-
-  # ── web ──────────────────────────────────────────────────────────
-  web:
-    needs: classify
-    if: needs.classify.outputs.should_test == 'true'
-    name: Web — typecheck, build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with: { version: 9 }
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-      - name: Lint (ESLint)
-        run: pnpm --filter @branchwork/web lint
-      - name: Format (Prettier)
-        run: pnpm --filter @branchwork/web format:check
-      - name: Build
-        run: pnpm --filter @branchwork/web build
-      - name: Bundle-size budget
-        run: pnpm --filter @branchwork/web bundle:check
-
-  # ── e2e ──────────────────────────────────────────────────────────
-  e2e:
-    needs: classify
-    if: needs.classify.outputs.should_test == 'true'
-    name: E2E tests (gh + Claude)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: server-rs
-    env:
-      GH_TOKEN: ${{ secrets.GH_PAT }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      BRANCHWORK_TEST_GH_REPOS: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            server-rs/target
-          key: ci-e2e-${{ hashFiles('server-rs/Cargo.lock') }}
-          restore-keys: |
-            ci-e2e-
-            ci-ubuntu-latest-
-      - run: mkdir -p ../web/dist && touch ../web/dist/index.html
-      - name: Verify gh CLI + auth
-        run: |
-          gh --version
-          if [ -n "$GH_TOKEN" ]; then
-            gh auth status
-          else
-            echo "::warning::GH_PAT not set; gh-backed paths will skip via tests/support/gh.rs::maybe_create"
-          fi
-      - name: cargo test --features e2e
-        run: cargo test --release --features e2e
+    name: Tests
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit
 
   # ── docker (amd64 only, single job) ──────────────────────────────
   # Single arch, single job: builds the image and pushes all the
@@ -409,7 +336,7 @@ jobs:
   # CMD is the linux/amd64 binary. arm64 was a future-proofing bet
   # that hasn't paid out in actual deployment.
   docker:
-    needs: [classify, server, web, e2e]
+    needs: [classify, tests]
     if: needs.classify.outputs.should_build == 'true'
     name: Docker
     runs-on: ubuntu-latest
