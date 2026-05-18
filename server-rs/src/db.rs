@@ -56,28 +56,38 @@ pub fn auto_mode_enabled(db: &Db, plan_name: &str) -> bool {
 /// Record that auto-mode has self-paused for `plan_name`. UPSERT so a
 /// pause that races a row deletion still lands; `enabled` is left
 /// untouched on the conflict path so the user's opt-in state survives.
+///
+/// `files` carries the trimmed dirty-tree file list that produced the
+/// pause (only set for `agent_left_uncommitted_work` paths today). When
+/// `Some`, it is JSON-encoded and stored in `paused_files`; when `None`,
+/// the column is cleared so a downstream pause from a different cause
+/// can't leak a stale file list into the dashboard. The "5-file trim"
+/// lives at the call site (matches the broadcast payload); this helper
+/// stores whatever it's handed.
 #[allow(dead_code)] // wired in by later auto-mode-loop tasks
-pub fn auto_mode_pause(db: &Db, plan_name: &str, reason: &str) {
+pub fn auto_mode_pause(db: &Db, plan_name: &str, reason: &str, files: Option<&[String]>) {
+    let files_json = files.map(|f| serde_json::to_string(f).unwrap_or_else(|_| "[]".to_string()));
     let conn = db.lock().unwrap();
     conn.execute(
-        "INSERT INTO plan_auto_mode (plan_name, paused_reason, paused_at) \
-         VALUES (?1, ?2, datetime('now')) \
+        "INSERT INTO plan_auto_mode (plan_name, paused_reason, paused_at, paused_files) \
+         VALUES (?1, ?2, datetime('now'), ?3) \
          ON CONFLICT(plan_name) DO UPDATE SET \
            paused_reason = excluded.paused_reason, \
-           paused_at = excluded.paused_at",
-        params![plan_name, reason],
+           paused_at = excluded.paused_at, \
+           paused_files = excluded.paused_files",
+        params![plan_name, reason, files_json],
     )
     .ok();
 }
 
-/// Clear `paused_reason` / `paused_at` for `plan_name`. No-op if no row
-/// exists — there is nothing to unpause.
+/// Clear `paused_reason` / `paused_at` / `paused_files` for `plan_name`.
+/// No-op if no row exists — there is nothing to unpause.
 #[allow(dead_code)] // wired in by later auto-mode-loop tasks
 pub fn auto_mode_resume(db: &Db, plan_name: &str) {
     let conn = db.lock().unwrap();
     conn.execute(
         "UPDATE plan_auto_mode \
-         SET paused_reason = NULL, paused_at = NULL \
+         SET paused_reason = NULL, paused_at = NULL, paused_files = NULL \
          WHERE plan_name = ?1",
         params![plan_name],
     )
@@ -94,16 +104,22 @@ pub struct AutoModeConfig {
     pub max_fix_attempts: u32,
     pub paused_reason: Option<String>,
     pub parallel: bool,
+    /// Dirty-tree file list captured at pause time. `None` when the row
+    /// has no pause context or the pause reason was non-dirty-tree (e.g.
+    /// `merge_conflict`, `ci_failed`). The list is whatever the caller of
+    /// [`auto_mode_pause`] handed in — trimmed at the call site to match
+    /// the broadcast payload (5 files today).
+    pub paused_files: Option<Vec<String>>,
 }
 
 /// Read the full `plan_auto_mode` row for `plan_name`. Defaults to
 /// `enabled=false`, `max_fix_attempts=3`, `paused_reason=None`,
-/// `parallel=false` when no row exists.
+/// `parallel=false`, `paused_files=None` when no row exists.
 #[allow(dead_code)] // wired in by 3.5.3 worktrees gate + later loop callers
 pub fn auto_mode_config(db: &Db, plan_name: &str) -> AutoModeConfig {
     let conn = db.lock().unwrap();
     conn.query_row(
-        "SELECT enabled, max_fix_attempts, paused_reason, parallel \
+        "SELECT enabled, max_fix_attempts, paused_reason, parallel, paused_files \
          FROM plan_auto_mode WHERE plan_name = ?1",
         params![plan_name],
         |row| {
@@ -112,6 +128,9 @@ pub fn auto_mode_config(db: &Db, plan_name: &str) -> AutoModeConfig {
                 max_fix_attempts: row.get::<_, i64>(1)? as u32,
                 paused_reason: row.get::<_, Option<String>>(2)?,
                 parallel: row.get::<_, i64>(3)? != 0,
+                paused_files: row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()),
             })
         },
     )
@@ -120,6 +139,7 @@ pub fn auto_mode_config(db: &Db, plan_name: &str) -> AutoModeConfig {
         max_fix_attempts: 3,
         paused_reason: None,
         parallel: false,
+        paused_files: None,
     })
 }
 
@@ -1147,6 +1167,17 @@ fn migrate(conn: &Connection) {
     )
     .ok();
 
+    // Dirty-tree file list captured at pause time (T3.1 of the
+    // dirty-tree-check plan). JSON-encoded `Vec<String>` so the dashboard
+    // can render `pausedFiles: ["server.log", ...]` next to
+    // `pausedReason: "agent_left_uncommitted_work"`. NULL when the pause
+    // has no file context (every non-dirty-tree reason — merge_conflict,
+    // ci_failed, etc.) — same column doubles as a discriminator. Capped
+    // at the call site (5 files today) to match the broadcast payload;
+    // helper stores whatever it's handed.
+    conn.execute_batch("ALTER TABLE plan_auto_mode ADD COLUMN paused_files TEXT;")
+        .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 
@@ -1849,26 +1880,36 @@ mod tests {
         }
         assert!(auto_mode_enabled(&db, "p1"));
 
-        auto_mode_pause(&db, "p1", "merge_conflict");
+        auto_mode_pause(&db, "p1", "merge_conflict", None);
         assert!(
             !auto_mode_enabled(&db, "p1"),
             "paused plan must report not-enabled"
         );
 
         // Inspect the row directly: paused_reason and paused_at landed,
-        // enabled is preserved.
+        // enabled is preserved, and paused_files stays NULL (no file
+        // context for a merge_conflict pause).
         let conn = db.lock().unwrap();
-        let (enabled, reason, paused_at): (i64, Option<String>, Option<String>) = conn
+        let (enabled, reason, paused_at, paused_files): (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
             .query_row(
-                "SELECT enabled, paused_reason, paused_at \
+                "SELECT enabled, paused_reason, paused_at, paused_files \
                  FROM plan_auto_mode WHERE plan_name = ?1",
                 params!["p1"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
         assert_eq!(enabled, 1, "pause must not flip enabled");
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
         assert!(paused_at.is_some(), "paused_at must be set");
+        assert!(
+            paused_files.is_none(),
+            "merge_conflict pause has no file context"
+        );
     }
 
     #[test]
@@ -1883,8 +1924,31 @@ mod tests {
             .unwrap();
         }
 
-        auto_mode_pause(&db, "p1", "fix_cap_reached");
+        auto_mode_pause(
+            &db,
+            "p1",
+            "agent_left_uncommitted_work",
+            Some(&["server.log".to_string(), "runner.log".to_string()]),
+        );
         assert!(!auto_mode_enabled(&db, "p1"));
+
+        // Verify pre-resume state: paused_files JSON landed.
+        {
+            let conn = db.lock().unwrap();
+            let files: Option<String> = conn
+                .query_row(
+                    "SELECT paused_files FROM plan_auto_mode WHERE plan_name = ?1",
+                    params!["p1"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let parsed: Vec<String> =
+                serde_json::from_str(files.as_deref().unwrap_or("[]")).unwrap();
+            assert_eq!(
+                parsed,
+                vec!["server.log".to_string(), "runner.log".to_string()]
+            );
+        }
 
         auto_mode_resume(&db, "p1");
         assert!(
@@ -1893,16 +1957,17 @@ mod tests {
         );
 
         let conn = db.lock().unwrap();
-        let (reason, paused_at): (Option<String>, Option<String>) = conn
-            .query_row(
-                "SELECT paused_reason, paused_at \
+        let (reason, paused_at, paused_files): (Option<String>, Option<String>, Option<String>) =
+            conn.query_row(
+                "SELECT paused_reason, paused_at, paused_files \
                  FROM plan_auto_mode WHERE plan_name = ?1",
                 params!["p1"],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(reason, None);
         assert_eq!(paused_at, None);
+        assert_eq!(paused_files, None, "resume must clear paused_files too");
     }
 
     #[test]
@@ -1910,7 +1975,7 @@ mod tests {
         // Defensive: if the loop pauses before the user toggled (or after
         // the row was deleted), the UPSERT must still record the reason.
         let (db, _dir) = test_db();
-        auto_mode_pause(&db, "p1", "merge_conflict");
+        auto_mode_pause(&db, "p1", "merge_conflict", None);
 
         let conn = db.lock().unwrap();
         let (enabled, reason): (i64, Option<String>) = conn
@@ -1923,6 +1988,63 @@ mod tests {
             .unwrap();
         assert_eq!(enabled, 0, "default-on-insert is 0; user has not opted in");
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
+    }
+
+    /// Pause with a file list, then pause again without one (different
+    /// reason). The second pause must clear paused_files, not leak the
+    /// stale list onto an unrelated pause reason.
+    #[test]
+    fn auto_mode_pause_overwrites_files_on_subsequent_pause() {
+        let (db, _dir) = test_db();
+        auto_mode_pause(
+            &db,
+            "p1",
+            "agent_left_uncommitted_work",
+            Some(&["server.log".to_string()]),
+        );
+        auto_mode_pause(&db, "p1", "merge_conflict", None);
+
+        let conn = db.lock().unwrap();
+        let (reason, files): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT paused_reason, paused_files FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["p1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("merge_conflict"));
+        assert!(
+            files.is_none(),
+            "stale paused_files must not leak across pause reasons"
+        );
+    }
+
+    #[test]
+    fn auto_mode_config_round_trips_paused_files() {
+        let (db, _dir) = test_db();
+        auto_mode_pause(
+            &db,
+            "p1",
+            "agent_left_uncommitted_work",
+            Some(&[
+                "server.log".to_string(),
+                "runner.log".to_string(),
+                "web-dev.log".to_string(),
+            ]),
+        );
+        let cfg = auto_mode_config(&db, "p1");
+        assert_eq!(
+            cfg.paused_reason.as_deref(),
+            Some("agent_left_uncommitted_work")
+        );
+        assert_eq!(
+            cfg.paused_files,
+            Some(vec![
+                "server.log".to_string(),
+                "runner.log".to_string(),
+                "web-dev.log".to_string(),
+            ])
+        );
     }
 
     #[test]

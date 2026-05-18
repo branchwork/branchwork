@@ -191,7 +191,7 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
                 holder.holder_kind, holder.age_secs,
             );
             let reason = "push_lock_unavailable";
-            crate::db::auto_mode_pause(&db, &plan_name, reason);
+            crate::db::auto_mode_pause(&db, &plan_name, reason, None);
             let payload = serde_json::json!({
                 "plan": plan_name,
                 "task": task_number,
@@ -280,8 +280,15 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
                 "[ci] push of {source_branch} failed: rebase conflict in {} file(s) — pausing plan {plan_name}",
                 files.len()
             );
+            // NOTE: rebase-conflict files are surfaced via the separate
+            // `autoPushRebaseConflicts` transient slice (T1.3 of this plan),
+            // not via `plan_auto_mode.paused_files` — that column is the
+            // dirty-tree-pause discriminator. Pass None here so the
+            // dashboard banner code can key off pausedReason without
+            // disambiguating "is `pausedFiles` a dirty-tree list or a
+            // rebase-conflict list?".
             let reason = "auto_push_rebase_conflict";
-            crate::db::auto_mode_pause(&db, &plan_name, reason);
+            crate::db::auto_mode_pause(&db, &plan_name, reason, None);
             let payload = serde_json::json!({
                 "plan": plan_name,
                 "task": task_number,

@@ -704,7 +704,7 @@ async fn on_verify_failed(
     broadcast_event(&state.broadcast_tx, "phase_verify_failed", payload.clone());
 
     let pause_reason = format!("phase_verify_failed: {reason}");
-    db::auto_mode_pause(&state.db, plan_name, &pause_reason);
+    db::auto_mode_pause(&state.db, plan_name, &pause_reason, None);
 
     if let Some(org_id) = lookup_org_for_plan(state, plan_name) {
         let conn = state.db.lock().unwrap();

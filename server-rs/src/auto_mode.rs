@@ -333,7 +333,7 @@ async fn run_merge_step(
         format!("merge_failed: {msg}")
     };
 
-    db::auto_mode_pause(&state.db, plan_name, &reason);
+    db::auto_mode_pause(&state.db, plan_name, &reason, None);
 
     let payload = serde_json::json!({
         "plan": plan_name,
@@ -576,7 +576,7 @@ async fn on_ci_stalled(
     merged_sha: &str,
 ) {
     let reason = "ci_stalled".to_string();
-    db::auto_mode_pause(&state.db, plan_name, &reason);
+    db::auto_mode_pause(&state.db, plan_name, &reason, None);
 
     let payload = serde_json::json!({
         "plan": plan_name,
@@ -1076,7 +1076,7 @@ async fn on_fix_agent_completed(
                     .to_string()
             };
             let reason = format!("fix_merge_failed: {detail}");
-            db::auto_mode_pause(&state.db, plan_name, &reason);
+            db::auto_mode_pause(&state.db, plan_name, &reason, None);
 
             let payload = serde_json::json!({
                 "plan": plan_name,
@@ -1346,7 +1346,7 @@ async fn try_spawn_fix_agent_with_cap(
 
     if attempts >= cap {
         let reason = "fix_cap_reached".to_string();
-        db::auto_mode_pause(&state.db, plan_name, &reason);
+        db::auto_mode_pause(&state.db, plan_name, &reason, None);
 
         let payload = serde_json::json!({
             "plan": plan_name,
@@ -1417,7 +1417,7 @@ async fn try_spawn_fix_agent_with_cap(
         );
     } else {
         let reason = "fix_spawn_failed: original task agent row missing".to_string();
-        db::auto_mode_pause(&state.db, plan_name, &reason);
+        db::auto_mode_pause(&state.db, plan_name, &reason, None);
         let payload = serde_json::json!({
             "plan": plan_name,
             "task": task_id,
@@ -1645,8 +1645,13 @@ async fn run_idle_pass(state: &AppState, threshold_secs: i64) {
             &plan_name,
         ) {
             crate::agents::TreeState::Dirty { files } => {
-                let trimmed: Vec<&String> = files.iter().take(5).collect();
-                db::auto_mode_pause(&state.db, &plan_name, "agent_left_uncommitted_work");
+                let trimmed: Vec<String> = files.iter().take(5).cloned().collect();
+                db::auto_mode_pause(
+                    &state.db,
+                    &plan_name,
+                    "agent_left_uncommitted_work",
+                    Some(&trimmed),
+                );
                 let payload = serde_json::json!({
                     "plan": plan_name,
                     "task": task_id,

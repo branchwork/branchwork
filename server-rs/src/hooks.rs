@@ -156,8 +156,13 @@ async fn handle_stop_hook(state: &AppState, session_id: &str) {
     // duplicate audit row + broadcast a redundant event.
     match crate::agents::check_tree_clean_for_completion(&state.db, &state.plans_dir, &plan_name) {
         crate::agents::TreeState::Dirty { files } => {
-            let trimmed: Vec<&String> = files.iter().take(5).collect();
-            crate::db::auto_mode_pause(&state.db, &plan_name, "agent_left_uncommitted_work");
+            let trimmed: Vec<String> = files.iter().take(5).cloned().collect();
+            crate::db::auto_mode_pause(
+                &state.db,
+                &plan_name,
+                "agent_left_uncommitted_work",
+                Some(&trimmed),
+            );
             let payload = serde_json::json!({
                 "plan": plan_name,
                 "task": task_id,

@@ -933,6 +933,15 @@ struct PlanConfig {
     auto_mode: bool,
     max_fix_attempts: u32,
     paused_reason: Option<String>,
+    /// Trimmed file list captured at pause time for dirty-tree pauses
+    /// (T3.1 of the dirty-tree-check plan). Only populated when the
+    /// pause reason is `agent_left_uncommitted_work`; `None` for every
+    /// other reason. Cleared on resume by [`crate::db::auto_mode_resume`].
+    /// Serialised as `pausedFiles` and omitted from the JSON when None
+    /// so the wire shape stays unchanged for plans that have never
+    /// dirty-tree-paused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paused_files: Option<Vec<String>>,
     /// Per-plan opt-in for fan-out spawn (3.5.2). Stored on both
     /// `plan_auto_mode` and `plan_auto_advance` and kept in lockstep by
     /// the unified PUT. Toggling to true is rejected at the API layer
@@ -1001,9 +1010,9 @@ fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
         )
         .unwrap_or((false, false));
 
-    let (auto_mode, max_fix_attempts, paused_reason, mode_parallel) = db
+    let (auto_mode, max_fix_attempts, paused_reason, mode_parallel, paused_files_json) = db
         .query_row(
-            "SELECT enabled, max_fix_attempts, paused_reason, parallel \
+            "SELECT enabled, max_fix_attempts, paused_reason, parallel, paused_files \
              FROM plan_auto_mode WHERE plan_name = ?1",
             params![name],
             |row| {
@@ -1012,10 +1021,20 @@ fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
                     row.get::<_, i64>(1)? as u32,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, i64>(3)? != 0,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
-        .unwrap_or((false, 3, None, false));
+        .unwrap_or((false, 3, None, false, None));
+
+    // `paused_files` is JSON-encoded `Vec<String>` written by
+    // `db::auto_mode_pause` only on dirty-tree pauses. A parse error
+    // collapses to `None` so a corrupted row never 500s the config
+    // endpoint — the dashboard simply shows no file list while the
+    // banner / pausedReason still surfaces.
+    let paused_files = paused_files_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
 
     let (runner_id, runner_failover) = db
         .query_row(
@@ -1043,6 +1062,7 @@ fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
         auto_mode,
         max_fix_attempts,
         paused_reason,
+        paused_files,
         parallel: mode_parallel || advance_parallel,
         runner_id,
         runner_failover,

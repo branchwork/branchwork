@@ -771,3 +771,133 @@ fn re_pinning_preserves_runner_failover_at_api_layer() {
     assert_eq!(body["runnerId"], "runner-b");
     assert_eq!(body["runnerFailover"], "sibling");
 }
+
+// ── 3.1 dirty-tree paused_files acceptance ──────────────────────────────
+
+#[test]
+fn get_config_surfaces_paused_files_after_dirty_tree_pause() {
+    // Acceptance: after a dirty-tree pause, GET /api/plans/{name}/config
+    // returns a `pausedFiles: ["server.log", ...]` array alongside the
+    // reason. We seed the row directly via SQL because the actual pause
+    // path requires a live agent + hook fire which the integration
+    // harness does not exercise; the wire is the same — the loop calls
+    // `db::auto_mode_pause` with the trimmed file list and the column
+    // round-trips through `read_plan_config`.
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-paused-files",
+        &minimal_plan("cfg-paused-files", &d.project),
+    );
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let files_json = serde_json::json!(["server.log", "runner.log", "web-dev.log"]).to_string();
+    conn.execute(
+        "INSERT INTO plan_auto_mode (plan_name, enabled, paused_reason, paused_at, paused_files) \
+         VALUES (?1, 1, ?2, datetime('now'), ?3) \
+         ON CONFLICT(plan_name) DO UPDATE SET \
+           paused_reason = excluded.paused_reason, \
+           paused_at = excluded.paused_at, \
+           paused_files = excluded.paused_files",
+        params![
+            "cfg-paused-files",
+            "agent_left_uncommitted_work",
+            files_json
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (s, body) = d.get("/api/plans/cfg-paused-files/config");
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(
+        body["pausedReason"], "agent_left_uncommitted_work",
+        "body: {body}"
+    );
+    let files = body["pausedFiles"]
+        .as_array()
+        .unwrap_or_else(|| panic!("pausedFiles must be an array, got: {body}"));
+    let files: Vec<&str> = files.iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(files, vec!["server.log", "runner.log", "web-dev.log"]);
+}
+
+#[test]
+fn get_config_omits_paused_files_when_no_pause() {
+    // Default state — no pause, no files. The field is omitted from the
+    // serialised JSON entirely (skip_serializing_if = Option::is_none) so
+    // the wire shape stays unchanged for plans that never dirty-tree-paused.
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-no-pause-files",
+        &minimal_plan("cfg-no-pause-files", &d.project),
+    );
+
+    let (s, body) = d.get("/api/plans/cfg-no-pause-files/config");
+    assert_eq!(s, 200, "body: {body}");
+    assert!(
+        body.get("pausedFiles").is_none(),
+        "pausedFiles must be omitted when no pause has files: {body}"
+    );
+}
+
+#[test]
+fn resume_via_explicit_null_paused_reason_clears_paused_files() {
+    // Seed a dirty-tree pause with a file list, then PUT pausedReason: null
+    // (the Resume button). Both pausedReason AND pausedFiles must clear.
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-resume-files",
+        &minimal_plan("cfg-resume-files", &d.project),
+    );
+
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let files_json = serde_json::json!(["server.log"]).to_string();
+    conn.execute(
+        "INSERT INTO plan_auto_mode (plan_name, enabled, paused_reason, paused_at, paused_files) \
+         VALUES (?1, 1, ?2, datetime('now'), ?3) \
+         ON CONFLICT(plan_name) DO UPDATE SET \
+           enabled = 1, \
+           paused_reason = excluded.paused_reason, \
+           paused_at = excluded.paused_at, \
+           paused_files = excluded.paused_files",
+        params![
+            "cfg-resume-files",
+            "agent_left_uncommitted_work",
+            files_json
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Confirm seed shows pausedFiles before resume.
+    let (s, body) = d.get("/api/plans/cfg-resume-files/config");
+    assert_eq!(s, 200);
+    assert_eq!(body["pausedFiles"].as_array().unwrap().len(), 1);
+
+    // Resume: pausedReason null clears the pause AND its file list.
+    let (s, body) = d.put(
+        "/api/plans/cfg-resume-files/config",
+        json!({"pausedReason": null}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert!(body["pausedReason"].is_null(), "got: {body}");
+    assert!(
+        body.get("pausedFiles").is_none(),
+        "pausedFiles must clear on resume: {body}"
+    );
+
+    // Direct DB check confirms the column is NULL, not an empty array.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT paused_files FROM plan_auto_mode WHERE plan_name = ?1",
+            params!["cfg-resume-files"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored, None,
+        "auto_mode_resume must NULL the column, not write an empty array"
+    );
+}

@@ -255,7 +255,7 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
             eprintln!(
                 "[spawn_ops] plan '{plan}' pinned to runner '{runner_id}' but runner is offline; pausing plan"
             );
-            crate::db::auto_mode_pause(&state.db, &plan, "runner_offline");
+            crate::db::auto_mode_pause(&state.db, &plan, "runner_offline", None);
             crate::ws::broadcast_event(
                 &state.broadcast_tx,
                 "auto_mode_paused",
