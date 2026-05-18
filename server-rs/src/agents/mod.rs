@@ -5009,4 +5009,80 @@ mod tests {
             other => panic!("expected Dirty (no dirty_tree section), got {other:?}"),
         }
     }
+
+    /// `git status --porcelain` already drops files flagged with
+    /// `--skip-worktree` (same goes for `--assume-unchanged`), so the
+    /// dirty-tree check inherits that masking for free. This test pins
+    /// the property: a future refactor (e.g. switching to a libgit2
+    /// call that walks the index differently) must keep dashboards
+    /// quiet for operators who deliberately took a tracked file out of
+    /// the working set (e.g. a local-only config override).
+    ///
+    /// Setup: track `local-config.json`, modify it on disk, observe
+    /// `Dirty`, flag `--skip-worktree`, observe `Clean`, flip to
+    /// `--no-skip-worktree`, observe `Dirty` again — all without
+    /// committing or reverting the on-disk change.
+    #[test]
+    fn skip_worktree_flagged_file_does_not_trip_dirty_check() {
+        crate::repo_config::clear_cache_for_tests();
+        let (db, _holder) = fresh_db();
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("project");
+        git_init_with_tracked_files(&cwd, &["local-config.json"]);
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        map_plan_to_project_path(&db, "p_skip", &cwd);
+
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&cwd)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        // Baseline: modify the tracked file on disk; with no flag set
+        // porcelain emits a ` M local-config.json` line, so we land on
+        // Dirty. Establishes that the test fixture is wired correctly
+        // before we exercise the skip-worktree behaviour.
+        std::fs::write(cwd.join("local-config.json"), "modified\n").unwrap();
+        match check_tree_clean_for_completion(&db, &plans_dir, "p_skip") {
+            TreeState::Dirty { files } => {
+                assert!(
+                    files.iter().any(|f| f.ends_with("local-config.json")),
+                    "baseline: expected local-config.json in dirty files, got {files:?}"
+                );
+            }
+            other => panic!("baseline: expected Dirty, got {other:?}"),
+        }
+
+        // Flag the file with --skip-worktree. The on-disk modification
+        // is unchanged; only git's index entry gets the bit set. Now
+        // porcelain omits the file and the check should flip to Clean.
+        git(&["update-index", "--skip-worktree", "local-config.json"]);
+        match check_tree_clean_for_completion(&db, &plans_dir, "p_skip") {
+            TreeState::Clean => {}
+            other => panic!("with --skip-worktree, expected Clean, got {other:?}"),
+        }
+
+        // Flip the flag off. The file is still modified on disk (we
+        // never touched it on the filesystem during the flag toggles),
+        // so porcelain emits it again and the verdict returns to Dirty.
+        git(&["update-index", "--no-skip-worktree", "local-config.json"]);
+        match check_tree_clean_for_completion(&db, &plans_dir, "p_skip") {
+            TreeState::Dirty { files } => {
+                assert!(
+                    files.iter().any(|f| f.ends_with("local-config.json")),
+                    "after --no-skip-worktree, expected local-config.json in dirty files, got {files:?}"
+                );
+            }
+            other => panic!("after --no-skip-worktree, expected Dirty, got {other:?}"),
+        }
+    }
 }
