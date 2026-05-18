@@ -5210,4 +5210,134 @@ mod tests {
         assert!(crate::db::release_push_lock(&db, "master", &token));
         assert!(crate::db::peek_push_lock(&db, "master").is_none());
     }
+
+    /// Regression test for the wiring gap that originally let auto-mode
+    /// merges land without recording a pending `ci_runs` row. Every call
+    /// site of [`merge_agent_branch_dispatch`] must be paired with a
+    /// [`crate::ci::trigger_after_merge`] spawn — either directly in the
+    /// caller, or via the single shared helper
+    /// [`crate::api::agents::merge_agent_branch_inner`] that
+    /// `merge_agent_branch_dispatch` delegates to.
+    ///
+    /// Pure code-shape test: pulls the three involved source files in
+    /// via `include_str!` and string-greps the post-comment-stripped
+    /// text. No DB, no spawn, no async.
+    ///
+    /// To verify the test catches regressions by hand, delete the
+    /// `tokio::spawn(crate::ci::trigger_after_merge(...))` block from
+    /// `api/agents.rs::merge_agent_branch_inner` and re-run: assertion
+    /// (3) fires immediately.
+    #[test]
+    fn every_merge_agent_branch_dispatch_call_site_pairs_with_trigger_after_merge() {
+        // Three files participate in the chain:
+        //   • `auto_mode.rs`     — host of the dispatch call sites
+        //   • `saas/dispatch.rs` — defines `merge_agent_branch_dispatch`
+        //                         and delegates to the shared helper
+        //   • `api/agents.rs`    — defines the shared helper
+        //                         `merge_agent_branch_inner` and spawns
+        //                         `trigger_after_merge` inside it
+        let auto_mode_src = include_str!("auto_mode.rs");
+        let dispatch_src = include_str!("saas/dispatch.rs");
+        let inner_src = include_str!("api/agents.rs");
+
+        // Strip everything after `//` on each line so doc comments and
+        // inline `//` notes don't show up as false call sites or fake
+        // pairings. The targeted identifiers
+        // (`merge_agent_branch_dispatch(`, `merge_agent_branch_inner`,
+        // `trigger_after_merge`) don't appear inside string literals
+        // anywhere in the repo today, so a naive split on `//` is safe.
+        let auto_mode_code = strip_line_comments(auto_mode_src);
+        let dispatch_code = strip_line_comments(dispatch_src);
+        let inner_code = strip_line_comments(inner_src);
+
+        // ── (1) Enumerate call sites of `merge_agent_branch_dispatch(` ────
+        //
+        // After comment-stripping, the literal `merge_agent_branch_dispatch(`
+        // only matches actual function calls and the function definition
+        // (excluded by the `fn`-prefix filter). The `use ...` import in
+        // `auto_mode.rs:31` has no `(` after the identifier, so it's
+        // already excluded by the substring match.
+        //
+        // Today there are exactly two call sites in `auto_mode.rs`:
+        //   • `run_merge_step`           (line ~298)
+        //   • `on_fix_agent_completed`   (line ~1031)
+        // A third caller (e.g. a future manual-rebase recovery path)
+        // would still route through `dispatch → inner → trigger`, so
+        // the chain holds without a test update.
+        let call_sites: Vec<(usize, &str)> = auto_mode_code
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("merge_agent_branch_dispatch("))
+            .filter(|(_, line)| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("pub async fn")
+                    && !trimmed.starts_with("async fn")
+                    && !trimmed.starts_with("fn ")
+            })
+            .collect();
+
+        assert!(
+            call_sites.len() >= 2,
+            "expected at least 2 call sites of `merge_agent_branch_dispatch` \
+             in `auto_mode.rs`, found {}: {:?}.\n\n\
+             If you've moved or removed a call site, ensure the new wiring \
+             still pairs with `crate::ci::trigger_after_merge` (directly, or \
+             via the shared helper `crate::api::agents::merge_agent_branch_inner`).",
+            call_sites.len(),
+            call_sites,
+        );
+
+        // ── (2) Dispatch delegates to the shared helper ───────────────────
+        //
+        // `merge_agent_branch_dispatch`'s entire job is to be a single
+        // uniform entry point — today it's a one-line delegation to
+        // `merge_agent_branch_inner`. If a future refactor inlines the
+        // merge logic or routes through a different helper, this test
+        // must be updated to point at the new pairing.
+        assert!(
+            dispatch_code.contains("merge_agent_branch_inner"),
+            "`merge_agent_branch_dispatch` in `saas/dispatch.rs` must \
+             delegate to `merge_agent_branch_inner` — the shared helper \
+             that spawns `crate::ci::trigger_after_merge`. If you've \
+             changed the dispatch surface, the new body must still reach \
+             `trigger_after_merge` (either by calling \
+             `merge_agent_branch_inner` here, or by spawning \
+             `trigger_after_merge` directly)."
+        );
+
+        // ── (3) The shared helper spawns `trigger_after_merge` ────────────
+        //
+        // This is the load-bearing wiring: break it and BOTH merge paths
+        // (user click via the HTTP merge endpoint, and auto-mode via
+        // `merge_agent_branch_dispatch`) silently stop recording CI rows.
+        // The literal `trigger_after_merge` survives comment-stripping
+        // only at the actual spawn site (the doc comment reference at
+        // `api/agents.rs:570` is stripped because it starts with `///`).
+        assert!(
+            inner_code.contains("trigger_after_merge"),
+            "`merge_agent_branch_inner` in `api/agents.rs` must spawn \
+             `crate::ci::trigger_after_merge` so every merge — user \
+             click via the HTTP endpoint AND auto-mode via \
+             `merge_agent_branch_dispatch` — records a pending `ci_runs` \
+             row. If you've moved the CI trigger out of \
+             `merge_agent_branch_inner`, update this test to point at \
+             the new pairing (either the new helper, or a direct \
+             pairing at every dispatch call site)."
+        );
+    }
+
+    /// Drop everything after `//` on each line so doc comments and
+    /// inline notes don't contribute false matches when grepping for
+    /// identifiers in this regression test. Doesn't handle block
+    /// comments (`/* ... */`) — the targeted identifiers never appear
+    /// inside block comments in this repo.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|line| match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
