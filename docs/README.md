@@ -53,6 +53,11 @@ The three-binary split, wire protocols, and storage model.
   manifest job in `docker.yml`), the consumer tag contract that lets
   the Hetzner deploy and `docker pull` resolve a single tag to the
   right per-arch slice, and the canonical pull-and-run smoke fixtures.
+- [architecture/ci-pipelines.md](architecture/ci-pipelines.md) — how
+  `pipeline.yml`, `task-tests.yml`, and the reusable `tests.yml` carve
+  up the per-event surface: which workflows fire on human master
+  pushes vs. auto-bump commits vs. `branchwork/**` pushes vs. PRs, and
+  how the nested `workflow_call` keeps the Actions tab honest.
 
 ## Reference
 
