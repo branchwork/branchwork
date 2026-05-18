@@ -345,10 +345,7 @@ interface PlanStore {
   /// Record the files captured on an `auto_push_rebase_conflict`
   /// pause so the banner can render them. Passing `null` clears the
   /// slice — driven by `auto_mode_resumed` (user clicked Resume).
-  setAutoPushRebaseConflict: (
-    planName: string,
-    state: AutoPushRebaseConflictState | null,
-  ) => void;
+  setAutoPushRebaseConflict: (planName: string, state: AutoPushRebaseConflictState | null) => void;
   pushToast: (toast: PushToastInput) => string;
   dismissToast: (id: string) => void;
   /// DELETE /api/plans/:name (with `?hard=true` when `opts.hard`).

@@ -23,10 +23,7 @@ function defaultConfig(overrides: Partial<PlanConfig> = {}): PlanConfig {
   };
 }
 
-function seed(
-  config: PlanConfig | null,
-  conflict: AutoPushRebaseConflictState | null,
-): void {
+function seed(config: PlanConfig | null, conflict: AutoPushRebaseConflictState | null): void {
   usePlanStore.setState({
     planConfigs: config ? { [PLAN]: config } : {},
     autoPushRebaseConflicts: conflict ? { [PLAN]: conflict } : {},
@@ -61,9 +58,7 @@ describe("AutoPushRebaseConflictBanner", () => {
       fileCount: 1,
     });
     render(<AutoPushRebaseConflictBanner planName={PLAN} />);
-    expect(
-      screen.getByText(/Auto-mode paused: post-merge rebase hit a conflict/i),
-    ).toBeTruthy();
+    expect(screen.getByText(/Auto-mode paused: post-merge rebase hit a conflict/i)).toBeTruthy();
     // Branch surfaces in the headline.
     expect(screen.getByText("master")).toBeTruthy();
     // File appears in the conflicting-file line.
@@ -88,9 +83,7 @@ describe("AutoPushRebaseConflictBanner", () => {
     // fallback copy that points the operator at the audit log.
     seed(defaultConfig({ pausedReason: "auto_push_rebase_conflict" }), null);
     render(<AutoPushRebaseConflictBanner planName={PLAN} />);
-    expect(
-      screen.getByText(/Auto-mode paused: post-merge rebase hit a conflict/i),
-    ).toBeTruthy();
+    expect(screen.getByText(/Auto-mode paused: post-merge rebase hit a conflict/i)).toBeTruthy();
     expect(screen.getByText(/File list not in memory/i)).toBeTruthy();
     expect(screen.getByText(/Activity log/i)).toBeTruthy();
   });
