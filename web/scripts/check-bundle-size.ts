@@ -12,7 +12,13 @@ import { gzipSync } from "node:zlib";
 // 145 KB gzipped is the post-lazy baseline (T10.4); +10% headroom rounds
 // to 160_000 bytes (~156 KiB). Bump deliberately when an intentional
 // addition lands — never auto-relax.
-const MAX_GZIPPED_BYTES = 160_000;
+//
+// Bumps:
+//   - 2026-05-19: 160_000 → 168_000 (~+8 KB). UncommittedWorkBanner
+//     gained pausedFiles list + Resume-anyway + Mark-as-operational
+//     diff preview (dirty-tree-check-stop-pausing-on-write-noise
+//     task 3.2, commit 1a71763). Real product surface, not bloat.
+const MAX_GZIPPED_BYTES = 168_000;
 
 const distAssets = join(import.meta.dirname, "..", "dist", "assets");
 
