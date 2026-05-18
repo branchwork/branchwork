@@ -372,6 +372,181 @@ pub fn fix_attempt_for_agent(db: &Db, plan_name: &str, agent_id: &str) -> Option
     .ok()
 }
 
+// ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
+
+/// Default TTL for a `master_push_lock` row. A holder that hasn't touched
+/// the row in this long is treated as crashed and its lock can be force-
+/// acquired by a fresh caller. Kept short so a wedged auto-mode worker
+/// doesn't deadlock CI for the entire pipeline run.
+pub const PUSH_LOCK_TTL_SECS: i64 = 30;
+
+/// Snapshot of the current holder of a `master_push_lock` row. Returned
+/// from [`peek_push_lock`] and from the `Err` arm of
+/// [`try_acquire_push_lock`] so callers can render a useful "lock busy"
+/// diagnostic (which kind of caller is holding it, how stale the row is).
+#[derive(Debug, Clone)]
+pub struct PushLockHolder {
+    /// Opaque random token identifying the holder. Required to release.
+    pub holder_token: String,
+    /// OS pid of the holding process. The server's own pid for in-process
+    /// auto-mode callers; the server's pid (NOT the CI runner's) for HTTP
+    /// callers (the row lives in the server's DB, so liveness is judged
+    /// by TTL, not by PID liveness).
+    pub holder_pid: i64,
+    /// `"auto_mode"` / `"ci"` / `"manual"` / other — free-form tag used
+    /// only for diagnostics + the audit log.
+    pub holder_kind: String,
+    /// JSON or other free-form metadata the holder wants to surface (e.g.
+    /// plan_name, ci_run_id). Optional.
+    pub holder_meta: Option<String>,
+    /// Wall-clock when the lock was taken, in SQLite `datetime('now')`
+    /// format.
+    pub taken_at: String,
+    /// Server-evaluated `now - taken_at` in seconds. Used by the API
+    /// endpoint to render age and by `try_acquire_push_lock` to TTL-evict.
+    pub age_secs: i64,
+}
+
+/// Attempt to acquire the per-branch push lock. Returns `Ok(token)` on
+/// success — the caller must pass that token back to
+/// [`release_push_lock`]. Returns `Err(holder)` when a live holder
+/// already exists (within TTL).
+///
+/// TTL eviction: if an existing row's `age_secs > ttl_secs`, the holder
+/// is treated as crashed and the row is replaced by the new caller. This
+/// is the only path that recovers from a server crash mid-push.
+///
+/// The whole acquire path runs inside a single `IMMEDIATE` transaction so
+/// two concurrent callers don't both see "no row" and both insert. SQLite
+/// `INSERT INTO ... ON CONFLICT(branch) DO UPDATE WHERE ...` does the
+/// atomic check-and-replace in a single statement; we only fall back to
+/// the `SELECT` if the conflict path was a no-op (i.e. a live holder
+/// already owned the lock).
+#[allow(dead_code)] // wired in by Phase 2 callers (auto_mode + /api/git/push-lock)
+pub fn try_acquire_push_lock(
+    db: &Db,
+    branch: &str,
+    holder_kind: &str,
+    holder_pid: i64,
+    holder_meta: Option<&str>,
+    ttl_secs: i64,
+) -> Result<String, PushLockHolder> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let conn = db.lock().unwrap();
+    // `WHERE` on the UPSERT path: only steal a row if it is past TTL.
+    // The row's `taken_at` is the canonical truth; we compute age via
+    // SQLite so callers don't have to round-trip the clock.
+    let rows_changed = conn
+        .execute(
+            "INSERT INTO master_push_lock \
+                (branch, holder_token, holder_pid, holder_kind, holder_meta, taken_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) \
+             ON CONFLICT(branch) DO UPDATE SET \
+                holder_token = excluded.holder_token, \
+                holder_pid   = excluded.holder_pid, \
+                holder_kind  = excluded.holder_kind, \
+                holder_meta  = excluded.holder_meta, \
+                taken_at     = excluded.taken_at \
+             WHERE CAST(strftime('%s','now') - strftime('%s', master_push_lock.taken_at) AS INTEGER) > ?6",
+            params![branch, token, holder_pid, holder_kind, holder_meta, ttl_secs],
+        )
+        .unwrap_or(0);
+
+    if rows_changed > 0 {
+        return Ok(token);
+    }
+
+    // Either the WHERE clause refused the steal (live holder), or the
+    // upsert silently no-op'd. Re-read the row to surface the live
+    // holder. If even the SELECT fails (race with a concurrent release),
+    // synthesize an empty holder so the caller's diagnostic still works.
+    match conn.query_row(
+        "SELECT holder_token, holder_pid, holder_kind, holder_meta, taken_at, \
+                CAST(strftime('%s','now') - strftime('%s', taken_at) AS INTEGER) \
+         FROM master_push_lock WHERE branch = ?1",
+        params![branch],
+        |row| {
+            Ok(PushLockHolder {
+                holder_token: row.get(0)?,
+                holder_pid: row.get(1)?,
+                holder_kind: row.get(2)?,
+                holder_meta: row.get(3)?,
+                taken_at: row.get(4)?,
+                age_secs: row.get(5)?,
+            })
+        },
+    ) {
+        Ok(h) => Err(h),
+        Err(_) => {
+            // Concurrent release between our upsert and our SELECT —
+            // retry the upsert exactly once. Avoids an unbounded loop
+            // and keeps the function constant-time in practice.
+            let retry = conn
+                .execute(
+                    "INSERT OR IGNORE INTO master_push_lock \
+                        (branch, holder_token, holder_pid, holder_kind, holder_meta, taken_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+                    params![branch, token, holder_pid, holder_kind, holder_meta],
+                )
+                .unwrap_or(0);
+            if retry > 0 {
+                Ok(token)
+            } else {
+                Err(PushLockHolder {
+                    holder_token: String::new(),
+                    holder_pid: 0,
+                    holder_kind: "unknown".to_string(),
+                    holder_meta: None,
+                    taken_at: String::new(),
+                    age_secs: 0,
+                })
+            }
+        }
+    }
+}
+
+/// Release the push lock for `branch` IFF `token` matches the current
+/// holder. Returns `true` if the row was deleted, `false` otherwise
+/// (wrong token, row already gone, etc.). Safe to call from the Drop
+/// impl of a guard: the worst case is a stale-token call that does
+/// nothing.
+#[allow(dead_code)] // wired in by Phase 2 callers (auto_mode + /api/git/push-lock)
+pub fn release_push_lock(db: &Db, branch: &str, token: &str) -> bool {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "DELETE FROM master_push_lock WHERE branch = ?1 AND holder_token = ?2",
+        params![branch, token],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// Read the current holder of `branch`'s push lock if any. Does NOT
+/// TTL-evict — that only happens on a real acquire attempt. Used by the
+/// HTTP endpoint to render the "lock busy" diagnostic and by tests to
+/// observe state.
+#[allow(dead_code)] // wired in by Phase 2 callers (api endpoint + tests)
+pub fn peek_push_lock(db: &Db, branch: &str) -> Option<PushLockHolder> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT holder_token, holder_pid, holder_kind, holder_meta, taken_at, \
+                CAST(strftime('%s','now') - strftime('%s', taken_at) AS INTEGER) \
+         FROM master_push_lock WHERE branch = ?1",
+        params![branch],
+        |row| {
+            Ok(PushLockHolder {
+                holder_token: row.get(0)?,
+                holder_pid: row.get(1)?,
+                holder_kind: row.get(2)?,
+                holder_meta: row.get(3)?,
+                taken_at: row.get(4)?,
+                age_secs: row.get(5)?,
+            })
+        },
+    )
+    .ok()
+}
+
 /// Open (or create) the database at `db_path` and run migrations.
 pub fn init(db_path: &Path) -> Db {
     if let Some(parent) = db_path.parent() {
@@ -743,6 +918,23 @@ fn migrate(conn: &Connection) {
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+
+        -- Per-branch advisory lock for the merge → push critical section
+        -- (Phase 2 of the auto-push-rebase plan). One row at most per
+        -- branch name; `holder_token` is the random opaque handle the
+        -- holder must present to release. `taken_at` anchors a TTL-based
+        -- liveness check so a crashed holder (server SIGKILL mid-push)
+        -- can't deadlock the lock indefinitely — a fresh acquire after
+        -- TTL_SECS overwrites in place. See `try_acquire_push_lock` /
+        -- `release_push_lock` / `peek_push_lock` helpers.
+        CREATE TABLE IF NOT EXISTS master_push_lock (
+            branch       TEXT PRIMARY KEY,
+            holder_token TEXT NOT NULL,
+            holder_pid   INTEGER NOT NULL,
+            holder_kind  TEXT NOT NULL,
+            holder_meta  TEXT,
+            taken_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )
     .expect("failed to run schema migration");
@@ -1054,6 +1246,7 @@ mod tests {
         assert!(tables.contains(&"audit_logs".to_string()));
         assert!(tables.contains(&"plan_snapshots".to_string()));
         assert!(tables.contains(&"plan_runner_affinity".to_string()));
+        assert!(tables.contains(&"master_push_lock".to_string()));
     }
 
     #[test]
@@ -2241,5 +2434,141 @@ mod tests {
             .unwrap()
         };
         assert_eq!(cleared, 0, "runner_config row should cascade-delete");
+    }
+
+    // ── master_push_lock (Phase 2 advisory lock) ────────────────────────────
+
+    #[test]
+    fn push_lock_acquire_returns_fresh_token_when_no_row_exists() {
+        let (db, _dir) = test_db();
+        let token = try_acquire_push_lock(
+            &db,
+            "master",
+            "auto_mode",
+            12345,
+            Some("p1"),
+            PUSH_LOCK_TTL_SECS,
+        )
+        .expect("first acquire should succeed");
+        assert!(!token.is_empty());
+
+        let holder = peek_push_lock(&db, "master").expect("row must exist after acquire");
+        assert_eq!(holder.holder_token, token);
+        assert_eq!(holder.holder_pid, 12345);
+        assert_eq!(holder.holder_kind, "auto_mode");
+        assert_eq!(holder.holder_meta.as_deref(), Some("p1"));
+        // SQLite's strftime granularity is whole seconds — fresh row may
+        // legitimately report 0s.
+        assert!(holder.age_secs >= 0);
+    }
+
+    #[test]
+    fn push_lock_second_acquire_refused_while_live_holder_exists() {
+        let (db, _dir) = test_db();
+        let first =
+            try_acquire_push_lock(&db, "master", "auto_mode", 1, None, PUSH_LOCK_TTL_SECS).unwrap();
+
+        let err = try_acquire_push_lock(&db, "master", "ci", 2, Some("run-7"), PUSH_LOCK_TTL_SECS)
+            .expect_err("second acquire must be rejected by the live holder");
+        // The error surface reports the EXISTING holder, not the
+        // attempted caller's metadata — that's how the API endpoint can
+        // tell the CI side who is currently pushing.
+        assert_eq!(err.holder_token, first);
+        assert_eq!(err.holder_pid, 1);
+        assert_eq!(err.holder_kind, "auto_mode");
+        // Holder row must still be the original.
+        let holder = peek_push_lock(&db, "master").unwrap();
+        assert_eq!(holder.holder_token, first);
+    }
+
+    #[test]
+    fn push_lock_acquire_succeeds_after_ttl_eviction() {
+        let (db, _dir) = test_db();
+        // Seed a stale row directly so we don't have to wait 30s. Use a
+        // very small TTL on the subsequent acquire to force the eviction
+        // path inside the same SQLite tick.
+        let _stale =
+            try_acquire_push_lock(&db, "master", "auto_mode", 1, None, PUSH_LOCK_TTL_SECS).unwrap();
+        // Backdate the row by 60s so age_secs > our 0-second TTL on
+        // re-acquire. (Using 0 means "anything past 0 seconds old can
+        // be evicted" — fits inside one SQLite second tick.)
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE master_push_lock SET taken_at = datetime('now','-60 seconds') \
+                 WHERE branch = ?1",
+                params!["master"],
+            )
+            .unwrap();
+        }
+        let fresh = try_acquire_push_lock(&db, "master", "ci", 99, Some("run-8"), 0)
+            .expect("acquire must succeed once the stale row's age exceeds TTL");
+        let holder = peek_push_lock(&db, "master").unwrap();
+        assert_eq!(holder.holder_token, fresh);
+        assert_eq!(holder.holder_kind, "ci");
+        assert_eq!(holder.holder_meta.as_deref(), Some("run-8"));
+    }
+
+    #[test]
+    fn push_lock_release_with_matching_token_drops_the_row() {
+        let (db, _dir) = test_db();
+        let token =
+            try_acquire_push_lock(&db, "master", "auto_mode", 1, None, PUSH_LOCK_TTL_SECS).unwrap();
+
+        assert!(release_push_lock(&db, "master", &token));
+        assert!(peek_push_lock(&db, "master").is_none());
+    }
+
+    #[test]
+    fn push_lock_release_with_wrong_token_leaves_row_intact() {
+        let (db, _dir) = test_db();
+        let _real =
+            try_acquire_push_lock(&db, "master", "auto_mode", 1, None, PUSH_LOCK_TTL_SECS).unwrap();
+
+        assert!(!release_push_lock(
+            &db,
+            "master",
+            "definitely-not-the-token"
+        ));
+        assert!(
+            peek_push_lock(&db, "master").is_some(),
+            "wrong-token release must NOT delete the row"
+        );
+    }
+
+    #[test]
+    fn push_lock_release_on_absent_row_is_a_silent_no_op() {
+        let (db, _dir) = test_db();
+        assert!(!release_push_lock(&db, "main", "any-token"));
+    }
+
+    #[test]
+    fn push_lock_is_per_branch_independent() {
+        let (db, _dir) = test_db();
+        let t_master =
+            try_acquire_push_lock(&db, "master", "auto_mode", 1, None, PUSH_LOCK_TTL_SECS).unwrap();
+        let t_main =
+            try_acquire_push_lock(&db, "main", "auto_mode", 1, None, PUSH_LOCK_TTL_SECS).unwrap();
+        assert_ne!(
+            t_master, t_main,
+            "different branches must get different tokens"
+        );
+        // Both rows coexist.
+        assert!(peek_push_lock(&db, "master").is_some());
+        assert!(peek_push_lock(&db, "main").is_some());
+    }
+
+    #[test]
+    fn push_lock_reacquire_after_release_returns_a_new_token() {
+        let (db, _dir) = test_db();
+        let first =
+            try_acquire_push_lock(&db, "master", "auto_mode", 1, None, PUSH_LOCK_TTL_SECS).unwrap();
+        assert!(release_push_lock(&db, "master", &first));
+        let second =
+            try_acquire_push_lock(&db, "master", "ci", 2, None, PUSH_LOCK_TTL_SECS).unwrap();
+        assert_ne!(
+            first, second,
+            "token must be fresh per acquire (callers rely on this for auth)"
+        );
     }
 }

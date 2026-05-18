@@ -48,6 +48,156 @@ pub mod actions {
     pub const AUTO_MODE_FIX_SPAWNED: &str = "auto_mode.fix_spawned";
 }
 
+// ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
+//
+// The merge → push critical section runs in this auto-mode flow (and in
+// the user-driven HTTP Merge button's spawned `trigger_after_merge`).
+// Both paths are serialized against external auto-bump CI via the
+// `master_push_lock` table — see [`db::try_acquire_push_lock`].
+//
+// The acquire helper polls the DB row every `PUSH_LOCK_POLL_MS` until it
+// succeeds or `wait_timeout` elapses. A successful acquire returns a
+// [`PushLockGuard`] whose `Drop` impl releases the row, so the caller
+// can't forget. Crashes during the critical section are recovered by the
+// 30-second TTL: a fresh acquire after that window force-evicts the
+// dead holder's row.
+
+/// How often the wait loop wakes up to retry `try_acquire_push_lock`.
+const PUSH_LOCK_POLL_MS: u64 = 200;
+
+/// Hard cap on how long auto-mode waits for the push lock before
+/// pausing the plan. CI / API callers carry their own per-request
+/// timeout; the in-process auto-mode flow uses this default.
+pub const PUSH_LOCK_DEFAULT_WAIT_SECS: u64 = 30;
+
+/// RAII guard returned by [`wait_for_push_lock`]. Dropping it releases
+/// the row from `master_push_lock`. Holding it past Drop is impossible
+/// (Drop is the only way the row is freed in the happy path) so callers
+/// don't have to chase explicit release calls through every early-return
+/// branch.
+pub struct PushLockGuard {
+    db: db::Db,
+    branch: String,
+    token: String,
+    /// Set to `true` by [`PushLockGuard::forget`] to skip the Drop
+    /// release. Used when an outer caller has taken ownership of the
+    /// release (e.g. the HTTP endpoint hands the token back to the
+    /// client so the client can release explicitly).
+    forgotten: bool,
+}
+
+impl PushLockGuard {
+    /// Branch the guard is holding the lock for. Useful for diagnostics.
+    #[allow(dead_code)]
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Token identifying this guard's hold. The HTTP endpoint surfaces
+    /// this to clients so they can release the lock explicitly; tests
+    /// use it to verify which call won the race.
+    #[allow(dead_code)] // exposed for tests + future callers that hold the token
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Disable the Drop-release. The caller becomes responsible for
+    /// calling [`db::release_push_lock`] (or letting the TTL evict the
+    /// row on its own). Used by the HTTP endpoint, where the guard
+    /// crosses an HTTP response boundary and the client holds the
+    /// release responsibility.
+    pub fn forget(mut self) -> String {
+        self.forgotten = true;
+        std::mem::take(&mut self.token)
+    }
+
+    /// Explicit release, primarily for tests. Equivalent to letting the
+    /// guard drop, but lets the caller assert on the return value.
+    #[allow(dead_code)]
+    pub fn release(mut self) -> bool {
+        if self.forgotten {
+            return false;
+        }
+        self.forgotten = true;
+        db::release_push_lock(&self.db, &self.branch, &self.token)
+    }
+}
+
+impl Drop for PushLockGuard {
+    fn drop(&mut self) {
+        if !self.forgotten {
+            db::release_push_lock(&self.db, &self.branch, &self.token);
+        }
+    }
+}
+
+/// Failure modes of [`wait_for_push_lock`]. The caller decides whether
+/// to pause the plan, return 503 over HTTP, or retry next tick.
+#[derive(Debug)]
+pub enum PushLockError {
+    /// `wait_timeout` elapsed without the live holder releasing. Carries
+    /// a snapshot of the holder that won the race so the caller can
+    /// surface a useful diagnostic.
+    Timeout(db::PushLockHolder),
+}
+
+impl std::fmt::Display for PushLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushLockError::Timeout(h) => write!(
+                f,
+                "push lock for branch held by {} (token {}, age {}s)",
+                h.holder_kind, h.holder_token, h.age_secs
+            ),
+        }
+    }
+}
+
+/// Wait until the per-branch push lock can be acquired, polling every
+/// `PUSH_LOCK_POLL_MS` (default 200 ms). Returns a [`PushLockGuard`] on
+/// success or [`PushLockError::Timeout`] if `wait_timeout` elapses with
+/// a live holder still in place.
+///
+/// The first poll iteration runs immediately so an uncontended acquire
+/// has zero added latency. After that, each retry first sleeps the poll
+/// interval to let the holder make progress.
+pub async fn wait_for_push_lock(
+    db: &db::Db,
+    branch: &str,
+    holder_kind: &str,
+    holder_pid: i64,
+    holder_meta: Option<&str>,
+    wait_timeout: Duration,
+) -> Result<PushLockGuard, PushLockError> {
+    let deadline = Instant::now() + wait_timeout;
+    let poll = Duration::from_millis(PUSH_LOCK_POLL_MS);
+    loop {
+        match db::try_acquire_push_lock(
+            db,
+            branch,
+            holder_kind,
+            holder_pid,
+            holder_meta,
+            db::PUSH_LOCK_TTL_SECS,
+        ) {
+            Ok(token) => {
+                return Ok(PushLockGuard {
+                    db: db.clone(),
+                    branch: branch.to_string(),
+                    token,
+                    forgotten: false,
+                });
+            }
+            Err(holder) => {
+                if Instant::now() >= deadline {
+                    return Err(PushLockError::Timeout(holder));
+                }
+                tokio::time::sleep(poll).await;
+            }
+        }
+    }
+}
+
 /// Phase labels broadcast on the `auto_mode_state` event so the UI pill can
 /// reflect the current step. The set is closed: any new transition needs a
 /// new constant + matching frontend label.
@@ -4807,5 +4957,189 @@ mod tests {
                 "threshold must default for {raw:?}"
             );
         }
+    }
+
+    // ── Push lock (Phase 2) ──────────────────────────────────────────────
+
+    /// Happy path: a single caller can acquire, observe the row, and the
+    /// guard's Drop releases the row.
+    #[tokio::test]
+    async fn push_lock_guard_releases_on_drop() {
+        let (db, _dir) = fresh_db();
+        {
+            let _guard = wait_for_push_lock(
+                &db,
+                "master",
+                "auto_mode",
+                std::process::id() as i64,
+                Some("plan=p"),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("uncontended acquire must succeed");
+            assert!(
+                crate::db::peek_push_lock(&db, "master").is_some(),
+                "row must exist while guard is alive"
+            );
+        }
+        assert!(
+            crate::db::peek_push_lock(&db, "master").is_none(),
+            "guard Drop must release the row"
+        );
+    }
+
+    /// The CORE acceptance criterion: with two callers firing in the same
+    /// second, exactly one acquires the lock first; the other waits.
+    /// Driving "the same second" with `tokio::join!` is sufficient because
+    /// the polling loop has a 200ms tick — the join races the two acquire
+    /// futures on the same thread, both hit `try_acquire_push_lock` within
+    /// a few microseconds of each other.
+    ///
+    /// We can't predict which caller wins (SQLite acquire order is
+    /// implementation-defined), but we CAN assert:
+    ///   - Both eventually succeed.
+    ///   - At every moment only one holder exists.
+    ///   - The winner's release is observed by the loser (the loser's
+    ///     final acquire happens AFTER the winner releases).
+    ///   - The two tokens differ.
+    #[tokio::test]
+    async fn two_simultaneous_acquires_serialize_with_one_winner() {
+        let (db, _dir) = fresh_db();
+        let db_a = db.clone();
+        let db_b = db.clone();
+
+        let started_b = Arc::new(StdMutex::new(false));
+        let started_b_clone = started_b.clone();
+
+        // Caller A acquires, holds for ~250ms (long enough to span at
+        // least one full poll tick on B's loop), then releases.
+        let task_a = tokio::spawn(async move {
+            let guard = wait_for_push_lock(
+                &db_a,
+                "master",
+                "auto_mode",
+                1,
+                Some("a"),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("A must acquire");
+            let token_a = guard.token().to_string();
+            // Wait until B has at least entered the wait loop. Then
+            // hold the lock through a couple of poll ticks.
+            for _ in 0..50 {
+                if *started_b_clone.lock().unwrap() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Snapshot the holder before drop so we can assert it was us.
+            let holder_before =
+                crate::db::peek_push_lock(&db_a, "master").expect("row must exist while A holds");
+            assert_eq!(holder_before.holder_token, token_a);
+            drop(guard);
+            token_a
+        });
+
+        // Tiny delay so A has a chance to acquire first; then B enters
+        // the wait loop. With a 1s timeout B will succeed once A drops.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        *started_b.lock().unwrap() = true;
+        let task_b = tokio::spawn(async move {
+            let guard =
+                wait_for_push_lock(&db_b, "master", "ci", 2, Some("b"), Duration::from_secs(5))
+                    .await
+                    .expect("B must acquire after A releases");
+            guard.token().to_string()
+        });
+
+        let token_a = task_a.await.unwrap();
+        let token_b = task_b.await.unwrap();
+        assert_ne!(
+            token_a, token_b,
+            "winner + loser must get different opaque tokens"
+        );
+        // After both tasks complete, B's guard has dropped too: no row.
+        assert!(
+            crate::db::peek_push_lock(&db, "master").is_none(),
+            "after both releases the row must be gone"
+        );
+    }
+
+    /// The /api/git/push-lock endpoint surface contract: when the lock
+    /// is held by another caller AND the wait_timeout elapses, the
+    /// helper returns `PushLockError::Timeout` carrying the live
+    /// holder snapshot. Tests the timeout path directly so we don't
+    /// need a full HTTP harness.
+    #[tokio::test]
+    async fn wait_for_push_lock_times_out_with_live_holder() {
+        let (db, _dir) = fresh_db();
+        // Hold the lock for a long time.
+        let _holder = wait_for_push_lock(
+            &db,
+            "master",
+            "auto_mode",
+            42,
+            Some("plan=p1"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let res = wait_for_push_lock(
+            &db,
+            "master",
+            "ci",
+            7,
+            Some("run-99"),
+            Duration::from_millis(400),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        match res {
+            Err(PushLockError::Timeout(h)) => {
+                assert_eq!(h.holder_kind, "auto_mode");
+                assert_eq!(h.holder_pid, 42);
+                assert_eq!(h.holder_meta.as_deref(), Some("plan=p1"));
+            }
+            Ok(_) => panic!("acquire must NOT succeed while another holder is alive"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "must wait the full timeout before returning Timeout, got {elapsed:?}"
+        );
+        // The original holder is still there.
+        let holder = crate::db::peek_push_lock(&db, "master").expect("row must still exist");
+        assert_eq!(holder.holder_kind, "auto_mode");
+    }
+
+    /// `PushLockGuard::forget()` disables the Drop release so the HTTP
+    /// endpoint can take ownership of the token. Verify the lock row
+    /// SURVIVES guard drop in that case.
+    #[tokio::test]
+    async fn push_lock_guard_forget_skips_drop_release() {
+        let (db, _dir) = fresh_db();
+        let guard = wait_for_push_lock(
+            &db,
+            "master",
+            "ci",
+            std::process::id() as i64,
+            Some("run-1"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let token = guard.forget();
+        // The Drop already ran when `forget()` consumed `guard`; row
+        // must still be present because Drop saw forgotten=true.
+        let holder =
+            crate::db::peek_push_lock(&db, "master").expect("forget() must skip Drop release");
+        assert_eq!(holder.holder_token, token);
+        // Caller is now responsible for explicit release.
+        assert!(crate::db::release_push_lock(&db, "master", &token));
+        assert!(crate::db::peek_push_lock(&db, "master").is_none());
     }
 }

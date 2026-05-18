@@ -86,6 +86,18 @@ pub mod actions {
     /// visibility — silent retries that succeed are fine, but a retry
     /// burst means the race window is widening and we should know.
     pub const AUTO_PUSH_REBASE_RETRY: &str = "auto_push_rebase_retry";
+    /// `POST /api/git/push-lock` successfully acquired the per-branch
+    /// advisory lock for an external caller (e.g. auto-bump CI). The
+    /// row records the holder's metadata so an org admin can audit
+    /// concurrent push attempts. Resource is the plan (`PLAN`) keyed by
+    /// the branch name (which is conventionally the project's default
+    /// branch, e.g. `master`).
+    pub const PUSH_LOCK_ACQUIRED: &str = "push_lock.acquired";
+    /// `POST /api/git/push-lock/release` was called. `released: true`
+    /// in the diff means the row was deleted; `false` means the token
+    /// didn't match (or the row was already gone — usually because the
+    /// TTL evicted a previous crashed holder).
+    pub const PUSH_LOCK_RELEASED: &str = "push_lock.released";
     pub const ORG_MEMBER_ADD: &str = "org.member_add";
     pub const ORG_MEMBER_REMOVE: &str = "org.member_remove";
     pub const ORG_MEMBER_ROLE_CHANGE: &str = "org.member_role_change";

@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod billing;
 pub mod ci;
+pub mod git;
 pub mod health;
 pub mod plans;
 pub mod runners;

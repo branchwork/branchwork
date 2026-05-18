@@ -147,6 +147,77 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
         return;
     }
 
+    // ── Per-branch advisory lock (Phase 2) ──────────────────────────────
+    //
+    // Serialize this push against any other writer that wants to push
+    // to `origin/<source_branch>` — most importantly external auto-bump
+    // CI calling `POST /api/git/push-lock`. Without the lock, two
+    // simultaneous pushes race: the loser gets a non-fast-forward
+    // rejection and falls through to the rebase-on-NFF logic from
+    // Phase 1. The lock collapses that race to a clean serialization
+    // and keeps the rebase path strictly for the cross-process case
+    // where another git client (outside this server) pushed first.
+    //
+    // The guard releases the lock on Drop, including the early-return
+    // paths inside the push-result match below.
+    let lock_meta = serde_json::json!({
+        "plan": plan_name,
+        "task": task_number,
+        "agent": agent_id,
+        "merged_sha": merged_sha,
+    })
+    .to_string();
+    let _lock_guard = match crate::auto_mode::wait_for_push_lock(
+        &db,
+        &source_branch,
+        "auto_mode",
+        std::process::id() as i64,
+        Some(&lock_meta),
+        std::time::Duration::from_secs(crate::auto_mode::PUSH_LOCK_DEFAULT_WAIT_SECS),
+    )
+    .await
+    {
+        Ok(g) => Some(g),
+        Err(crate::auto_mode::PushLockError::Timeout(holder)) => {
+            // The lock is held by something else (most likely an
+            // external auto-bump CI call). Pause the plan so the
+            // operator can investigate; the TTL eviction will recover
+            // automatically if the holder actually crashed. Skip the
+            // push and the `ci_runs` insert — auto-mode resumes from
+            // the next task completion.
+            eprintln!(
+                "[ci] push lock for `{source_branch}` held by {} for {}s — \
+                 pausing plan {plan_name}",
+                holder.holder_kind, holder.age_secs,
+            );
+            let reason = "push_lock_unavailable";
+            crate::db::auto_mode_pause(&db, &plan_name, reason);
+            let payload = serde_json::json!({
+                "plan": plan_name,
+                "task": task_number,
+                "reason": reason,
+                "branch": source_branch,
+                "holder_kind": holder.holder_kind,
+                "holder_age_secs": holder.age_secs,
+            });
+            broadcast_event(&broadcast_tx, "auto_mode_paused", payload.clone());
+            {
+                let conn = db.lock().unwrap();
+                crate::audit::log(
+                    &conn,
+                    &org_id,
+                    None,
+                    Some("branchwork-auto-mode"),
+                    crate::auto_mode::actions::AUTO_MODE_PAUSED,
+                    crate::audit::resources::PLAN,
+                    Some(&plan_name),
+                    Some(&payload.to_string()),
+                );
+            }
+            return;
+        }
+    };
+
     // Push the source branch so CI on the remote can fire.
     let push =
         crate::agents::git_ops::push_branch(&db, &runners, &org_id, &cwd, &source_branch).await;

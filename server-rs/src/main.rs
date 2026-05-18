@@ -371,6 +371,12 @@ async fn run_server(cli: Cli) {
             axum::routing::delete(api::ci::dismiss_run),
         )
         .route("/api/ci/{ci_run_id}/failure-log", get(api::ci::failure_log))
+        // Per-branch push lock: external auto-bump CI shares the same
+        // master_push_lock table the in-process auto-mode flow holds
+        // during merge → push, so the two never race to push to origin.
+        .route("/api/git/push-lock", post(api::git::acquire))
+        .route("/api/git/push-lock/release", post(api::git::release))
+        .route("/api/git/push-lock/{branch}", get(api::git::peek))
         .route(
             "/api/plans/{name}/phases/{phase_number}/start",
             post(api::plans::start_phase_tasks),
