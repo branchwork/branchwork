@@ -20,7 +20,6 @@ server.log
 runner.log
 # Vite dev server output (`pnpm dev` redirects: Makefile dev-web target).
 web-dev.log
-# Bob (operator scratch): per-checkout notes + transient error logs.
-# Track only the README that documents what the dir is for.
+# Operator scratch dirs — per-host CLI tooling state, never committed.
 .bob/
 .codex/
