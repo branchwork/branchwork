@@ -1,0 +1,177 @@
+name: Push-lock smoke
+
+# Manual smoke test of the per-branch push lock — acquire, peek, hold,
+# release — against the live `BRANCHWORK_SAAS_URL` server. Does NOT
+# perform a real bump or push; the operator can run this any time to
+# verify the endpoint trio is wired correctly and that audit-log rows
+# land in the dashboard.
+#
+# Lifted out of ci.yml (auto-push-rebase-on-non-fast-forward plan task
+# 2.3) so it no longer surfaces as a permanently-skipped row inside
+# every master push's CI workflow run. The lock acquire/push/release
+# flow is still wired into bump.yml so real master pushes benefit from
+# coordination too; this workflow only exercises the endpoint trio.
+# Acceptance criterion for auto-push-rebase-on-non-fast-forward/2.2.
+#
+# Required secret: `BRANCHWORK_SAAS_URL` (e.g. https://branchwork.dev).
+# Optional secret: `BUMP_PUSH_TOKEN` — Bearer-token forwarded as
+# `Authorization: Bearer ${BUMP_PUSH_TOKEN}` for operators who put a
+# reverse proxy in front of the lock endpoint.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-push-lock:
+    name: Push-lock smoke test (manual)
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      BRANCHWORK_SAAS_URL: ${{ secrets.BRANCHWORK_SAAS_URL }}
+      BUMP_PUSH_TOKEN: ${{ secrets.BUMP_PUSH_TOKEN }}
+      GITHUB_RUN_ID: ${{ github.run_id }}
+      GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+    steps:
+      - name: Verify required secrets
+        run: |
+          if [[ -z "${BRANCHWORK_SAAS_URL:-}" ]]; then
+            echo "::error::BRANCHWORK_SAAS_URL secret is required for this manual smoke test."
+            echo "::error::Configure it in repository → Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          echo "Targeting $BRANCHWORK_SAAS_URL"
+          if [[ -z "${BUMP_PUSH_TOKEN:-}" ]]; then
+            echo "::notice::BUMP_PUSH_TOKEN secret not set; running unauthenticated (fine if no reverse proxy guards the endpoint)."
+          fi
+
+      - name: Acquire push lock
+        id: acquire
+        run: |
+          set -euo pipefail
+          saas_url="${BRANCHWORK_SAAS_URL%/}"
+          holder_meta="ci-smoke-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          body=$(jq -nc \
+            --arg branch master \
+            --arg holderKind ci \
+            --arg holderMeta "$holder_meta" \
+            --argjson waitSecs 10 \
+            '{branch:$branch, holderKind:$holderKind, holderMeta:$holderMeta, waitSecs:$waitSecs}')
+          auth_args=()
+          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
+            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
+          fi
+          set +e
+          http_code=$(curl -sS -m 60 -X POST \
+            "${auth_args[@]}" \
+            -H 'Content-Type: application/json' \
+            -d "$body" \
+            -o /tmp/acquire.json \
+            -w '%{http_code}' \
+            "$saas_url/api/git/push-lock" 2>/tmp/acquire.stderr)
+          curl_exit=$?
+          set -e
+          if [[ $curl_exit -ne 0 ]]; then
+            echo "::error::curl failed (exit=$curl_exit): $(cat /tmp/acquire.stderr 2>/dev/null || true)"
+            exit 1
+          fi
+          if [[ "$http_code" != "200" ]]; then
+            echo "::error::Acquire returned http=$http_code: $(cat /tmp/acquire.json)"
+            exit 1
+          fi
+          token=$(jq -r '.token // empty' /tmp/acquire.json)
+          holder_kind=$(jq -r '.holderKind // empty' /tmp/acquire.json)
+          if [[ -z "$token" ]]; then
+            echo "::error::Acquire 200 but .token missing: $(cat /tmp/acquire.json)"
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          {
+            echo "BUMP_LOCK_TOKEN=$token"
+            echo "BUMP_LOCK_HOLDER_META=$holder_meta"
+          } >> "$GITHUB_ENV"
+          echo "::notice::Acquired lock — holderKind=$holder_kind, holderMeta=$holder_meta."
+
+      - name: Peek lock state
+        run: |
+          set -euo pipefail
+          saas_url="${BRANCHWORK_SAAS_URL%/}"
+          auth_args=()
+          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
+            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
+          fi
+          http_code=$(curl -sS -m 30 \
+            "${auth_args[@]}" \
+            -o /tmp/peek.json \
+            -w '%{http_code}' \
+            "$saas_url/api/git/push-lock/master")
+          if [[ "$http_code" != "200" ]]; then
+            echo "::warning::Peek returned http=$http_code: $(cat /tmp/peek.json)"
+          else
+            echo "::notice::Peek body: $(cat /tmp/peek.json)"
+            # Sanity-check: holder snapshot must match what we set.
+            seen_meta=$(jq -r '.holderMeta // empty' /tmp/peek.json)
+            if [[ "$seen_meta" != "$BUMP_LOCK_HOLDER_META" ]]; then
+              echo "::warning::Peek holderMeta ($seen_meta) does not match the one we set ($BUMP_LOCK_HOLDER_META) — another caller may have raced us."
+            fi
+          fi
+
+      - name: Hold briefly (simulate work)
+        run: sleep 3
+
+      - name: Release push lock
+        if: always() && env.BUMP_LOCK_TOKEN != ''
+        run: |
+          set -euo pipefail
+          saas_url="${BRANCHWORK_SAAS_URL%/}"
+          body=$(jq -nc --arg branch master --arg token "$BUMP_LOCK_TOKEN" \
+            '{branch:$branch, token:$token}')
+          auth_args=()
+          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
+            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
+          fi
+          http_code=$(curl -sS -m 30 -X POST \
+            "${auth_args[@]}" \
+            -H 'Content-Type: application/json' \
+            -d "$body" \
+            -o /tmp/release.json \
+            -w '%{http_code}' \
+            "$saas_url/api/git/push-lock/release")
+          if [[ "$http_code" != "200" ]]; then
+            echo "::error::Release returned http=$http_code: $(cat /tmp/release.json)"
+            exit 1
+          fi
+          released=$(jq -r '.released // false' /tmp/release.json)
+          if [[ "$released" != "true" ]]; then
+            echo "::error::Release returned released=false: $(cat /tmp/release.json)"
+            exit 1
+          fi
+          echo "::notice::Released lock cleanly. Audit-log rows for acquire + release should now be visible in the dashboard Activity tab (search 'push_lock')."
+
+      - name: Verify lock is gone
+        run: |
+          set -euo pipefail
+          saas_url="${BRANCHWORK_SAAS_URL%/}"
+          auth_args=()
+          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
+            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
+          fi
+          http_code=$(curl -sS -m 30 \
+            "${auth_args[@]}" \
+            -o /tmp/peek-final.json \
+            -w '%{http_code}' \
+            "$saas_url/api/git/push-lock/master")
+          if [[ "$http_code" == "404" ]]; then
+            echo "::notice::Peek confirms lock is gone (404 no_lock)."
+          elif [[ "$http_code" == "200" ]]; then
+            # The lock may have been re-acquired by another caller in the
+            # window between our release and this peek. That's fine — what
+            # we DO want to fail on is "still held by us".
+            seen_meta=$(jq -r '.holderMeta // empty' /tmp/peek-final.json)
+            if [[ "$seen_meta" == "$BUMP_LOCK_HOLDER_META" ]]; then
+              echo "::error::Lock is STILL held by us after release: $(cat /tmp/peek-final.json)"
+              exit 1
+            fi
+            echo "::notice::Another caller acquired the lock after our release (holderMeta=$seen_meta) — that's fine."
+          else
+            echo "::warning::Final peek returned http=$http_code: $(cat /tmp/peek-final.json)"
+          fi

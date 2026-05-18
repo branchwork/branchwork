@@ -26,12 +26,13 @@ jobs:
     #   1. The triggering CI run must have been green.
     #   2. The commit at the tip must be an auto-bump commit (subject
     #      starts with `chore: auto-bump to v`).
-    # The second gate exists because ci.yml's bump-version job pushes a
-    # bump commit *for every* human master push. The human commit's
-    # CI run succeeds (only the bump job ran), but we only want to
-    # build the image for the *bump commit* — that one carries the
-    # new version, and the version progression depends on each deploy
-    # being tied to a distinct patch number.
+    # The second gate is belt-and-suspenders since auto-push-rebase-on-
+    # non-fast-forward task 2.3 split bump.yml out of ci.yml: ci.yml
+    # now only fires (does real work) on the bump commit itself, so the
+    # CI runs Docker would see are already filtered to bump commits.
+    # The gate stays in place to handle workflow_dispatch and any
+    # edge case where ci.yml runs on a non-bump commit (e.g. a future
+    # workflow_run from a different upstream).
     #
     # Tag pushes (`push: tags: v*`) and manual dispatches bypass both
     # gates — releases are explicit and don't go through the bump path.

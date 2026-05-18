@@ -1,324 +1,37 @@
 name: CI
 
+# CI is the full pipeline (server / web / e2e). It fires on:
+#   - PRs against master (unconditionally — every PR push runs CI).
+#   - Master pushes whose head commit is a bump commit (i.e. one whose
+#     subject starts with `chore: auto-bump to v`). Human master pushes
+#     don't run CI directly — they trigger bump.yml first, which pushes
+#     a bump commit; that bump commit's push then triggers CI.
+#
+# This split (auto-push-rebase-on-non-fast-forward plan task 2.3) replaces
+# the previous arrangement where ci.yml fired on every master push and
+# carried a bump-version job whose only purpose was to skip on non-bump
+# commits — leaving four other jobs as "Skipped" rows for every human
+# push, plus a permanently-skipped `test-push-lock` row. Now:
+#   - bump.yml owns the bump/push-lock flow (lifted out of here).
+#   - push-lock-smoke.yml owns the manual smoke test (lifted out of here).
+#   - ci.yml fires only when there is real CI work to do.
 on:
   push:
     branches: [master]
   pull_request:
     branches: [master]
-  # `workflow_dispatch` is the operator entry point for end-to-end
-  # smoke-testing the per-branch push lock (see `test-push-lock` below
-  # and `server-rs/src/api/git.rs`). Acceptance criterion for the
-  # auto-push-rebase-on-non-fast-forward plan, task 2.2:
-  #   "End-to-end test (gh + simulated bump): a manual dispatch of the
-  #    bump-version job acquires the lock, pushes, releases - visible
-  #    in the audit log."
-  # We split that into a lock-only smoke job here (no real bump), and
-  # keep the lock acquire/push/release flow wired into bump-version
-  # itself so real master pushes benefit from coordination too.
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # On every master push, bump the patch version of server-rs/Cargo.toml
-  # (and the matching Cargo.lock entry) and push the bump back as a fresh
-  # commit. The downstream build / docker / deploy chain picks up that
-  # bump commit, so every deploy lands on a distinct version number — a
-  # human-visible "which build is in prod" signal.
-  #
-  # The job is self-idempotent: if the current commit is *itself* a bump
-  # commit (recognised by its `chore: auto-bump to v…` subject), the
-  # bump is skipped and the downstream jobs proceed normally. This is
-  # what breaks the loop: human push A → bump pushes B → CI fires on B
-  # with is_bump_commit=true → no further bump, full pipeline runs.
-  #
-  # Docker's workflow_run trigger (docker.yml) also filters on the bump
-  # commit subject, so the build/publish only happens for the bump
-  # commit, not the human commit underneath it.
-  bump-version:
-    name: Auto-bump patch on master push
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    permissions:
-      contents: write
-    outputs:
-      is_bump_commit: ${{ steps.classify.outputs.is_bump_commit }}
-      new_version: ${{ steps.bump.outputs.new_version }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # GH_PAT is used so the resulting push *triggers* a follow-up
-          # CI run on the bump commit. Pushes made with the default
-          # GITHUB_TOKEN do not trigger downstream workflows.
-          token: ${{ secrets.GH_PAT }}
-          # fetch-depth bumped from 2 → 0 so the rebase+retry fallback
-          # in the push step has enough history to rebase against an
-          # `origin/master` that has drifted multiple commits ahead.
-          # The bump-version path is a single workflow per push so the
-          # one-shot full-clone cost is fine; the bigger `server` /
-          # `web` / `tests-e2e` jobs still default to a shallow fetch.
-          fetch-depth: 0
-
-      - name: Classify current commit
-        id: classify
-        run: |
-          msg=$(git log -1 --format=%s)
-          if [[ "$msg" == "chore: auto-bump to v"* ]]; then
-            echo "is_bump_commit=true" >> "$GITHUB_OUTPUT"
-            echo "Already a bump commit ($msg) — skipping bump, downstream jobs run."
-          else
-            echo "is_bump_commit=false" >> "$GITHUB_OUTPUT"
-            echo "Human commit ($msg) — will bump patch and push."
-          fi
-
-      - name: Bump Cargo.toml + Cargo.lock (commit only)
-        if: steps.classify.outputs.is_bump_commit == 'false'
-        id: bump
-        run: |
-          set -euo pipefail
-          cur=$(grep -m1 '^version' server-rs/Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
-          IFS=. read -r maj min pat <<<"$cur"
-          new="$maj.$min.$((pat + 1))"
-          echo "Bumping $cur -> $new"
-          # Cargo.toml: only one [package] version line.
-          sed -i "s/^version = \"$cur\"$/version = \"$new\"/" server-rs/Cargo.toml
-          # Cargo.lock: the version line *immediately following* the
-          # `name = "branchwork-server"` line. The `n;s/.../.../` pair
-          # reads the next line into the pattern space, then substitutes.
-          sed -i '/^name = "branchwork-server"$/{n;s/^version = "'"$cur"'"$/version = "'"$new"'"/}' server-rs/Cargo.lock
-          # Confirm both files actually moved — `set -e` won't catch a
-          # silently-non-matching sed.
-          grep -q "^version = \"$new\"$" server-rs/Cargo.toml
-          grep -A1 '^name = "branchwork-server"$' server-rs/Cargo.lock | grep -q "version = \"$new\""
-          git config user.name "branchwork-bot"
-          git config user.email "bot@branchwork.dev"
-          # actions/checkout@v4 leaves us in detached HEAD; pin to a
-          # real local `master` so `git pull --rebase origin master`
-          # in the push step below operates on a branch, not a detached
-          # HEAD (which it can, but the resulting state is harder to
-          # reason about when debugging a stuck CI run).
-          git checkout -B master
-          git add server-rs/Cargo.toml server-rs/Cargo.lock
-          git commit -m "chore: auto-bump to v$new"
-          echo "new_version=$new" >> "$GITHUB_OUTPUT"
-
-      # Best-effort acquire of the per-branch advisory push lock that
-      # `branchwork-server`'s auto-mode loop also holds during merge →
-      # push (server-rs/src/api/git.rs + auto_mode::wait_for_push_lock).
-      # If the lock acquires, the in-process auto-mode flow will block
-      # on `wait_for_push_lock` until we release, so the two never race
-      # to push to origin/master.
-      #
-      # Degradation modes (all fall through to the rebase+retry push):
-      #   - `BRANCHWORK_SAAS_URL` secret absent → skip coordination.
-      #   - Endpoint unreachable / non-2xx → skip coordination.
-      #   - Endpoint returns 503 three times running → skip coordination.
-      # In every miss case, the push step below still absorbs non-FF
-      # rejections via `git pull --rebase --autostash` (the shell mirror
-      # of `git_helpers::push_branch_local` from Phase 1).
-      #
-      # NOTE: the endpoint is `OptionalAuthUser` today, so the
-      # `BUMP_PUSH_TOKEN` secret is forwarded as a Bearer header for
-      # operators who put a reverse proxy in front of the SaaS URL.
-      # When unset, the request is sent unauthenticated.
-      - name: Acquire push lock (best-effort)
-        if: steps.classify.outputs.is_bump_commit == 'false'
-        id: lock
-        env:
-          BRANCHWORK_SAAS_URL: ${{ secrets.BRANCHWORK_SAAS_URL }}
-          BUMP_PUSH_TOKEN: ${{ secrets.BUMP_PUSH_TOKEN }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${BRANCHWORK_SAAS_URL:-}" ]]; then
-            echo "::notice::BRANCHWORK_SAAS_URL secret not set; skipping push-lock coordination."
-            exit 0
-          fi
-          saas_url="${BRANCHWORK_SAAS_URL%/}"
-          url="$saas_url/api/git/push-lock"
-          # Separate the substitution so a missing git or a corrupt
-          # checkout doesn't fail the whole step under `set -e` — the
-          # lock acquire must remain best-effort.
-          short_sha=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
-          holder_meta="ci-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}-sha-${short_sha}"
-          body=$(jq -nc \
-            --arg branch master \
-            --arg holderKind ci \
-            --arg holderMeta "$holder_meta" \
-            --argjson waitSecs 30 \
-            '{branch:$branch, holderKind:$holderKind, holderMeta:$holderMeta, waitSecs:$waitSecs}')
-          auth_args=()
-          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
-            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
-          fi
-          # Outer retry loop: the server already waits up to `waitSecs`
-          # internally for the holder to release, so a 503 here means
-          # the holder kept the lock the whole 30 seconds. Retry a few
-          # times with exponential-ish backoff (5s, 10s, 15s) before
-          # giving up and falling through to the unlocked push.
-          for attempt in 1 2 3; do
-            set +e
-            http_code=$(curl -sS -m 60 -X POST \
-              "${auth_args[@]}" \
-              -H 'Content-Type: application/json' \
-              -d "$body" \
-              -o /tmp/lock-response.json \
-              -w '%{http_code}' \
-              "$url" 2>/tmp/lock-stderr)
-            curl_exit=$?
-            set -e
-            case "$curl_exit:$http_code" in
-              0:200)
-                token=$(jq -r '.token // empty' /tmp/lock-response.json)
-                if [[ -z "$token" ]]; then
-                  echo "::warning::Acquire response missing .token field; body: $(cat /tmp/lock-response.json)"
-                  break
-                fi
-                # Mask the token in subsequent log output, then expose
-                # it to later steps via $GITHUB_ENV so the always-run
-                # release step can use it.
-                echo "::add-mask::$token"
-                {
-                  echo "BUMP_LOCK_TOKEN=$token"
-                  echo "BUMP_LOCK_BRANCH=master"
-                  echo "BUMP_LOCK_HOLDER_META=$holder_meta"
-                } >> "$GITHUB_ENV"
-                echo "::notice::Acquired push lock on attempt $attempt (holderMeta=$holder_meta)."
-                exit 0
-                ;;
-              0:503)
-                holder=$(jq -c '.holder // {}' /tmp/lock-response.json 2>/dev/null || echo "{}")
-                echo "::warning::Push lock busy on attempt $attempt; live holder: $holder"
-                sleep $((5 * attempt))
-                ;;
-              0:*)
-                echo "::warning::Push-lock endpoint returned http=$http_code on attempt $attempt: $(cat /tmp/lock-response.json 2>/dev/null || true)"
-                break
-                ;;
-              *)
-                echo "::warning::curl to push-lock endpoint failed (exit=$curl_exit, http=$http_code, attempt=$attempt): $(cat /tmp/lock-stderr 2>/dev/null || true)"
-                break
-                ;;
-            esac
-          done
-          echo "::warning::Falling back to no-lock push; rebase+retry will absorb any non-FF contention."
-
-      # The actual push, with a 3-attempt rebase+retry loop that mirrors
-      # `server-rs/src/git_helpers.rs::push_branch_local` (Phase 1 of
-      # the auto-push-rebase-on-non-fast-forward plan). Even when the
-      # lock was acquired above, we keep the rebase fallback as defense
-      # in depth — the lock is a coordination hint, not a hard barrier.
-      #
-      # `!cancelled() && steps.bump.outcome == 'success'`: run regardless
-      # of whether the Acquire step succeeded or fell through to its
-      # graceful-degradation path (or even crashed for an unexpected
-      # reason). The acquire is best-effort; the push must always run
-      # when the bump itself succeeded.
-      - name: Push (rebase + retry on non-fast-forward)
-        if: |
-          !cancelled() &&
-          steps.bump.outcome == 'success'
-        run: |
-          set -euo pipefail
-          max_attempts=3
-          for ((attempt=1; attempt<=max_attempts; attempt++)); do
-            if git push origin master 2>/tmp/push-stderr; then
-              if [[ $attempt -gt 1 ]]; then
-                echo "::notice::Push succeeded on attempt $attempt after rebase."
-              fi
-              exit 0
-            fi
-            stderr=$(cat /tmp/push-stderr || true)
-            # Same three markers `is_non_fast_forward_error` matches:
-            # `rejected` | `non-fast-forward` | `fetch first`.
-            if ! grep -qiE 'non-fast-forward|fetch first|rejected' <<<"$stderr"; then
-              echo "::error::git push failed with non-non-FF error; not retrying."
-              echo "$stderr" >&2
-              exit 1
-            fi
-            if [[ $attempt -ge $max_attempts ]]; then
-              echo "::error::Exhausted $max_attempts push attempts; bubbling last error."
-              echo "$stderr" >&2
-              exit 1
-            fi
-            echo "::notice::Push rejected as non-fast-forward (attempt $attempt); rebasing against origin/master."
-            if ! git pull --rebase --autostash origin master 2>/tmp/rebase-stderr; then
-              conflicting=$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
-              if [[ -n "$conflicting" ]]; then
-                echo "::error::Rebase against origin/master produced conflicts in: $conflicting"
-                git rebase --abort 2>/dev/null || true
-                exit 1
-              fi
-              echo "::error::Rebase against origin/master failed (non-conflict)."
-              cat /tmp/rebase-stderr >&2
-              git rebase --abort 2>/dev/null || true
-              exit 1
-            fi
-          done
-          # Unreachable: the loop either `exit 0`s on success or `exit 1`s
-          # on terminal error. Belt-and-braces safety.
-          exit 1
-
-      # Always-run cleanup so an early-failing push step still releases
-      # the lock. The 30s server-side TTL force-evicts orphaned locks
-      # eventually, but explicit release unblocks in-process auto-mode
-      # immediately. Best-effort: a release failure is logged as a
-      # warning and does not fail the job.
-      - name: Release push lock
-        if: always() && steps.classify.outputs.is_bump_commit == 'false' && env.BUMP_LOCK_TOKEN != ''
-        env:
-          BRANCHWORK_SAAS_URL: ${{ secrets.BRANCHWORK_SAAS_URL }}
-          BUMP_PUSH_TOKEN: ${{ secrets.BUMP_PUSH_TOKEN }}
-        run: |
-          set -euo pipefail
-          saas_url="${BRANCHWORK_SAAS_URL%/}"
-          url="$saas_url/api/git/push-lock/release"
-          body=$(jq -nc \
-            --arg branch "${BUMP_LOCK_BRANCH:-master}" \
-            --arg token "$BUMP_LOCK_TOKEN" \
-            '{branch:$branch, token:$token}')
-          auth_args=()
-          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
-            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
-          fi
-          set +e
-          http_code=$(curl -sS -m 30 -X POST \
-            "${auth_args[@]}" \
-            -H 'Content-Type: application/json' \
-            -d "$body" \
-            -o /tmp/release-response.json \
-            -w '%{http_code}' \
-            "$url" 2>/tmp/release-stderr)
-          curl_exit=$?
-          set -e
-          if [[ $curl_exit -ne 0 || "$http_code" != "200" ]]; then
-            echo "::warning::Push-lock release failed (exit=$curl_exit, http=$http_code): $(cat /tmp/release-stderr 2>/dev/null || true). Lock will auto-evict after the 30s server-side TTL."
-            exit 0
-          fi
-          released=$(jq -r '.released // false' /tmp/release-response.json 2>/dev/null || echo "false")
-          if [[ "$released" == "true" ]]; then
-            echo "::notice::Push lock released (holderMeta=${BUMP_LOCK_HOLDER_META:-unknown})."
-          else
-            echo "::warning::Push-lock release returned released=false (lock may have already evicted via TTL)."
-          fi
-
   server:
-    needs: bump-version
-    # Run on PRs (where bump-version is skipped) and on bump commits
-    # (where bump-version ran with is_bump_commit=true). Skip on the
-    # original human master push (bump-version=false): the bump commit
-    # it produced will get its own full CI run a moment later.
-    # PR runs unconditionally; push runs only on the bump commit
-    # (the human commit underneath produces its own bump commit which
-    # will get its own full run a moment later); workflow_dispatch is
-    # for the `test-push-lock` smoke job only — skip these.
+    # PR runs unconditionally; master push runs only on the bump commit
+    # that bump.yml produces. Human master pushes are absorbed by
+    # bump.yml; their resulting bump commit triggers this run.
     if: |
-      always() && (
-        github.event_name == 'pull_request' ||
-        (github.event_name == 'push' && needs.bump-version.outputs.is_bump_commit == 'true')
-      )
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore: auto-bump to v'))
     name: Rust — ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -386,16 +99,9 @@ jobs:
         run: cargo audit
 
   web:
-    needs: bump-version
-    # PR runs unconditionally; push runs only on the bump commit
-    # (the human commit underneath produces its own bump commit which
-    # will get its own full run a moment later); workflow_dispatch is
-    # for the `test-push-lock` smoke job only — skip these.
     if: |
-      always() && (
-        github.event_name == 'pull_request' ||
-        (github.event_name == 'push' && needs.bump-version.outputs.is_bump_commit == 'true')
-      )
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore: auto-bump to v'))
     name: Web — typecheck, build
     runs-on: ubuntu-latest
 
@@ -441,16 +147,9 @@ jobs:
   # and the matrix multiplier on the `server` job is enough OS coverage
   # for the rest of the suite.
   tests-e2e:
-    needs: bump-version
-    # PR runs unconditionally; push runs only on the bump commit
-    # (the human commit underneath produces its own bump commit which
-    # will get its own full run a moment later); workflow_dispatch is
-    # for the `test-push-lock` smoke job only — skip these.
     if: |
-      always() && (
-        github.event_name == 'pull_request' ||
-        (github.event_name == 'push' && needs.bump-version.outputs.is_bump_commit == 'true')
-      )
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore: auto-bump to v'))
     name: E2E tests (gh + Claude)
     runs-on: ubuntu-latest
     defaults:
@@ -506,169 +205,3 @@ jobs:
 
       - name: cargo test --features e2e
         run: cargo test --release --features e2e
-
-  # Manual smoke test of the per-branch push lock — acquire, peek, hold,
-  # release — against the live `BRANCHWORK_SAAS_URL` server. Does NOT
-  # perform a real bump or push; the operator can run this any time to
-  # verify the endpoint trio is wired correctly and that audit-log rows
-  # land in the dashboard. Acceptance criterion for
-  # auto-push-rebase-on-non-fast-forward/2.2.
-  #
-  # Required secret: `BRANCHWORK_SAAS_URL` (e.g. https://branchwork.dev).
-  # Optional secret: `BUMP_PUSH_TOKEN` — Bearer-token forwarded as
-  # `Authorization: Bearer ${BUMP_PUSH_TOKEN}` for operators who put a
-  # reverse proxy in front of the lock endpoint.
-  test-push-lock:
-    name: Push-lock smoke test (manual)
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions: {}
-    env:
-      BRANCHWORK_SAAS_URL: ${{ secrets.BRANCHWORK_SAAS_URL }}
-      BUMP_PUSH_TOKEN: ${{ secrets.BUMP_PUSH_TOKEN }}
-      GITHUB_RUN_ID: ${{ github.run_id }}
-      GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
-    steps:
-      - name: Verify required secrets
-        run: |
-          if [[ -z "${BRANCHWORK_SAAS_URL:-}" ]]; then
-            echo "::error::BRANCHWORK_SAAS_URL secret is required for this manual smoke test."
-            echo "::error::Configure it in repository → Settings → Secrets and variables → Actions."
-            exit 1
-          fi
-          echo "Targeting $BRANCHWORK_SAAS_URL"
-          if [[ -z "${BUMP_PUSH_TOKEN:-}" ]]; then
-            echo "::notice::BUMP_PUSH_TOKEN secret not set; running unauthenticated (fine if no reverse proxy guards the endpoint)."
-          fi
-
-      - name: Acquire push lock
-        id: acquire
-        run: |
-          set -euo pipefail
-          saas_url="${BRANCHWORK_SAAS_URL%/}"
-          holder_meta="ci-smoke-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
-          body=$(jq -nc \
-            --arg branch master \
-            --arg holderKind ci \
-            --arg holderMeta "$holder_meta" \
-            --argjson waitSecs 10 \
-            '{branch:$branch, holderKind:$holderKind, holderMeta:$holderMeta, waitSecs:$waitSecs}')
-          auth_args=()
-          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
-            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
-          fi
-          set +e
-          http_code=$(curl -sS -m 60 -X POST \
-            "${auth_args[@]}" \
-            -H 'Content-Type: application/json' \
-            -d "$body" \
-            -o /tmp/acquire.json \
-            -w '%{http_code}' \
-            "$saas_url/api/git/push-lock" 2>/tmp/acquire.stderr)
-          curl_exit=$?
-          set -e
-          if [[ $curl_exit -ne 0 ]]; then
-            echo "::error::curl failed (exit=$curl_exit): $(cat /tmp/acquire.stderr 2>/dev/null || true)"
-            exit 1
-          fi
-          if [[ "$http_code" != "200" ]]; then
-            echo "::error::Acquire returned http=$http_code: $(cat /tmp/acquire.json)"
-            exit 1
-          fi
-          token=$(jq -r '.token // empty' /tmp/acquire.json)
-          holder_kind=$(jq -r '.holderKind // empty' /tmp/acquire.json)
-          if [[ -z "$token" ]]; then
-            echo "::error::Acquire 200 but .token missing: $(cat /tmp/acquire.json)"
-            exit 1
-          fi
-          echo "::add-mask::$token"
-          {
-            echo "BUMP_LOCK_TOKEN=$token"
-            echo "BUMP_LOCK_HOLDER_META=$holder_meta"
-          } >> "$GITHUB_ENV"
-          echo "::notice::Acquired lock — holderKind=$holder_kind, holderMeta=$holder_meta."
-
-      - name: Peek lock state
-        run: |
-          set -euo pipefail
-          saas_url="${BRANCHWORK_SAAS_URL%/}"
-          auth_args=()
-          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
-            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
-          fi
-          http_code=$(curl -sS -m 30 \
-            "${auth_args[@]}" \
-            -o /tmp/peek.json \
-            -w '%{http_code}' \
-            "$saas_url/api/git/push-lock/master")
-          if [[ "$http_code" != "200" ]]; then
-            echo "::warning::Peek returned http=$http_code: $(cat /tmp/peek.json)"
-          else
-            echo "::notice::Peek body: $(cat /tmp/peek.json)"
-            # Sanity-check: holder snapshot must match what we set.
-            seen_meta=$(jq -r '.holderMeta // empty' /tmp/peek.json)
-            if [[ "$seen_meta" != "$BUMP_LOCK_HOLDER_META" ]]; then
-              echo "::warning::Peek holderMeta ($seen_meta) does not match the one we set ($BUMP_LOCK_HOLDER_META) — another caller may have raced us."
-            fi
-          fi
-
-      - name: Hold briefly (simulate work)
-        run: sleep 3
-
-      - name: Release push lock
-        if: always() && env.BUMP_LOCK_TOKEN != ''
-        run: |
-          set -euo pipefail
-          saas_url="${BRANCHWORK_SAAS_URL%/}"
-          body=$(jq -nc --arg branch master --arg token "$BUMP_LOCK_TOKEN" \
-            '{branch:$branch, token:$token}')
-          auth_args=()
-          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
-            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
-          fi
-          http_code=$(curl -sS -m 30 -X POST \
-            "${auth_args[@]}" \
-            -H 'Content-Type: application/json' \
-            -d "$body" \
-            -o /tmp/release.json \
-            -w '%{http_code}' \
-            "$saas_url/api/git/push-lock/release")
-          if [[ "$http_code" != "200" ]]; then
-            echo "::error::Release returned http=$http_code: $(cat /tmp/release.json)"
-            exit 1
-          fi
-          released=$(jq -r '.released // false' /tmp/release.json)
-          if [[ "$released" != "true" ]]; then
-            echo "::error::Release returned released=false: $(cat /tmp/release.json)"
-            exit 1
-          fi
-          echo "::notice::Released lock cleanly. Audit-log rows for acquire + release should now be visible in the dashboard Activity tab (search 'push_lock')."
-
-      - name: Verify lock is gone
-        run: |
-          set -euo pipefail
-          saas_url="${BRANCHWORK_SAAS_URL%/}"
-          auth_args=()
-          if [[ -n "${BUMP_PUSH_TOKEN:-}" ]]; then
-            auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
-          fi
-          http_code=$(curl -sS -m 30 \
-            "${auth_args[@]}" \
-            -o /tmp/peek-final.json \
-            -w '%{http_code}' \
-            "$saas_url/api/git/push-lock/master")
-          if [[ "$http_code" == "404" ]]; then
-            echo "::notice::Peek confirms lock is gone (404 no_lock)."
-          elif [[ "$http_code" == "200" ]]; then
-            # The lock may have been re-acquired by another caller in the
-            # window between our release and this peek. That's fine — what
-            # we DO want to fail on is "still held by us".
-            seen_meta=$(jq -r '.holderMeta // empty' /tmp/peek-final.json)
-            if [[ "$seen_meta" == "$BUMP_LOCK_HOLDER_META" ]]; then
-              echo "::error::Lock is STILL held by us after release: $(cat /tmp/peek-final.json)"
-              exit 1
-            fi
-            echo "::notice::Another caller acquired the lock after our release (holderMeta=$seen_meta) — that's fine."
-          else
-            echo "::warning::Final peek returned http=$http_code: $(cat /tmp/peek-final.json)"
-          fi
