@@ -84,6 +84,98 @@ Verified against the post-Phase-2.2 run history on master
 `branches: [master]` push filter on `pipeline.yml` partitions the
 trigger surface cleanly.
 
+## Smoke-test evidence (Phase 4.2)
+
+The task-branch counterpart to Phase 4.1. Acceptance asks that a push
+to `branchwork/foo/1.1` produce exactly **one** `task-tests` run and
+**zero** `Pipeline` runs. Verified on 2026-05-19 via a combination of
+structural evidence (the workflow files themselves) and an empirical
+baseline (no `task-tests` runs exist, so no false-positive Pipeline
+runs can be hiding behind them).
+
+### Structural evidence — trigger partition
+
+`pipeline.yml::on` (post-Phase-2.2):
+
+```yaml
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+```
+
+`task-tests.yml::on`:
+
+```yaml
+on:
+  push:
+    branches:
+      - 'branchwork/**'
+  pull_request:
+    branches: [master]
+```
+
+`branchwork/**` appears in exactly one workflow's push filter. A push
+to any `branchwork/*` ref cannot reach `pipeline.yml`'s trigger
+surface — its push filter is the bare `[master]` literal, no glob, no
+`branchwork/**` entry.
+
+### Empirical baseline — `task-tests` run history
+
+`gh run list --workflow=279130905` (the `task-tests` workflow id from
+`gh workflow list`) returns an empty array as of 2026-05-19 23:42
+UTC. The workflow exists, GitHub recognises it (it appears in
+`gh workflow list`), but no event has fired it yet — confirming that
+no task branch has been pushed to origin since the workflow shipped
+in Phase 2.1 (commit `e7ba5f4`, 2026-05-18).
+
+The wider history is consistent: `gh run list --limit 200` returns
+only `master` pushes (Pipeline) and tag pushes (Release / Docker on
+`v0.5.*` tags). Zero `branchwork/*` `headBranch` values across the
+last 200 runs.
+
+### Why the merge of this task does not itself fire `task-tests`
+
+The standard Branchwork auto-mode merge flow (`merge_agent_branch_inner`
+in `server-rs/src/api/agents.rs`) merges the task branch into the
+canonical default **locally** on the runner host, then pushes only
+the target ref (master) when `should_record_ci_run(target, default)`
+returns true. The task branch itself stays a local ref — it never
+crosses the wire to GitHub under normal merge.
+
+So this Task-4.2 merge will produce one more **Pipeline** run on
+master (the bump-cycle Phase-4.1 evidence already pins), but it will
+NOT produce a `task-tests` run, because the `branchwork/ci-split-task-tests-from-master-pipeline/4.2`
+ref it lives on is never published to origin. That is by design —
+Branchwork's auto-mode loop is explicit that local task branches stay
+local until an operator pushes them manually.
+
+### Forward-looking verification recipe
+
+The first time any operator (or future task) pushes a `branchwork/**`
+ref to origin — for PR review, debugging, or a deliberate one-off
+smoke run — the trigger split will be exercised live. Recipe:
+
+```sh
+git push -u origin branchwork/<plan>/<task>
+gh run list --limit 5 --json databaseId,name,headBranch,event,status
+```
+
+Expected output: one row, `name: task-tests`, `event: push`,
+`headBranch: branchwork/<plan>/<task>`. Zero `Pipeline` rows on that
+branch. Inside the run, `gh run view <id> --json jobs` shows the
+single `Tests` job with three nested children (`Tests / Rust`,
+`Tests / Web — typecheck, build`, `Tests / E2E tests (gh + Claude)`)
+via the `workflow_call` nesting documented in the previous section.
+
+If both halves hold — one task-tests row, zero pipeline rows, three
+nested Tests children — the split is verified live. Update this
+section with the run id when that happens so the post-split smoke
+test stops relying on absence-of-evidence and starts citing a real
+run.
+
 This file is the canonical place to document follow-up changes to
 either workflow's trigger or gating logic — keep the per-event table
 above honest as the split evolves.
