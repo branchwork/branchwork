@@ -1,0 +1,605 @@
+name: Pipeline
+
+# Single workflow for the whole master + PR cycle. Replaces the
+# Bump → CI → Docker → Deploy chain of separate workflows that fired
+# off each other via `workflow_run`. The chained model produced 4
+# top-level runs per master push with 3+ Skipped/Cancelled rows in
+# the Actions tab — visual noise that made it impossible to answer
+# "is master green?" with a single API call.
+#
+# This file collapses that into ONE run per push. All jobs live here,
+# wired by `needs:` and gated by a `classify` job that decides which
+# parts of the pipeline apply to the current event. Skipped jobs stay
+# scoped to this run rather than spawning sibling runs.
+#
+# Per-event behaviour:
+#   - PR (any commit on the PR branch):
+#       classify → server (matrix) + web + e2e
+#   - Master push, *non*-bump commit (i.e. a human push):
+#       classify → bump
+#       (bump pushes a `chore: auto-bump to vX.Y.Z` commit using a PAT,
+#        which fires this workflow again on that commit.)
+#   - Master push, bump commit:
+#       classify → server (matrix) + web + e2e → docker-build → docker-manifest → deploy
+#   - workflow_dispatch:
+#       classify → server (matrix) + web + e2e → docker-build → docker-manifest → deploy
+#       (manual full-pipeline override; deploys whatever HEAD is on master.)
+#
+# Tag pushes (`v*`) are handled by `tag-build.yml`, which is a
+# separate workflow because its trigger surface and image tagging
+# scheme are different from the master path. Releases are explicit
+# human action and don't share this file's automation.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # the `bump` job pushes a commit back to master
+  packages: write   # the `docker-*` jobs push images to GHCR
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# A second master push that arrives while a deploy is in flight
+# queues behind it rather than cancelling — same semantics as the
+# old standalone deploy.yml.
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── classify ─────────────────────────────────────────────────────
+  # 30-second job that figures out what the current event implies.
+  # Output booleans drive every downstream `if:` gate so the
+  # decision logic lives in exactly one place.
+  classify:
+    name: Classify event
+    runs-on: ubuntu-latest
+    outputs:
+      is_bump_commit: ${{ steps.c.outputs.is_bump_commit }}
+      should_bump:    ${{ steps.c.outputs.should_bump }}
+      should_test:    ${{ steps.c.outputs.should_test }}
+      should_build:   ${{ steps.c.outputs.should_build }}
+      should_deploy:  ${{ steps.c.outputs.should_deploy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: c
+        run: |
+          set -euo pipefail
+          msg=$(git log -1 --format=%s)
+          event="${{ github.event_name }}"
+          ref="${{ github.ref }}"
+
+          is_master_push=false
+          is_pr=false
+          is_dispatch=false
+          is_bump=false
+          [[ "$event" == "push"            && "$ref" == "refs/heads/master" ]] && is_master_push=true
+          [[ "$event" == "pull_request" ]]                                     && is_pr=true
+          [[ "$event" == "workflow_dispatch" ]]                                && is_dispatch=true
+          [[ "$msg"   == "chore: auto-bump to v"* ]]                           && is_bump=true
+
+          should_bump=false
+          [[ "$is_master_push" == "true" && "$is_bump" != "true" ]] && should_bump=true
+
+          should_test=false
+          [[ "$is_pr" == "true" ]] && should_test=true
+          [[ "$is_master_push" == "true" && "$is_bump" == "true" ]] && should_test=true
+          [[ "$is_dispatch" == "true" ]] && should_test=true
+
+          should_build=false
+          [[ "$is_master_push" == "true" && "$is_bump" == "true" ]] && should_build=true
+          [[ "$is_dispatch" == "true" ]] && should_build=true
+
+          should_deploy=$should_build
+
+          {
+            echo "is_bump_commit=$is_bump"
+            echo "should_bump=$should_bump"
+            echo "should_test=$should_test"
+            echo "should_build=$should_build"
+            echo "should_deploy=$should_deploy"
+          } >> "$GITHUB_OUTPUT"
+
+          cat <<SUMMARY
+          event=$event ref=$ref msg='$msg'
+            is_master_push=$is_master_push is_pr=$is_pr is_dispatch=$is_dispatch is_bump=$is_bump
+            should_bump=$should_bump should_test=$should_test should_build=$should_build should_deploy=$should_deploy
+          SUMMARY
+
+  # ── bump ─────────────────────────────────────────────────────────
+  # Runs for human master pushes only. Bumps `server-rs/Cargo.toml`
+  # patch + the matching `Cargo.lock` entry, commits, pushes via PAT
+  # so the resulting commit fires this workflow again (a follow-up
+  # GITHUB_TOKEN push would NOT trigger downstream).
+  #
+  # Push-lock coordination: best-effort POST to
+  # `<saas-url>/api/git/push-lock` so an in-process auto-mode merge
+  # doesn't race us. Falls through to rebase-on-non-FF on any miss.
+  bump:
+    needs: classify
+    if: needs.classify.outputs.should_bump == 'true'
+    name: Auto-bump patch version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Bump Cargo.toml + Cargo.lock (commit only)
+        id: bump
+        run: |
+          set -euo pipefail
+          cur=$(grep -m1 '^version' server-rs/Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          IFS=. read -r maj min pat <<<"$cur"
+          new="$maj.$min.$((pat + 1))"
+          echo "Bumping $cur -> $new"
+          sed -i "s/^version = \"$cur\"$/version = \"$new\"/" server-rs/Cargo.toml
+          sed -i '/^name = "branchwork-server"$/{n;s/^version = "'"$cur"'"$/version = "'"$new"'"/}' server-rs/Cargo.lock
+          grep -q "^version = \"$new\"$" server-rs/Cargo.toml
+          grep -A1 '^name = "branchwork-server"$' server-rs/Cargo.lock | grep -q "version = \"$new\""
+          git config user.name "branchwork-bot"
+          git config user.email "bot@branchwork.dev"
+          git checkout -B master
+          git add server-rs/Cargo.toml server-rs/Cargo.lock
+          git commit -m "chore: auto-bump to v$new"
+          echo "new_version=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Acquire push lock (best-effort)
+        id: lock
+        env:
+          BRANCHWORK_SAAS_URL: ${{ secrets.BRANCHWORK_SAAS_URL }}
+          BUMP_PUSH_TOKEN: ${{ secrets.BUMP_PUSH_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${BRANCHWORK_SAAS_URL:-}" ]]; then
+            echo "::notice::BRANCHWORK_SAAS_URL secret not set; skipping push-lock coordination."
+            exit 0
+          fi
+          saas_url="${BRANCHWORK_SAAS_URL%/}"
+          url="$saas_url/api/git/push-lock"
+          short_sha=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+          holder_meta="ci-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}-sha-${short_sha}"
+          body=$(jq -nc \
+            --arg branch master \
+            --arg holderKind ci \
+            --arg holderMeta "$holder_meta" \
+            --argjson waitSecs 30 \
+            '{branch:$branch, holderKind:$holderKind, holderMeta:$holderMeta, waitSecs:$waitSecs}')
+          auth_args=()
+          [[ -n "${BUMP_PUSH_TOKEN:-}" ]] && auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
+          for attempt in 1 2 3; do
+            set +e
+            http_code=$(curl -sS -m 60 -X POST "${auth_args[@]}" \
+              -H 'Content-Type: application/json' -d "$body" \
+              -o /tmp/lock-response.json -w '%{http_code}' \
+              "$url" 2>/tmp/lock-stderr)
+            curl_exit=$?
+            set -e
+            case "$curl_exit:$http_code" in
+              0:200)
+                token=$(jq -r '.token // empty' /tmp/lock-response.json)
+                if [[ -z "$token" ]]; then
+                  echo "::warning::Acquire response missing .token; body: $(cat /tmp/lock-response.json)"
+                  break
+                fi
+                echo "::add-mask::$token"
+                {
+                  echo "BUMP_LOCK_TOKEN=$token"
+                  echo "BUMP_LOCK_BRANCH=master"
+                  echo "BUMP_LOCK_HOLDER_META=$holder_meta"
+                } >> "$GITHUB_ENV"
+                echo "::notice::Acquired push lock on attempt $attempt"
+                exit 0
+                ;;
+              0:503)
+                echo "::warning::Push lock busy attempt $attempt; holder: $(jq -c '.holder // {}' /tmp/lock-response.json)"
+                sleep $((5 * attempt))
+                ;;
+              *)
+                echo "::warning::Push-lock endpoint unavailable (curl=$curl_exit http=$http_code attempt=$attempt)"
+                break
+                ;;
+            esac
+          done
+          echo "::warning::Falling back to no-lock push; rebase+retry absorbs contention."
+
+      - name: Push (rebase + retry on non-fast-forward)
+        if: ${{ !cancelled() && steps.bump.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          max_attempts=3
+          for ((attempt=1; attempt<=max_attempts; attempt++)); do
+            if git push origin master 2>/tmp/push-stderr; then
+              [[ $attempt -gt 1 ]] && echo "::notice::Push succeeded on attempt $attempt after rebase."
+              exit 0
+            fi
+            stderr=$(cat /tmp/push-stderr || true)
+            if ! grep -qiE 'non-fast-forward|fetch first|rejected' <<<"$stderr"; then
+              echo "::error::git push failed with non-non-FF error; not retrying."
+              echo "$stderr" >&2
+              exit 1
+            fi
+            if [[ $attempt -ge $max_attempts ]]; then
+              echo "::error::Exhausted $max_attempts push attempts."
+              echo "$stderr" >&2
+              exit 1
+            fi
+            echo "::notice::Push rejected as non-fast-forward (attempt $attempt); rebasing."
+            if ! git pull --rebase --autostash origin master 2>/tmp/rebase-stderr; then
+              conflicting=$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+              if [[ -n "$conflicting" ]]; then
+                echo "::error::Rebase conflicts: $conflicting"
+              else
+                cat /tmp/rebase-stderr >&2
+              fi
+              git rebase --abort 2>/dev/null || true
+              exit 1
+            fi
+          done
+          exit 1
+
+      - name: Release push lock
+        if: ${{ always() && env.BUMP_LOCK_TOKEN != '' }}
+        env:
+          BRANCHWORK_SAAS_URL: ${{ secrets.BRANCHWORK_SAAS_URL }}
+          BUMP_PUSH_TOKEN: ${{ secrets.BUMP_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          saas_url="${BRANCHWORK_SAAS_URL%/}"
+          url="$saas_url/api/git/push-lock/release"
+          body=$(jq -nc \
+            --arg branch "${BUMP_LOCK_BRANCH:-master}" \
+            --arg token "$BUMP_LOCK_TOKEN" \
+            '{branch:$branch, token:$token}')
+          auth_args=()
+          [[ -n "${BUMP_PUSH_TOKEN:-}" ]] && auth_args=(-H "Authorization: Bearer ${BUMP_PUSH_TOKEN}")
+          set +e
+          http_code=$(curl -sS -m 30 -X POST "${auth_args[@]}" \
+            -H 'Content-Type: application/json' -d "$body" \
+            -o /tmp/release-response.json -w '%{http_code}' \
+            "$url" 2>/tmp/release-stderr)
+          curl_exit=$?
+          set -e
+          if [[ $curl_exit -ne 0 || "$http_code" != "200" ]]; then
+            echo "::warning::Lock release failed (curl=$curl_exit http=$http_code); 30s TTL will evict."
+            exit 0
+          fi
+          echo "::notice::Push lock released."
+
+  # ── server (Rust matrix) ─────────────────────────────────────────
+  server:
+    needs: classify
+    if: needs.classify.outputs.should_test == 'true'
+    name: Rust — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: server-rs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server-rs/target
+          key: ci-${{ matrix.os }}-${{ hashFiles('server-rs/Cargo.lock') }}
+          restore-keys: ci-${{ matrix.os }}-
+      - name: Create web/dist placeholder (Unix)
+        if: runner.os != 'Windows'
+        run: mkdir -p ../web/dist && touch ../web/dist/index.html
+      - name: Create web/dist placeholder (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ../web/dist | Out-Null
+          New-Item -ItemType File -Force -Path ../web/dist/index.html | Out-Null
+      - name: cargo fmt --check
+        if: runner.os != 'Windows'
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: cargo test (unit + e2e)
+        run: cargo test --release
+      - name: Install cargo-audit
+        if: runner.os != 'Windows'
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        if: runner.os != 'Windows'
+        run: cargo audit
+
+  # ── web ──────────────────────────────────────────────────────────
+  web:
+    needs: classify
+    if: needs.classify.outputs.should_test == 'true'
+    name: Web — typecheck, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Lint (ESLint)
+        run: pnpm --filter @branchwork/web lint
+      - name: Format (Prettier)
+        run: pnpm --filter @branchwork/web format:check
+      - name: Build
+        run: pnpm --filter @branchwork/web build
+      - name: Bundle-size budget
+        run: pnpm --filter @branchwork/web bundle:check
+
+  # ── e2e ──────────────────────────────────────────────────────────
+  e2e:
+    needs: classify
+    if: needs.classify.outputs.should_test == 'true'
+    name: E2E tests (gh + Claude)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server-rs
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      BRANCHWORK_TEST_GH_REPOS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server-rs/target
+          key: ci-e2e-${{ hashFiles('server-rs/Cargo.lock') }}
+          restore-keys: |
+            ci-e2e-
+            ci-ubuntu-latest-
+      - run: mkdir -p ../web/dist && touch ../web/dist/index.html
+      - name: Verify gh CLI + auth
+        run: |
+          gh --version
+          if [ -n "$GH_TOKEN" ]; then
+            gh auth status
+          else
+            echo "::warning::GH_PAT not set; gh-backed paths will skip via tests/support/gh.rs::maybe_create"
+          fi
+      - name: cargo test --features e2e
+        run: cargo test --release --features e2e
+
+  # ── docker-build (matrix per arch) ───────────────────────────────
+  docker-build:
+    needs: [classify, server, web, e2e]
+    if: needs.classify.outputs.should_build == 'true'
+    name: Docker build (${{ matrix.arch.docker }})
+    runs-on: ${{ matrix.arch.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { docker: amd64, runner: ubuntu-latest, suffix: amd64 }
+          - { docker: arm64, runner: ubuntu-latest, suffix: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/${{ matrix.arch.docker }}
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          outputs: type=image,push-by-digest=true,name-canonical=true
+          cache-from: type=gha,scope=${{ matrix.arch.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch.suffix }}
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          echo -n "${{ steps.build.outputs.digest }}" > /tmp/digests/${{ matrix.arch.suffix }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch.suffix }}
+          path: /tmp/digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  # ── docker-manifest ──────────────────────────────────────────────
+  docker-manifest:
+    needs: [classify, docker-build]
+    if: needs.classify.outputs.should_build == 'true'
+    name: Docker manifest (multi-arch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=sha,prefix=,format=short
+      - name: Create manifest
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          tags=$(echo '${{ steps.meta.outputs.tags }}' | sed 's|^|--tag |' | tr '\n' ' ')
+          refs=$(for f in *; do
+            echo -n "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$(cat $f) "
+          done)
+          docker buildx imagetools create $tags $refs
+
+  # ── deploy ───────────────────────────────────────────────────────
+  deploy:
+    needs: [classify, docker-manifest]
+    if: needs.classify.outputs.should_deploy == 'true'
+    name: Deploy to Hetzner
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    env:
+      HETZNER_USER: cpo
+      HETZNER_HOST: 95.216.191.129
+      PROD_DIR: /opt/branchwork/src
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve target SHA
+        id: target
+        run: |
+          set -euo pipefail
+          full="${{ github.sha }}"
+          short="${full:0:7}"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "Deploying ghcr.io/branchwork/branchwork:$short (commit $full)"
+      - name: Install SSH credentials
+        env:
+          SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.HETZNER_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Capture pre-deploy state
+        id: pre
+        run: |
+          set -euo pipefail
+          before=$(curl -sf --max-time 10 https://branchwork.dev/health || echo '{}')
+          echo "Pre-deploy /health: $before"
+          ws=$(echo "$before" | jq -r '.wsConnections // 0')
+          uptime=$(echo "$before" | jq -r '.uptimeSeconds // 0')
+          echo "ws=$ws" >> "$GITHUB_OUTPUT"
+          echo "uptime=$uptime" >> "$GITHUB_OUTPUT"
+      - name: Sync compose files
+        run: |
+          set -euo pipefail
+          scp -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes \
+              deploy/docker-compose.yml deploy/docker-compose.prod.yml \
+              ${HETZNER_USER}@${HETZNER_HOST}:${PROD_DIR}/deploy/
+      - name: Pin version + roll container
+        env:
+          SHA: ${{ steps.target.outputs.short }}
+          FULL_SHA: ${{ steps.target.outputs.full }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes \
+              ${HETZNER_USER}@${HETZNER_HOST} \
+              "SHA=${SHA} FULL_SHA=${FULL_SHA} PROD_DIR=${PROD_DIR} bash -se" <<'REMOTE'
+          set -euo pipefail
+          cd "${PROD_DIR}/deploy"
+          [ -f .env ] && cp .env ".env.bak.$(date +%s)"
+          {
+            echo "# Written by pipeline.yml — do not edit by hand"
+            echo "# Commit: ${FULL_SHA}"
+            echo "# At:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "BRANCHWORK_VERSION=${SHA}"
+          } > .env
+          cd "${PROD_DIR}"
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml pull
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml up -d
+          REMOTE
+      - name: Verify post-deploy health
+        id: post
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            resp=$(curl -sf --max-time 5 https://branchwork.dev/health || echo '')
+            if [ -n "$resp" ]; then
+              uptime=$(echo "$resp" | jq -r '.uptimeSeconds // -1')
+              echo "Post-deploy /health: $resp"
+              echo "uptime=$uptime" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "[$i/60] /health not 200 yet…"
+            sleep 5
+          done
+          echo "::error::/health did not return 200 within 5 minutes"
+          exit 1
+      - name: Verify running image matches target SHA
+        env:
+          SHA: ${{ steps.target.outputs.short }}
+        run: |
+          set -euo pipefail
+          running=$(ssh -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes \
+              ${HETZNER_USER}@${HETZNER_HOST} \
+              "cd ${PROD_DIR} && docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml ps --format '{{.Image}}' branchwork")
+          echo "Running image: $running"
+          if [[ "$running" != *":${SHA}" ]]; then
+            echo "::error::Running image '$running' does not end in ':${SHA}'"
+            exit 1
+          fi
+      - name: Verify WS connections recovered
+        run: |
+          set -euo pipefail
+          pre_ws='${{ steps.pre.outputs.ws }}'
+          pre_uptime='${{ steps.pre.outputs.uptime }}'
+          post_uptime='${{ steps.post.outputs.uptime }}'
+          if [ "$pre_ws" = "0" ] || [ -z "$pre_ws" ]; then
+            echo "No WS connections pre-deploy; skipping reconnect check"
+            exit 0
+          fi
+          if [ "$post_uptime" -ge "$pre_uptime" ]; then
+            echo "No container recreate; skipping reconnect check"
+            exit 0
+          fi
+          for i in $(seq 1 12); do
+            after_ws=$(curl -sf --max-time 5 https://branchwork.dev/health | jq -r '.wsConnections // 0')
+            if [ "$after_ws" -gt 0 ]; then
+              echo "WS reconnected: $after_ws (was $pre_ws pre-deploy)"
+              exit 0
+            fi
+            echo "[$i/12] waiting for WS reconnect (currently $after_ws)…"
+            sleep 5
+          done
+          echo "::error::No WS clients reconnected within 60s (had $pre_ws before)"
+          exit 1
