@@ -221,6 +221,14 @@ async fn run_server(cli: Cli) {
     // HTTP listener readiness probe is not blocked by the per-row dispatch.
     ci::spawn_backfill(state.clone());
 
+    // One-shot startup backfill (Phase 3.2): for every auto-mode merge in
+    // the last 30 days that landed without a corresponding `ci_runs` row,
+    // dispatch the gh lookup and INSERT the resulting verdict so the
+    // dashboard's per-task CI badge populates without operator action.
+    // Idempotent at the row level (keyed on plan/task/SHA); no settings
+    // gate needed.
+    ci::spawn_backfill_missing_ci_runs(state.clone());
+
     // Start the auto-mode idle poller (drivers without a Stop hook fall
     // back to a 60 s tick + idle threshold). Off by default; set
     // `BRANCHWORK_AUTO_FINISH_IDLE=1` to enable. Env vars are read once

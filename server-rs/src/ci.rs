@@ -867,6 +867,249 @@ fn set_backfill_gate(db: &Db) {
     .ok();
 }
 
+// ── Backfill: insert missing ci_runs rows for auto-mode merges ──────────────
+
+/// Lookback window for the missing-rows backfill. Any merge audit row older
+/// than this is skipped so a long-lived install doesn't spam the GitHub API
+/// on every boot. Tuned per the task brief.
+const MISSING_BACKFILL_LOOKBACK_DAYS: i64 = 30;
+
+/// Spawn a one-shot startup scan that backfills `ci_runs` rows for
+/// auto-mode merges that left the dashboard's per-task CI badge empty.
+///
+/// Before the auto-mode → CI wiring landed, every task merged through
+/// the auto-mode loop completed without inserting a `ci_runs` row,
+/// even when CI ran on the resulting commit on origin. This scan
+/// walks the `audit_logs.action = 'auto_mode.merged'` rows from the
+/// last [`MISSING_BACKFILL_LOOKBACK_DAYS`] days and, for each one
+/// that lacks a corresponding `ci_runs` row (keyed on
+/// `(plan_name, task_number, commit_sha)`), dispatches the existing
+/// aggregate-aware GH lookup and INSERTs the resulting verdict.
+///
+/// Idempotent at the row level: re-running on a fresh boot sees the
+/// rows it already inserted and skips them. No settings-gate is
+/// needed — the 30-day window is the cost bound.
+pub fn spawn_backfill_missing_ci_runs(state: AppState) {
+    tokio::spawn(async move {
+        backfill_missing_ci_runs(state).await;
+    });
+}
+
+/// Per-row idempotent: skip when a `ci_runs` row already exists for the
+/// `(plan_name, task_number, commit_sha)` triple. Dispatch failures
+/// (runner offline, malformed reply, no gh runs for the SHA) leave the
+/// audit row alone so the next boot can retry. Logs one line per row
+/// (insert / skip / no-runs / offline) so an operator can spot gaps.
+pub async fn backfill_missing_ci_runs(state: AppState) {
+    // Parsed shape of one `auto_mode.merged` audit row that survived
+    // the diff-JSON parse. `agent_id` comes from `resource_id`
+    // (audit::resources::AGENT was passed to `audit::log` at the emit
+    // site in `auto_mode::run_merge_step`). `org_id` comes straight
+    // off the audit row so we don't need a JOIN through `agents`.
+    struct MergeRow {
+        agent_id: Option<String>,
+        org_id: String,
+        plan_name: String,
+        task_number: String,
+        commit_sha: String,
+        target_branch: Option<String>,
+    }
+
+    let rows: Vec<MergeRow> = {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT resource_id, org_id, diff FROM audit_logs \
+             WHERE action = ?1 \
+               AND created_at >= datetime('now', ?2) \
+             ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[ci-backfill-missing] prepare failed: {e}");
+                return;
+            }
+        };
+        let lookback = format!("-{MISSING_BACKFILL_LOOKBACK_DAYS} days");
+        let raw: Vec<(Option<String>, String, Option<String>)> = stmt
+            .query_map(
+                params![crate::auto_mode::actions::AUTO_MODE_MERGED, lookback],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_default();
+        raw.into_iter()
+            .filter_map(|(agent_id, org_id, diff)| {
+                let diff = diff?;
+                let v: serde_json::Value = serde_json::from_str(&diff).ok()?;
+                let plan_name = v.get("plan")?.as_str()?.to_string();
+                let task_number = v.get("task")?.as_str()?.to_string();
+                let commit_sha = v.get("sha")?.as_str()?.to_string();
+                let target_branch = v.get("target").and_then(|t| t.as_str()).map(String::from);
+                Some(MergeRow {
+                    agent_id,
+                    org_id,
+                    plan_name,
+                    task_number,
+                    commit_sha,
+                    target_branch,
+                })
+            })
+            .collect()
+    };
+
+    let total = rows.len();
+    eprintln!(
+        "[ci-backfill-missing] starting: {total} merge audit row(s) in last {MISSING_BACKFILL_LOOKBACK_DAYS} days"
+    );
+
+    // Resolve project dirs once; used to derive `run_url` for inserted rows.
+    // In SaaS mode this is empty (the agent's cwd lives on the runner), and
+    // `derive_run_url` returns None — same behaviour as `poll_once`.
+    let project_dirs = resolve_project_dirs(&state.plans_dir, &state.db);
+
+    let mut inserted = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut skipped_no_runs = 0usize;
+    let mut offline = 0usize;
+
+    for row in rows {
+        // Idempotency check: skip if a ci_runs row already exists for
+        // this (plan, task, sha) triple. Subsequent boots see the row
+        // we just inserted and short-circuit here.
+        let exists = {
+            let conn = state.db.lock().unwrap();
+            conn.query_row(
+                "SELECT 1 FROM ci_runs \
+                 WHERE plan_name = ?1 AND task_number = ?2 AND commit_sha = ?3 \
+                 LIMIT 1",
+                params![row.plan_name, row.task_number, row.commit_sha],
+                |_| Ok(()),
+            )
+            .is_ok()
+        };
+        if exists {
+            skipped_existing += 1;
+            continue;
+        }
+
+        let aggregate = match get_ci_run_status_dispatch(
+            &state,
+            &row.org_id,
+            &row.plan_name,
+            &row.task_number,
+            &row.commit_sha,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(CiStatusError::Rpc(e)) => {
+                // Runner offline / timeout — leave the audit row alone.
+                // Next boot retries within the lookback window.
+                eprintln!(
+                    "[ci-backfill-missing] {}/{}: runner offline, leaving audit row untouched: {e}",
+                    row.plan_name, row.task_number
+                );
+                offline += 1;
+                continue;
+            }
+            Err(CiStatusError::InvalidResponse) => {
+                eprintln!(
+                    "[ci-backfill-missing] {}/{}: dispatch returned an unexpected reply variant",
+                    row.plan_name, row.task_number
+                );
+                continue;
+            }
+        };
+
+        let Some(agg) = aggregate else {
+            // No gh runs for this SHA. Either the merge target wasn't
+            // the canonical default branch (so no workflow fired —
+            // see `should_record_ci_run`), or gh is unavailable.
+            // Nothing to write; the audit row stays without a sibling
+            // `ci_runs` row, which is the correct end state.
+            eprintln!(
+                "[ci-backfill-missing] {}/{}: sha {} has no gh runs — skipping",
+                row.plan_name, row.task_number, row.commit_sha
+            );
+            skipped_no_runs += 1;
+            continue;
+        };
+
+        let new_status = normalize(Some(&agg.status), agg.conclusion.as_deref());
+        let new_run_id = agg.failing_run_id.as_deref();
+        let run_url = new_run_id.and_then(|id| {
+            project_dirs
+                .get(&row.plan_name)
+                .and_then(|d| derive_run_url(d, id))
+        });
+        let branch = row.target_branch.as_deref();
+
+        let new_row_id = {
+            let conn = state.db.lock().unwrap();
+            match conn.execute(
+                "INSERT INTO ci_runs \
+                   (plan_name, task_number, agent_id, provider, commit_sha, branch, \
+                    status, conclusion, run_id, run_url, org_id) \
+                 VALUES (?1, ?2, ?3, 'github', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    row.plan_name,
+                    row.task_number,
+                    row.agent_id,
+                    row.commit_sha,
+                    branch,
+                    new_status,
+                    agg.conclusion.as_deref(),
+                    new_run_id,
+                    run_url.as_deref(),
+                    row.org_id,
+                ],
+            ) {
+                Ok(_) => Some(conn.last_insert_rowid()),
+                Err(e) => {
+                    eprintln!(
+                        "[ci-backfill-missing] {}/{}: insert failed: {e}",
+                        row.plan_name, row.task_number
+                    );
+                    None
+                }
+            }
+        };
+
+        let Some(id) = new_row_id else {
+            continue;
+        };
+
+        // Broadcast so any connected dashboard sees the backfilled badge
+        // without having to refetch the full plan view.
+        broadcast_event(
+            &state.broadcast_tx,
+            "ci_status_changed",
+            serde_json::json!({
+                "id": id,
+                "plan_name": row.plan_name,
+                "task_number": row.task_number,
+                "status": new_status,
+                "conclusion": agg.conclusion.as_deref(),
+                "run_url": run_url.as_deref(),
+                "run_id": new_run_id,
+                "commit_sha": row.commit_sha,
+            }),
+        );
+        inserted += 1;
+        eprintln!(
+            "[ci-backfill-missing] {}/{}: inserted ci_runs id={id} sha={} → status={new_status}",
+            row.plan_name, row.task_number, row.commit_sha
+        );
+    }
+
+    eprintln!(
+        "[ci-backfill-missing] done: {inserted}/{total} inserted, \
+         {skipped_existing} already had rows, \
+         {skipped_no_runs} had no gh runs, \
+         {offline} skipped (runner offline)"
+    );
+}
+
 /// Resolve the on-disk directory for a single plan. Mirrors the per-plan
 /// lookup inside [`resolve_project_dirs`] but cheaper when the caller only
 /// needs one plan — used by the failure-log endpoint.
@@ -2003,5 +2246,451 @@ mod tests {
             "second pass must not run while gate is set"
         );
         assert_eq!(run_id.as_deref(), Some("legacy-docker-id"));
+    }
+
+    // ── Backfill regression (Phase 3.2): for every auto-mode merge in
+    // the last 30 days that landed without a corresponding `ci_runs`
+    // row, INSERT a new row keyed on (plan, task, sha). Idempotent at
+    // the row level — re-running on a fresh boot is a no-op.
+
+    /// Seed an in-memory DB with the bare schema the missing-rows
+    /// backfill touches: runners (so `org_has_runner` returns true and
+    /// dispatch routes through the runner mock), audit_logs (the
+    /// source of merge audit rows), ci_runs (the insertion target),
+    /// and settings (unused by this backfill but kept so the shared
+    /// helpers don't panic if exercised). One runner row is inserted
+    /// so the SaaS branch fires.
+    fn missing_backfill_db(org_id: &str, runner_id: &str) -> Db {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runners ( \
+               id TEXT PRIMARY KEY, name TEXT, org_id TEXT, status TEXT, \
+               hostname TEXT, version TEXT, last_seen_at TEXT, \
+               created_at TEXT \
+             ); \
+             CREATE TABLE agents ( \
+               id TEXT PRIMARY KEY, plan_name TEXT, task_id TEXT, \
+               org_id TEXT, cwd TEXT \
+             ); \
+             CREATE TABLE ci_runs ( \
+               id INTEGER PRIMARY KEY AUTOINCREMENT, plan_name TEXT, \
+               task_number TEXT, agent_id TEXT, provider TEXT, \
+               commit_sha TEXT, branch TEXT, status TEXT, \
+               conclusion TEXT, run_url TEXT, run_id TEXT, \
+               created_at TEXT DEFAULT (datetime('now')), \
+               updated_at TEXT DEFAULT (datetime('now')), \
+               failure_log TEXT, dismissed_at TEXT, org_id TEXT \
+             ); \
+             CREATE TABLE audit_logs ( \
+               id INTEGER PRIMARY KEY AUTOINCREMENT, \
+               org_id TEXT NOT NULL, user_id TEXT, user_email TEXT, \
+               action TEXT NOT NULL, resource_type TEXT NOT NULL, \
+               resource_id TEXT, diff TEXT, \
+               created_at TEXT NOT NULL DEFAULT (datetime('now')) \
+             ); \
+             CREATE TABLE settings ( \
+               key TEXT PRIMARY KEY, value TEXT \
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runners (id, org_id, status, last_seen_at) \
+             VALUES (?1, ?2, 'online', datetime('now'))",
+            params![runner_id, org_id],
+        )
+        .unwrap();
+        Arc::new(StdMutex::new(conn))
+    }
+
+    /// Insert one `auto_mode.merged` audit row with the diff JSON
+    /// shape `auto_mode::run_merge_step` emits in production
+    /// (`{plan, task, sha, target}`). `days_ago = 0` writes
+    /// `datetime('now')`; positive values land the row that many
+    /// days in the past so the 30-day lookback bound is exercisable.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_merge_audit(
+        db: &Db,
+        org_id: &str,
+        agent_id: &str,
+        plan: &str,
+        task: &str,
+        sha: &str,
+        target: &str,
+        days_ago: i64,
+    ) {
+        let diff = serde_json::json!({
+            "plan": plan,
+            "task": task,
+            "sha": sha,
+            "target": target,
+        })
+        .to_string();
+        let conn = db.lock().unwrap();
+        // SQLite's datetime() modifier can't be parameterized; embed
+        // the literal then bind the rest of the row through ?N.
+        let sql = format!(
+            "INSERT INTO audit_logs \
+               (org_id, user_email, action, resource_type, resource_id, diff, created_at) \
+             VALUES (?1, 'branchwork-auto-mode', ?2, ?3, ?4, ?5, datetime('now', '-{days_ago} days'))"
+        );
+        conn.execute(
+            &sql,
+            params![
+                org_id,
+                crate::auto_mode::actions::AUTO_MODE_MERGED,
+                crate::audit::resources::AGENT,
+                agent_id,
+                diff,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Count `ci_runs` rows whose `(plan_name, task_number, commit_sha)`
+    /// matches the triple, regardless of status. Used by the backfill
+    /// tests to assert insert/skip outcomes without coupling to the row id.
+    fn ci_runs_count(db: &Db, plan: &str, task: &str, sha: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM ci_runs \
+             WHERE plan_name = ?1 AND task_number = ?2 AND commit_sha = ?3",
+            params![plan, task, sha],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    /// Acceptance: N audit rows without ci_runs sibs → N rows inserted
+    /// on first boot; subsequent boots produce zero new rows.
+    #[tokio::test]
+    async fn missing_backfill_inserts_n_rows_then_is_idempotent() {
+        let org_id = "org-1";
+        let runner_id = "runner-1";
+        let plan = "auto-push-rebase-on-non-fast-forward";
+
+        let db = missing_backfill_db(org_id, runner_id);
+        // Three auto-mode merges from the last 30 days, all missing
+        // their ci_runs sibling. SHAs are distinct so the (plan, task,
+        // sha) triple is unique per row.
+        seed_merge_audit(
+            &db,
+            org_id,
+            "agent-1",
+            plan,
+            "1.1",
+            "1111111111111111111111111111111111111111",
+            "master",
+            0,
+        );
+        seed_merge_audit(
+            &db,
+            org_id,
+            "agent-2",
+            plan,
+            "1.2",
+            "2222222222222222222222222222222222222222",
+            "master",
+            5,
+        );
+        seed_merge_audit(
+            &db,
+            org_id,
+            "agent-3",
+            plan,
+            "1.3",
+            "3333333333333333333333333333333333333333",
+            "master",
+            29,
+        );
+
+        let runners = new_runner_registry();
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let state = poll_test_app_state(db.clone(), runners, plans_dir.path().to_path_buf());
+
+        backfill_missing_ci_runs(state.clone()).await;
+
+        // Exactly 3 ci_runs rows now exist.
+        let total: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM ci_runs", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(total, 3, "expected exactly 3 inserted rows");
+        assert_eq!(
+            ci_runs_count(&db, plan, "1.1", "1111111111111111111111111111111111111111"),
+            1
+        );
+        assert_eq!(
+            ci_runs_count(&db, plan, "1.2", "2222222222222222222222222222222222222222"),
+            1
+        );
+        assert_eq!(
+            ci_runs_count(&db, plan, "1.3", "3333333333333333333333333333333333333333"),
+            1
+        );
+
+        // Each inserted row carries the responder's verdict: blocking
+        // CI:failure on a SHA whose Docker run succeeded. Pin one row's
+        // status + run_id to confirm the dispatch shaped the insert.
+        let (status, conclusion, run_id, agent_id, branch, org): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status, conclusion, run_id, agent_id, branch, org_id \
+                 FROM ci_runs \
+                 WHERE plan_name = ?1 AND task_number = ?2",
+                params![plan, "1.1"],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(status, "failure");
+        assert_eq!(conclusion.as_deref(), Some("failure"));
+        assert_eq!(run_id.as_deref(), Some("25520540172"));
+        assert_eq!(agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(branch.as_deref(), Some("master"));
+        assert_eq!(org, org_id);
+
+        // Second pass: idempotent. Re-running must add zero rows.
+        backfill_missing_ci_runs(state).await;
+        let after: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM ci_runs", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(
+            after, 3,
+            "re-running backfill must be a no-op once rows exist"
+        );
+    }
+
+    /// Audit rows OLDER than the lookback window are silently
+    /// ignored — keeps GitHub API calls bounded on long-lived installs.
+    #[tokio::test]
+    async fn missing_backfill_skips_audit_rows_older_than_30_days() {
+        let org_id = "org-old";
+        let runner_id = "runner-old";
+        let plan = "ancient-plan";
+
+        let db = missing_backfill_db(org_id, runner_id);
+        seed_merge_audit(
+            &db,
+            org_id,
+            "agent-old",
+            plan,
+            "1.1",
+            "abcdef0000000000000000000000000000000000",
+            "master",
+            45, // > MISSING_BACKFILL_LOOKBACK_DAYS
+        );
+
+        let runners = new_runner_registry();
+        // Responder installed but should never be hit — the audit row
+        // falls outside the lookback window.
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let state = poll_test_app_state(db.clone(), runners, plans_dir.path().to_path_buf());
+
+        backfill_missing_ci_runs(state).await;
+
+        let total: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM ci_runs", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(total, 0, "out-of-window audit rows must not insert");
+    }
+
+    /// When a `ci_runs` row already exists for the (plan, task, sha)
+    /// triple, the audit row is skipped without re-querying gh. The
+    /// existing row is left untouched (the legacy backfill owns
+    /// flipping stale verdicts).
+    #[tokio::test]
+    async fn missing_backfill_skips_when_ci_run_already_exists() {
+        let org_id = "org-existing";
+        let runner_id = "runner-existing";
+        let plan = "already-has-row";
+        let sha = "deadbeef0000000000000000000000000000beef";
+
+        let db = missing_backfill_db(org_id, runner_id);
+        seed_merge_audit(&db, org_id, "agent-x", plan, "2.1", sha, "master", 1);
+        // Pre-existing ci_runs row for the same triple. The status is
+        // intentionally `success` so a stale verdict would be visible
+        // if the new backfill ever re-wrote it.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO ci_runs \
+                   (plan_name, task_number, agent_id, provider, commit_sha, branch, \
+                    status, conclusion, run_id, run_url, org_id) \
+                 VALUES (?1, '2.1', 'agent-x', 'github', ?2, 'master', \
+                         'success', 'success', 'preexisting-run', \
+                         'https://github.com/x/y/actions/runs/preexisting-run', ?3)",
+                params![plan, sha, org_id],
+            )
+            .unwrap();
+        }
+
+        let runners = new_runner_registry();
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let state = poll_test_app_state(db.clone(), runners, plans_dir.path().to_path_buf());
+
+        backfill_missing_ci_runs(state).await;
+
+        // Still exactly one row for this (plan, task, sha) — the
+        // pre-existing one. Status is untouched.
+        let (count, status, run_id): (i64, String, Option<String>) = {
+            let conn = db.lock().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ci_runs \
+                     WHERE plan_name = ?1 AND task_number = '2.1' AND commit_sha = ?2",
+                    params![plan, sha],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+            let (s, r): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT status, run_id FROM ci_runs \
+                     WHERE plan_name = ?1 AND task_number = '2.1' AND commit_sha = ?2",
+                    params![plan, sha],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            (count, s, r)
+        };
+        assert_eq!(count, 1);
+        assert_eq!(status, "success");
+        assert_eq!(run_id.as_deref(), Some("preexisting-run"));
+    }
+
+    /// Runner-offline: dispatch returns `RunnerRpcError::NoConnectedRunner`
+    /// (the registry is empty even though `runners` has a row), the
+    /// backfill leaves the audit row alone, and a SUBSEQUENT boot with
+    /// the responder installed picks the same audit row up and inserts
+    /// the row. This is the explicit retry contract the new backfill
+    /// gets for free by not using a settings-gate.
+    #[tokio::test]
+    async fn missing_backfill_offline_leaves_audit_alone_for_retry() {
+        let org_id = "org-offline";
+        let runner_id = "runner-offline";
+        let plan = "offline-plan";
+        let sha = "1234567890123456789012345678901234567890";
+
+        let db = missing_backfill_db(org_id, runner_id);
+        seed_merge_audit(&db, org_id, "agent-o", plan, "3.1", sha, "master", 1);
+
+        // First pass: no responder. Registry empty → NoConnectedRunner.
+        let runners = new_runner_registry();
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let state =
+            poll_test_app_state(db.clone(), runners.clone(), plans_dir.path().to_path_buf());
+
+        backfill_missing_ci_runs(state.clone()).await;
+        assert_eq!(
+            ci_runs_count(&db, plan, "3.1", sha),
+            0,
+            "runner-offline first pass must not insert a row"
+        );
+
+        // Second pass: responder available. Same audit row → insert lands.
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+        backfill_missing_ci_runs(state).await;
+        assert_eq!(
+            ci_runs_count(&db, plan, "3.1", sha),
+            1,
+            "subsequent boot with runner online must insert the row"
+        );
+    }
+
+    /// Aggregate=None (no gh runs for the SHA — e.g. merge target
+    /// wasn't the canonical default branch so no workflow fired)
+    /// leaves the audit row without a ci_runs sibling. Idempotent: a
+    /// subsequent boot with the same responder still produces no row.
+    #[tokio::test]
+    async fn missing_backfill_no_gh_runs_skips_insert() {
+        let org_id = "org-empty";
+        let runner_id = "runner-empty";
+        let plan = "empty-plan";
+        let sha = "0000111100001111000011110000111100001111";
+
+        let db = missing_backfill_db(org_id, runner_id);
+        seed_merge_audit(&db, org_id, "agent-e", plan, "4.1", sha, "feature/x", 1);
+
+        // Responder that replies with `Ok(None)` — the runner found no
+        // gh runs for this SHA.
+        let runners = new_runner_registry();
+        install_empty_aggregate_responder(&runners, runner_id).await;
+
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let state = poll_test_app_state(db.clone(), runners, plans_dir.path().to_path_buf());
+
+        backfill_missing_ci_runs(state.clone()).await;
+        assert_eq!(
+            ci_runs_count(&db, plan, "4.1", sha),
+            0,
+            "aggregate=None must not insert"
+        );
+
+        // Idempotent: re-run, still no row.
+        backfill_missing_ci_runs(state).await;
+        assert_eq!(ci_runs_count(&db, plan, "4.1", sha), 0);
+    }
+
+    /// Variant of [`install_aggregate_responder`] that replies with
+    /// `Ok(None)` — the runner ran `gh run list` and got an empty
+    /// array back (SHA never triggered a workflow).
+    async fn install_empty_aggregate_responder(registry: &RunnerRegistry, runner_id: &str) {
+        let pending: Arc<
+            Mutex<std::collections::HashMap<String, oneshot::Sender<RunnerResponse>>>,
+        > = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pending_clone = pending.clone();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
+
+        tokio::spawn(async move {
+            while let Some(payload) = cmd_rx.recv().await {
+                let envelope: Envelope = match serde_json::from_str(&payload) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if let WireMessage::GetCiRunStatus { req_id, .. } = envelope.message
+                    && let Some(tx) = pending_clone.lock().await.remove(&req_id)
+                {
+                    let _ = tx.send(RunnerResponse::CiRunStatusResolved(None));
+                }
+            }
+        });
+
+        registry.lock().await.insert(
+            runner_id.to_string(),
+            ConnectedRunner {
+                command_tx: cmd_tx,
+                hostname: None,
+                version: None,
+                drivers: None,
+                pending,
+                server_url: "http://localhost:3100".to_string(),
+            },
+        );
     }
 }
