@@ -2006,11 +2006,19 @@ mod tests {
         seed_agent(&db, "agent-1", &cwd, "p", "1.1", "branchwork/p/1.1");
         enable_auto_mode(&db, "p");
 
-        run_merge_step(&state, "default-org", "agent-1", "p", "1.1").await;
+        let outcome = run_merge_step(&state, "default-org", "agent-1", "p", "1.1").await;
+        let merged_sha = match &outcome {
+            MergeStepOutcome::Merged(sha) => sha.clone(),
+            MergeStepOutcome::Paused => panic!("expected Merged, got Paused"),
+        };
 
         // Trunk SHA advanced — branch was actually merged.
         let master_after = git_head_sha(&cwd);
         assert_ne!(master_before, master_after, "master should advance");
+        assert_eq!(
+            merged_sha, master_after,
+            "MergeStepOutcome::Merged(sha) should carry the new trunk HEAD"
+        );
 
         // Broadcast event "auto_mode_merged" (alongside the inner
         // "agent_branch_merged" that merge_agent_branch_inner emits).
@@ -2031,32 +2039,92 @@ mod tests {
             actions::AUTO_MODE_MERGED
         );
 
-        // ci::trigger_after_merge is spawned by the merge inner; for a
-        // canonical-default merge it pushes + writes a pending ci_runs
-        // row. Poll for the row with a generous deadline — the spawn
-        // races the assertion otherwise, and the chain of shell-outs
-        // (has_remote, default_branch, push) is slow on Windows CI
-        // (every `git` invocation pays MSYS startup cost).
+        // ci::trigger_after_merge is spawned by the merge inner —
+        // run_merge_step and the manual /merge endpoint converge on the
+        // same async post-merge trigger (Phase 3 acceptance: the
+        // downstream ci_runs insert + gh_run_list poll behaves
+        // identically whether the merge came from a human click or
+        // from auto-mode). Poll for the pending row with a generous
+        // deadline — the spawn races the assertion otherwise, and the
+        // chain of shell-outs (has_remote, default_branch, push) is
+        // slow on Windows CI (every `git` invocation pays MSYS startup
+        // cost).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut ci_run_count: i64 = 0;
+        type CiRunRow = (String, String, String, Option<String>, String, i64);
+        let mut row: Option<CiRunRow> = None;
         while std::time::Instant::now() < deadline {
-            ci_run_count = {
+            row = {
                 let conn = db.lock().unwrap();
                 conn.query_row(
-                    "SELECT COUNT(*) FROM ci_runs WHERE plan_name = ?1",
+                    "SELECT provider, status, task_number, commit_sha, plan_name, id \
+                     FROM ci_runs WHERE plan_name = ?1",
                     params!["p"],
-                    |row| row.get::<_, i64>(0),
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, i64>(5)?,
+                        ))
+                    },
                 )
-                .unwrap_or(0)
+                .ok()
             };
-            if ci_run_count > 0 {
+            if row.is_some() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        let (provider, status, task_number, commit_sha, plan_name, ci_row_id) =
+            row.expect("expected ci::trigger_after_merge to insert a pending ci_runs row");
+
+        // Acceptance (a): row has provider='github', status='pending',
+        // commit_sha pinned to the merged SHA returned by run_merge_step.
+        assert_eq!(provider, "github", "provider must be 'github'");
+        assert_eq!(status, "pending", "status must be 'pending'");
+        assert_eq!(task_number, "1.1");
+        assert_eq!(plan_name, "p");
         assert_eq!(
-            ci_run_count, 1,
-            "expected ci::trigger_after_merge to insert a pending ci_runs row"
+            commit_sha.as_deref(),
+            Some(merged_sha.as_str()),
+            "commit_sha must match the MergeStepOutcome::Merged(sha) value"
+        );
+
+        // Sanity: exactly one row, not two — guards against a future
+        // refactor that accidentally spawns trigger_after_merge twice
+        // (once from the inner, once from run_merge_step).
+        let count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM ci_runs WHERE plan_name = ?1",
+                params!["p"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        };
+        assert_eq!(
+            count, 1,
+            "expected exactly one ci_runs row — duplicate trigger would surface here"
+        );
+
+        // Acceptance (b): plan API's per-task lookup (ci::latest_per_task)
+        // now returns a populated CiStatus for task 1.1, so the dashboard's
+        // ciRunId no longer reads as the placeholder '-'.
+        let ci_map = {
+            let conn = db.lock().unwrap();
+            crate::ci::latest_per_task(&conn, "p", &["1.1"])
+        };
+        let ci = ci_map
+            .get("1.1")
+            .expect("latest_per_task should return a CiStatus for task 1.1");
+        assert_eq!(ci.id, ci_row_id, "CiStatus.id must match ci_runs.id");
+        assert_eq!(ci.status, "pending");
+        assert_eq!(ci.commit_sha.as_deref(), Some(merged_sha.as_str()));
+        assert!(
+            ci.via_fix_attempt.is_none(),
+            "first run on canonical task — no fix-attempt rollup yet"
         );
     }
 
