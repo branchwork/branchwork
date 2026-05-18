@@ -249,9 +249,72 @@ pub fn discard_branch_local(cwd: &Path, target: &str, task_branch: &str) -> Resu
     }
 }
 
-/// `git push origin <branch>` in `cwd`. `Err(stderr)` carries the captured
-/// error so the caller can log it.
+/// `git push origin <branch>` in `cwd`. On non-fast-forward rejection (a
+/// sibling agent / parallel CI run pushed to the same branch first), runs
+/// `git pull --rebase --autostash origin <branch>` and retries. Caps at
+/// [`MAX_PUSH_ATTEMPTS`] total attempts; non-non-FF failures (auth, hooks,
+/// permission denied) return immediately without retry. `Err(stderr)`
+/// carries the captured error so the caller can log it.
+///
+/// Caller assumption: HEAD is on `branch`. All current callers either ran
+/// `git checkout <branch>` first (`merge_branch_local`) or are operating
+/// on the branch they just merged. Pulling --rebase on a different branch
+/// would silently rebase the wrong ref.
 pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_PUSH_ATTEMPTS {
+        match try_push_once(cwd, branch) {
+            Ok(()) => {
+                if attempt > 1 {
+                    eprintln!(
+                        "[push-retry] push of {branch} succeeded on attempt {attempt} after rebase"
+                    );
+                }
+                return Ok(());
+            }
+            Err(stderr) => {
+                last_err = stderr.clone();
+                if !is_non_fast_forward_error(&stderr) {
+                    // Not a non-FF rejection — auth failure, hook decline,
+                    // permission denied, etc. Rebase will not fix any of
+                    // these; return immediately so the caller sees the
+                    // original error.
+                    return Err(stderr);
+                }
+                if attempt >= MAX_PUSH_ATTEMPTS {
+                    break;
+                }
+                eprintln!(
+                    "[push-retry] push of {branch} rejected as non-fast-forward (attempt {attempt}); rebasing against origin/{branch}"
+                );
+                if let Err(rebase_err) = rebase_against_origin(cwd, branch) {
+                    // Best-effort abort so we leave a clean tree behind.
+                    // `--autostash` keeps the stash on rebase conflict;
+                    // `git rebase --abort` will not unstash either, but
+                    // leaves the rebase in a non-conflicted state so the
+                    // operator can inspect.
+                    let _ = Command::new("git")
+                        .args(["rebase", "--abort"])
+                        .current_dir(cwd)
+                        .output();
+                    return Err(format!(
+                        "push rejected as non-fast-forward; rebase against origin/{branch} failed: {rebase_err}"
+                    ));
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Cap on the number of `git push` attempts inside [`push_branch_local`].
+/// Initial push counts as attempt 1, so the loop performs at most
+/// `MAX_PUSH_ATTEMPTS - 1 = 2` rebase-and-retry cycles.
+const MAX_PUSH_ATTEMPTS: usize = 3;
+
+/// Single shot of `git push origin <branch>`. Returns the captured stderr on
+/// failure so the caller can pattern-match for non-FF markers.
+fn try_push_once(cwd: &Path, branch: &str) -> Result<(), String> {
     let push = Command::new("git")
         .args(["push", "origin", branch])
         .current_dir(cwd)
@@ -260,6 +323,42 @@ pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<(), String> {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
         Err(e) => Err(format!("failed to run git push: {e}")),
+    }
+}
+
+/// Does the captured `git push` stderr look like a non-fast-forward
+/// rejection that a `git pull --rebase` could plausibly resolve?
+///
+/// Case-insensitive substring match on the three markers git emits:
+/// - `rejected`        — the `[rejected]` ref-update marker
+/// - `non-fast-forward` — the explicit refusal classifier
+/// - `fetch first`     — used when origin has unfetched commits
+///
+/// `rejected` alone also matches pre-receive-hook / branch-protection
+/// rejections that a rebase will not fix; in that case the retry loop
+/// will burn up to two extra attempts before bubbling the same error.
+/// That's an intentional trade-off — the spec explicitly lists `rejected`
+/// as one of the markers, and the loud-eventually behaviour is still
+/// correct.
+fn is_non_fast_forward_error(stderr: &str) -> bool {
+    let s = stderr.to_lowercase();
+    s.contains("non-fast-forward") || s.contains("fetch first") || s.contains("rejected")
+}
+
+/// `git pull --rebase --autostash origin <branch>`. `--autostash` is the
+/// defence-in-depth safeguard against a sibling agent leaving worktree
+/// modifications during the merge step — the dirty-tree check upstream
+/// should have caught that, but if it didn't, we don't want a clean push
+/// to fail just because of stray writes.
+fn rebase_against_origin(cwd: &Path, branch: &str) -> Result<(), String> {
+    let pull = Command::new("git")
+        .args(["pull", "--rebase", "--autostash", "origin", branch])
+        .current_dir(cwd)
+        .output();
+    match pull {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => Err(format!("failed to run git pull --rebase: {e}")),
     }
 }
 
@@ -548,5 +647,212 @@ mod tests {
         assert!(matches!(outcome, MergeOutcome::Conflict { .. }));
         // No leftover MERGE_HEAD.
         assert!(!dir.path().join(".git/MERGE_HEAD").exists());
+    }
+
+    // ── push_branch_local: non-FF rebase + retry ────────────────────────────
+    //
+    // Phase 1 / Task 1.1 of the auto-push-rebase-on-non-fast-forward plan.
+    // The classic race: a sibling agent / auto-bump job pushes to origin
+    // between our merge and our push. The bare-helper level must absorb
+    // that race so the auto-mode loop doesn't pause on every parallel push.
+
+    /// Configure a freshly-cloned working tree so `git commit` works without
+    /// inheriting the operator's `user.email` / `user.name`.
+    fn configure_identity(cwd: &Path, email: &str, name: &str) {
+        for args in [
+            vec!["config", "user.email", email],
+            vec!["config", "user.name", name],
+        ] {
+            let ok = Command::new("git")
+                .args(args.as_slice())
+                .current_dir(cwd)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git config {args:?} failed");
+        }
+    }
+
+    /// Add a file with `body` and commit with `msg` in `cwd`.
+    fn commit_file(cwd: &Path, name: &str, body: &str, msg: &str) {
+        std::fs::write(cwd.join(name), body).unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed in {}", cwd.display());
+        };
+        run(&["add", name]);
+        run(&["commit", "-m", msg]);
+    }
+
+    /// `git log --format=%s <branch>` parsed into a `Vec<String>` of subjects.
+    /// Most-recent-first, matching `git log` default order.
+    fn log_subjects(cwd: &Path, refspec: &str) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["log", "--format=%s", refspec])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git log {refspec} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn push_branch_local_rebases_on_non_fast_forward() {
+        // Acceptance scenario verbatim from the task brief:
+        //   - spawn a bare origin
+        //   - push commit A from local-a
+        //   - in parallel clone local-b push commit B (origin now ahead)
+        //   - call push_branch_local from local-a on a new commit C
+        //   - assert C lands cleanly and origin sees A -> B -> C-after-rebase
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let local_a = tmp.path().join("local-a");
+        let local_b = tmp.path().join("local-b");
+
+        // Bare origin, default branch master.
+        let ok = Command::new("git")
+            .args(["init", "--bare", "-b", "master"])
+            .arg(&origin)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init --bare failed");
+
+        // Clone to local-a, commit A, push.
+        let ok = Command::new("git")
+            .args([
+                "clone",
+                origin.to_string_lossy().as_ref(),
+                local_a.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "clone to local-a failed");
+        configure_identity(&local_a, "a@t", "agent-a");
+        commit_file(&local_a, "a.txt", "A\n", "A");
+        assert!(
+            push_branch_local(&local_a, "master").is_ok(),
+            "first push (A) should succeed"
+        );
+
+        // Clone to local-b (parallel agent), commit B, push.
+        let ok = Command::new("git")
+            .args([
+                "clone",
+                origin.to_string_lossy().as_ref(),
+                local_b.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "clone to local-b failed");
+        configure_identity(&local_b, "b@t", "agent-b");
+        commit_file(&local_b, "b.txt", "B\n", "B");
+        assert!(
+            push_branch_local(&local_b, "master").is_ok(),
+            "second push (B from parallel clone) should succeed"
+        );
+        // Origin now at A -> B; local-a still at A.
+
+        // local-a makes commit C on top of A and pushes — should detect
+        // non-FF, rebase onto origin/master (= B), and push cleanly.
+        commit_file(&local_a, "c.txt", "C\n", "C");
+        let result = push_branch_local(&local_a, "master");
+        assert!(
+            result.is_ok(),
+            "third push (C, with rebase) should succeed: {result:?}"
+        );
+
+        // Origin should now see A -> B -> C-after-rebase in linear history.
+        // git log default ordering is newest-first.
+        let subjects = log_subjects(&origin, "master");
+        assert_eq!(
+            subjects,
+            vec!["C".to_string(), "B".to_string(), "A".to_string()],
+            "expected linear history A -> B -> C, got {subjects:?}"
+        );
+
+        // All three files should be present in the final tree.
+        let ls = Command::new("git")
+            .args(["ls-tree", "--name-only", "-r", "master"])
+            .current_dir(&origin)
+            .output()
+            .unwrap();
+        let files: std::collections::HashSet<String> = String::from_utf8_lossy(&ls.stdout)
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            assert!(
+                files.contains(name),
+                "expected {name} in origin tree, got {files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_branch_local_does_not_retry_on_non_non_ff_error() {
+        // Auth failures, hook declines, permission denied — none of these
+        // are fixable by a rebase, so the retry loop must NOT swallow N
+        // attempts trying. Simulate by pushing to a non-existent remote
+        // URL: the failure isn't tagged as non-FF, so we should see
+        // exactly one push attempt and immediate failure.
+        let tmp = TempDir::new().unwrap();
+        git_init_with_commit(tmp.path(), "master");
+        // Set origin to a path that does not exist — git will fail with
+        // "fatal: '<path>' does not appear to be a git repository" or
+        // "could not read from remote repository". Neither contains any
+        // of the non-FF markers (rejected / non-fast-forward / fetch
+        // first), so the loop must bail out after attempt 1.
+        let bogus = tmp.path().join("nope.git");
+        let ok = Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(&bogus)
+            .current_dir(tmp.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git remote add failed");
+
+        let result = push_branch_local(tmp.path(), "master");
+        assert!(result.is_err(), "push to bogus remote should fail");
+        let err = result.unwrap_err();
+        // Sanity check: the error should NOT include our retry banner
+        // (which would only show up if the loop tried to rebase).
+        assert!(
+            !err.to_lowercase().contains("rebase against origin"),
+            "did not expect rebase-failure formatting on a non-non-FF error: {err}"
+        );
+    }
+
+    #[test]
+    fn is_non_fast_forward_error_recognises_canonical_markers() {
+        // Pin the three markers the brief enumerates (rejected,
+        // non-fast-forward, fetch first). A reword in any of git's
+        // localized strings would break the retry signal — anchor here
+        // first.
+        let canonical_non_ff = "To /tmp/origin.git\n ! [rejected]        master -> master (non-fast-forward)\nerror: failed to push some refs to '/tmp/origin.git'\n";
+        let fetch_first = "To /tmp/origin.git\n ! [rejected]        master -> master (fetch first)\nerror: failed to push some refs to '/tmp/origin.git'\n";
+        let auth = "fatal: Authentication failed for 'https://example.com/repo.git/'\n";
+        let no_remote = "fatal: '/tmp/nope.git' does not appear to be a git repository\nfatal: Could not read from remote repository.\n";
+
+        assert!(is_non_fast_forward_error(canonical_non_ff));
+        assert!(is_non_fast_forward_error(fetch_first));
+        assert!(!is_non_fast_forward_error(auth));
+        assert!(!is_non_fast_forward_error(no_remote));
+        assert!(!is_non_fast_forward_error(""));
     }
 }
