@@ -24,7 +24,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::db::Db;
-use crate::git_helpers::PushReport;
+use crate::git_helpers::{PushError, PushReport};
 use crate::saas::dispatch::org_has_runner;
 use crate::saas::runner_protocol::{MergeOutcome, WireMessage};
 use crate::saas::runner_rpc::{RunnerRpcError, runner_request_with_registry};
@@ -140,25 +140,29 @@ pub use crate::git_helpers::merge_branch_local;
 /// - Standalone: run [`push_branch_local`] directly.
 ///
 /// Outer `Result` is `Err` only when the SaaS path failed to reach the runner.
-/// Inner `Result<PushReport, String>` is `Ok(PushReport { retries })` on a
+/// Inner `Result<PushReport, PushError>` is `Ok(PushReport { retries })` on a
 /// successful push (with the rebase-retry history; empty vec when the very
-/// first attempt landed cleanly) and `Err(stderr)` when the push itself
-/// failed (no remote, auth error, etc).
+/// first attempt landed cleanly) and `Err(PushError)` when the push itself
+/// failed. The structured [`PushError::RebaseConflict`] variant is what the
+/// auto-mode caller (`ci::trigger_after_merge`) branches on to pause the
+/// plan with reason `auto_push_rebase_conflict`.
 ///
-/// SaaS-mode retry visibility is a known gap: `WireMessage::PushResult`
-/// today carries only `{ok, stderr}`, so any rebase retries the runner
-/// performed are invisible on the server side and the returned
-/// `PushReport.retries` is always empty for SaaS callers. Extending the
-/// wire protocol is tracked as a follow-up; for now, only the standalone
-/// path produces the `auto_push_rebase_retry` audit + `auto_push_rebased`
-/// broadcast.
+/// SaaS-mode visibility is a known gap on two axes: (a) rebase-retry
+/// history is lost because `WireMessage::PushResult` today carries only
+/// `{ok, stderr}`, and (b) rebase conflicts come back as generic
+/// `PushError::Other { stderr }` since the runner can't transmit the
+/// structured `RebaseConflict { files }` over the existing wire shape.
+/// Extending the wire protocol to carry both is tracked as a follow-up;
+/// for now, only the standalone path produces the
+/// `auto_push_rebase_retry` audit + `auto_push_rebased` broadcast and
+/// the `auto_push_rebase_conflict` pause.
 pub async fn push_branch(
     db: &Db,
     runners: &RunnerRegistry,
     org_id: &str,
     cwd: &Path,
     branch: &str,
-) -> Result<Result<PushReport, String>, RunnerRpcError> {
+) -> Result<Result<PushReport, PushError>, RunnerRpcError> {
     if org_has_runner(db, org_id) {
         let req_id = Uuid::new_v4().to_string();
         let msg = WireMessage::PushBranch {
@@ -168,9 +172,9 @@ pub async fn push_branch(
         };
         match runner_request_with_registry(db, runners, org_id, msg, WRITE_TIMEOUT).await? {
             RunnerResponse::PushResult { ok: true, .. } => Ok(Ok(PushReport::default())),
-            RunnerResponse::PushResult { ok: false, stderr } => {
-                Ok(Err(stderr.unwrap_or_else(|| "push failed".to_string())))
-            }
+            RunnerResponse::PushResult { ok: false, stderr } => Ok(Err(PushError::Other {
+                stderr: stderr.unwrap_or_else(|| "push failed".to_string()),
+            })),
             other => unexpected_response("push_result", &other),
         }
     } else {

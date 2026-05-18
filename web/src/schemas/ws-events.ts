@@ -132,6 +132,15 @@ const AutoModePaused = v.object({
     reason: v.string(),
     target: NullishStr,
     runner_id: v.optional(v.string()),
+    /// `auto_push_rebase_conflict` pauses carry the branch that failed
+    /// to push + the conflicting file list captured from
+    /// `git diff --name-only --diff-filter=U` before the rebase abort.
+    /// Wire is capped to the first 10 paths so a pathological N-file
+    /// conflict doesn't blow the WS frame; the audit row carries the
+    /// full list, and `file_count` exposes the real total.
+    branch: v.optional(v.string()),
+    files: v.optional(v.array(v.string())),
+    file_count: v.optional(v.number()),
   }),
 });
 

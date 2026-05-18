@@ -16,9 +16,11 @@ afterEach(() => {
   usePlanStore.setState({
     autoModeRuntimes: {},
     autoPushRebases: {},
+    autoPushRebaseConflicts: {},
     toasts: [],
     plans: [],
     selectedPlan: null,
+    planConfigs: {},
     fetchPlans: planInitial.fetchPlans,
     selectPlan: planInitial.selectPlan,
     patchTaskStatus: planInitial.patchTaskStatus,
@@ -83,6 +85,75 @@ describe("ws-store handleWsMessage", () => {
     });
 
     expect(fetchAgents).toHaveBeenCalledTimes(1);
+  });
+
+  it("auto_mode_paused stashes the rebase-conflict file list when reason matches", () => {
+    // Seed the persistent half so the patchPlanConfig call inside
+    // handleWsMessage can attach `pausedReason` (the action is a no-op
+    // for plans with no existing config row).
+    usePlanStore.setState({
+      planConfigs: {
+        p: {
+          autoAdvance: false,
+          autoMode: true,
+          maxFixAttempts: 3,
+          pausedReason: null,
+          parallel: false,
+          runnerId: null,
+          runnerFailover: "pause",
+        },
+      },
+    });
+
+    handleWsMessage({
+      type: "auto_mode_paused",
+      data: {
+        plan: "p",
+        task: "1.3",
+        reason: "auto_push_rebase_conflict",
+        target: null,
+        branch: "master",
+        files: ["Cargo.toml", "src/lib.rs"],
+        file_count: 2,
+      },
+    });
+    const conflict = usePlanStore.getState().autoPushRebaseConflicts["p"];
+    expect(conflict).toEqual({
+      branch: "master",
+      files: ["Cargo.toml", "src/lib.rs"],
+      fileCount: 2,
+    });
+    // PausedReason is also patched on the persistent half so the banner
+    // survives a page reload (without the file list).
+    expect(usePlanStore.getState().planConfigs["p"]?.pausedReason).toBe(
+      "auto_push_rebase_conflict",
+    );
+  });
+
+  it("auto_mode_paused does NOT stash conflict files for unrelated reasons", () => {
+    handleWsMessage({
+      type: "auto_mode_paused",
+      data: {
+        plan: "p",
+        task: "1.3",
+        reason: "merge_conflict",
+        target: null,
+      },
+    });
+    expect(usePlanStore.getState().autoPushRebaseConflicts["p"]).toBeUndefined();
+  });
+
+  it("auto_mode_resumed clears the rebase-conflict stash", () => {
+    usePlanStore.setState({
+      autoPushRebaseConflicts: {
+        p: { branch: "master", files: ["Cargo.toml"], fileCount: 1 },
+      },
+    });
+    handleWsMessage({
+      type: "auto_mode_resumed",
+      data: { plan: "p", last_completed_task: null },
+    });
+    expect(usePlanStore.getState().autoPushRebaseConflicts["p"]).toBeUndefined();
   });
 
   it("sets auto_finishing pill state on auto_finish_triggered", () => {

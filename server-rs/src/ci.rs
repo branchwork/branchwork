@@ -196,7 +196,50 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
                 );
             }
         }
-        Ok(Err(stderr)) => {
+        Ok(Err(crate::git_helpers::PushError::RebaseConflict { files })) => {
+            // Same-line overlap between the rebased commit and a commit
+            // on origin (auto-bump bumped Cargo.toml line 3 while the
+            // task agent also edited line 3 is the canonical case).
+            // `push_branch_local` already aborted the rebase, so the
+            // worktree is clean. Pause the plan with the dedicated
+            // `auto_push_rebase_conflict` reason so the dashboard banner
+            // can surface the conflicting files and the operator can
+            // resolve them by hand.
+            eprintln!(
+                "[ci] push of {source_branch} failed: rebase conflict in {} file(s) — pausing plan {plan_name}",
+                files.len()
+            );
+            let reason = "auto_push_rebase_conflict";
+            crate::db::auto_mode_pause(&db, &plan_name, reason);
+            let payload = serde_json::json!({
+                "plan": plan_name,
+                "task": task_number,
+                "reason": reason,
+                "branch": source_branch,
+                // Sorted + deduped by `collect_conflicting_files`. Capped
+                // to a sane preview length on the wire so a pathological
+                // 10k-file conflict doesn't blow the WS frame; the audit
+                // row carries the full list.
+                "files": files.iter().take(10).cloned().collect::<Vec<_>>(),
+                "file_count": files.len(),
+            });
+            broadcast_event(&broadcast_tx, "auto_mode_paused", payload.clone());
+            {
+                let conn = db.lock().unwrap();
+                crate::audit::log(
+                    &conn,
+                    &org_id,
+                    None,
+                    Some("branchwork-auto-mode"),
+                    crate::auto_mode::actions::AUTO_MODE_PAUSED,
+                    crate::audit::resources::PLAN,
+                    Some(&plan_name),
+                    Some(&payload.to_string()),
+                );
+            }
+            return;
+        }
+        Ok(Err(crate::git_helpers::PushError::Other { stderr })) => {
             eprintln!("[ci] push failed for {source_branch}: {stderr}");
             return;
         }

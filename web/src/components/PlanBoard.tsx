@@ -354,6 +354,7 @@ export function PlanBoard() {
 
       <UncommittedWorkBanner planName={plan.name} />
       <RunnerOfflineBanner planName={plan.name} />
+      <AutoPushRebaseConflictBanner planName={plan.name} />
 
       {/* Tabs: Board (phase cards + filter) vs Settings (per-plan
           ci_blocking_workflows + phase_verification overrides + repo
@@ -1290,6 +1291,79 @@ export function RunnerOfflineBanner({ planName }: { planName: string }) {
   );
 }
 
+/// Banner above the board for the `auto_push_rebase_conflict` pause —
+/// the dedicated reason `ci::trigger_after_merge` writes when a post-
+/// merge `git push` failed as non-fast-forward AND the follow-up
+/// `git pull --rebase` produced CONFLICT (the rebased commit touches
+/// the same lines as a commit on origin; auto-bump bumping `Cargo.toml`
+/// line 3 while the task agent also edited line 3 is the canonical
+/// trigger). The rebase was aborted before this banner rendered, so
+/// the working tree is clean — the operator just needs to resolve the
+/// overlap and click Resume on the pill above.
+///
+/// File list comes from the transient `autoPushRebaseConflicts` slice
+/// in plan-store, populated by the `auto_mode_paused` WS handler. The
+/// persistent half (`pausedReason === "auto_push_rebase_conflict"`)
+/// survives reload; the file list does not, so a reload after the
+/// pause renders the banner with a generic "see audit log" hint.
+export function AutoPushRebaseConflictBanner({ planName }: { planName: string }) {
+  const config = usePlanStore((s) => s.planConfigs[planName] ?? null);
+  const conflict = usePlanStore((s) => s.autoPushRebaseConflicts[planName] ?? null);
+
+  if (config?.pausedReason !== "auto_push_rebase_conflict") return null;
+
+  // `conflict` may be null after a reload (server only persists the
+  // reason, not the file list). The banner still shows, but with the
+  // fallback copy that points the operator at the audit log.
+  const branch = conflict?.branch ?? null;
+  const files = conflict?.files ?? [];
+  const fileCount = conflict?.fileCount ?? files.length;
+  const overflow = fileCount > files.length;
+
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-start gap-3 rounded border border-amber-700/50 bg-amber-900/20 px-4 py-3 text-sm"
+    >
+      <span
+        aria-hidden="true"
+        className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-amber-700/60 text-xs font-bold text-amber-100"
+      >
+        !
+      </span>
+      <div className="flex-1 text-amber-100">
+        <div className="font-medium">
+          Auto-mode paused: post-merge rebase hit a conflict
+          {branch ? (
+            <>
+              {" "}
+              on <span className="font-mono">{branch}</span>
+            </>
+          ) : null}
+          .
+        </div>
+        {files.length > 0 ? (
+          <div className="mt-1 text-amber-200/90">
+            Conflicting file{files.length === 1 ? "" : "s"}:{" "}
+            <span className="font-mono">{files.join(", ")}</span>
+            {overflow ? (
+              <span className="text-amber-200/70"> (+{fileCount - files.length} more)</span>
+            ) : null}
+          </div>
+        ) : (
+          <div className="mt-1 text-amber-200/90">
+            File list not in memory (reload?) — see the Activity log for the full diff.
+          </div>
+        )}
+        <div className="mt-1 text-amber-200/80">
+          Resolve the overlap on the merge target (origin moved while the agent's branch was being
+          merged), then click Resume.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /// Live status pill for the auto-mode loop. Renders alongside the plan
 /// title and reflects the current loop phase via the `auto_mode_state` /
 /// `auto_mode_paused` / `auto_mode_merged` / `auto_mode_fix_spawned` WS
@@ -1467,6 +1541,7 @@ function humanPauseReason(reason: string): string {
   if (reason === "ci_stalled") return "CI stalled";
   if (reason === "runner_offline") return "runner offline";
   if (reason === "agent_left_uncommitted_work") return "uncommitted work";
+  if (reason === "auto_push_rebase_conflict") return "push rebase conflict";
   if (reason.startsWith("merge_failed")) return "merge failed";
   if (reason.startsWith("fix_merge_failed")) return "fix merge failed";
   if (reason.startsWith("fix_spawn_failed")) return "fix spawn failed";

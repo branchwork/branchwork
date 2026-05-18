@@ -171,6 +171,28 @@ export interface AutoPushRebasedPillState {
 /// recent retry, in ms. The brief asks for ~10 s.
 export const AUTO_PUSH_REBASED_PILL_TTL_MS = 10_000;
 
+/// Transient state for the `auto_push_rebase_conflict` banner — the
+/// dedicated pause reason produced by `ci::trigger_after_merge` when a
+/// post-merge rebase hits CONFLICT (the rebased commit touches the same
+/// lines as a commit on origin). Persistent half lives in
+/// `planConfigs[plan].pausedReason === 'auto_push_rebase_conflict'`;
+/// the files list is broadcast-only (not persisted server-side) so the
+/// banner falls back to a generic "see audit log" hint when the user
+/// reloads after the pause.
+export interface AutoPushRebaseConflictState {
+  /// The branch that failed to push — surfaced in the banner copy so
+  /// the operator can `git checkout <branch>` and inspect.
+  branch: string;
+  /// Conflicting paths captured by
+  /// `git diff --name-only --diff-filter=U` before the rebase abort.
+  /// Server caps the wire payload at 10 entries; the full list lives
+  /// in the audit-log diff.
+  files: string[];
+  /// Real total — when `files.length < fileCount`, the banner shows a
+  /// "+ N more" hint and points at the audit log.
+  fileCount: number;
+}
+
 export type ToastKind = "info" | "error" | "success";
 
 /// Optional inline action attached to a toast. When `snapshotId` is set
@@ -271,6 +293,14 @@ interface PlanStore {
   /// recent retry. A burst of N rebases over 8 s renders the pill for
   /// ~18 s total with the count climbing as events arrive.
   autoPushRebases: Record<string, AutoPushRebasedPillState | null>;
+  /// Per-plan transient state for the `auto_push_rebase_conflict`
+  /// banner. Driven by the `auto_mode_paused` WS event when reason
+  /// matches. The persistent half (the pause itself) is in
+  /// `planConfigs[plan].pausedReason`; this slice carries the file
+  /// list that the WS event captured. Reload loses the files (server
+  /// only persists `paused_reason`); the banner shows a generic
+  /// "see audit log" hint in that case.
+  autoPushRebaseConflicts: Record<string, AutoPushRebaseConflictState | null>;
   /// Transient toast queue. Driven by ws-store on destructive
   /// operations (e.g. `plan_deleted` pushes an "Undo" toast). The
   /// renderer reads this slice; auto-dismiss is wired into `pushToast`
@@ -312,6 +342,13 @@ interface PlanStore {
   /// setTimeout the ws-store handler schedules after the TTL elapses
   /// (and from `reset()`). Idempotent — safe to call with no entry.
   clearAutoPushRebased: (planName: string) => void;
+  /// Record the files captured on an `auto_push_rebase_conflict`
+  /// pause so the banner can render them. Passing `null` clears the
+  /// slice — driven by `auto_mode_resumed` (user clicked Resume).
+  setAutoPushRebaseConflict: (
+    planName: string,
+    state: AutoPushRebaseConflictState | null,
+  ) => void;
   pushToast: (toast: PushToastInput) => string;
   dismissToast: (id: string) => void;
   /// DELETE /api/plans/:name (with `?hard=true` when `opts.hard`).
@@ -359,6 +396,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   planConfigs: {},
   autoModeRuntimes: {},
   autoPushRebases: {},
+  autoPushRebaseConflicts: {},
   toasts: [],
 
   fetchPlans: () => {
@@ -664,6 +702,18 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     });
   },
 
+  setAutoPushRebaseConflict: (planName, state) => {
+    set((s) => {
+      const next = { ...s.autoPushRebaseConflicts };
+      if (state === null) {
+        delete next[planName];
+      } else {
+        next[planName] = state;
+      }
+      return { autoPushRebaseConflicts: next };
+    });
+  },
+
   pushToast: ({ id, kind, message, action, ttlMs }) => {
     const toastId = id ?? `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     set((s) => ({
@@ -714,6 +764,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       planConfigs: {},
       autoModeRuntimes: {},
       autoPushRebases: {},
+      autoPushRebaseConflicts: {},
       toasts: [],
     });
   },

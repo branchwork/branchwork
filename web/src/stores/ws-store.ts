@@ -474,6 +474,22 @@ function dispatch(msg: WsMessage) {
         task: d.task ?? null,
         reason: d.reason,
       });
+      // `auto_push_rebase_conflict` pauses carry a file list captured
+      // before the rebase abort. Stash it in transient state so the
+      // dashboard banner can name the offending paths. Reload loses
+      // the list (the server only persists `paused_reason`), and the
+      // banner falls back to a "see audit log" hint in that case.
+      if (
+        d.reason === "auto_push_rebase_conflict" &&
+        d.branch !== undefined &&
+        d.files !== undefined
+      ) {
+        planStore.setAutoPushRebaseConflict(d.plan, {
+          branch: d.branch,
+          files: d.files,
+          fileCount: d.file_count ?? d.files.length,
+        });
+      }
       const taskLabel = d.task ? lookupTaskTitle(d.plan, d.task) : "plan";
       notify(
         "auto_mode_paused",
@@ -490,6 +506,7 @@ function dispatch(msg: WsMessage) {
       const d = msg.data;
       planStore.patchPlanConfig(d.plan, { pausedReason: null });
       planStore.setAutoModeRuntime(d.plan, null);
+      planStore.setAutoPushRebaseConflict(d.plan, null);
       break;
     }
     case "plan_runner_affinity_changed": {

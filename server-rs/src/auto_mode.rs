@@ -2063,6 +2063,195 @@ mod tests {
         );
     }
 
+    /// Task 1.3 of auto-push-rebase-on-non-fast-forward: when the
+    /// post-merge push hits a non-FF rejection AND the rebase produces
+    /// CONFLICT (the rebased commit touches the same lines as a commit
+    /// on origin — e.g. auto-bump bumped Cargo.toml line 3 while the
+    /// task agent also edited line 3), the loop must:
+    ///   1. Leave a clean worktree (rebase aborted, no MERGE_HEAD).
+    ///   2. NOT insert a `ci_runs` row (no successful push happened).
+    ///   3. Pause the plan with reason `auto_push_rebase_conflict`.
+    ///   4. Broadcast `auto_mode_paused` carrying the conflicting files.
+    ///   5. Audit `AUTO_MODE_PAUSED` with the same payload (PLAN resource).
+    /// Pins the wiring in `ci::trigger_after_merge`.
+    #[tokio::test]
+    async fn standalone_post_merge_rebase_conflict_pauses_with_files() {
+        let (db, dir) = fresh_db();
+
+        // ─── Bare origin + two clones, but with an OVERLAPPING file
+        //     edit on line 3 of Cargo.toml so the rebase produces a
+        //     CONFLICT instead of cleanly stacking.
+        let origin = dir.path().join("origin.git");
+        let init = Command::new("git")
+            .args(["init", "--bare", "-q", "-b", "master"])
+            .arg(&origin)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        // local-a: workflow + Cargo.toml + initial push.
+        let cwd = dir.path().join("local-a");
+        let ok = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                cwd.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "clone to local-a failed");
+        run_git(&cwd, &["config", "user.email", "a@t.test"]);
+        run_git(&cwd, &["config", "user.name", "agent-a"]);
+        std::fs::create_dir_all(cwd.join(".github").join("workflows")).unwrap();
+        std::fs::write(
+            cwd.join(".github").join("workflows").join("ci.yml"),
+            "name: ci\non: [push]\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        run_git(&cwd, &["add", ".github/workflows/ci.yml", "Cargo.toml"]);
+        run_git(&cwd, &["commit", "-q", "-m", "init"]);
+        run_git(&cwd, &["push", "-q", "-u", "origin", "master"]);
+
+        // local-b races: bump line 3 to 0.2.0 + push (wins race).
+        let local_b = dir.path().join("local-b");
+        let ok = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                local_b.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "clone to local-b failed");
+        run_git(&local_b, &["config", "user.email", "b@t.test"]);
+        run_git(&local_b, &["config", "user.name", "auto-bump"]);
+        std::fs::write(
+            local_b.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        run_git(&local_b, &["add", "Cargo.toml"]);
+        run_git(&local_b, &["commit", "-q", "-m", "auto-bump 0.2.0"]);
+        run_git(&local_b, &["push", "-q", "origin", "master"]);
+
+        // local-a creates a task branch, edits the SAME line to 0.3.0,
+        // commits, and arms a merge. master is still at the pre-race
+        // SHA in local-a's view, so the merge will FF.
+        let task_branch = "branchwork/p/1.3";
+        run_git(&cwd, &["checkout", "-q", "-b", task_branch]);
+        std::fs::write(
+            cwd.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.3.0\"\n",
+        )
+        .unwrap();
+        run_git(&cwd, &["add", "Cargo.toml"]);
+        run_git(&cwd, &["commit", "-q", "-m", "task agent 0.3.0"]);
+        run_git(&cwd, &["checkout", "-q", "master"]);
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        seed_agent(&db, "agent-1", &cwd, "p", "1.3", task_branch);
+        enable_auto_mode(&db, "p");
+
+        run_merge_step(&state, "default-org", "agent-1", "p", "1.3").await;
+
+        // Wait for `trigger_after_merge` (spawned in a tokio task) to
+        // run through the push → non-FF → rebase → CONFLICT → pause
+        // sequence. Done when paused_reason is set; never inserts a
+        // ci_runs row on this path.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut reason: Option<String> = None;
+        let mut ci_run_count: i64 = 0;
+        while std::time::Instant::now() < deadline {
+            reason = paused_reason(&db, "p");
+            {
+                let conn = db.lock().unwrap();
+                ci_run_count = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM ci_runs WHERE plan_name = ?1",
+                        params!["p"],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0);
+            }
+            if reason.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            reason.as_deref(),
+            Some("auto_push_rebase_conflict"),
+            "expected plan to pause with auto_push_rebase_conflict reason, got {reason:?}"
+        );
+        assert_eq!(
+            ci_run_count, 0,
+            "ci_runs row must NOT be inserted when the push fails on rebase conflict"
+        );
+
+        // Worktree must be clean — no MERGE_HEAD, no in-progress rebase.
+        assert!(!cwd.join(".git/MERGE_HEAD").exists());
+        assert!(!cwd.join(".git/rebase-merge").exists());
+        assert!(!cwd.join(".git/rebase-apply").exists());
+
+        // Broadcast: an `auto_mode_paused` event with reason + the
+        // conflicting file list must have fired. Capture the full frames
+        // so we can pin the payload shape, not just the event type.
+        let mut frames: Vec<String> = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            frames.push(msg);
+        }
+        let pause_event = frames
+            .iter()
+            .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+            .find(|v| {
+                v.get("type").and_then(|t| t.as_str()) == Some("auto_mode_paused")
+                    && v["data"].get("reason").and_then(|r| r.as_str())
+                        == Some("auto_push_rebase_conflict")
+            })
+            .expect("expected an auto_mode_paused event with auto_push_rebase_conflict reason");
+        let files = pause_event["data"]["files"]
+            .as_array()
+            .expect("files must be an array");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], "Cargo.toml");
+        assert_eq!(pause_event["data"]["plan"], "p");
+        assert_eq!(pause_event["data"]["task"], "1.3");
+        assert_eq!(pause_event["data"]["branch"], "master");
+
+        // Audit row body: AUTO_MODE_PAUSED logged for resource_id=plan
+        // with the same files payload.
+        let diff_json: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT diff FROM audit_logs \
+                 WHERE action = ?1 AND resource_id = ?2 \
+                 ORDER BY id DESC LIMIT 1",
+                params![crate::auto_mode::actions::AUTO_MODE_PAUSED, "p"],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        };
+        let diff: serde_json::Value =
+            serde_json::from_str(&diff_json.expect("expected an AUTO_MODE_PAUSED audit row"))
+                .unwrap();
+        assert_eq!(diff["reason"], "auto_push_rebase_conflict");
+        assert_eq!(diff["files"][0], "Cargo.toml");
+        assert_eq!(diff["file_count"], 1);
+    }
+
     #[tokio::test]
     async fn standalone_no_commit_pauses_with_merge_failed_reason() {
         let (db, dir) = fresh_db();

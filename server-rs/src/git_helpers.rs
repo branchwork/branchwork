@@ -282,12 +282,75 @@ pub struct PushReport {
     pub retries: Vec<RebaseRetry>,
 }
 
+/// Why a [`push_branch_local`] call failed. Carries enough structure for
+/// the auto-mode caller to pause the plan with a specific reason on the
+/// `RebaseConflict` arm, vs. just logging + bailing on the generic
+/// `Other` arm.
+///
+/// Wire shape (kept stable for `serde_json::to_string` round-trips even
+/// though we don't currently send `PushError` over the wire — the runner
+/// still flattens to `{ok, stderr}`):
+/// `{"code":"rebase_conflict","files":["..."]}` or
+/// `{"code":"other","stderr":"..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum PushError {
+    /// `git pull --rebase` returned CONFLICT (the rebased commit touches
+    /// the same lines as a commit on origin). The rebase was aborted
+    /// before return so the working tree is clean — `files` is the
+    /// conflicting-file list captured *before* the abort via
+    /// `git diff --name-only --diff-filter=U`. Caller should pause
+    /// auto-mode with reason `auto_push_rebase_conflict` and surface
+    /// the file list on the dashboard banner.
+    RebaseConflict {
+        #[serde(default)]
+        files: Vec<String>,
+    },
+    /// Any other push failure: auth denial, missing remote, hook reject,
+    /// non-FF rejection that exhausted the retry budget, or a non-conflict
+    /// rebase-time error (fetch failure, autostash issue, etc). String is
+    /// the captured stderr — caller logs it.
+    Other {
+        #[serde(default)]
+        stderr: String,
+    },
+}
+
+impl PushError {
+    /// True iff this is a structured rebase conflict (the auto-mode
+    /// caller branches on this to pause vs. log).
+    pub fn is_rebase_conflict(&self) -> bool {
+        matches!(self, PushError::RebaseConflict { .. })
+    }
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushError::RebaseConflict { files } => {
+                if files.is_empty() {
+                    f.write_str("push rejected as non-fast-forward; rebase produced conflicts")
+                } else {
+                    write!(
+                        f,
+                        "push rejected as non-fast-forward; rebase conflicts on: {}",
+                        files.join(", ")
+                    )
+                }
+            }
+            PushError::Other { stderr } => f.write_str(stderr),
+        }
+    }
+}
+
 /// `git push origin <branch>` in `cwd`. On non-fast-forward rejection (a
 /// sibling agent / parallel CI run pushed to the same branch first), runs
 /// `git pull --rebase --autostash origin <branch>` and retries. Caps at
 /// [`MAX_PUSH_ATTEMPTS`] total attempts; non-non-FF failures (auth, hooks,
-/// permission denied) return immediately without retry. `Err(stderr)`
-/// carries the captured error so the caller can log it.
+/// permission denied) return immediately without retry. `Err(PushError)`
+/// carries either a structured `RebaseConflict { files }` (caller pauses
+/// auto-mode with reason `auto_push_rebase_conflict`) or `Other { stderr }`
+/// for anything else.
 ///
 /// On success, the returned `PushReport` describes every rebase-then-retry
 /// cycle the helper performed (empty `retries` for a clean first-attempt
@@ -300,7 +363,7 @@ pub struct PushReport {
 /// `git checkout <branch>` first (`merge_branch_local`) or are operating
 /// on the branch they just merged. Pulling --rebase on a different branch
 /// would silently rebase the wrong ref.
-pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<PushReport, String> {
+pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<PushReport, PushError> {
     let mut report = PushReport::default();
     let mut last_err = String::new();
     for attempt in 1..=MAX_PUSH_ATTEMPTS {
@@ -320,7 +383,7 @@ pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<PushReport, String>
                     // permission denied, etc. Rebase will not fix any of
                     // these; return immediately so the caller sees the
                     // original error.
-                    return Err(stderr);
+                    return Err(PushError::Other { stderr });
                 }
                 if attempt >= MAX_PUSH_ATTEMPTS {
                     break;
@@ -339,7 +402,26 @@ pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<PushReport, String>
                             prior_remote_sha,
                         });
                     }
-                    Err(rebase_err) => {
+                    Err(RebaseError::Conflict { files }) => {
+                        // Same-line overlap between the rebased commit and
+                        // a commit on origin (e.g. auto-bump bumped
+                        // Cargo.toml line 3 while the task agent also
+                        // edited line 3). Abort so we leave a clean tree
+                        // behind, then return the structured conflict so
+                        // the auto-mode caller can pause with reason
+                        // `auto_push_rebase_conflict` and surface the
+                        // file list on the dashboard banner.
+                        let _ = Command::new("git")
+                            .args(["rebase", "--abort"])
+                            .current_dir(cwd)
+                            .output();
+                        eprintln!(
+                            "[push-retry] rebase against origin/{branch} produced CONFLICT in {} file(s); aborting and surfacing structured error",
+                            files.len()
+                        );
+                        return Err(PushError::RebaseConflict { files });
+                    }
+                    Err(RebaseError::Other(rebase_err)) => {
                         // Best-effort abort so we leave a clean tree behind.
                         // `--autostash` keeps the stash on rebase conflict;
                         // `git rebase --abort` will not unstash either, but
@@ -349,15 +431,17 @@ pub fn push_branch_local(cwd: &Path, branch: &str) -> Result<PushReport, String>
                             .args(["rebase", "--abort"])
                             .current_dir(cwd)
                             .output();
-                        return Err(format!(
-                            "push rejected as non-fast-forward; rebase against origin/{branch} failed: {rebase_err}"
-                        ));
+                        return Err(PushError::Other {
+                            stderr: format!(
+                                "push rejected as non-fast-forward; rebase against origin/{branch} failed: {rebase_err}"
+                            ),
+                        });
                     }
                 }
             }
         }
     }
-    Err(last_err)
+    Err(PushError::Other { stderr: last_err })
 }
 
 /// Cap on the number of `git push` attempts inside [`push_branch_local`].
@@ -398,6 +482,18 @@ fn is_non_fast_forward_error(stderr: &str) -> bool {
     s.contains("non-fast-forward") || s.contains("fetch first") || s.contains("rejected")
 }
 
+/// Why a `rebase_against_origin` call failed. Internal to `push_branch_local`
+/// — the public surface is [`PushError`].
+enum RebaseError {
+    /// Rebase produced merge conflicts (U-status files visible in the
+    /// working tree before abort). Files are the conflicting paths
+    /// captured via `git diff --name-only --diff-filter=U`.
+    Conflict { files: Vec<String> },
+    /// Anything else: network fetch failure, autostash issue, missing
+    /// branch on origin, etc. String is the captured stderr.
+    Other(String),
+}
+
 /// `git pull --rebase --autostash origin <branch>`. `--autostash` is the
 /// defence-in-depth safeguard against a sibling agent leaving worktree
 /// modifications during the merge step — the dirty-tree check upstream
@@ -417,7 +513,13 @@ fn is_non_fast_forward_error(stderr: &str) -> bool {
 /// the empty string in the corresponding slot rather than failing the
 /// retry — the push itself already succeeded; the diagnostic SHAs are
 /// nice-to-have, not load-bearing.
-fn rebase_against_origin(cwd: &Path, branch: &str) -> Result<(String, String), String> {
+///
+/// On failure, distinguishes [`RebaseError::Conflict`] (U-status files
+/// present — caller surfaces structured error) from
+/// [`RebaseError::Other`] (anything else — caller logs stderr). The
+/// U-file check runs *before* `git rebase --abort` so the caller can
+/// capture the file list and then clean up.
+fn rebase_against_origin(cwd: &Path, branch: &str) -> Result<(String, String), RebaseError> {
     let pull = Command::new("git")
         .args(["pull", "--rebase", "--autostash", "origin", branch])
         .current_dir(cwd)
@@ -429,8 +531,47 @@ fn rebase_against_origin(cwd: &Path, branch: &str) -> Result<(String, String), S
                 git_rev_parse(cwd, &format!("refs/remotes/origin/{branch}")).unwrap_or_default();
             Ok((last_rebase_sha, prior_remote_sha))
         }
-        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).to_string()),
-        Err(e) => Err(format!("failed to run git pull --rebase: {e}")),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            // If the rebase is mid-conflict, there are U-status files in
+            // the index. Capture them BEFORE the caller aborts so the
+            // dashboard banner can name the offending paths.
+            match collect_conflicting_files(cwd) {
+                Some(files) => Err(RebaseError::Conflict { files }),
+                None => Err(RebaseError::Other(stderr)),
+            }
+        }
+        Err(e) => Err(RebaseError::Other(format!(
+            "failed to run git pull --rebase: {e}"
+        ))),
+    }
+}
+
+/// Collect U-status files via `git diff --name-only --diff-filter=U`.
+/// Returns `Some(non_empty_vec)` when the rebase is in conflict state;
+/// `None` for non-conflict failures (clean tree, network error, etc).
+/// `git diff` itself returns 0 on success even with a mid-conflict tree.
+fn collect_conflicting_files(cwd: &Path) -> Option<Vec<String>> {
+    let out = Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if files.is_empty() {
+        None
+    } else {
+        // Stable order for tests + audit-log readability.
+        files.sort();
+        files.dedup();
+        Some(files)
     }
 }
 
@@ -958,12 +1099,213 @@ mod tests {
         let result = push_branch_local(tmp.path(), "master");
         assert!(result.is_err(), "push to bogus remote should fail");
         let err = result.unwrap_err();
-        // Sanity check: the error should NOT include our retry banner
-        // (which would only show up if the loop tried to rebase).
+        // Sanity check: must be the catch-all variant, NOT the structured
+        // rebase-conflict arm — and the stderr should NOT include our
+        // retry banner (which would only show up if the loop tried to
+        // rebase).
         assert!(
-            !err.to_lowercase().contains("rebase against origin"),
-            "did not expect rebase-failure formatting on a non-non-FF error: {err}"
+            !err.is_rebase_conflict(),
+            "auth/missing-remote failures must not be classified as rebase conflicts: {err:?}"
         );
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            !msg.contains("rebase against origin"),
+            "did not expect rebase-failure formatting on a non-non-FF error: {msg}"
+        );
+    }
+
+    #[test]
+    fn push_branch_local_returns_rebase_conflict_with_file_list() {
+        // Task 1.3 of auto-push-rebase-on-non-fast-forward: when the
+        // sibling agent pushed a commit that touches the SAME LINE that
+        // our local commit also touches, `git pull --rebase` produces a
+        // CONFLICT. The helper must abort the rebase, leave a clean
+        // tree, and return `PushError::RebaseConflict { files }` with
+        // the conflicting paths so the auto-mode caller can pause and
+        // the dashboard banner can name them.
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let local_a = tmp.path().join("local-a");
+        let local_b = tmp.path().join("local-b");
+
+        // Bare origin.
+        let ok = Command::new("git")
+            .args(["init", "--bare", "-q", "-b", "master"])
+            .arg(&origin)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init --bare failed");
+
+        // Clone A, seed a shared file, push.
+        let ok = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                local_a.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "clone to local-a failed");
+        configure_identity(&local_a, "a@t", "agent-a");
+        commit_file(
+            &local_a,
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+            "init",
+        );
+        let first =
+            push_branch_local(&local_a, "master").expect("first push (init) should succeed");
+        assert!(first.retries.is_empty(), "init push should be clean");
+
+        // Clone B, bump version on line 3, push (wins the race).
+        let ok = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                local_b.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "clone to local-b failed");
+        configure_identity(&local_b, "b@t", "agent-b");
+        // Auto-bump style change: bump line 3 to 0.2.0.
+        std::fs::write(
+            local_b.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        let run_b = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&local_b)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed in local-b");
+        };
+        run_b(&["add", "Cargo.toml"]);
+        run_b(&["commit", "-q", "-m", "auto-bump 0.2.0"]);
+        push_branch_local(&local_b, "master").expect("bump push from local-b should succeed");
+
+        // local-a edits the SAME line independently — task agent bump
+        // to 0.3.0 — then tries to push. Rebase against origin/master
+        // (= local-b's 0.2.0) overlaps on line 3 → CONFLICT.
+        std::fs::write(
+            local_a.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.3.0\"\n",
+        )
+        .unwrap();
+        let run_a = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&local_a)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed in local-a");
+        };
+        run_a(&["add", "Cargo.toml"]);
+        run_a(&["commit", "-q", "-m", "task agent 0.3.0"]);
+
+        let result = push_branch_local(&local_a, "master");
+        let err = result.expect_err("conflicting push must return Err");
+        match err {
+            PushError::RebaseConflict { files } => {
+                assert_eq!(
+                    files,
+                    vec!["Cargo.toml".to_string()],
+                    "expected Cargo.toml to be the conflicting file"
+                );
+            }
+            other => panic!("expected RebaseConflict, got {other:?}"),
+        }
+
+        // Tree must be CLEAN after the abort — no MERGE_HEAD, no
+        // rebase-merge state directory.
+        assert!(
+            !local_a.join(".git/MERGE_HEAD").exists(),
+            "MERGE_HEAD must not survive the rebase abort"
+        );
+        assert!(
+            !local_a.join(".git/rebase-merge").exists(),
+            ".git/rebase-merge must not survive the rebase abort"
+        );
+        assert!(
+            !local_a.join(".git/rebase-apply").exists(),
+            ".git/rebase-apply must not survive the rebase abort"
+        );
+
+        // HEAD must still be on the local task commit (the abort restores
+        // pre-rebase HEAD). Origin must NOT carry local-a's commit — the
+        // helper returned without re-attempting the push.
+        let head_subject = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["log", "-1", "--format=%s"])
+                .current_dir(&local_a)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(head_subject, "task agent 0.3.0");
+
+        let origin_log = log_subjects(&origin, "master");
+        assert!(
+            !origin_log.contains(&"task agent 0.3.0".to_string()),
+            "origin must not have local-a's commit after a conflict: {origin_log:?}"
+        );
+    }
+
+    #[test]
+    fn push_error_serializes_with_code_tag() {
+        // Wire shape pin — the structured PushError is serialized via
+        // serde tag="code" so any field rename would break a downstream
+        // consumer that parses the JSON form. Keep this test as the
+        // anchor for the schema.
+        let conflict = PushError::RebaseConflict {
+            files: vec!["Cargo.toml".to_string(), "src/lib.rs".to_string()],
+        };
+        let conflict_json = serde_json::to_string(&conflict).unwrap();
+        assert!(
+            conflict_json.contains("\"code\":\"rebase_conflict\""),
+            "expected code=rebase_conflict in {conflict_json}"
+        );
+        assert!(conflict_json.contains("Cargo.toml"));
+        assert!(conflict_json.contains("src/lib.rs"));
+
+        let other = PushError::Other {
+            stderr: "boom".to_string(),
+        };
+        let other_json = serde_json::to_string(&other).unwrap();
+        assert!(
+            other_json.contains("\"code\":\"other\""),
+            "expected code=other in {other_json}"
+        );
+    }
+
+    #[test]
+    fn push_error_display_includes_files_for_conflict() {
+        let with_files = PushError::RebaseConflict {
+            files: vec!["a.rs".to_string(), "b.rs".to_string()],
+        };
+        let s = with_files.to_string();
+        assert!(s.contains("rebase conflicts on"), "{s}");
+        assert!(s.contains("a.rs"));
+        assert!(s.contains("b.rs"));
+
+        let no_files = PushError::RebaseConflict { files: vec![] };
+        assert!(no_files.to_string().contains("rebase produced conflicts"));
+
+        let other = PushError::Other {
+            stderr: "fatal: nope".to_string(),
+        };
+        assert_eq!(other.to_string(), "fatal: nope");
     }
 
     #[test]

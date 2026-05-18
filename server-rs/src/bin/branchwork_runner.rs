@@ -1563,13 +1563,19 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                     })
                     .await;
                     match result {
-                        // SaaS-mode retry visibility is a follow-up: the
-                        // runner discards the `PushReport`, so any rebase
-                        // retries the runner performed don't propagate to
-                        // the server's audit log / WS broadcast. Phase 1.2
-                        // wires the standalone path only.
+                        // SaaS-mode visibility gaps tracked as follow-ups:
+                        // (a) rebase-retry history is discarded — the
+                        //     wire today carries only `{ok, stderr}`.
+                        // (b) `PushError::RebaseConflict { files }`
+                        //     collapses into the same flat stderr string,
+                        //     so the SaaS server treats a runner-side
+                        //     rebase conflict as a generic push failure
+                        //     and does NOT fire the
+                        //     `auto_push_rebase_conflict` pause path.
+                        // Both are intentional for Phase 1; extending
+                        // `PushResult` would un-block the SaaS side.
                         Some(Ok(_report)) => (true, None),
-                        Some(Err(e)) => (false, Some(e)),
+                        Some(Err(e)) => (false, Some(e.to_string())),
                         None => (
                             false,
                             Some(format!(
