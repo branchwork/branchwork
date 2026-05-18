@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
 import { UncommittedWorkBanner } from "./PlanBoard.js";
 import { usePlanStore, type PlanConfig } from "../stores/plan-store.js";
@@ -18,6 +18,18 @@ function defaultConfig(overrides: Partial<PlanConfig> = {}): PlanConfig {
     runnerFailover: "pause",
     ...overrides,
   };
+}
+
+function installFetchMock(
+  handler: (path: string, init?: RequestInit) => Response | Promise<Response>,
+): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === "string" ? input : input.toString();
+      return handler(path, init);
+    }),
+  );
 }
 
 function agent(overrides: Partial<Agent> = {}): Agent {
@@ -52,8 +64,15 @@ function seed(config: PlanConfig | null, agents: Agent[]): void {
   useAgentStore.setState({ agents });
 }
 
+beforeEach(() => {
+  // Default no-op fetch — individual tests override when they exercise
+  // the Resume PUT.
+  vi.stubGlobal("fetch", vi.fn());
+});
+
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   usePlanStore.setState({ planConfigs: {} });
   useAgentStore.setState({ agents: [], selectedAgentId: null });
 });
@@ -157,5 +176,125 @@ describe("UncommittedWorkBanner", () => {
     fireEvent.click(screen.getByRole("button", { name: /Inspect agent/i }));
 
     expect(selectAgentSpy).toHaveBeenCalledWith("task-agent");
+  });
+
+  it("renders the pausedFiles list as a collapsible details block", () => {
+    seed(
+      defaultConfig({
+        pausedReason: "agent_left_uncommitted_work",
+        pausedFiles: ["server.log", "runner.log", "web-dev.log"],
+      }),
+      [],
+    );
+    const { container } = render(<UncommittedWorkBanner planName={PLAN} />);
+
+    // <details><summary>Uncommitted files (3)</summary>…
+    const summary = screen.getByText(/Uncommitted files \(3\)/);
+    expect(summary).toBeTruthy();
+    expect(summary.tagName).toBe("SUMMARY");
+
+    // All three filenames render in the collapsed payload.
+    expect(container.textContent).toContain("server.log");
+    expect(container.textContent).toContain("runner.log");
+    expect(container.textContent).toContain("web-dev.log");
+
+    // One "Mark as operational" button per file.
+    const buttons = screen.getAllByRole("button", { name: /Mark as operational/i });
+    expect(buttons).toHaveLength(3);
+  });
+
+  it("uses singular 'Uncommitted file' for a single entry", () => {
+    seed(
+      defaultConfig({
+        pausedReason: "agent_left_uncommitted_work",
+        pausedFiles: ["server.log"],
+      }),
+      [],
+    );
+    render(<UncommittedWorkBanner planName={PLAN} />);
+    expect(screen.getByText(/Uncommitted file \(1\)/)).toBeTruthy();
+  });
+
+  it("omits the file list when pausedFiles is missing or empty", () => {
+    seed(defaultConfig({ pausedReason: "agent_left_uncommitted_work" }), []);
+    render(<UncommittedWorkBanner planName={PLAN} />);
+    expect(screen.queryByText(/Uncommitted files?/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Mark as operational/i })).toBeNull();
+  });
+
+  it("Resume anyway PUTs pausedReason:null and updates the store", async () => {
+    const updatedConfig = defaultConfig({
+      pausedReason: null,
+      pausedFiles: null,
+    });
+    let observedBody: unknown = null;
+    installFetchMock((path, init) => {
+      if (path === "/api/plans/p1/config" && init?.method === "PUT") {
+        observedBody = JSON.parse(init.body as string);
+        return new Response(JSON.stringify(updatedConfig), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("", { status: 404 });
+    });
+
+    seed(
+      defaultConfig({
+        pausedReason: "agent_left_uncommitted_work",
+        pausedFiles: ["server.log"],
+      }),
+      [],
+    );
+    render(<UncommittedWorkBanner planName={PLAN} />);
+
+    const button = screen.getByRole("button", { name: /Resume anyway/i });
+    await act(async () => {
+      fireEvent.click(button);
+    });
+
+    await waitFor(() => {
+      expect(observedBody).toEqual({ pausedReason: null });
+    });
+    // setPlanConfig wrote the cleared config to the store, so the banner
+    // disappears on the next render.
+    await waitFor(() => {
+      expect(usePlanStore.getState().planConfigs[PLAN]?.pausedReason).toBeNull();
+    });
+  });
+
+  it("clicking Mark as operational opens the modal with a diff preview for the chosen file", async () => {
+    seed(
+      defaultConfig({
+        pausedReason: "agent_left_uncommitted_work",
+        pausedFiles: ["server.log", "runner.log"],
+      }),
+      [],
+    );
+    render(<UncommittedWorkBanner planName={PLAN} />);
+
+    // Modal not in the DOM before any click.
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    // Click the first file's "Mark as operational" button.
+    const buttons = screen.getAllByRole("button", { name: /Mark as operational/i });
+    fireEvent.click(buttons[0]);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toBeTruthy();
+
+    // The dialog explicitly references branchwork.toml and the
+    // chosen file, with a `+`-prefixed addition.
+    expect(dialog.textContent).toContain("branchwork.toml");
+    expect(dialog.textContent).toContain("[auto_mode.dirty_tree]");
+    expect(dialog.textContent).toContain('"server.log"');
+    // The second file's name must NOT appear — modal is per-file.
+    expect(dialog.textContent ?? "").not.toContain("runner.log");
+
+    // Close button dismisses.
+    fireEvent.click(screen.getByRole("button", { name: /^Close$/ }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
   });
 });

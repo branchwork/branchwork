@@ -96,6 +96,14 @@ export interface PlanConfig {
   autoMode: boolean;
   maxFixAttempts: number;
   pausedReason: string | null;
+  /// Trimmed list (≤5) of dirty file paths captured when the auto-mode
+  /// loop paused with reason `agent_left_uncommitted_work` (T3.1 of the
+  /// dirty-tree-check plan). Absent in the JSON for non-dirty-tree pauses
+  /// and for plans that never dirty-tree-paused — server uses
+  /// `skip_serializing_if = "Option::is_none"`, so an undefined field on
+  /// the wire is normal. Cleared on resume by the server-side
+  /// `auto_mode_resume` helper.
+  pausedFiles?: string[] | null;
   /// Per-plan opt-in for fan-out spawn (3.5.2). Toggling to true is rejected
   /// at the API layer with 412 until worktree-per-agent isolation ships
   /// (3.5.3) — the UI renders the switch disabled until then.

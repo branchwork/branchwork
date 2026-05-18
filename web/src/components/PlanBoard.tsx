@@ -1195,11 +1195,25 @@ export function FailoverPicker({
 /// still `running` and the user needs to inspect, then commit/discard,
 /// then click Resume on the pill above. The "Inspect agent" button opens
 /// the running agent's terminal panel so they can do exactly that.
+///
+/// T3.2 of the dirty-tree-check plan: the banner also reads the trimmed
+/// `pausedFiles` list (≤5 paths) that the server captured at pause time
+/// (T3.1) and renders it as a collapsible list. Each file has a
+/// "Mark as operational" button that opens a modal previewing the
+/// `branchwork.toml` ignore-list entry that would silence the false
+/// positive (T2.1 of this plan supplies the matcher; the modal does NOT
+/// write the file — operators copy the snippet manually because in SaaS
+/// mode `branchwork.toml` lives on the runner host, not the server).
+/// "Resume anyway" PUTs `pausedReason: null` to the existing config
+/// endpoint, mirroring the AutoModeStatusPill resume path.
 export function UncommittedWorkBanner({ planName }: { planName: string }) {
   const config = usePlanStore((s) => s.planConfigs[planName] ?? null);
+  const setPlanConfig = usePlanStore((s) => s.setPlanConfig);
   const agents = useAgentStore((s) => s.agents);
   const selectAgent = useAgentStore((s) => s.selectAgent);
   const goToAgent = useGoToAgent();
+  const [resuming, setResuming] = useState(false);
+  const [markFile, setMarkFile] = useState<string | null>(null);
 
   if (config?.pausedReason !== "agent_left_uncommitted_work") return null;
 
@@ -1215,39 +1229,171 @@ export function UncommittedWorkBanner({ planName }: { planName: string }) {
       (a.status === "running" || a.status === "starting"),
   );
 
+  const pausedFiles = config.pausedFiles ?? [];
+
+  async function handleResume() {
+    setResuming(true);
+    try {
+      const cfg = await putJson<PlanConfig>(`/api/plans/${planName}/config`, {
+        pausedReason: null,
+      });
+      setPlanConfig(planName, cfg);
+    } catch (e) {
+      toastError(e, "Resume failed");
+    } finally {
+      setResuming(false);
+    }
+  }
+
   return (
-    <div
-      role="alert"
-      className="mb-4 flex items-start gap-3 rounded border border-red-700/50 bg-red-900/20 px-4 py-3 text-sm"
-    >
-      <span
-        aria-hidden="true"
-        className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-red-700/60 text-xs font-bold text-red-100"
+    <>
+      <div
+        role="alert"
+        className="mb-4 flex items-start gap-3 rounded border border-red-700/50 bg-red-900/20 px-4 py-3 text-sm"
       >
-        !
-      </span>
-      <div className="flex-1 text-red-100">
-        <div className="font-medium">Auto-mode paused: agent left uncommitted work.</div>
-        <div className="mt-0.5 text-red-200/80">
-          Inspect and either commit, discard, or click Resume.
+        <span
+          aria-hidden="true"
+          className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-red-700/60 text-xs font-bold text-red-100"
+        >
+          !
+        </span>
+        <div className="flex-1 text-red-100">
+          <div className="font-medium">Auto-mode paused: agent left uncommitted work.</div>
+          <div className="mt-0.5 text-red-200/80">
+            Inspect and either commit, discard, or click Resume.
+          </div>
+          {pausedFiles.length > 0 && (
+            <details className="mt-2 text-red-200/90">
+              <summary className="cursor-pointer select-none text-xs font-medium text-red-100/90 hover:text-white">
+                Uncommitted file{pausedFiles.length === 1 ? "" : "s"} ({pausedFiles.length})
+              </summary>
+              <ul className="mt-1.5 space-y-1">
+                {pausedFiles.map((file) => (
+                  <li key={file} className="flex items-center justify-between gap-2 text-xs">
+                    <span className="font-mono break-all text-red-100/90">{file}</span>
+                    <button
+                      type="button"
+                      onClick={() => setMarkFile(file)}
+                      className="flex-shrink-0 rounded border border-red-700/60 bg-red-900/30 px-2 py-0.5 text-[11px] text-red-100/90 transition hover:bg-red-800/50 hover:text-white"
+                      title={`Preview adding ${file} to branchwork.toml's ignore list`}
+                    >
+                      Mark as operational
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+        <div className="flex flex-shrink-0 flex-col items-stretch gap-2 self-center sm:flex-row">
+          <button
+            type="button"
+            onClick={() => {
+              if (!runningAgent) return;
+              selectAgent(runningAgent.id);
+              goToAgent(runningAgent.id);
+            }}
+            disabled={!runningAgent}
+            className="flex-shrink-0 rounded border border-red-700/60 bg-red-900/40 px-3 py-1 text-xs text-red-100 transition hover:bg-red-800/50 hover:text-white disabled:opacity-50 disabled:hover:bg-red-900/40 disabled:hover:text-red-100"
+            title={
+              runningAgent
+                ? "Open the agent's terminal panel"
+                : "No running agent found for this plan"
+            }
+          >
+            Inspect agent
+          </button>
+          <button
+            type="button"
+            onClick={handleResume}
+            disabled={resuming}
+            className="flex-shrink-0 rounded border border-red-700/60 bg-red-900/40 px-3 py-1 text-xs text-red-100 transition hover:bg-red-800/50 hover:text-white disabled:opacity-50 disabled:hover:bg-red-900/40 disabled:hover:text-red-100"
+            title="Clear the pause and re-evaluate from the last completed task"
+          >
+            {resuming ? "Resuming..." : "Resume anyway"}
+          </button>
         </div>
       </div>
-      <button
-        type="button"
-        onClick={() => {
-          if (!runningAgent) return;
-          selectAgent(runningAgent.id);
-          goToAgent(runningAgent.id);
-        }}
-        disabled={!runningAgent}
-        className="flex-shrink-0 self-center rounded border border-red-700/60 bg-red-900/40 px-3 py-1 text-xs text-red-100 transition hover:bg-red-800/50 hover:text-white disabled:opacity-50 disabled:hover:bg-red-900/40 disabled:hover:text-red-100"
-        title={
-          runningAgent ? "Open the agent's terminal panel" : "No running agent found for this plan"
-        }
-      >
-        Inspect agent
-      </button>
-    </div>
+      <MarkAsOperationalModal
+        open={markFile !== null}
+        onClose={() => setMarkFile(null)}
+        file={markFile ?? ""}
+      />
+    </>
+  );
+}
+
+/// Modal that previews adding a file path to the
+/// `[auto_mode.dirty_tree].ignore` list in `branchwork.toml`. Preview only
+/// — no write: the file lives on the runner host in SaaS mode and on the
+/// project root in standalone, so the dashboard can't reliably author
+/// edits. The operator copies the snippet and applies it themselves.
+///
+/// Renders a synthetic unified-diff hunk so the user sees exactly the
+/// line that would be added in the context of the section. The proposed
+/// pattern is the path verbatim (gitignore-style: a basename-only
+/// pattern like `server.log` matches the file at any depth, a pattern
+/// with `/` matches the full path — see
+/// `server-rs/src/repo_config.rs::matches_ignore_pattern`).
+export function MarkAsOperationalModal({
+  open,
+  onClose,
+  file,
+}: {
+  open: boolean;
+  onClose: () => void;
+  file: string;
+}) {
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Mark as operational"
+      description="Add this file to branchwork.toml's dirty-tree ignore list so it stops pausing auto-mode."
+      size="2xl"
+      closeOnBackdropClick={true}
+    >
+      <div className="mt-3 space-y-3 text-sm text-gray-200">
+        <div>
+          Edit{" "}
+          <code className="rounded bg-gray-800 px-1.5 py-0.5 font-mono text-xs text-gray-100">
+            branchwork.toml
+          </code>{" "}
+          at the project root and add the line marked{" "}
+          <span className="font-mono text-emerald-400">+</span> below.
+        </div>
+        <pre
+          aria-label="branchwork.toml diff preview"
+          className="overflow-x-auto rounded border border-gray-700 bg-gray-950 p-3 font-mono text-xs leading-relaxed text-gray-200"
+        >
+          <span className="text-gray-500"> </span>
+          <span className="text-gray-300">[auto_mode.dirty_tree]</span>
+          {"\n"}
+          <span className="text-gray-500"> </span>
+          <span className="text-gray-300">ignore = [</span>
+          {"\n"}
+          <span className="text-gray-500"> </span>
+          <span className="text-gray-500">{"    # ...existing patterns..."}</span>
+          {"\n"}
+          <span className="text-emerald-400">+</span>
+          <span className="text-emerald-300">{`    "${file}",`}</span>
+          {"\n"}
+          <span className="text-gray-500"> </span>
+          <span className="text-gray-300">]</span>
+        </pre>
+        <div className="text-xs text-gray-400">
+          Patterns are gitignore-style: <code className="font-mono text-gray-300">basename</code>{" "}
+          matches at any depth; <code className="font-mono text-gray-300">a/b/**</code> matches
+          everything under a directory. Edit the value above if you want a wildcard family (e.g.{" "}
+          <code className="font-mono text-gray-300">*.log</code>) instead of a literal path.
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="ghost" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
