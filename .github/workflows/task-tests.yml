@@ -1,0 +1,32 @@
+name: task-tests
+
+# Pre-merge gate for Branchwork-managed task branches. Each task
+# branch (`branchwork/<plan>/<task>`) needs a green CI run before the
+# auto-mode loop will merge it; this workflow is what produces that
+# verdict.
+#
+# It is intentionally minimal: no classify, no bump, no build, no
+# deploy. Just the reusable `tests.yml` workflow that carries the
+# server / web / e2e jobs (Phase 1.1 of the CI split). The plan's
+# `ciBlockingWorkflows` setting is migrated to `["task-tests"]` in
+# Phase 3.1 so the auto-mode loop polls this workflow's run rather
+# than `pipeline.yml`'s.
+#
+# Phase 2.2 removes the `branchwork/**` trigger from `pipeline.yml`
+# so each task-branch push fires exactly one workflow.
+#
+# `secrets: inherit` forwards GH_PAT + ANTHROPIC_API_KEY through to
+# `tests.yml`, matching the pattern used by `pipeline.yml::tests`.
+
+on:
+  push:
+    branches:
+      - 'branchwork/**'
+  pull_request:
+    branches: [master]
+
+jobs:
+  tests:
+    name: Tests
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit
