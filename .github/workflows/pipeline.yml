@@ -37,15 +37,7 @@ name: Pipeline
 
 on:
   push:
-    branches:
-      - master
-      # Branchwork-managed task branches. The agent pushes each
-      # task's commits to `branchwork/<plan>/<task>` before merging
-      # to master; the plan's `ciBlockingWorkflows` setting wants
-      # a green Pipeline run on the task branch as a pre-merge
-      # gate. Without this glob the workflow never fires on those
-      # branches and auto-mode pauses with `ci_stalled`.
-      - 'branchwork/**'
+    branches: [master]
   pull_request:
     branches: [master]
   workflow_dispatch:
@@ -92,15 +84,12 @@ jobs:
           ref="${{ github.ref }}"
 
           is_master_push=false
-          is_task_branch_push=false
           is_pr=false
           is_dispatch=false
           is_bump=false
           if [[ "$event" == "push" ]]; then
             if [[ "$ref" == "refs/heads/master" ]]; then
               is_master_push=true
-            elif [[ "$ref" == refs/heads/branchwork/* ]]; then
-              is_task_branch_push=true
             fi
           fi
           [[ "$event" == "pull_request" ]]                                     && is_pr=true
@@ -112,13 +101,12 @@ jobs:
           [[ "$is_master_push" == "true" && "$is_bump" != "true" ]] && should_bump=true
 
           # Run server/web/e2e for: PRs, the bump commit on master,
-          # workflow_dispatch, AND every push on a branchwork task
-          # branch (so the plan's pre-merge CI gate gets a verdict).
+          # workflow_dispatch. Task-branch pushes are handled by
+          # `task-tests.yml`, which calls the same `tests.yml`.
           should_test=false
           [[ "$is_pr" == "true" ]] && should_test=true
           [[ "$is_master_push" == "true" && "$is_bump" == "true" ]] && should_test=true
           [[ "$is_dispatch" == "true" ]] && should_test=true
-          [[ "$is_task_branch_push" == "true" ]] && should_test=true
 
           # Build + deploy only on bump-commit master pushes (or
           # explicit dispatch). Task branches don't ship images.
@@ -138,7 +126,7 @@ jobs:
 
           cat <<SUMMARY
           event=$event ref=$ref msg='$msg'
-            is_master_push=$is_master_push is_task_branch_push=$is_task_branch_push is_pr=$is_pr is_dispatch=$is_dispatch is_bump=$is_bump
+            is_master_push=$is_master_push is_pr=$is_pr is_dispatch=$is_dispatch is_bump=$is_bump
             should_bump=$should_bump should_test=$should_test should_build=$should_build should_deploy=$should_deploy
           SUMMARY
 
