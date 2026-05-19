@@ -14,6 +14,7 @@
 //! or has self-paused — checking that gate is cheap and keeps the call
 //! sites unconditional.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -26,6 +27,8 @@ use crate::agents::pty_agent::StartPtyOpts;
 use crate::agents::spawn_ops::start_agent_dispatch;
 use crate::audit;
 use crate::db;
+use crate::plan_parser;
+use crate::repo_config::MergeCadence;
 use crate::saas::dispatch::{
     CiStatusError, fetch_failure_log_dispatch, get_ci_run_status_dispatch,
     has_github_actions_dispatch, merge_agent_branch_dispatch,
@@ -272,6 +275,132 @@ pub async fn on_task_agent_completed(
             run_state_machine(&state, &org_id, &agent_id, &plan_name, &task_id).await;
         }
     });
+}
+
+/// Decide whether auto-mode should merge `completed_task`'s branch right
+/// now, given the plan's effective [`MergeCadence`].
+///
+/// Resolution chain (mirrors `repo_defaults_for` + [`db::plan_merge_cadence`]
+/// in `api/plans.rs` and the `resolveMergeCadence` helper in
+/// `web/src/api/plans.ts`):
+///
+/// 1. Plan-level pin: `plan_auto_mode.merge_cadence` if set
+///    ([`db::plan_merge_cadence`]).
+/// 2. Repo default: `[auto_mode].merge_cadence` from the project's
+///    `branchwork.toml` ([`crate::repo_config::load_for_project_dir`]).
+/// 3. Hard-coded fallback: [`MergeCadence::default()`] (= [`MergeCadence::Phase`]).
+///
+/// Rules per cadence:
+///   - [`MergeCadence::Task`]: always `true` (legacy auto-mode behaviour;
+///     fastest feedback, highest CI volume).
+///   - [`MergeCadence::Phase`]: `true` iff every task in `completed_task`'s
+///     phase has `status IN (completed, skipped)`. `completed_task` itself
+///     is treated as completed (the caller is telling us it just
+///     finished — the corresponding `task_status` write may race the
+///     call).
+///   - [`MergeCadence::Plan`]: `true` iff every task in every phase
+///     satisfies the same rule. With a single-phase plan, this collapses
+///     to the same trigger as [`MergeCadence::Phase`] — accepted per the
+///     plan brief.
+///
+/// `failed` blocks the boundary (and so does `pending` / `in_progress` /
+/// `checking` — any non-done status keeps the predicate `false`). The
+/// operator either fixes the failing task or marks it skipped before the
+/// loop can advance.
+///
+/// Returns `false` defensively when the plan can't be loaded or when
+/// `completed_task` doesn't appear in any phase — auto-mode never
+/// half-merges on incomplete metadata.
+#[allow(dead_code)] // wired in by 2.2+ when the merge-gate consumer lands
+pub fn should_merge_now(state: &AppState, plan_name: &str, completed_task: &str) -> bool {
+    let cadence = resolve_effective_cadence(state, plan_name);
+
+    // `Task` cadence is the legacy "merge on every completion" mode;
+    // skip the plan/status load entirely so the hot path stays cheap.
+    if cadence == MergeCadence::Task {
+        return true;
+    }
+
+    let plan = match plan_parser::find_plan_file(&state.plans_dir, plan_name)
+        .and_then(|p| plan_parser::parse_plan_file(&p).ok())
+    {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let status_map: HashMap<String, String> = {
+        let conn = state.db.lock().unwrap();
+        let Ok(mut stmt) =
+            conn.prepare("SELECT task_number, status FROM task_status WHERE plan_name = ?1")
+        else {
+            return false;
+        };
+        stmt.query_map(params![plan_name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    };
+
+    // The caller's word is authoritative for the just-completed task —
+    // its `task_status` row may not have been written yet (the auto-mode
+    // hot path races the MCP / HTTP / fix-agent paths that write it).
+    let is_done = |task_number: &str| -> bool {
+        if task_number == completed_task {
+            return true;
+        }
+        matches!(
+            status_map.get(task_number).map(String::as_str),
+            Some("completed") | Some("skipped"),
+        )
+    };
+
+    match cadence {
+        // Task already handled above; included for exhaustiveness.
+        MergeCadence::Task => true,
+        MergeCadence::Phase => {
+            // Find the phase that owns the just-completed task.
+            let Some(phase) = plan
+                .phases
+                .iter()
+                .find(|p| p.tasks.iter().any(|t| t.number == completed_task))
+            else {
+                return false;
+            };
+            phase.tasks.iter().all(|t| is_done(&t.number))
+        }
+        MergeCadence::Plan => {
+            // Defensive: refuse the merge if `completed_task` isn't even
+            // in the plan (parser drift, stale agent row).
+            if !plan
+                .phases
+                .iter()
+                .any(|p| p.tasks.iter().any(|t| t.number == completed_task))
+            {
+                return false;
+            }
+            plan.phases
+                .iter()
+                .flat_map(|p| p.tasks.iter())
+                .all(|t| is_done(&t.number))
+        }
+    }
+}
+
+/// Resolve the effective merge cadence for `plan_name`. Plan-level
+/// override wins; otherwise inherit the repo `[auto_mode] merge_cadence`
+/// if a `branchwork.toml` is present; otherwise [`MergeCadence::default()`]
+/// (= [`MergeCadence::Phase`]).
+fn resolve_effective_cadence(state: &AppState, plan_name: &str) -> MergeCadence {
+    if let Some(c) = db::plan_merge_cadence(&state.db, plan_name) {
+        return c;
+    }
+    if let Some(dir) = crate::ci::project_dir_for(&state.plans_dir, &state.db, plan_name)
+        && let Some(cfg) = crate::repo_config::load_for_project_dir(&dir)
+    {
+        return cfg.auto_mode.merge_cadence;
+    }
+    MergeCadence::default()
 }
 
 /// Outcome of [`run_merge_step`] — what the orchestrator should do next.
@@ -5852,5 +5981,313 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // ── should_merge_now (Task 2.1) ─────────────────────────────────────
+    //
+    // Pin the four acceptance branches from the brief:
+    //   (a) `task` cadence always returns `true`.
+    //   (b) `phase` returns `false` mid-phase, `true` at the last task.
+    //   (c) `plan` returns `false` mid-plan, `true` at the final task.
+    //   (d) `failed` blocks the boundary (operator either fixes it or
+    //       marks the task `skipped`).
+    //
+    // Plus a few sanity tests: skipped counts as done, the resolution
+    // chain (plan-pin → repo default → hard-coded `Phase`), and the
+    // defensive return when `completed_task` isn't in the plan.
+
+    /// Write a 2-phase, 3-tasks-per-phase plan with an ABSOLUTE
+    /// `project:` path so [`crate::ci::project_dir_for`] resolves
+    /// straight to the tempdir we control — drop a `branchwork.toml`
+    /// inside to exercise the repo-default branch of the resolution
+    /// chain. `home.join(abs)` correctly discards `home` (well-tested
+    /// Rust `PathBuf::join` behaviour).
+    fn write_six_task_plan(plans_dir: &Path, name: &str, project_dir: &Path) {
+        std::fs::create_dir_all(plans_dir).unwrap();
+        let yaml = format!(
+            "title: Six-task plan\n\
+             project: {project}\n\
+             phases:\n  \
+               - number: 0\n    \
+                 title: Phase 0\n    \
+                 tasks:\n      \
+                   - number: \"0.1\"\n        \
+                     title: 0.1\n      \
+                   - number: \"0.2\"\n        \
+                     title: 0.2\n      \
+                   - number: \"0.3\"\n        \
+                     title: 0.3\n  \
+               - number: 1\n    \
+                 title: Phase 1\n    \
+                 tasks:\n      \
+                   - number: \"1.1\"\n        \
+                     title: 1.1\n      \
+                   - number: \"1.2\"\n        \
+                     title: 1.2\n      \
+                   - number: \"1.3\"\n        \
+                     title: 1.3\n",
+            project = project_dir.display(),
+        );
+        std::fs::write(plans_dir.join(format!("{name}.yaml")), yaml).unwrap();
+    }
+
+    /// Insert a `task_status` row with any status — extends
+    /// [`mark_task_status_completed`] for the `failed` / `skipped`
+    /// / `in_progress` cases the predicate must respect.
+    fn mark_task_status(db: &Db, plan: &str, task: &str, status: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_status (plan_name, task_number, status, updated_at) \
+             VALUES (?1, ?2, ?3, datetime('now')) \
+             ON CONFLICT(plan_name, task_number) DO UPDATE SET status = excluded.status",
+            params![plan, task, status],
+        )
+        .unwrap();
+    }
+
+    /// Build a minimal `AppState` with the chosen `plans_dir`; the
+    /// caller drops the broadcast receiver because `should_merge_now`
+    /// emits no events.
+    fn app_state(db: Db, plans_dir: PathBuf) -> AppState {
+        let (state, _rx) = test_app_state(db, new_runner_registry(), plans_dir);
+        state
+    }
+
+    #[test]
+    fn should_merge_now_task_cadence_always_true() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        db::set_plan_merge_cadence(&db, "p", Some(MergeCadence::Task));
+
+        let state = app_state(db.clone(), plans_dir);
+
+        // No task_status rows at all → still true.
+        assert!(should_merge_now(&state, "p", "0.1"));
+        // Even with a failed sibling, `task` cadence is unconditional.
+        mark_task_status(&db, "p", "0.2", "failed");
+        assert!(should_merge_now(&state, "p", "0.1"));
+        // Mid-plan completion of a later task is also fine.
+        assert!(should_merge_now(&state, "p", "1.2"));
+    }
+
+    #[test]
+    fn should_merge_now_phase_returns_false_mid_phase_and_true_at_last_task() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        db::set_plan_merge_cadence(&db, "p", Some(MergeCadence::Phase));
+
+        let state = app_state(db.clone(), plans_dir);
+
+        // First in phase 0; 0.2 and 0.3 still pending → false.
+        assert!(!should_merge_now(&state, "p", "0.1"));
+
+        // Mid-phase: 0.1 already done but 0.3 still pending → false.
+        mark_task_status(&db, "p", "0.1", "completed");
+        assert!(!should_merge_now(&state, "p", "0.2"));
+
+        // Last task in phase 0: 0.1 + 0.2 done, completing 0.3 closes
+        // the phase → true. Phase 1 tasks pending don't matter for
+        // `phase` cadence.
+        mark_task_status(&db, "p", "0.2", "completed");
+        assert!(should_merge_now(&state, "p", "0.3"));
+    }
+
+    #[test]
+    fn should_merge_now_plan_returns_false_mid_plan_and_true_at_final_task() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        db::set_plan_merge_cadence(&db, "p", Some(MergeCadence::Plan));
+
+        let state = app_state(db.clone(), plans_dir);
+
+        // Nothing done → false.
+        assert!(!should_merge_now(&state, "p", "0.1"));
+
+        // Phase 0 fully done, completing first phase-1 task → still
+        // false because phase 1 is mostly pending.
+        for t in &["0.1", "0.2", "0.3"] {
+            mark_task_status(&db, "p", t, "completed");
+        }
+        assert!(!should_merge_now(&state, "p", "1.1"));
+
+        // Phase 1 first two done; completing 1.3 closes the plan → true.
+        mark_task_status(&db, "p", "1.1", "completed");
+        mark_task_status(&db, "p", "1.2", "completed");
+        assert!(should_merge_now(&state, "p", "1.3"));
+    }
+
+    #[test]
+    fn should_merge_now_failed_task_blocks_phase_predicate() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        db::set_plan_merge_cadence(&db, "p", Some(MergeCadence::Phase));
+
+        let state = app_state(db.clone(), plans_dir);
+
+        // Phase otherwise full: 0.1 just completed (caller's word),
+        // 0.3 completed, but 0.2 failed → false.
+        mark_task_status(&db, "p", "0.2", "failed");
+        mark_task_status(&db, "p", "0.3", "completed");
+        assert!(!should_merge_now(&state, "p", "0.1"));
+
+        // Resolving the failure by marking it skipped flips the
+        // predicate to true (operator escape hatch in the brief).
+        mark_task_status(&db, "p", "0.2", "skipped");
+        assert!(should_merge_now(&state, "p", "0.1"));
+    }
+
+    #[test]
+    fn should_merge_now_failed_task_blocks_plan_predicate() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        db::set_plan_merge_cadence(&db, "p", Some(MergeCadence::Plan));
+
+        let state = app_state(db.clone(), plans_dir);
+
+        // Every task done except 1.2 (failed) → completing 1.3 still
+        // can't close the plan.
+        for t in &["0.1", "0.2", "0.3", "1.1"] {
+            mark_task_status(&db, "p", t, "completed");
+        }
+        mark_task_status(&db, "p", "1.2", "failed");
+        assert!(!should_merge_now(&state, "p", "1.3"));
+    }
+
+    #[test]
+    fn should_merge_now_skipped_counts_as_done() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        db::set_plan_merge_cadence(&db, "p", Some(MergeCadence::Phase));
+
+        let state = app_state(db.clone(), plans_dir);
+
+        // 0.1 skipped, 0.3 completed, completing 0.2 should close
+        // the phase (skipped tasks are treated as done).
+        mark_task_status(&db, "p", "0.1", "skipped");
+        mark_task_status(&db, "p", "0.3", "completed");
+        assert!(should_merge_now(&state, "p", "0.2"));
+    }
+
+    #[test]
+    fn should_merge_now_defaults_to_phase_when_no_pin_and_no_repo_config() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        // Deliberately no `db::set_plan_merge_cadence` call AND no
+        // `branchwork.toml` in `project_dir`. Resolution chain falls
+        // through to `MergeCadence::default()` (= Phase).
+
+        let state = app_state(db.clone(), plans_dir);
+
+        // Mid-phase → false. Last task in phase 0 → true. That's the
+        // Phase contract.
+        assert!(!should_merge_now(&state, "p", "0.1"));
+        mark_task_status(&db, "p", "0.1", "completed");
+        mark_task_status(&db, "p", "0.2", "completed");
+        assert!(should_merge_now(&state, "p", "0.3"));
+    }
+
+    #[test]
+    fn should_merge_now_inherits_repo_default_when_no_plan_pin() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        // Repo override: branchwork.toml says merge_cadence = "plan".
+        // Combined with no plan-level pin, the predicate uses Plan.
+        std::fs::write(
+            project_dir.join("branchwork.toml"),
+            "[auto_mode]\nmerge_cadence = \"plan\"\n",
+        )
+        .unwrap();
+        // The `repo_config` cache is keyed by canonical path; tests in
+        // other modules also write toml in tempdirs, so unique paths
+        // already keep us out of each other's way.
+        crate::repo_config::clear_cache_for_tests();
+
+        let state = app_state(db.clone(), plans_dir);
+
+        // Phase 0 fully done, completing first phase-1 task → false
+        // because Plan cadence requires every task done, and phase 1
+        // is still mostly pending.
+        for t in &["0.1", "0.2", "0.3"] {
+            mark_task_status(&db, "p", t, "completed");
+        }
+        assert!(!should_merge_now(&state, "p", "1.1"));
+    }
+
+    #[test]
+    fn should_merge_now_plan_pin_wins_over_repo_default() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        // Repo override says Plan; plan pin says Task. Plan pin wins,
+        // so the predicate is unconditionally `true` even with
+        // everything else pending.
+        std::fs::write(
+            project_dir.join("branchwork.toml"),
+            "[auto_mode]\nmerge_cadence = \"plan\"\n",
+        )
+        .unwrap();
+        crate::repo_config::clear_cache_for_tests();
+        db::set_plan_merge_cadence(&db, "p", Some(MergeCadence::Task));
+
+        let state = app_state(db, plans_dir);
+
+        assert!(should_merge_now(&state, "p", "0.1"));
+    }
+
+    #[test]
+    fn should_merge_now_unknown_task_returns_false_defensively() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+        db::set_plan_merge_cadence(&db, "p", Some(MergeCadence::Phase));
+
+        let state = app_state(db, plans_dir);
+
+        // Bogus task number: parser drift, stale agent row. Refuse
+        // the merge rather than guess.
+        assert!(!should_merge_now(&state, "p", "9.9"));
+    }
+
+    #[test]
+    fn should_merge_now_returns_false_when_plan_missing() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        // No plan YAML at all.
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        db::set_plan_merge_cadence(&db, "ghost", Some(MergeCadence::Phase));
+
+        let state = app_state(db, plans_dir);
+
+        // No plan to load → refuse. `Task` cadence still short-circuits
+        // before the load, so this only fires for Phase/Plan.
+        assert!(!should_merge_now(&state, "ghost", "0.1"));
     }
 }
