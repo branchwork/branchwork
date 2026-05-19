@@ -28,6 +28,17 @@
 //! #   "plan"  — only at end of plan (one shipped version per plan)
 //! merge_cadence = "phase"
 //!
+//! # Optional pre-merge gate: shell checks that must pass before
+//! # auto-mode merges a task branch into the canonical default.
+//! # Empty (the default) = gate inactive — the feature is opt-in.
+//! pre_merge_checks = [
+//!   { name = "rust-fmt",    cmd = "cargo fmt --check", timeout_secs = 30, cwd = "server-rs" },
+//!   { name = "rust-clippy", cmd = "cargo clippy --release --bin branchwork-server -- -D warnings", timeout_secs = 300, cwd = "server-rs" },
+//! ]
+//! # Wall-clock cap on the entire pre-merge gate. A runaway check can't
+//! # wedge the merge pipeline past this many seconds. Default 600.
+//! pre_merge_total_timeout_secs = 600
+//!
 //! [auto_mode.dirty_tree]
 //! # Paths whose dirty state should NOT trigger the
 //! # "agent_left_uncommitted_work" pause. Globs supported.
@@ -104,8 +115,45 @@ pub enum MergeCadence {
     Plan,
 }
 
+/// Default value for [`AutoModeConfig::pre_merge_total_timeout_secs`].
+/// 600 seconds (10 minutes) is the brief-mandated default ceiling on the
+/// whole pre-merge gate.
+fn default_pre_merge_total_timeout_secs() -> u32 {
+    600
+}
+
+/// Skip emitting the field when it matches the default — keeps serialized
+/// `branchwork.toml` round-trips small.
+fn is_default_pre_merge_total_timeout_secs(v: &u32) -> bool {
+    *v == default_pre_merge_total_timeout_secs()
+}
+
+/// One entry in [`AutoModeConfig::pre_merge_checks`] — a single shell
+/// command that must exit 0 before auto-mode merges a task branch into
+/// the canonical default.
+///
+/// Phase 1 (this struct) only parses and validates the schema; phase 2+
+/// of the `pre-merge-gate` plan wires execution and the per-check /
+/// whole-gate timeouts into the merge pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreMergeCheck {
+    /// Human-readable identifier shown in the dashboard / audit log.
+    /// Must be unique within the `pre_merge_checks` array; uniqueness is
+    /// validated at deserialize time.
+    pub name: String,
+    /// Shell command to run. Passed verbatim to the runner; empty
+    /// strings are rejected at deserialize time.
+    pub cmd: String,
+    /// Per-check timeout in seconds. Must be in `1..=600`.
+    pub timeout_secs: u32,
+    /// Optional working directory relative to the project root. When
+    /// `None`, the command runs at the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
 /// `[auto_mode]` table — auto-mode loop tuning.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AutoModeConfig {
     /// See [`MergeCadence`]. Defaults to [`MergeCadence::Phase`] for new
@@ -115,6 +163,85 @@ pub struct AutoModeConfig {
     #[serde(default)]
     pub merge_cadence: MergeCadence,
     pub dirty_tree: DirtyTreeConfig,
+    /// Optional pre-merge gate. Each entry is a shell check that must
+    /// pass (exit 0) before a task's branch is merged into the canonical
+    /// default in auto-mode. Empty (default) = gate inactive — the
+    /// feature is strictly opt-in.
+    ///
+    /// Validated at deserialize time: `name` must be unique within the
+    /// list, `cmd` must be non-empty, and `timeout_secs` must be in
+    /// `1..=600`. Validation errors surface at `toml::from_str` time and
+    /// name the offending check, so HTTP callers (a future `POST
+    /// /api/projects` validator, say) can echo the deserializer's
+    /// message verbatim to the user.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_pre_merge_checks"
+    )]
+    pub pre_merge_checks: Vec<PreMergeCheck>,
+    /// Wall-clock cap on the entire pre-merge gate (default 600s, ten
+    /// minutes). When the cumulative runtime of all checks exceeds this,
+    /// the gate fails closed and pauses the plan — keeps a runaway check
+    /// from wedging the merge pipeline indefinitely.
+    #[serde(
+        default = "default_pre_merge_total_timeout_secs",
+        skip_serializing_if = "is_default_pre_merge_total_timeout_secs"
+    )]
+    pub pre_merge_total_timeout_secs: u32,
+}
+
+impl Default for AutoModeConfig {
+    fn default() -> Self {
+        Self {
+            merge_cadence: MergeCadence::default(),
+            dirty_tree: DirtyTreeConfig::default(),
+            pre_merge_checks: Vec::new(),
+            pre_merge_total_timeout_secs: default_pre_merge_total_timeout_secs(),
+        }
+    }
+}
+
+/// Validate the `pre_merge_checks` array during deserialization.
+///
+/// - `cmd` must be non-empty (rejecting accidental blank entries that
+///   would silently pass the gate).
+/// - `timeout_secs` must be in `1..=600` (0 is meaningless; >600
+///   exceeds the whole-gate ceiling and is almost certainly a typo).
+/// - Each `name` must be unique within the list (used as a stable ID
+///   in dashboard payloads + audit rows; collisions would conflate
+///   results).
+///
+/// Errors are returned via `D::Error::custom` and include the offending
+/// `name` so a caller can route the message back to the user verbatim.
+fn deserialize_pre_merge_checks<'de, D>(deserializer: D) -> Result<Vec<PreMergeCheck>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let checks = Vec::<PreMergeCheck>::deserialize(deserializer)?;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for c in &checks {
+        if c.cmd.is_empty() {
+            return Err(D::Error::custom(format!(
+                "pre_merge_checks: cmd is empty for check {:?}",
+                c.name
+            )));
+        }
+        if c.timeout_secs == 0 || c.timeout_secs > 600 {
+            return Err(D::Error::custom(format!(
+                "pre_merge_checks: timeout_secs must be in 1..=600 for check {:?}, got {}",
+                c.name, c.timeout_secs
+            )));
+        }
+        if !seen.insert(c.name.as_str()) {
+            return Err(D::Error::custom(format!(
+                "pre_merge_checks: duplicate name {:?}",
+                c.name
+            )));
+        }
+    }
+    Ok(checks)
 }
 
 /// `[auto_mode.dirty_tree]` table — controls the dirty-tree check that
@@ -171,6 +298,8 @@ impl RepoConfig {
             && self.phase.verification.is_none()
             && self.auto_mode.dirty_tree.ignore.is_none()
             && self.auto_mode.merge_cadence == MergeCadence::default()
+            && self.auto_mode.pre_merge_checks.is_empty()
+            && self.auto_mode.pre_merge_total_timeout_secs == default_pre_merge_total_timeout_secs()
     }
 }
 
@@ -554,10 +683,10 @@ blocking_workflows = ["CI"]
 
         let with_auto_mode = RepoConfig {
             auto_mode: AutoModeConfig {
-                merge_cadence: MergeCadence::Phase,
                 dirty_tree: DirtyTreeConfig {
                     ignore: Some(vec!["*.log".into()]),
                 },
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -567,11 +696,36 @@ blocking_workflows = ["CI"]
         let with_cadence_only = RepoConfig {
             auto_mode: AutoModeConfig {
                 merge_cadence: MergeCadence::Task,
-                dirty_tree: DirtyTreeConfig::default(),
+                ..Default::default()
             },
             ..Default::default()
         };
         assert!(!with_cadence_only.is_empty());
+
+        // A populated pre_merge_checks alone counts as non-empty.
+        let with_pre_merge_checks = RepoConfig {
+            auto_mode: AutoModeConfig {
+                pre_merge_checks: vec![PreMergeCheck {
+                    name: "fmt".into(),
+                    cmd: "cargo fmt --check".into(),
+                    timeout_secs: 30,
+                    cwd: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!with_pre_merge_checks.is_empty());
+
+        // A non-default whole-gate timeout alone counts as non-empty.
+        let with_custom_total_timeout = RepoConfig {
+            auto_mode: AutoModeConfig {
+                pre_merge_total_timeout_secs: 1200,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!with_custom_total_timeout.is_empty());
     }
 
     // ---- merge_cadence ------------------------------------------
@@ -708,6 +862,263 @@ ignore = ["*.log", ".bob/**", ".mcp.json"]
                 ][..]
             )
         );
+    }
+
+    // ---- pre_merge_checks ----------------------------------------
+
+    #[test]
+    fn pre_merge_checks_default_to_empty_vec_when_absent() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        // Empty file → empty checks list + default total timeout.
+        write(dir.path(), "branchwork.toml", "");
+        let cfg = load_for_project_dir(dir.path()).expect("empty TOML is valid");
+        assert!(cfg.auto_mode.pre_merge_checks.is_empty());
+        assert_eq!(cfg.auto_mode.pre_merge_total_timeout_secs, 600);
+
+        // `[auto_mode]` table present but pre_merge_checks absent → same.
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            "[auto_mode]\nmerge_cadence = \"task\"\n",
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert!(cfg.auto_mode.pre_merge_checks.is_empty());
+        assert_eq!(cfg.auto_mode.pre_merge_total_timeout_secs, 600);
+    }
+
+    #[test]
+    fn pre_merge_checks_parses_full_block_with_optional_cwd() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            r#"
+[auto_mode]
+pre_merge_total_timeout_secs = 1200
+pre_merge_checks = [
+  { name = "web-format",   cmd = "pnpm --filter @branchwork/web format:check", timeout_secs = 60 },
+  { name = "web-lint",     cmd = "pnpm --filter @branchwork/web lint",         timeout_secs = 60 },
+  { name = "web-types",    cmd = "pnpm --filter @branchwork/web tsc --noEmit", timeout_secs = 120 },
+  { name = "rust-fmt",     cmd = "cargo fmt --check",                          timeout_secs = 30, cwd = "server-rs" },
+  { name = "rust-clippy",  cmd = "cargo clippy --release --bin branchwork-server -- -D warnings", timeout_secs = 300, cwd = "server-rs" },
+]
+"#,
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert_eq!(cfg.auto_mode.pre_merge_checks.len(), 5);
+        assert_eq!(cfg.auto_mode.pre_merge_total_timeout_secs, 1200);
+
+        // First entry: no cwd.
+        let first = &cfg.auto_mode.pre_merge_checks[0];
+        assert_eq!(first.name, "web-format");
+        assert_eq!(first.cmd, "pnpm --filter @branchwork/web format:check");
+        assert_eq!(first.timeout_secs, 60);
+        assert!(first.cwd.is_none());
+
+        // Fourth entry: cwd set.
+        let rust_fmt = &cfg.auto_mode.pre_merge_checks[3];
+        assert_eq!(rust_fmt.name, "rust-fmt");
+        assert_eq!(rust_fmt.cmd, "cargo fmt --check");
+        assert_eq!(rust_fmt.timeout_secs, 30);
+        assert_eq!(rust_fmt.cwd.as_deref(), Some("server-rs"));
+
+        // Boundary: timeout_secs = 300 is within 1..=600.
+        let rust_clippy = &cfg.auto_mode.pre_merge_checks[4];
+        assert_eq!(rust_clippy.timeout_secs, 300);
+    }
+
+    #[test]
+    fn pre_merge_checks_zero_timeout_fails_to_parse_with_check_name() {
+        // Direct toml::from_str path: the deserializer rejects with a
+        // custom error containing the offending check name. This is the
+        // surface a hypothetical `POST /api/projects` validator would
+        // echo back as a 400 body.
+        let toml_src = r#"
+[auto_mode]
+pre_merge_checks = [
+  { name = "rust-fmt", cmd = "cargo fmt --check", timeout_secs = 0 },
+]
+"#;
+        let err =
+            toml::from_str::<RepoConfig>(toml_src).expect_err("timeout_secs = 0 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rust-fmt"),
+            "expected error to name the offending check, got: {msg}"
+        );
+        assert!(
+            msg.contains("timeout_secs"),
+            "expected error to mention timeout_secs, got: {msg}"
+        );
+        assert!(
+            msg.contains("1..=600"),
+            "expected error to state the accepted range, got: {msg}"
+        );
+
+        // File-level path: malformed values fold into the existing
+        // "warn + return None" contract, matching every other invalid
+        // TOML case.
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "branchwork.toml", toml_src);
+        assert!(
+            load_for_project_dir(dir.path()).is_none(),
+            "invalid timeout should be rejected like any other malformed TOML"
+        );
+    }
+
+    #[test]
+    fn pre_merge_checks_oversize_timeout_fails_to_parse_with_check_name() {
+        let toml_src = r#"
+[auto_mode]
+pre_merge_checks = [
+  { name = "rust-clippy", cmd = "cargo clippy", timeout_secs = 1000 },
+]
+"#;
+        let err = toml::from_str::<RepoConfig>(toml_src)
+            .expect_err("timeout_secs = 1000 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rust-clippy"),
+            "expected error to name the offending check, got: {msg}"
+        );
+        assert!(
+            msg.contains("1000"),
+            "expected error to echo the offending value, got: {msg}"
+        );
+        assert!(
+            msg.contains("1..=600"),
+            "expected error to state the accepted range, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pre_merge_checks_boundary_timeouts_are_accepted() {
+        // 1 and 600 are inside the accepted range; both must parse cleanly.
+        let toml_src = r#"
+[auto_mode]
+pre_merge_checks = [
+  { name = "low",  cmd = "true",  timeout_secs = 1 },
+  { name = "high", cmd = "true",  timeout_secs = 600 },
+]
+"#;
+        let cfg: RepoConfig = toml::from_str(toml_src).expect("boundary timeouts must parse");
+        assert_eq!(cfg.auto_mode.pre_merge_checks[0].timeout_secs, 1);
+        assert_eq!(cfg.auto_mode.pre_merge_checks[1].timeout_secs, 600);
+    }
+
+    #[test]
+    fn pre_merge_checks_empty_cmd_fails_to_parse_with_check_name() {
+        let toml_src = r#"
+[auto_mode]
+pre_merge_checks = [
+  { name = "noop", cmd = "", timeout_secs = 60 },
+]
+"#;
+        let err = toml::from_str::<RepoConfig>(toml_src).expect_err("empty cmd must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("noop"),
+            "expected error to name the offending check, got: {msg}"
+        );
+        assert!(
+            msg.contains("cmd is empty"),
+            "expected error to mention empty cmd, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pre_merge_checks_duplicate_name_fails_to_parse() {
+        let toml_src = r#"
+[auto_mode]
+pre_merge_checks = [
+  { name = "fmt", cmd = "cargo fmt --check",    timeout_secs = 30 },
+  { name = "fmt", cmd = "pnpm format:check",    timeout_secs = 60 },
+]
+"#;
+        let err =
+            toml::from_str::<RepoConfig>(toml_src).expect_err("duplicate name must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate"),
+            "expected error to mention duplication, got: {msg}"
+        );
+        assert!(
+            msg.contains("\"fmt\""),
+            "expected error to name the duplicated check, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pre_merge_checks_default_total_timeout_when_only_checks_set() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            r#"
+[auto_mode]
+pre_merge_checks = [
+  { name = "fmt", cmd = "cargo fmt --check", timeout_secs = 30 },
+]
+"#,
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert_eq!(cfg.auto_mode.pre_merge_checks.len(), 1);
+        // The whole-gate ceiling defaults to 600s even when checks are
+        // configured but the operator hasn't overridden it.
+        assert_eq!(cfg.auto_mode.pre_merge_total_timeout_secs, 600);
+    }
+
+    #[test]
+    fn pre_merge_checks_round_trip_via_default() {
+        // Default `AutoModeConfig` round-trips through TOML cleanly: the
+        // skip_serializing_if attributes keep the wire output small, so
+        // re-parsing the serialized form yields the same default value.
+        let default = RepoConfig::default();
+        let text = toml::to_string(&default).unwrap();
+        let reparsed: RepoConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            reparsed.auto_mode.pre_merge_checks,
+            Vec::<PreMergeCheck>::new()
+        );
+        assert_eq!(reparsed.auto_mode.pre_merge_total_timeout_secs, 600);
+        assert_eq!(reparsed, default);
+    }
+
+    #[test]
+    fn pre_merge_checks_round_trip_with_full_block() {
+        // Populated config round-trips: serialize then re-parse should
+        // re-validate without raising, and the deserialized form must
+        // equal the original.
+        let cfg = RepoConfig {
+            auto_mode: AutoModeConfig {
+                pre_merge_checks: vec![
+                    PreMergeCheck {
+                        name: "rust-fmt".into(),
+                        cmd: "cargo fmt --check".into(),
+                        timeout_secs: 30,
+                        cwd: Some("server-rs".into()),
+                    },
+                    PreMergeCheck {
+                        name: "rust-clippy".into(),
+                        cmd: "cargo clippy --release --bin branchwork-server -- -D warnings".into(),
+                        timeout_secs: 300,
+                        cwd: Some("server-rs".into()),
+                    },
+                ],
+                pre_merge_total_timeout_secs: 1200,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        let reparsed: RepoConfig = toml::from_str(&text).unwrap();
+        assert_eq!(reparsed, cfg);
     }
 
     // ---- glob matcher --------------------------------------------
