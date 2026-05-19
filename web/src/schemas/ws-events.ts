@@ -55,6 +55,23 @@ const AgentStopped = v.object({
   }),
 });
 
+/// Runner reported `Command::spawn` Err for the session daemon (Task 1.1,
+/// runner-install-and-spawn-reliability plan). The server already wrote the
+/// pre-rendered message to `agents.spawn_error`; this broadcast triggers a
+/// refetch so the dashboard surfaces the new column inline on the task
+/// card. The matching `agent_stopped` envelope (status="failed") follows
+/// immediately and is what actually flips the row off "starting".
+const AgentSpawnFailed = v.object({
+  type: v.literal("agent_spawn_failed"),
+  data: v.object({
+    id: v.string(),
+    command: v.string(),
+    errno: v.optional(v.number()),
+    errno_str: v.string(),
+    message: v.string(),
+  }),
+});
+
 const AgentBranchMerged = v.object({
   type: v.literal("agent_branch_merged"),
   data: v.unknown(),
@@ -416,6 +433,7 @@ export const WsMessageSchema = v.variant("type", [
   AgentStarted,
   AgentOutput,
   AgentStopped,
+  AgentSpawnFailed,
   AgentBranchMerged,
   AgentBranchDiscarded,
   AgentBranchCleared,

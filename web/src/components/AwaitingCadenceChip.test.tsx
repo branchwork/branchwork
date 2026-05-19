@@ -28,6 +28,7 @@ function agent(overrides: Partial<Agent> = {}): Agent {
     cost_usd: null,
     driver: "claude",
     merge_status: "deferred_for_cadence",
+    spawn_error: null,
     ...overrides,
   };
 }

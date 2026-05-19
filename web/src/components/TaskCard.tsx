@@ -141,10 +141,11 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
   // updates that don't change either reference don't re-render this card.
   // Audit §10 minor: pre-fix every TaskCard re-rendered on every agent
   // store update because they all subscribed to `s.agents` directly.
-  const { branchAgent, runningAgent } = useAgentStore(
+  const { branchAgent, runningAgent, spawnFailedAgent } = useAgentStore(
     useShallow((s) => {
       let branch: import("../stores/agent-store.js").Agent | undefined;
       let running: import("../stores/agent-store.js").Agent | undefined;
+      let spawnFailed: import("../stores/agent-store.js").Agent | undefined;
       for (const a of s.agents) {
         if (a.plan_name !== planName || a.task_id !== task.number) continue;
         if (a.status === "running" || a.status === "starting") {
@@ -152,8 +153,28 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
         } else if (a.branch) {
           if (!branch) branch = a;
         }
+        // The agents store is ordered started_at DESC, so the first
+        // failed-with-spawn_error match is the most recent. Surface it
+        // on the task card so a fresh Start click that crashed the
+        // runner spawn doesn't go silent (Task 1.1, runner-install-and-
+        // spawn-reliability plan). A subsequent successful spawn flips
+        // the row's `status` away from `failed` (and a fresh Start
+        // produces a new row entirely), so the banner naturally clears.
+        if (
+          a.status === "failed" &&
+          a.spawn_error &&
+          !spawnFailed &&
+          !running &&
+          !branch
+        ) {
+          spawnFailed = a;
+        }
       }
-      return { branchAgent: branch, runningAgent: running };
+      return {
+        branchAgent: branch,
+        runningAgent: running,
+        spawnFailedAgent: spawnFailed,
+      };
     }),
   );
   const selectAgent = useAgentStore((s) => s.selectAgent);
@@ -745,6 +766,26 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
           )}
         </div>
       </div>
+
+      {/* Spawn-failure banner — Task 1.1, runner-install-and-spawn-
+          reliability plan. Shows when the runner failed to spawn the
+          session daemon (typically the `branchwork-server session`
+          binary missing on the runner's PATH, or a permissions issue).
+          The structured `spawn_error` column was populated by the SaaS
+          runner_ws handler when it received the `AgentSpawnFailed`
+          envelope; rendering it inline turns a previously-silent Start
+          click into an actionable error the operator can fix. */}
+      {spawnFailedAgent?.spawn_error && (
+        <div
+          className="mt-2 flex items-center gap-2 bg-red-950/40 border border-red-800/40 rounded px-2 py-1"
+          data-testid="spawn-error-banner"
+        >
+          <span className="text-red-400 text-[10px]">&#9888;</span>
+          <span className="text-[10px] text-red-300/90 font-mono break-all">
+            {spawnFailedAgent.spawn_error}
+          </span>
+        </div>
+      )}
 
       {/* Blocked banner — shown when unmet dependencies prevent starting */}
       {blocked && status === "pending" && (

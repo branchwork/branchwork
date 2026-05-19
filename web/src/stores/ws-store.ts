@@ -358,6 +358,25 @@ function dispatch(msg: WsMessage) {
       });
       break;
     }
+    case "agent_spawn_failed": {
+      // Task 1.1 (runner-install-and-spawn-reliability): the runner could
+      // not `Command::spawn` the session daemon. The server already wrote
+      // `agents.spawn_error` and the matching `agent_stopped` envelope is
+      // about to flip the row's status to `failed`. Refetch so the task
+      // card surfaces the inline error banner before the user has to
+      // refresh the page. Also surface a system notification so an
+      // operator who clicked Start session sees the failure immediately
+      // even when the task card is offscreen.
+      const d = msg.data;
+      notify(
+        "agent_stopped",
+        d.message ?? "Spawn failed",
+        "Runner spawn failed",
+        `agent-spawn-failed-${d.id}`,
+      );
+      agentStore.fetchAgents();
+      break;
+    }
     case "agent_stopped": {
       const d = msg.data;
       const agent = agentStore.agents.find((a) => a.id === d.id);

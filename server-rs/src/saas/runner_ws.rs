@@ -844,6 +844,43 @@ async fn handle_runner_message(
             }
         }
 
+        WireMessage::AgentSpawnFailed {
+            agent_id,
+            command,
+            errno,
+            errno_str,
+        } => {
+            // Runner couldn't `Command::spawn` the session daemon — typically
+            // because `--server-bin` points at a missing or unauthorised path.
+            // Render a precise, actionable message and stash it on the agents
+            // row so the dashboard can surface it inline next to the agent
+            // card. The follow-up `AgentStopped` (also reliable, also from
+            // this runner) does the row's status flip; this arm only owns
+            // the `spawn_error` column and the `agent_spawn_failed`
+            // broadcast.
+            let message = format!("runner could not spawn: {command} ({errno_str})");
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute(
+                    "UPDATE agents SET spawn_error = ?1 WHERE id = ?2",
+                    params![message, agent_id],
+                )
+                .ok();
+            }
+            broadcast_event(
+                &state.broadcast_tx,
+                "agent_spawn_failed",
+                serde_json::json!({
+                    "id": agent_id,
+                    "command": command,
+                    "errno": errno,
+                    "errno_str": errno_str,
+                    "message": message,
+                    "runner_id": runner_id,
+                }),
+            );
+        }
+
         WireMessage::TaskStatusChanged {
             plan_name,
             task_number,

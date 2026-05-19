@@ -314,6 +314,7 @@ describe("auth-store logout", () => {
             cost_usd: null,
             driver: null,
             merge_status: null,
+  spawn_error: null,
           },
         ],
         agentsFetched: true,

@@ -33,6 +33,15 @@ export interface Agent {
   /// flush via POST /api/plans/:name/flush-merges, Task 2.3) drains
   /// the row. `null` on every non-deferred agent.
   merge_status: string | null;
+  /// Pre-rendered "runner could not spawn: <path> (<errno_tag>)"
+  /// message, written by the SaaS runner_ws handler when the runner
+  /// reports a `Command::spawn` Err via the `AgentSpawnFailed` wire
+  /// envelope (Task 1.1, runner-install-and-spawn-reliability plan).
+  /// `null` on every successful spawn and on every non-spawn failure
+  /// (those still flow through `stop_reason` instead). When non-null
+  /// the dashboard renders an inline error banner on the task card so
+  /// the "Start session" click stops going silent.
+  spawn_error: string | null;
 }
 
 export interface AgentDiff {

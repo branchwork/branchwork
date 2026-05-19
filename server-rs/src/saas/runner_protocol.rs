@@ -86,6 +86,38 @@ pub enum WireMessage {
         stop_reason: Option<String>,
     },
 
+    /// `Command::spawn` returned `Err` before the session daemon could
+    /// fork. Distinct from `AgentStopped { status: "failed" }` because the
+    /// failure is structured and recoverable — the operator can read the
+    /// errno and fix the cause (missing binary on PATH, permission denied,
+    /// etc.) instead of guessing at a free-form `stop_reason` string. The
+    /// server stores the message on the agent row and the dashboard renders
+    /// it inline on the agent card so the "Start session" click doesn't go
+    /// silent.
+    ///
+    /// Reliable: the runner pushes this through the outbox so a flapping
+    /// WS during a fast spawn-fail still lands on the dashboard.
+    AgentSpawnFailed {
+        agent_id: String,
+        /// The executable path the runner attempted to spawn (i.e.
+        /// `state.server_bin.display().to_string()`). Echoed verbatim in
+        /// the dashboard error message so the operator sees exactly which
+        /// path failed — the runner's `--server-bin` flag isn't visible
+        /// from the dashboard otherwise.
+        command: String,
+        /// Raw OS error code, if `io::Error::raw_os_error()` returned one.
+        /// `None` for non-OS errors (e.g. UTF-8 problems building the
+        /// command). Frontends should treat the absence as "unknown errno".
+        #[serde(skip_serializing_if = "Option::is_none")]
+        errno: Option<i32>,
+        /// Short human-readable errno tag derived from the OS error
+        /// (e.g. "ENOENT", "EACCES"). Falls back to a generic "OS_ERROR"
+        /// label when the errno is set but doesn't map to a known tag, or
+        /// "IO_ERROR" when no raw OS error is available. Always set so
+        /// the dashboard has something to render after the path.
+        errno_str: String,
+    },
+
     /// Task status changed (reported by agent via MCP or detected by runner).
     TaskStatusChanged {
         plan_name: String,
@@ -864,6 +896,7 @@ impl WireMessage {
             WireMessage::AgentStarted { .. } => "agent_started",
             WireMessage::AgentOutput { .. } => "agent_output",
             WireMessage::AgentStopped { .. } => "agent_stopped",
+            WireMessage::AgentSpawnFailed { .. } => "agent_spawn_failed",
             WireMessage::TaskStatusChanged { .. } => "task_status_changed",
             WireMessage::DriverAuthReport { .. } => "driver_auth_report",
             WireMessage::RunnerLogLine { .. } => "runner_log_line",
@@ -1014,6 +1047,59 @@ mod tests {
         };
         assert!(!msg.is_best_effort(), "AgentStopped must be reliable");
         assert_eq!(msg.event_type(), "agent_stopped");
+    }
+
+    #[test]
+    fn agent_spawn_failed_round_trip_and_is_reliable() {
+        // Task 1.1 pin: `AgentSpawnFailed` is the structured signal the
+        // runner emits when `Command::spawn` returns Err before the
+        // session daemon ever runs. Must stay reliable so a fast WS
+        // flap during the failure burst still lands on the dashboard.
+        let msg = WireMessage::AgentSpawnFailed {
+            agent_id: "agent-x".into(),
+            command: "/usr/local/bin/branchwork-server".into(),
+            errno: Some(2),
+            errno_str: "ENOENT".into(),
+        };
+        assert!(!msg.is_best_effort(), "AgentSpawnFailed must be reliable");
+        assert_eq!(msg.event_type(), "agent_spawn_failed");
+
+        let env = Envelope::reliable("r1".into(), 7, msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"agent_spawn_failed\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::AgentSpawnFailed {
+                agent_id,
+                command,
+                errno,
+                errno_str,
+            } => {
+                assert_eq!(agent_id, "agent-x");
+                assert_eq!(command, "/usr/local/bin/branchwork-server");
+                assert_eq!(errno, Some(2));
+                assert_eq!(errno_str, "ENOENT");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_spawn_failed_omits_errno_when_none() {
+        // Non-OS errors (e.g. command-string UTF-8 problems) leave errno
+        // as None — the serializer must skip the key so the wire stays
+        // tidy and old consumers that don't know the field don't trip
+        // on a JSON null they didn't expect.
+        let msg = WireMessage::AgentSpawnFailed {
+            agent_id: "a".into(),
+            command: "x".into(),
+            errno: None,
+            errno_str: "IO_ERROR".into(),
+        };
+        let env = Envelope::reliable("r1".into(), 1, msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"errno\""), "errno key should be omitted");
+        assert!(json.contains("\"errno_str\":\"IO_ERROR\""));
     }
 
     #[test]

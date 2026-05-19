@@ -26,6 +26,7 @@ function agent(overrides: Partial<Agent> = {}): Agent {
     cost_usd: null,
     driver: "claude",
     merge_status: null,
+  spawn_error: null,
     ...overrides,
   };
 }

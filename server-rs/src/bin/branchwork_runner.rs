@@ -1088,6 +1088,29 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                 }
                 Err(e) => {
                     log_warn!("[runner] failed to spawn agent {agent_id}: {e}");
+                    // Task 1.1: surface a structured `AgentSpawnFailed`
+                    // envelope BEFORE the generic `AgentStopped` so the
+                    // server can store the errno + command path on the
+                    // agent row and the dashboard renders an actionable
+                    // message ("runner could not spawn: /usr/local/bin/
+                    // branchwork-server (ENOENT)") instead of going silent.
+                    //
+                    // Both events are reliable + outbox-backed, so the
+                    // server sees `agent_spawn_failed` followed by
+                    // `agent_stopped` in stable seq order. The
+                    // `AgentStopped` is kept for back-compat with older
+                    // servers (and for the same row-status flip every
+                    // other terminal path produces).
+                    if let SpawnAgentError::Spawn { io, command } = &e {
+                        let (errno, errno_str) = classify_spawn_io_error(io);
+                        let failed = WireMessage::AgentSpawnFailed {
+                            agent_id: agent_id.clone(),
+                            command: command.clone(),
+                            errno,
+                            errno_str,
+                        };
+                        send_reliable(state, failed).await;
+                    }
                     // Report immediate failure.
                     let stopped = WireMessage::AgentStopped {
                         agent_id: agent_id.clone(),
@@ -1852,6 +1875,7 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
         | WireMessage::AgentStarted { .. }
         | WireMessage::AgentOutput { .. }
         | WireMessage::AgentStopped { .. }
+        | WireMessage::AgentSpawnFailed { .. }
         | WireMessage::TaskStatusChanged { .. }
         | WireMessage::DriverAuthReport { .. }
         | WireMessage::FoldersListed { .. }
@@ -2559,6 +2583,76 @@ mod checkout_task_branch_tests {
     }
 }
 
+/// Error returned by [`spawn_agent`]. The two variants let the caller
+/// distinguish a structured `Command::spawn` failure (binary not on PATH,
+/// permission denied, ...) from any other unexpected error during the
+/// pre/post-spawn dance. The first turns into a `AgentSpawnFailed` wire
+/// envelope so the dashboard can render a precise reason next to the
+/// agent card; the second falls through to the existing `AgentStopped`
+/// path with a generic `stop_reason`.
+#[derive(Debug)]
+enum SpawnAgentError {
+    /// `Command::spawn` returned `Err`. Carries the OS error and the path
+    /// the runner attempted to spawn (i.e. `state.server_bin`) so the
+    /// caller can build a structured `AgentSpawnFailed` envelope without
+    /// re-resolving them.
+    Spawn { io: std::io::Error, command: String },
+    /// Any other failure — mkdir, settings.json write, socket-never-
+    /// appeared, etc. Kept opaque because the existing `AgentStopped`
+    /// path stringifies it verbatim into `stop_reason`.
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for SpawnAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnAgentError::Spawn { io, command } => {
+                write!(
+                    f,
+                    "could not spawn {command} ({}): {io}",
+                    classify_spawn_io_error(io).1
+                )
+            }
+            SpawnAgentError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<E: Into<Box<dyn std::error::Error + Send + Sync>>> From<E> for SpawnAgentError {
+    fn from(e: E) -> Self {
+        SpawnAgentError::Other(e.into())
+    }
+}
+
+/// Map an `io::Error` from `Command::spawn` onto `(Option<errno>, errno_tag)`.
+/// The tag is a short human-readable label ("ENOENT", "EACCES", ...) that
+/// the dashboard surfaces inline so operators don't have to look up errnos.
+/// `errno` is the raw OS code when available — `None` for io::Errors that
+/// didn't carry one. Always returns a non-empty tag so callers don't have
+/// to handle the missing-tag case.
+fn classify_spawn_io_error(io: &std::io::Error) -> (Option<i32>, String) {
+    use std::io::ErrorKind;
+    let raw = io.raw_os_error();
+    // Prefer the ErrorKind tag (portable) and fall back to a generic
+    // "OS_ERROR(<n>)" label so a future kind we haven't enumerated still
+    // produces something useful on the dashboard.
+    let tag = match io.kind() {
+        ErrorKind::NotFound => "ENOENT",
+        ErrorKind::PermissionDenied => "EACCES",
+        ErrorKind::InvalidInput => "EINVAL",
+        ErrorKind::Interrupted => "EINTR",
+        ErrorKind::Other => match raw {
+            Some(c) => return (Some(c), format!("OS_ERROR({c})")),
+            None => "IO_ERROR",
+        },
+        _ => match raw {
+            Some(c) => return (Some(c), format!("OS_ERROR({c})")),
+            None => "IO_ERROR",
+        },
+    };
+    (raw, tag.to_string())
+}
+
 #[allow(clippy::too_many_arguments)] // Mirrors driver::SpawnOpts on the server side.
 async fn spawn_agent(
     state: &Arc<RunnerState>,
@@ -2572,7 +2666,7 @@ async fn spawn_agent(
     skip_permissions: bool,
     mcp_config: &str,
     settings_json: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), SpawnAgentError> {
     // Build socket path.
     let sockets_dir = state.cwd.join(".branchwork-runner-sessions");
     std::fs::create_dir_all(&sockets_dir)?;
@@ -2730,7 +2824,23 @@ async fn spawn_agent(
         cmd.creation_flags(0x0000_0008 | 0x0800_0000); // DETACHED_PROCESS | CREATE_NO_WINDOW
     }
 
-    let child = cmd.spawn()?;
+    // `Command::spawn` is the load-bearing call this whole task is about
+    // (Task 1.1, runner-install-and-spawn-reliability plan). On Err, hand
+    // the io::Error + the command path back through `SpawnAgentError::Spawn`
+    // so the caller can emit a structured `AgentSpawnFailed` envelope with
+    // errno + errno_tag. Other failure modes (mkdir, file write, the
+    // socket-didn't-appear timeout below) still flow through the generic
+    // `SpawnAgentError::Other` path and the dashboard sees only the
+    // free-form `stop_reason` string from `AgentStopped`.
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(io) => {
+            return Err(SpawnAgentError::Spawn {
+                io,
+                command: state.server_bin.display().to_string(),
+            });
+        }
+    };
     let fork_parent_pid = child.id();
 
     log_info!(
@@ -2742,7 +2852,9 @@ async fn spawn_agent(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !socket_path.exists() {
         if tokio::time::Instant::now() > deadline {
-            return Err("session daemon socket did not appear within 10s".into());
+            return Err(SpawnAgentError::Other(
+                "session daemon socket did not appear within 10s".into(),
+            ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -5129,5 +5241,57 @@ mod tests {
         drop(got_rx);
         let _ = server_task.await;
         let _ = client_task.await;
+    }
+
+    /// Task 1.1 (runner-install-and-spawn-reliability) regression:
+    /// `classify_spawn_io_error` maps `io::Error` onto `(errno, tag)`
+    /// pairs the runner ships in `AgentSpawnFailed`. The dashboard reads
+    /// the tag directly so a future rename here is a wire-visible change
+    /// — pin every kind we currently care about so accidental drift trips.
+    #[test]
+    fn classify_spawn_io_error_maps_not_found_to_enoent() {
+        let io = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let (errno, tag) = classify_spawn_io_error(&io);
+        assert_eq!(tag, "ENOENT");
+        // ErrorKind::NotFound carries no `raw_os_error` by itself — only
+        // io::Errors built via `from_raw_os_error` do. The classifier
+        // must return whatever `raw_os_error()` reports verbatim.
+        assert_eq!(errno, None);
+    }
+
+    #[test]
+    fn classify_spawn_io_error_maps_permission_denied_to_eacces() {
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (_, tag) = classify_spawn_io_error(&io);
+        assert_eq!(tag, "EACCES");
+    }
+
+    #[test]
+    fn classify_spawn_io_error_preserves_raw_os_error_with_enoent() {
+        // ENOENT from a real exec() call carries libc::ENOENT (2 on Linux,
+        // but constant elsewhere). The classifier must surface the code
+        // verbatim so an operator running `strace`/`ltrace` can correlate.
+        let io = std::io::Error::from_raw_os_error(2);
+        let (errno, tag) = classify_spawn_io_error(&io);
+        assert_eq!(errno, Some(2));
+        // ErrorKind for raw_os_error(2) is NotFound on Unix (matched on
+        // libc::ENOENT). On Windows the same code maps differently — the
+        // tag falls back to "OS_ERROR(2)" there, which the classifier
+        // produces via the `_ => match raw {...}` arm.
+        assert!(
+            tag == "ENOENT" || tag == "OS_ERROR(2)",
+            "unexpected tag for raw os error 2: {tag}",
+        );
+    }
+
+    #[test]
+    fn classify_spawn_io_error_falls_back_to_io_error_when_unknown() {
+        // ErrorKind::Other with no raw OS error — typical for io::Errors
+        // built from a plain string. Tag must still be non-empty so the
+        // dashboard always has something to render.
+        let io = std::io::Error::other("synthetic");
+        let (errno, tag) = classify_spawn_io_error(&io);
+        assert_eq!(errno, None);
+        assert_eq!(tag, "IO_ERROR");
     }
 }

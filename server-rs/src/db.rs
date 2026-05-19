@@ -1275,6 +1275,20 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE agents ADD COLUMN merge_status TEXT;")
         .ok();
 
+    // Structured spawn-failure message set by the SaaS runner_ws handler
+    // when it receives an `AgentSpawnFailed` envelope from the runner
+    // (Task 1.1, runner-install-and-spawn-reliability plan). Pre-fix the
+    // runner just logged `failed to spawn agent <id>: <err>` and stayed
+    // silent — the dashboard showed a `failed` row with no actionable
+    // reason. The column carries the user-facing rendering string (e.g.
+    // "runner could not spawn: /usr/local/bin/branchwork-server (ENOENT)")
+    // so the dashboard surfaces the same copy regardless of which
+    // backend recorded it. NULL on every successful spawn and on every
+    // failure path that isn't a `Command::spawn` Err (those still flow
+    // through the existing `stop_reason` column via `AgentStopped`).
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN spawn_error TEXT;")
+        .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 

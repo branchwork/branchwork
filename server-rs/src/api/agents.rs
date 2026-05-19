@@ -94,7 +94,8 @@ pub async fn list_agents(
             "SELECT id, session_id, pid, parent_agent_id, plan_name, task_id, \
                     cwd, status, mode, prompt, started_at, finished_at, \
                     last_tool, last_activity_at, base_commit, branch, \
-                    source_branch, cost_usd, driver, merge_status \
+                    source_branch, cost_usd, driver, merge_status, \
+                    spawn_error \
              FROM agents WHERE org_id = ?1 \
              ORDER BY started_at DESC LIMIT 50",
         )
@@ -134,6 +135,13 @@ pub async fn list_agents(
                 // are sitting on committed branches waiting for the
                 // cadence boundary. NULL on every non-deferred agent.
                 "merge_status": row.get::<_, Option<String>>(19)?,
+                // Task 1.1 (runner-install-and-spawn-reliability): pre-
+                // rendered "runner could not spawn: <path> (<errno_tag>)"
+                // message, written by the SaaS runner_ws handler when
+                // the runner reports `AgentSpawnFailed`. NULL on every
+                // successful spawn — UI gates the inline error banner
+                // on this field being non-null.
+                "spawn_error": row.get::<_, Option<String>>(20)?,
             }))
         })
         .unwrap()

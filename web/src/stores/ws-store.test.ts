@@ -53,6 +53,7 @@ function makeAgent(overrides: Partial<Agent> = {}): Agent {
     cost_usd: null,
     driver: null,
     merge_status: null,
+  spawn_error: null,
     ...overrides,
   };
 }
@@ -82,6 +83,30 @@ describe("ws-store handleWsMessage", () => {
         plan: "fix-plan-done-in-progress",
         from_task: "1.1",
         to_tasks: ["1.2", "1.3"],
+      },
+    });
+
+    expect(fetchAgents).toHaveBeenCalledTimes(1);
+  });
+
+  it("agent_spawn_failed refetches agents so the inline banner appears", () => {
+    // Task 1.1, runner-install-and-spawn-reliability: when the runner
+    // can't `Command::spawn` the session daemon, the server pre-renders
+    // a "runner could not spawn: <path> (<errno_tag>)" message to
+    // `agents.spawn_error` and broadcasts this event. The frontend's
+    // job is to refetch so the task card surfaces the new column without
+    // requiring a page reload.
+    const fetchAgents = vi.fn().mockResolvedValue(undefined);
+    useAgentStore.setState({ fetchAgents });
+
+    handleWsMessage({
+      type: "agent_spawn_failed",
+      data: {
+        id: "agent-x",
+        command: "/usr/local/bin/branchwork-server",
+        errno: 2,
+        errno_str: "ENOENT",
+        message: "runner could not spawn: /usr/local/bin/branchwork-server (ENOENT)",
       },
     });
 
