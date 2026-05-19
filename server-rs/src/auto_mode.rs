@@ -953,6 +953,27 @@ async fn run_state_machine(
     // true and the drain helper short-circuits to empty.
     if !should_merge_now(state, plan_name, task_id) {
         defer_for_cadence(state, org_id, agent_id, plan_name, task_id, cadence).await;
+        // Deferral doesn't merge, but the phase still needs to make
+        // progress — otherwise auto-mode deadlocks here (task done,
+        // merge deferred, no next-task spawn). Kick try_auto_advance
+        // so the next pending task in the phase picks up. `None` for
+        // merged_sha: no merge happened, manual-path semantics.
+        let registry = state.registry.clone();
+        let plans_dir = state.plans_dir.clone();
+        let plan_name_owned = plan_name.to_string();
+        let task_id_owned = task_id.to_string();
+        let effort = *state.effort.lock().unwrap();
+        let port = state.config_port();
+        crate::agents::try_auto_advance(
+            registry,
+            plans_dir,
+            plan_name_owned,
+            task_id_owned,
+            effort,
+            port,
+            None,
+        )
+        .await;
         return;
     }
 
