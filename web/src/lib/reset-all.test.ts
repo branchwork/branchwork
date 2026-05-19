@@ -92,7 +92,7 @@ function seedAllStores() {
         cost_usd: null,
         driver: null,
         merge_status: null,
-  spawn_error: null,
+        spawn_error: null,
       },
     ],
     selectedAgentId: "agent-a-1",

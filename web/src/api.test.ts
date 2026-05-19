@@ -207,7 +207,7 @@ describe("fetchJson session-expiry interceptor", () => {
             cost_usd: null,
             driver: null,
             merge_status: null,
-  spawn_error: null,
+            spawn_error: null,
           },
         ],
         agentsFetched: true,

@@ -53,7 +53,7 @@ function makeAgent(overrides: Partial<Agent> = {}): Agent {
     cost_usd: null,
     driver: null,
     merge_status: null,
-  spawn_error: null,
+    spawn_error: null,
     ...overrides,
   };
 }

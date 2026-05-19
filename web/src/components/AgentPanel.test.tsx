@@ -156,7 +156,7 @@ describe("AgentPanel DiffView merge dropdown", () => {
       cost_usd: null,
       driver: "claude",
       merge_status: null,
-  spawn_error: null,
+      spawn_error: null,
     };
     useAgentStore.setState({
       agents: [agent],

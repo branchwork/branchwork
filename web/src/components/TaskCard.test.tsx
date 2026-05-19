@@ -76,7 +76,7 @@ function agent(overrides: Partial<Agent> = {}): Agent {
     cost_usd: null,
     driver: null,
     merge_status: null,
-  spawn_error: null,
+    spawn_error: null,
     ...overrides,
   };
 }
@@ -658,7 +658,7 @@ describe("TaskCard awaiting-cadence pill", () => {
           status: "completed",
           branch: null,
           merge_status: null,
-  spawn_error: null,
+          spawn_error: null,
         }),
       ],
     });
@@ -769,7 +769,7 @@ describe("TaskCard awaiting-cadence pill", () => {
           status: "completed",
           branch: null,
           merge_status: null,
-  spawn_error: null,
+          spawn_error: null,
         }),
       ],
     });

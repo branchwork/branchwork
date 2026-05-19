@@ -160,13 +160,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
         // spawn-reliability plan). A subsequent successful spawn flips
         // the row's `status` away from `failed` (and a fresh Start
         // produces a new row entirely), so the banner naturally clears.
-        if (
-          a.status === "failed" &&
-          a.spawn_error &&
-          !spawnFailed &&
-          !running &&
-          !branch
-        ) {
+        if (a.status === "failed" && a.spawn_error && !spawnFailed && !running && !branch) {
           spawnFailed = a;
         }
       }
