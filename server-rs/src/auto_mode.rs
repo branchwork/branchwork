@@ -41,6 +41,14 @@ use crate::ws::broadcast_event;
 pub mod actions {
     /// A task agent completed and the loop merged its branch.
     pub const AUTO_MODE_MERGED: &str = "auto_mode.merged";
+    /// A task agent completed cleanly but the loop's cadence gate
+    /// ([`super::should_merge_now`]) said it wasn't time to merge yet —
+    /// the agent's branch was left intact and the row marked
+    /// `merge_status='deferred_for_cadence'`. The next completion that
+    /// flips the gate to true drains every deferred row in dependency
+    /// order before merging itself. Diff carries
+    /// `{plan, task, agent_id, cadence}`.
+    pub const AUTO_MODE_MERGE_DEFERRED: &str = "auto_mode.merge_deferred";
     /// The loop aborted itself for a plan and recorded a pause reason.
     pub const AUTO_MODE_PAUSED: &str = "auto_mode.paused";
     /// CI came back green (or wasn't configured) — loop advanced.
@@ -215,6 +223,10 @@ mod state_labels {
     pub const AWAITING_CI: &str = "awaiting_ci";
     pub const ADVANCING: &str = "advancing";
     pub const PAUSED: &str = "paused";
+    /// The cadence gate ([`super::should_merge_now`]) returned false —
+    /// the agent merged nothing and the row is marked
+    /// `deferred_for_cadence` until the boundary task completes.
+    pub const DEFERRED: &str = "deferred";
 }
 
 /// Called from the agent-completion path (standalone and SaaS) once a task
@@ -423,14 +435,23 @@ enum MergeStepOutcome {
 /// CI gate without re-reading state. Pulled out as a free function so
 /// unit tests can drive just the merge half synchronously without
 /// triggering the CI poll.
+///
+/// `trigger_ci=true` (the default for the cadence-boundary trigger
+/// merge) spawns `crate::ci::trigger_after_merge` which pushes the
+/// new trunk SHA to origin and inserts the `ci_runs` row. `false` is
+/// used for the deferred siblings during a cadence batch drain — they
+/// land locally; the final merge in the batch is what pushes. Either
+/// way the per-merge `auto_mode_merged` broadcast + audit row still
+/// fire, so the dashboard sees every drained task get marked merged.
 async fn run_merge_step(
     state: &AppState,
     org_id: &str,
     agent_id: &str,
     plan_name: &str,
     task_id: &str,
+    trigger_ci: bool,
 ) -> MergeStepOutcome {
-    let outcome = merge_agent_branch_dispatch(state, org_id, agent_id, None).await;
+    let outcome = merge_agent_branch_dispatch(state, org_id, agent_id, None, trigger_ci).await;
 
     if let Some(sha) = outcome.merged_sha {
         let payload = serde_json::json!({
@@ -451,6 +472,18 @@ async fn run_merge_step(
             Some(agent_id),
             Some(&payload.to_string()),
         );
+        // Clear any stale cadence-deferral marker on this agent row —
+        // a successful merge is the natural transition out of the
+        // `deferred_for_cadence` state. (Drains run a SELECT before
+        // calling us, but a defensive UPDATE here is cheap and keeps
+        // the column self-healing if a row ever ends up marked
+        // without being in the drain list.)
+        conn.execute(
+            "UPDATE agents SET merge_status = NULL \
+             WHERE id = ?1 AND merge_status = 'deferred_for_cadence'",
+            params![agent_id],
+        )
+        .ok();
         return MergeStepOutcome::Merged(sha);
     }
 
@@ -517,6 +550,201 @@ fn broadcast_state(
     broadcast_event(&state.broadcast_tx, "auto_mode_state", payload);
 }
 
+/// Mark `agent_id` as `merge_status='deferred_for_cadence'`, broadcast
+/// `auto_mode_merge_deferred` and the matching `auto_mode_state(deferred)`
+/// pill update, and write an audit row. Used by [`run_state_machine`]
+/// when [`should_merge_now`] returns false on a clean task completion.
+/// The agent's `branch` column is left intact — the cadence-boundary
+/// drain reads it back when it's time to merge.
+async fn defer_for_cadence(
+    state: &AppState,
+    org_id: &str,
+    agent_id: &str,
+    plan_name: &str,
+    task_id: &str,
+    cadence: MergeCadence,
+) {
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET merge_status = 'deferred_for_cadence' WHERE id = ?1",
+            params![agent_id],
+        )
+        .ok();
+    }
+
+    let cadence_wire = db::merge_cadence_wire(cadence);
+    let payload = serde_json::json!({
+        "plan": plan_name,
+        "task": task_id,
+        "agent_id": agent_id,
+        "cadence": cadence_wire,
+    });
+    broadcast_event(
+        &state.broadcast_tx,
+        "auto_mode_merge_deferred",
+        payload.clone(),
+    );
+    broadcast_state(
+        state,
+        plan_name,
+        task_id,
+        state_labels::DEFERRED,
+        None,
+        Some(cadence_wire),
+    );
+
+    let conn = state.db.lock().unwrap();
+    audit::log(
+        &conn,
+        org_id,
+        None,
+        Some("branchwork-auto-mode"),
+        actions::AUTO_MODE_MERGE_DEFERRED,
+        audit::resources::AGENT,
+        Some(agent_id),
+        Some(&payload.to_string()),
+    );
+}
+
+/// Look up agent rows for `plan_name` that completed cleanly but were
+/// deferred via [`defer_for_cadence`]. The list is filtered to the
+/// scope implied by `cadence`:
+///
+/// - [`MergeCadence::Phase`]: only deferred agents whose task lives in
+///   the same phase as `trigger_task` (the task that just completed
+///   and flipped [`should_merge_now`] to true).
+/// - [`MergeCadence::Plan`]: every deferred agent in the plan.
+/// - [`MergeCadence::Task`]: empty (this cadence never defers, so the
+///   drain is a no-op).
+///
+/// The trigger agent itself is intentionally **not** in the returned
+/// list — the caller merges it separately as the final step of the
+/// batch (so the per-merge CI trigger fires exactly once on the
+/// boundary).
+///
+/// Output is ordered by **dependency order** — the YAML declaration
+/// order in the plan. Production task numbers like "1.10" don't sort
+/// lexically alongside "1.2", so we walk `plan.phases.tasks` to
+/// produce an ordered task list, then filter to the deferred subset.
+/// Agent rows are joined to that ordering, so a phase with deferred
+/// agents on tasks 1.1, 1.2, 1.3 is returned in that exact order.
+fn list_deferred_for_cadence_in_order(
+    state: &AppState,
+    plan_name: &str,
+    trigger_task: &str,
+    trigger_agent_id: &str,
+    cadence: MergeCadence,
+) -> Vec<(String, String)> {
+    if cadence == MergeCadence::Task {
+        return Vec::new();
+    }
+
+    let plan = match plan_parser::find_plan_file(&state.plans_dir, plan_name)
+        .and_then(|p| plan_parser::parse_plan_file(&p).ok())
+    {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    // Build the dependency-ordered task list scoped to phase or plan.
+    let task_order: Vec<String> = match cadence {
+        MergeCadence::Task => return Vec::new(),
+        MergeCadence::Phase => {
+            let Some(phase) = plan
+                .phases
+                .iter()
+                .find(|p| p.tasks.iter().any(|t| t.number == trigger_task))
+            else {
+                return Vec::new();
+            };
+            phase.tasks.iter().map(|t| t.number.clone()).collect()
+        }
+        MergeCadence::Plan => plan
+            .phases
+            .iter()
+            .flat_map(|p| p.tasks.iter().map(|t| t.number.clone()))
+            .collect(),
+    };
+
+    // Pull the deferred agents in scope into a (task_id -> agent_id) map.
+    // A task may have multiple agent rows (retries, killed siblings); the
+    // drain only cares about rows that (a) are marked deferred AND (b)
+    // still carry a non-null branch (the merge target). Take the most
+    // recent matching row per task — that's the row whose branch points
+    // at the actual committed work.
+    let mut per_task: HashMap<String, String> = HashMap::new();
+    {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, task_id FROM agents \
+             WHERE plan_name = ?1 \
+               AND merge_status = 'deferred_for_cadence' \
+               AND branch IS NOT NULL \
+               AND id != ?2 \
+             ORDER BY started_at ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![plan_name, trigger_agent_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for r in rows.flatten() {
+                // Last-write-wins: keep the most-recent deferred agent
+                // for a given task (ORDER BY started_at ASC means the
+                // latest row wins on collision).
+                per_task.insert(r.1, r.0);
+            }
+        }
+    }
+
+    task_order
+        .into_iter()
+        .filter_map(|t| per_task.remove(&t).map(|agent_id| (agent_id, t)))
+        .collect()
+}
+
+/// Drain every deferred-for-cadence agent in scope before the trigger
+/// agent is merged. Each drained merge fires the `auto_mode_merged`
+/// broadcast + audit row but DOES NOT push (the trigger agent's merge
+/// is what pushes). Returns `Some(reason)` if any drained merge failed —
+/// the plan is already paused + audit-logged by [`run_merge_step`], so
+/// the caller just propagates the abort and lets the UI flip out of
+/// `merging`. Returns `None` on full success (or empty drain queue).
+async fn drain_deferred_for_cadence(
+    state: &AppState,
+    org_id: &str,
+    plan_name: &str,
+    trigger_task: &str,
+    trigger_agent_id: &str,
+    cadence: MergeCadence,
+) -> Option<()> {
+    let deferred = list_deferred_for_cadence_in_order(
+        state,
+        plan_name,
+        trigger_task,
+        trigger_agent_id,
+        cadence,
+    );
+    if deferred.is_empty() {
+        return Some(()); // nothing to drain — success
+    }
+
+    for (agent_id, task_id) in deferred {
+        match run_merge_step(state, org_id, &agent_id, plan_name, &task_id, false).await {
+            MergeStepOutcome::Merged(_) => continue,
+            MergeStepOutcome::Paused => {
+                // run_merge_step has already paused + audit-logged; the
+                // caller flips the pill out of `merging` to `paused`.
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
 /// State-machine driver: wraps the merge step in a CI poll + advance
 /// chain. Mirrors the brief code:
 ///
@@ -535,6 +763,15 @@ fn broadcast_state(
 /// stays live; the merge-side `auto_mode_merged` / `auto_mode_paused`
 /// events from [`run_merge_step`] still fire (existing dashboard
 /// listeners depend on them).
+///
+/// Task 2.2 added a cadence gate at the top: [`should_merge_now`]
+/// decides whether the just-completed task crosses the configured
+/// boundary (phase / plan). If not, the agent is marked
+/// `merge_status='deferred_for_cadence'`, `auto_mode_merge_deferred`
+/// fires, and the loop returns without touching trunk. The next
+/// completion that flips `should_merge_now` to true drains every
+/// deferred sibling in dependency order (no per-merge push), then
+/// merges itself (the one push that lands the whole batch).
 async fn run_state_machine(
     state: &AppState,
     org_id: &str,
@@ -542,9 +779,32 @@ async fn run_state_machine(
     plan_name: &str,
     task_id: &str,
 ) {
+    let cadence = resolve_effective_cadence(state, plan_name);
+
+    // Cadence gate: if we're not at the boundary, defer and bail.
+    // `Task` cadence never defers — `should_merge_now` always returns
+    // true and the drain helper short-circuits to empty.
+    if !should_merge_now(state, plan_name, task_id) {
+        defer_for_cadence(state, org_id, agent_id, plan_name, task_id, cadence).await;
+        return;
+    }
+
     broadcast_state(state, plan_name, task_id, state_labels::MERGING, None, None);
 
-    let merged_sha = match run_merge_step(state, org_id, agent_id, plan_name, task_id).await {
+    // Drain deferred siblings before the trigger merge. Each drained
+    // merge lands on trunk locally but does NOT push (trigger_ci=false);
+    // the trigger merge below is what pushes the whole batch.
+    if drain_deferred_for_cadence(state, org_id, plan_name, task_id, agent_id, cadence)
+        .await
+        .is_none()
+    {
+        // A drained merge failed; `run_merge_step` already paused the
+        // plan. Flip the pill out of `merging` to `paused`.
+        broadcast_state(state, plan_name, task_id, state_labels::PAUSED, None, None);
+        return;
+    }
+
+    let merged_sha = match run_merge_step(state, org_id, agent_id, plan_name, task_id, true).await {
         MergeStepOutcome::Merged(sha) => sha,
         MergeStepOutcome::Paused => {
             // run_merge_step has already paused + audit-logged; emit only
@@ -1162,8 +1422,9 @@ async fn on_fix_agent_completed(
     // canonical default at merge time (master / main). The fix branch
     // does NOT land back on the original task branch — fixes go straight
     // to trunk so try_auto_advance can immediately move to the next task
-    // once CI is green.
-    let outcome = merge_agent_branch_dispatch(state, org_id, fix_agent_id, None).await;
+    // once CI is green. `trigger_ci = true` — fix merges always push
+    // (they're standalone, never batched via the cadence drain).
+    let outcome = merge_agent_branch_dispatch(state, org_id, fix_agent_id, None, true).await;
 
     let merged_sha = match outcome.merged_sha.clone() {
         Some(sha) => {
@@ -2384,7 +2645,7 @@ mod tests {
         seed_agent(&db, "agent-1", &cwd, "p", "1.1", "branchwork/p/1.1");
         enable_auto_mode(&db, "p");
 
-        let outcome = run_merge_step(&state, "default-org", "agent-1", "p", "1.1").await;
+        let outcome = run_merge_step(&state, "default-org", "agent-1", "p", "1.1", true).await;
         let merged_sha = match &outcome {
             MergeStepOutcome::Merged(sha) => sha.clone(),
             MergeStepOutcome::Paused => panic!("expected Merged, got Paused"),
@@ -2584,7 +2845,7 @@ mod tests {
         seed_agent(&db, "agent-1", &cwd, "p", "1.1", "branchwork/p/1.1");
         enable_auto_mode(&db, "p");
 
-        run_merge_step(&state, "default-org", "agent-1", "p", "1.1").await;
+        run_merge_step(&state, "default-org", "agent-1", "p", "1.1", true).await;
 
         // Master moved (merge happened locally) and the spawned
         // `trigger_after_merge` ran the rebase-then-retry path. Poll for
@@ -2760,7 +3021,7 @@ mod tests {
         seed_agent(&db, "agent-1", &cwd, "p", "1.3", task_branch);
         enable_auto_mode(&db, "p");
 
-        run_merge_step(&state, "default-org", "agent-1", "p", "1.3").await;
+        run_merge_step(&state, "default-org", "agent-1", "p", "1.3", true).await;
 
         // Wait for `trigger_after_merge` (spawned in a tokio task) to
         // run through the push → non-FF → rebase → CONFLICT → pause
@@ -2866,7 +3127,7 @@ mod tests {
         seed_agent(&db, "agent-1", &cwd, "p", "1.1", "branchwork/p/1.1");
         enable_auto_mode(&db, "p");
 
-        run_merge_step(&state, "default-org", "agent-1", "p", "1.1").await;
+        run_merge_step(&state, "default-org", "agent-1", "p", "1.1", true).await;
 
         // Master untouched.
         assert_eq!(git_head_sha(&cwd), master_before, "master should not move");
@@ -2977,7 +3238,7 @@ mod tests {
         );
         enable_auto_mode(&db, "p");
 
-        run_merge_step(&state, "default-org", "agent-1", "p", "1.1").await;
+        run_merge_step(&state, "default-org", "agent-1", "p", "1.1", true).await;
 
         let events = drain_event_types(&mut rx);
         assert!(
@@ -3026,7 +3287,7 @@ mod tests {
         );
         enable_auto_mode(&db, "p");
 
-        run_merge_step(&state, "default-org", "agent-1", "p", "1.1").await;
+        run_merge_step(&state, "default-org", "agent-1", "p", "1.1", true).await;
 
         let reason = paused_reason(&db, "p").expect("plan should be paused");
         assert!(
@@ -3082,7 +3343,7 @@ mod tests {
         );
         enable_auto_mode(&db, "p");
 
-        run_merge_step(&state, "default-org", "agent-1", "p", "1.1").await;
+        run_merge_step(&state, "default-org", "agent-1", "p", "1.1", true).await;
 
         // Drain everything the runner saw and look for MergeBranch.
         let mut saw_merge = false;
@@ -3977,7 +4238,7 @@ mod tests {
         // 20-min timeout — and stubbing the dispatch to return Ok(None)
         // forever via the runner is more invasive than just calling the
         // already-tested `on_ci_stalled` branch directly.
-        let merge_outcome = run_merge_step(&state, org_id, "agent-1", "p", "0.1").await;
+        let merge_outcome = run_merge_step(&state, org_id, "agent-1", "p", "0.1", true).await;
         let merged_sha = match merge_outcome {
             MergeStepOutcome::Merged(sha) => sha,
             MergeStepOutcome::Paused => panic!("merge should succeed in stub"),
@@ -6289,5 +6550,717 @@ mod tests {
         // No plan to load → refuse. `Task` cadence still short-circuits
         // before the load, so this only fires for Phase/Plan.
         assert!(!should_merge_now(&state, "ghost", "0.1"));
+    }
+
+    // ── cadence-deferral + boundary drain (Task 2.2) ────────────────────
+    //
+    // These pin the Task 2.2 contract end-to-end:
+    //   - Mid-phase / mid-plan completions defer: the agent's row
+    //     gains `merge_status='deferred_for_cadence'`, no MergeBranch
+    //     / PushBranch envelopes go out, no `ci_runs` row appears.
+    //   - The boundary-task completion drains every deferred sibling
+    //     in dependency order (per the plan's YAML declaration order),
+    //     then merges itself. The trigger merge is the only one that
+    //     produces a PushBranch envelope — the upstream drains run
+    //     with `trigger_ci=false`, so a 4-task phase produces exactly
+    //     ONE master push and ONE `ci_runs` row.
+
+    /// Write a 4-task single-phase plan YAML. Mirrors the headline
+    /// acceptance scenario in the brief: phase 1 with tasks 1.1 / 1.2 /
+    /// 1.3 / 1.4. `project` is set to a unique fake path so the helpers
+    /// that resolve `work_dir` don't touch a real repo.
+    fn write_four_task_phase_plan(plans_dir: &Path, name: &str, fake_project: &str) {
+        std::fs::create_dir_all(plans_dir).unwrap();
+        let yaml = format!(
+            "title: 4-task phase plan\n\
+             project: {fake_project}\n\
+             phases:\n  \
+               - number: 1\n    \
+                 title: Phase 1\n    \
+                 tasks:\n      \
+                   - number: \"1.1\"\n        \
+                     title: 1.1\n      \
+                   - number: \"1.2\"\n        \
+                     title: 1.2\n      \
+                   - number: \"1.3\"\n        \
+                     title: 1.3\n      \
+                   - number: \"1.4\"\n        \
+                     title: 1.4\n"
+        );
+        std::fs::write(plans_dir.join(format!("{name}.yaml")), yaml).unwrap();
+    }
+
+    /// Read `merge_status` for the agent row.
+    fn agent_merge_status(db: &Db, agent_id: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT merge_status FROM agents WHERE id = ?1",
+            params![agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Drain `auto_mode_merge_deferred` event payloads in arrival order.
+    fn drain_merge_deferred_payloads(
+        rx: &mut broadcast::Receiver<String>,
+    ) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg)
+                && v.get("type").and_then(|t| t.as_str()) == Some("auto_mode_merge_deferred")
+                && let Some(d) = v.get("data")
+            {
+                out.push(d.clone());
+            }
+        }
+        out
+    }
+
+    /// Drain `auto_mode_merged` event payloads in arrival order.
+    fn drain_merged_payloads(rx: &mut broadcast::Receiver<String>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg)
+                && v.get("type").and_then(|t| t.as_str()) == Some("auto_mode_merged")
+                && let Some(d) = v.get("data")
+            {
+                out.push(d.clone());
+            }
+        }
+        out
+    }
+
+    /// Convenience: insert one agent row per (id, task) pair on plan
+    /// `p`. Each row carries a synthetic task branch name. `cwd` is the
+    /// same for every agent because the SaaS-mode merge dispatch
+    /// (echo runner) doesn't actually shell out to git — the path just
+    /// has to deserialize.
+    fn seed_phase_agents(db: &Db, cwd: &Path, rows: &[(&str, &str)]) {
+        for (id, task) in rows {
+            let branch = format!("branchwork/p/{task}");
+            seed_agent(db, id, cwd, "p", task, &branch);
+        }
+    }
+
+    /// Count agents on plan `p` whose `merge_status='deferred_for_cadence'`.
+    fn count_deferred_agents(db: &Db, plan: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM agents \
+             WHERE plan_name = ?1 AND merge_status = 'deferred_for_cadence'",
+            params![plan],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Drain every pending envelope from the echo runner's outgoing
+    /// channel and append it to `seen`. Callers maintain their own
+    /// growing list of captured envelope types so they can assert
+    /// running totals AND envelope ordering across multiple state-
+    /// machine calls — single-shot `try_recv` would lose anything
+    /// emitted after the assertion and the wrong envelope type would
+    /// be silently consumed.
+    ///
+    /// Each entry in `seen` is the JSON `"type"` discriminator
+    /// (the snake_case `WireMessage` variant name). `Envelope` carries
+    /// its `message` via `#[serde(flatten)]`, so the discriminator
+    /// lives at the top level — no nested `"message"` key.
+    fn drain_envelope_types(rx: &mut mpsc::UnboundedReceiver<String>, seen: &mut Vec<String>) {
+        while let Ok(payload) = rx.try_recv() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload)
+                && let Some(t) = v.get("type").and_then(|t| t.as_str())
+            {
+                seen.push(t.to_string());
+            }
+        }
+    }
+
+    /// Brief's headline acceptance test: 4-task phase under
+    /// `merge_cadence='phase'`. Tasks 1.1 / 1.2 / 1.3 each complete →
+    /// no master pushes (and no `ci_runs` rows); task 1.4 completes →
+    /// ONE master push containing all four task merges in order.
+    #[tokio::test]
+    async fn phase_cadence_defers_three_then_drains_all_four_on_boundary() {
+        let (db, dir) = fresh_db();
+        let org_id = "default-org";
+        seed_runner_row(&db, "runner-1", org_id);
+
+        let plans_dir = dir.path().join("plans");
+        let fake_project = format!(
+            "branchwork-test-{}-phase-batch",
+            uuid::Uuid::new_v4().simple()
+        );
+        write_four_task_phase_plan(&plans_dir, "p", &fake_project);
+        // The cadence pin is what flips this plan out of legacy `Task`
+        // behaviour; without it the gate would always return true and
+        // each completion would merge immediately.
+        db::set_plan_merge_cadence(&db, "p", Some(MergeCadence::Phase));
+        enable_auto_mode(&db, "p");
+
+        // Echo runner stubs: deterministic merged_sha per envelope so the
+        // assertions on order are unambiguous. Counter via Arc<Mutex>
+        // so the closure can mutate per call.
+        let merge_counter = Arc::new(StdMutex::new(0u32));
+        let mc = merge_counter.clone();
+        let runners = new_runner_registry();
+        let mut outgoing = install_echo_runner(&runners, "runner-1", move |msg| match msg {
+            WireMessage::GetDefaultBranch { .. } => {
+                Some(RunnerResponse::DefaultBranchResolved(Some("master".into())))
+            }
+            WireMessage::MergeBranch { .. } => {
+                let mut n = mc.lock().unwrap();
+                *n += 1;
+                Some(RunnerResponse::MergeResult(WireMergeOutcome::Ok {
+                    merged_sha: format!("sha-{n:03}"),
+                }))
+            }
+            WireMessage::PushBranch { .. } => Some(RunnerResponse::PushResult {
+                ok: true,
+                stderr: None,
+            }),
+            WireMessage::HasGithubActions { .. } => {
+                Some(RunnerResponse::GithubActionsDetected(true))
+            }
+            WireMessage::GetCiRunStatus { .. } => Some(RunnerResponse::CiRunStatusResolved(Some(
+                aggregate_success(),
+            ))),
+            _ => None,
+        })
+        .await;
+
+        let (state, mut rx) = test_app_state(db.clone(), runners, plans_dir);
+
+        // Seed all four agent rows + their task branches. cwd is on the
+        // "runner" so it never touches real disk.
+        let cwd = Path::new("/runner/cwd");
+        seed_phase_agents(
+            &db,
+            cwd,
+            &[
+                ("agent-1.1", "1.1"),
+                ("agent-1.2", "1.2"),
+                ("agent-1.3", "1.3"),
+                ("agent-1.4", "1.4"),
+            ],
+        );
+
+        // Per-call running tally — drain_envelope_types accumulates
+        // envelope types into `seen`. Indirect `count` helper closes
+        // over `seen` to count entries matching a given event_type.
+        let mut seen: Vec<String> = Vec::new();
+        let count = |seen: &[String], et: &str| seen.iter().filter(|s| *s == et).count();
+
+        // ── Drive 1.1 ─────────────────────────────────────────────
+        // No task_status rows yet → caller's word treats 1.1 as done,
+        // 1.2/1.3/1.4 still pending → defer.
+        run_state_machine(&state, org_id, "agent-1.1", "p", "1.1").await;
+        drain_envelope_types(&mut outgoing, &mut seen);
+
+        assert_eq!(
+            agent_merge_status(&db, "agent-1.1").as_deref(),
+            Some("deferred_for_cadence"),
+            "1.1 must be marked deferred at the cadence gate"
+        );
+        // Mid-phase: zero MergeBranch envelopes, zero PushBranch envelopes,
+        // no ci_runs row inserted.
+        assert_eq!(
+            count(&seen, "merge_branch"),
+            0,
+            "1.1 defer must not send MergeBranch"
+        );
+        assert_eq!(
+            count(&seen, "push_branch"),
+            0,
+            "1.1 defer must not send PushBranch"
+        );
+        let ci_count = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM ci_runs WHERE plan_name = 'p'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        };
+        assert_eq!(ci_count, 0, "1.1 defer must not insert a ci_runs row");
+
+        // Now flip the task_status row so the gate at 1.2 sees 1.1 as done
+        // (via the persisted row, since the auto-mode loop reads from
+        // `task_status`, not just the caller's word).
+        mark_task_status(&db, "p", "1.1", "completed");
+
+        // ── Drive 1.2 ─────────────────────────────────────────────
+        run_state_machine(&state, org_id, "agent-1.2", "p", "1.2").await;
+        drain_envelope_types(&mut outgoing, &mut seen);
+        assert_eq!(
+            agent_merge_status(&db, "agent-1.2").as_deref(),
+            Some("deferred_for_cadence"),
+        );
+        assert_eq!(count(&seen, "merge_branch"), 0);
+        assert_eq!(count(&seen, "push_branch"), 0);
+
+        mark_task_status(&db, "p", "1.2", "completed");
+
+        // ── Drive 1.3 ─────────────────────────────────────────────
+        run_state_machine(&state, org_id, "agent-1.3", "p", "1.3").await;
+        drain_envelope_types(&mut outgoing, &mut seen);
+        assert_eq!(
+            agent_merge_status(&db, "agent-1.3").as_deref(),
+            Some("deferred_for_cadence"),
+        );
+        assert_eq!(count(&seen, "merge_branch"), 0);
+        assert_eq!(count(&seen, "push_branch"), 0);
+
+        // All three deferred rows are present.
+        assert_eq!(count_deferred_agents(&db, "p"), 3);
+
+        // Three `auto_mode_merge_deferred` broadcasts, one per defer.
+        let deferred_events = drain_merge_deferred_payloads(&mut rx);
+        let deferred_tasks: Vec<String> = deferred_events
+            .iter()
+            .filter_map(|d| d.get("task").and_then(|t| t.as_str()).map(String::from))
+            .collect();
+        assert_eq!(
+            deferred_tasks,
+            vec!["1.1".to_string(), "1.2".to_string(), "1.3".to_string()],
+            "expected one deferred broadcast per task, in task order"
+        );
+        for d in &deferred_events {
+            assert_eq!(
+                d.get("cadence").and_then(|c| c.as_str()),
+                Some("phase"),
+                "every deferred broadcast carries the effective cadence"
+            );
+        }
+
+        mark_task_status(&db, "p", "1.3", "completed");
+
+        // ── Drive 1.4: the cadence boundary ───────────────────────
+        // should_merge_now flips true (every task in phase 1 is done
+        // per task_status + caller's word). The state machine must
+        // drain 1.1/1.2/1.3 in YAML declaration order, then merge
+        // 1.4 with `trigger_ci=true` — single PushBranch envelope,
+        // single `ci_runs` row.
+        run_state_machine(&state, org_id, "agent-1.4", "p", "1.4").await;
+        drain_envelope_types(&mut outgoing, &mut seen);
+
+        // Exactly 4 MergeBranch envelopes (3 drain + 1 trigger).
+        assert_eq!(
+            count(&seen, "merge_branch"),
+            4,
+            "expected 4 MergeBranch envelopes (3 drains + 1 trigger), got {}",
+            count(&seen, "merge_branch"),
+        );
+
+        // Poll for the PushBranch envelope: trigger_after_merge is
+        // spawned, so the push lands asynchronously. Drain into the
+        // running tally on each poll so we don't lose any envelope.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && count(&seen, "push_branch") == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drain_envelope_types(&mut outgoing, &mut seen);
+        }
+        let pushes = count(&seen, "push_branch");
+        assert_eq!(
+            pushes, 1,
+            "single master push at the end of the batch, got {pushes}",
+        );
+
+        // Exactly one `ci_runs` row for the entire phase batch (pinned
+        // to 1.4's trigger; the drains used `trigger_ci=false`).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ci_count = 0i64;
+        while std::time::Instant::now() < deadline {
+            ci_count = {
+                let conn = db.lock().unwrap();
+                conn.query_row(
+                    "SELECT COUNT(*) FROM ci_runs WHERE plan_name = 'p'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+            };
+            if ci_count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ci_count, 1,
+            "single ci_runs row for the whole batch, got {ci_count}",
+        );
+
+        // All four agents merged → no rows left in the deferred set.
+        assert_eq!(
+            count_deferred_agents(&db, "p"),
+            0,
+            "drain must clear merge_status on every batched agent",
+        );
+
+        // Four `auto_mode_merged` broadcasts arrive in YAML
+        // declaration order (1.1, 1.2, 1.3, 1.4). The trigger agent's
+        // merge fires last because the drain runs first.
+        let merged_events = drain_merged_payloads(&mut rx);
+        let merged_tasks: Vec<String> = merged_events
+            .iter()
+            .filter_map(|d| d.get("task").and_then(|t| t.as_str()).map(String::from))
+            .collect();
+        assert_eq!(
+            merged_tasks,
+            vec![
+                "1.1".to_string(),
+                "1.2".to_string(),
+                "1.3".to_string(),
+                "1.4".to_string(),
+            ],
+            "drain merges in YAML declaration order, trigger merges last",
+        );
+
+        // Plan stays unpaused on success.
+        assert!(paused_reason(&db, "p").is_none());
+    }
+
+    /// Direct cover for [`defer_for_cadence`]: a non-boundary completion
+    /// stamps `merge_status='deferred_for_cadence'` on the agent row,
+    /// emits the `auto_mode_merge_deferred` broadcast, and audits the
+    /// `AUTO_MODE_MERGE_DEFERRED` action. The agent's `branch` column
+    /// is left intact so the eventual drain can find the branch back.
+    #[tokio::test]
+    async fn defer_for_cadence_marks_agent_and_broadcasts_event() {
+        let (db, dir) = fresh_db();
+        let org_id = "default-org";
+        let plans_dir = dir.path().join("plans");
+        let fake_project = format!(
+            "branchwork-test-{}-defer-only",
+            uuid::Uuid::new_v4().simple()
+        );
+        write_four_task_phase_plan(&plans_dir, "p", &fake_project);
+
+        let cwd = Path::new("/runner/cwd");
+        seed_agent(&db, "agent-1.1", cwd, "p", "1.1", "branchwork/p/1.1");
+
+        let runners = new_runner_registry();
+        let (state, mut rx) = test_app_state(db.clone(), runners, plans_dir);
+
+        // Pre-condition: branch column is set, merge_status is NULL.
+        let pre_status = agent_merge_status(&db, "agent-1.1");
+        assert!(pre_status.is_none());
+
+        defer_for_cadence(&state, org_id, "agent-1.1", "p", "1.1", MergeCadence::Phase).await;
+
+        // Post-condition: merge_status flipped to `deferred_for_cadence`.
+        assert_eq!(
+            agent_merge_status(&db, "agent-1.1").as_deref(),
+            Some("deferred_for_cadence"),
+        );
+
+        // Branch column intact — the drain reads it back later.
+        let branch: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT branch FROM agents WHERE id = 'agent-1.1'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap_or(None)
+        };
+        assert_eq!(branch.as_deref(), Some("branchwork/p/1.1"));
+
+        // Broadcast payload carries plan/task/agent_id/cadence.
+        let payloads = drain_merge_deferred_payloads(&mut rx);
+        assert_eq!(payloads.len(), 1, "exactly one deferred broadcast");
+        let d = &payloads[0];
+        assert_eq!(d.get("plan").and_then(|v| v.as_str()), Some("p"));
+        assert_eq!(d.get("task").and_then(|v| v.as_str()), Some("1.1"));
+        assert_eq!(
+            d.get("agent_id").and_then(|v| v.as_str()),
+            Some("agent-1.1"),
+        );
+        assert_eq!(d.get("cadence").and_then(|v| v.as_str()), Some("phase"));
+
+        // Audit row recorded.
+        let actions = audit_actions_for(&db, "agent-1.1");
+        assert!(
+            actions
+                .iter()
+                .any(|a| a == actions::AUTO_MODE_MERGE_DEFERRED),
+            "expected AUTO_MODE_MERGE_DEFERRED in actions: {actions:?}"
+        );
+    }
+
+    /// Direct cover for [`list_deferred_for_cadence_in_order`]: deferred
+    /// agents are returned in YAML declaration order regardless of the
+    /// insertion order, the trigger agent is excluded, and the helper
+    /// returns the agent_id↔task_id pairs (so the drain can iterate
+    /// without re-querying the DB).
+    #[test]
+    fn list_deferred_returns_agents_in_yaml_declaration_order() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let fake_project = format!(
+            "branchwork-test-{}-deferred-order",
+            uuid::Uuid::new_v4().simple()
+        );
+        write_four_task_phase_plan(&plans_dir, "p", &fake_project);
+
+        let cwd = Path::new("/runner/cwd");
+
+        // Seed in REVERSE order so a buggy implementation that returns
+        // started_at order would produce [1.3, 1.2, 1.1].
+        for (id, task) in &[
+            ("agent-1.3", "1.3"),
+            ("agent-1.1", "1.1"),
+            ("agent-1.2", "1.2"),
+            ("agent-1.4", "1.4"),
+        ] {
+            let branch = format!("branchwork/p/{task}");
+            seed_agent(&db, id, cwd, "p", task, &branch);
+        }
+        // Mark 1.1/1.2/1.3 as deferred. 1.4 is the trigger — left
+        // unmarked so the helper excludes it explicitly.
+        for id in &["agent-1.1", "agent-1.2", "agent-1.3"] {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET merge_status = 'deferred_for_cadence' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let state = app_state(db, plans_dir);
+        let got = list_deferred_for_cadence_in_order(
+            &state,
+            "p",
+            "1.4",
+            "agent-1.4",
+            MergeCadence::Phase,
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("agent-1.1".to_string(), "1.1".to_string()),
+                ("agent-1.2".to_string(), "1.2".to_string()),
+                ("agent-1.3".to_string(), "1.3".to_string()),
+            ],
+            "expected drain order matching YAML declaration"
+        );
+
+        // The trigger agent (agent-1.4) is excluded even when it carries
+        // `merge_status='deferred_for_cadence'` itself — defensive
+        // against a race where the agent flips status mid-flight.
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET merge_status = 'deferred_for_cadence' \
+                 WHERE id = 'agent-1.4'",
+                [],
+            )
+            .unwrap();
+        }
+        let got = list_deferred_for_cadence_in_order(
+            &state,
+            "p",
+            "1.4",
+            "agent-1.4",
+            MergeCadence::Phase,
+        );
+        assert_eq!(got.len(), 3, "trigger agent must be excluded");
+    }
+
+    /// Task cadence never defers — the drain helper short-circuits to
+    /// an empty list and the state machine merges every completion
+    /// immediately, mirroring legacy auto-mode.
+    #[test]
+    fn list_deferred_returns_empty_for_task_cadence() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let fake_project = format!(
+            "branchwork-test-{}-task-noop",
+            uuid::Uuid::new_v4().simple()
+        );
+        write_four_task_phase_plan(&plans_dir, "p", &fake_project);
+
+        // Mark every agent deferred — but with Task cadence the helper
+        // returns empty regardless.
+        let cwd = Path::new("/runner/cwd");
+        seed_phase_agents(&db, cwd, &[("a", "1.1"), ("b", "1.2"), ("c", "1.3")]);
+        for id in &["a", "b", "c"] {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET merge_status = 'deferred_for_cadence' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let state = app_state(db, plans_dir);
+        let got =
+            list_deferred_for_cadence_in_order(&state, "p", "1.4", "agent-1.4", MergeCadence::Task);
+        assert!(
+            got.is_empty(),
+            "Task cadence drain is unconditionally empty"
+        );
+    }
+
+    /// Plan cadence scopes the drain to every deferred agent in the
+    /// plan, not just the trigger's phase. A 2-phase plan with deferred
+    /// agents in both phases drains all of them together.
+    #[test]
+    fn list_deferred_plan_cadence_drains_across_phases() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        // Reuse the existing 2-phase / 3-task-per-phase helper.
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+
+        let cwd = Path::new("/runner/cwd");
+        // Phase 0 has one deferred agent; phase 1 has two.
+        seed_agent(&db, "a-0.2", cwd, "p", "0.2", "branchwork/p/0.2");
+        seed_agent(&db, "a-1.1", cwd, "p", "1.1", "branchwork/p/1.1");
+        seed_agent(&db, "a-1.2", cwd, "p", "1.2", "branchwork/p/1.2");
+        // Trigger row — phase 1 task 1.3.
+        seed_agent(&db, "a-1.3", cwd, "p", "1.3", "branchwork/p/1.3");
+        for id in &["a-0.2", "a-1.1", "a-1.2"] {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET merge_status = 'deferred_for_cadence' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let state = app_state(db, plans_dir);
+        let got =
+            list_deferred_for_cadence_in_order(&state, "p", "1.3", "a-1.3", MergeCadence::Plan);
+        assert_eq!(
+            got,
+            vec![
+                ("a-0.2".to_string(), "0.2".to_string()),
+                ("a-1.1".to_string(), "1.1".to_string()),
+                ("a-1.2".to_string(), "1.2".to_string()),
+            ],
+            "plan cadence drain must walk every phase in YAML order"
+        );
+    }
+
+    /// Phase cadence does NOT drain agents from another phase. A
+    /// deferred agent on task 0.2 (phase 0) must NOT appear when phase
+    /// 1's boundary fires.
+    #[test]
+    fn list_deferred_phase_cadence_scopes_to_trigger_phase() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+
+        let cwd = Path::new("/runner/cwd");
+        seed_agent(&db, "a-0.2", cwd, "p", "0.2", "branchwork/p/0.2");
+        seed_agent(&db, "a-1.1", cwd, "p", "1.1", "branchwork/p/1.1");
+        seed_agent(&db, "a-1.3", cwd, "p", "1.3", "branchwork/p/1.3");
+        for id in &["a-0.2", "a-1.1"] {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET merge_status = 'deferred_for_cadence' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let state = app_state(db, plans_dir);
+        let got =
+            list_deferred_for_cadence_in_order(&state, "p", "1.3", "a-1.3", MergeCadence::Phase);
+        assert_eq!(
+            got,
+            vec![("a-1.1".to_string(), "1.1".to_string())],
+            "phase cadence must not drain agents from another phase"
+        );
+    }
+
+    /// A row without a `branch` column is ignored even if it carries
+    /// `merge_status='deferred_for_cadence'` — the drain only acts on
+    /// rows that still point at a mergeable ref. This also covers the
+    /// case where a sibling merge already cleared the branch on a
+    /// retry row.
+    #[test]
+    fn list_deferred_ignores_rows_with_null_branch() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+
+        let cwd = Path::new("/runner/cwd");
+        seed_agent(&db, "a-1.1", cwd, "p", "1.1", "branchwork/p/1.1");
+        seed_agent(&db, "a-1.2-stale", cwd, "p", "1.2", "branchwork/p/1.2");
+        // Clear branch on the stale row (simulates sibling-merge cleanup).
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET branch = NULL, merge_status = 'deferred_for_cadence' \
+                 WHERE id = 'a-1.2-stale'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE agents SET merge_status = 'deferred_for_cadence' WHERE id = 'a-1.1'",
+                [],
+            )
+            .unwrap();
+        }
+        seed_agent(&db, "a-1.3", cwd, "p", "1.3", "branchwork/p/1.3");
+
+        let state = app_state(db, plans_dir);
+        let got =
+            list_deferred_for_cadence_in_order(&state, "p", "1.3", "a-1.3", MergeCadence::Phase);
+        assert_eq!(
+            got,
+            vec![("a-1.1".to_string(), "1.1".to_string())],
+            "rows with NULL branch must not appear in the drain"
+        );
+    }
+
+    /// When two agent rows exist for the same task (e.g. a killed
+    /// retry), the LATEST one wins. The drain uses the most-recently
+    /// started agent's branch — the killed sibling's stale branch ref
+    /// would point at orphan commits.
+    #[test]
+    fn list_deferred_picks_most_recent_agent_per_task() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_six_task_plan(&plans_dir, "p", &project_dir);
+
+        let cwd = Path::new("/runner/cwd");
+        seed_agent(&db, "a-1.1-killed", cwd, "p", "1.1", "branchwork/p/1.1");
+        // The default `started_at` is `datetime('now')` — sleep briefly
+        // so the second row's timestamp is strictly later. SQLite
+        // datetime resolution is 1s; we just need NEWER to win on the
+        // ORDER BY started_at ASC tie-break.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        seed_agent(&db, "a-1.1-retry", cwd, "p", "1.1", "branchwork/p/1.1-r2");
+        for id in &["a-1.1-killed", "a-1.1-retry"] {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET merge_status = 'deferred_for_cadence' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+        seed_agent(&db, "a-1.3", cwd, "p", "1.3", "branchwork/p/1.3");
+
+        let state = app_state(db, plans_dir);
+        let got =
+            list_deferred_for_cadence_in_order(&state, "p", "1.3", "a-1.3", MergeCadence::Phase);
+        assert_eq!(
+            got,
+            vec![("a-1.1-retry".to_string(), "1.1".to_string())],
+            "most-recent agent per task must win the drain slot"
+        );
     }
 }

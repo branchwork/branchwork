@@ -454,6 +454,25 @@ fn full_unattended_run_chains_through_two_phases() {
     );
     assert_eq!(s, 200);
 
+    // 3b. Pin merge_cadence='task' on this plan so the test exercises
+    // legacy per-task merge behaviour. The post-T1.1 default cadence
+    // is `phase`, which would defer every mid-phase completion via the
+    // Task 2.2 cadence gate (`should_merge_now`) — tasks 5.1, 5.2
+    // would never merge until 5.3 completes, and the test would time
+    // out waiting for `auto_mode.merged` on 5.1. The `/config`
+    // endpoint doesn't carry `merge_cadence` today (that field lives
+    // on the `/settings` endpoint, but that endpoint runs YAML-edit
+    // gymnastics — overkill here); writing the column directly is
+    // the same effect.
+    {
+        let db = server.db();
+        db.execute(
+            "UPDATE plan_auto_mode SET merge_cadence = 'task' WHERE plan_name = ?1",
+            rusqlite::params![PLAN_NAME],
+        )
+        .expect("pin merge_cadence='task' on plan_auto_mode row");
+    }
+
     // 4. Pre-claim task 5.1 as `in_progress`. The `start-task`
     // endpoint does NOT write `task_status` (it just spawns the
     // agent), but the auto-mode chain — after 5.1 merges — calls

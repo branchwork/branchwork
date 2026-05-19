@@ -561,14 +561,23 @@ pub struct MergeOutcome {
 /// unresolvable override falls through to the default (matches the HTTP
 /// behaviour codified by `merge_with_unresolvable_into_body_falls_back_to_default`).
 ///
+/// `trigger_ci = true` (the default for user-driven merges + the *final*
+/// merge in an auto-mode cadence batch) spawns
+/// [`crate::ci::trigger_after_merge`], which pushes the resulting
+/// trunk SHA to origin and inserts the `ci_runs` row. `trigger_ci =
+/// false` is used by the auto-mode loop when draining a cadence batch:
+/// the intermediate merges land locally but don't push, so the cadence
+/// boundary produces a single push containing every batched merge in
+/// order (Task 2.2 of the ci-cadence-build-vs-test-configurable plan).
+///
 /// Side effects on success:
 /// - Clears `branch` in the `agents` table for *every* row matching the
 ///   merged branch (siblings — killed retries, check agents — must stop
 ///   advertising the merged ref).
 /// - Broadcasts an `agent_branch_merged` event so connected dashboards
 ///   refresh immediately.
-/// - Spawns [`crate::ci::trigger_after_merge`] if the agent has a
-///   plan/task and the merge SHA is non-empty.
+/// - When `trigger_ci=true`: spawns [`crate::ci::trigger_after_merge`]
+///   if the agent has a plan/task and the merge SHA is non-empty.
 ///
 /// Audit logging is **not** done here — the caller knows whose action
 /// this is. The HTTP wrapper logs the user; the auto-mode loop will log
@@ -577,6 +586,7 @@ pub async fn merge_agent_branch_inner(
     state: &AppState,
     agent_id: &str,
     into: Option<&str>,
+    trigger_ci: bool,
 ) -> MergeOutcome {
     // Look up agent details (need plan/task for CI bookkeeping too).
     // org_id picks the runner in SaaS mode.
@@ -762,8 +772,11 @@ pub async fn merge_agent_branch_inner(
     // Kick off CI pipeline (push to origin, record pending run).
     // Only possible when we know which task this agent was for, and when
     // the merged SHA is non-empty (runner-side cleanup may leave it blank
-    // on edge cases).
-    if let (Some(plan), Some(task)) = (plan_name, task_id)
+    // on edge cases). Suppressed when the auto-mode batch drain is
+    // running (`trigger_ci=false`); the final merge in the batch is
+    // what pushes the accumulated trunk in one go.
+    if trigger_ci
+        && let (Some(plan), Some(task)) = (plan_name, task_id)
         && !merged_sha.is_empty()
     {
         tokio::spawn(crate::ci::trigger_after_merge(crate::ci::TriggerArgs {
@@ -813,7 +826,7 @@ pub async fn merge_agent_branch(
     body: Option<Json<MergeBody>>,
 ) -> impl IntoResponse {
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let outcome = merge_agent_branch_inner(&state, &id, body.into.as_deref()).await;
+    let outcome = merge_agent_branch_inner(&state, &id, body.into.as_deref(), true).await;
 
     if outcome.merged_sha.is_some() {
         // Audit-log the user-initiated merge. Re-fetch plan/task — the

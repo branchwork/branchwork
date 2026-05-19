@@ -91,6 +91,22 @@ const AutoModeMerged = v.object({
   }),
 });
 
+/// A task completed cleanly under a `phase` or `plan` merge cadence
+/// but the cadence boundary hasn't been crossed yet. The agent's branch
+/// stays intact; the dashboard can show a "deferred" pip on the task
+/// card and the next boundary completion will drain everything in one
+/// push. `cadence` carries the effective cadence ('task' | 'phase' |
+/// 'plan') so the UI can render an explanatory tooltip.
+const AutoModeMergeDeferred = v.object({
+  type: v.literal("auto_mode_merge_deferred"),
+  data: v.object({
+    plan: v.string(),
+    task: v.string(),
+    agent_id: v.string(),
+    cadence: v.string(),
+  }),
+});
+
 const AutoFinishTriggered = v.object({
   type: v.literal("auto_finish_triggered"),
   data: v.object({
@@ -390,6 +406,7 @@ export const WsMessageSchema = v.variant("type", [
   AgentBranchDiscarded,
   AgentBranchCleared,
   AutoModeMerged,
+  AutoModeMergeDeferred,
   AutoFinishTriggered,
   AutoModeState,
   AutoModeFixSpawned,

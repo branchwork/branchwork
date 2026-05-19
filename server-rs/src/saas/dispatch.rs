@@ -103,13 +103,22 @@ impl std::error::Error for CiStatusError {}
 /// `org_id` is intentionally accepted but not threaded through — the inner
 /// function reads it from the agent row itself, which is more reliable than
 /// the auto-mode loop guessing.
+///
+/// `trigger_ci=true` mirrors the user-facing merge endpoint: spawn
+/// `crate::ci::trigger_after_merge` after a successful merge so the
+/// resulting trunk SHA is pushed and the `ci_runs` row is recorded.
+/// `trigger_ci=false` is used by the auto-mode cadence batch drain
+/// (Task 2.2 of the ci-cadence-build-vs-test-configurable plan) — the
+/// intermediate merges land locally, only the final merge in the batch
+/// pushes.
 pub async fn merge_agent_branch_dispatch(
     state: &AppState,
     _org_id: &str,
     agent_id: &str,
     into: Option<&str>,
+    trigger_ci: bool,
 ) -> MergeOutcome {
-    crate::api::agents::merge_agent_branch_inner(state, agent_id, into).await
+    crate::api::agents::merge_agent_branch_inner(state, agent_id, into, trigger_ci).await
 }
 
 /// Mode-aware "does this agent's project use GitHub Actions?". Returns

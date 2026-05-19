@@ -1261,6 +1261,20 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE plan_auto_mode ADD COLUMN merge_cadence TEXT;")
         .ok();
 
+    // Per-agent cadence-deferral marker (Task 2.2 of the
+    // ci-cadence-build-vs-test-configurable plan). NULL = unfilled / not
+    // applicable; 'deferred_for_cadence' = the agent completed cleanly
+    // but `should_merge_now` returned false at the time, so the merge
+    // step was skipped. The next completion that flips
+    // `should_merge_now` to true drains every row carrying this marker
+    // (in dependency order) before merging itself, so a phase- or
+    // plan-cadence boundary produces a single batched master push
+    // instead of one push per completed task. Cleared on successful
+    // merge (the agent's `branch` column is also cleared by the
+    // inner merge helper).
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN merge_status TEXT;")
+        .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 
