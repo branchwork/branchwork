@@ -539,6 +539,10 @@ async fn run_server(cli: Cli) {
             "/api/runners/{runner_id}",
             delete(api::runners::delete_runner),
         )
+        .route(
+            "/api/runners/{runner_id}/version-mismatch-override",
+            post(api::runners::set_version_mismatch_override),
+        )
         // Populate AuthUser on every request. Protected handlers opt in by
         // taking `AuthUser` as an extractor; public routes (health, login,
         // signup, static) are unaffected.

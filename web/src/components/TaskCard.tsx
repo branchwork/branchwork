@@ -1,9 +1,10 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import type { PlanTask } from "../stores/plan-store.js";
 import { fetchJson, postJson, putJson, deleteJson } from "../api.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { usePlanStore } from "../stores/plan-store.js";
+import { useRunnerStore, type Runner } from "../stores/runner-store.js";
 import { isDriverReady, useSettingsStore, type AuthStatus } from "../stores/settings-store.js";
 import { EditableText } from "./EditableText.js";
 import { Button } from "./ui/Button.js";
@@ -126,6 +127,38 @@ function authStatusLabel(auth: AuthStatus | undefined): string {
     default:
       return "ready";
   }
+}
+
+/// T1.3 dispatch-target prediction: mirror
+/// `spawn_ops::resolve_runner_for_spawn` just enough to know which
+/// runner the next Start click would route to. The pin wins when set
+/// AND the runner is online; otherwise we fall back to the
+/// most-recently-seen online runner (the dashboard's `runners` array
+/// is already sorted by `last_seen_at DESC`).
+///
+/// Returns `null` when no online runner is available — the dispatcher's
+/// other failure modes (PinnedRunnerOffline, NoRunner) already produce
+/// their own user-visible banners + pauses, so we don't double-disable
+/// Start here.
+export function pickDispatchTargetRunner(
+  runners: Runner[],
+  planRunnerId: string | null,
+): Runner | null {
+  if (planRunnerId) {
+    const pinned = runners.find((r) => r.id === planRunnerId);
+    // Pinned but offline: fall through to the offline-pause path the
+    // dispatcher will surface. Pinned and online: route there.
+    if (pinned && pinned.status === "online") return pinned;
+    return null;
+  }
+  return runners.find((r) => r.status === "online") ?? null;
+}
+
+/// Shape of the version-mismatch block surfaced to the operator on the
+/// Start button when the chosen runner is red-severity.
+interface RunnerVersionBlock {
+  runnerId: string;
+  runnerVersion: string | null;
 }
 
 function TaskCardInner({ task, planName, phaseNumber }: Props) {
@@ -302,6 +335,38 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
   // Auth gate: selected driver must be installed + authenticated.
   const auth = driverAuth(driver);
   const authReady = isDriverReady(auth);
+
+  // T1.3 runner-version gate: if this plan would dispatch to a runner
+  // whose `versionSeverity` is `red` (and the operator hasn't lifted
+  // the block via "Connect anyway"), Start session must be disabled
+  // with a tooltip pointing the user at the per-runner override.
+  //
+  // The dashboard mirrors the dispatcher's resolution order
+  // (`spawn_ops::resolve_runner_for_spawn`) just enough to predict
+  // which runner would be picked: the plan's pinned runner if set,
+  // otherwise the most-recently-seen online runner. We deliberately
+  // do NOT replicate sibling-failover logic here — it lives on the
+  // server and surfaces as a runner_failover broadcast on dispatch;
+  // surfacing it pre-click would be incorrect when the pinned runner
+  // is actually online.
+  const planRunnerId = usePlanStore((s) => s.planConfigs[planName]?.runnerId ?? null);
+  const runnerBlockRaw = useRunnerStore(
+    useShallow((s) => {
+      // Standalone deployments don't have runners — the gate doesn't
+      // apply. `unknown` is also pass-through: a missing /api/runners
+      // fetch shouldn't disable Start retroactively.
+      if (s.mode !== "saas") return null;
+      const target = pickDispatchTargetRunner(s.runners, planRunnerId);
+      if (!target) return null;
+      if (target.versionSeverity !== "red") return null;
+      if (target.versionMismatchOverride === true) return null;
+      return {
+        runnerId: target.id,
+        runnerVersion: target.version ?? null,
+      } as RunnerVersionBlock;
+    }),
+  );
+  const runnerBlock = useMemo(() => runnerBlockRaw, [runnerBlockRaw]);
 
   async function handleStart(mode: "start" | "continue" = "start") {
     setStarting(true);
@@ -695,17 +760,22 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
               variant="primary"
               size="sm"
               onClick={() => handleStart("start")}
-              disabled={starting || blocked || !authReady || taskLocked}
+              disabled={
+                starting || blocked || !authReady || taskLocked || runnerBlock !== null
+              }
               title={
                 taskLocked
                   ? "Agent running — wait for it to finish"
-                  : !authReady
-                    ? `${driver} not ready: ${authStatusLabel(auth)}`
-                    : blocked
-                      ? `Blocked by ${unmetDeps.join(", ")}`
-                      : undefined
+                  : runnerBlock
+                    ? "runner too old — upgrade required"
+                    : !authReady
+                      ? `${driver} not ready: ${authStatusLabel(auth)}`
+                      : blocked
+                        ? `Blocked by ${unmetDeps.join(", ")}`
+                        : undefined
               }
               className="px-2 py-1"
+              data-testid="start-task-button"
             >
               {starting ? "..." : "Start"}
             </Button>
@@ -715,15 +785,18 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
           {status === "in_progress" && !agentId && (
             <button
               onClick={() => handleStart("continue")}
-              disabled={starting || !authReady || taskLocked}
+              disabled={starting || !authReady || taskLocked || runnerBlock !== null}
               title={
                 taskLocked
                   ? "Agent running — wait for it to finish"
-                  : !authReady
-                    ? `${driver} not ready: ${authStatusLabel(auth)}`
-                    : undefined
+                  : runnerBlock
+                    ? "runner too old — upgrade required"
+                    : !authReady
+                      ? `${driver} not ready: ${authStatusLabel(auth)}`
+                      : undefined
               }
               className="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
+              data-testid="continue-task-button"
             >
               {starting ? "..." : "Continue"}
             </button>
@@ -733,15 +806,18 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
           {status === "failed" && !agentId && (
             <button
               onClick={() => handleStart("continue")}
-              disabled={starting || !authReady || taskLocked}
+              disabled={starting || !authReady || taskLocked || runnerBlock !== null}
               title={
                 taskLocked
                   ? "Agent running — wait for it to finish"
-                  : !authReady
-                    ? `${driver} not ready: ${authStatusLabel(auth)}`
-                    : undefined
+                  : runnerBlock
+                    ? "runner too old — upgrade required"
+                    : !authReady
+                      ? `${driver} not ready: ${authStatusLabel(auth)}`
+                      : undefined
               }
               className="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed text-white rounded transition"
+              data-testid="retry-task-button"
             >
               {starting ? "..." : "Retry"}
             </button>

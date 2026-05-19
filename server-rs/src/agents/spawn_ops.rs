@@ -296,6 +296,68 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
         }
     };
 
+    // T1.3: version-mismatch dispatch gate. We just resolved a runner
+    // (online + targetable); refuse to send `StartAgent` if its
+    // `versionSeverity` is `red` and the operator hasn't explicitly
+    // opted in via the `version_mismatch_override` column. Same shape
+    // as the `PinnedRunnerOffline` arm: pause the plan with a distinct
+    // reason, fail the just-inserted starting row, broadcast both
+    // events, and bail before the StartAgent envelope is built.
+    //
+    // The override is per-runner so an operator who knows a particular
+    // runner is fine (e.g. running their own custom build that reports
+    // a stale CARGO_PKG_VERSION) can selectively re-enable it without
+    // weakening the rule for other runners.
+    if let Some(block) = check_version_block(&state.db, &runner_id) {
+        let server_version_owned = env!("CARGO_PKG_VERSION").to_string();
+        eprintln!(
+            "[spawn_ops] refusing to dispatch to runner '{runner_id}' (version_severity=red: \
+             runner_version={runner:?} server_version={server_version_owned}); use \
+             /api/runners/{runner_id}/version-mismatch-override to opt in",
+            runner = block.runner_version,
+        );
+        // Plan-scoped pause: only fires for plan-bound dispatches. The
+        // NewPlanForm path (no plan_name) just fails the row + bails.
+        if let Some(plan) = plan_name {
+            crate::db::auto_mode_pause(&state.db, plan, "runner_version_mismatch", None);
+            crate::ws::broadcast_event(
+                &state.broadcast_tx,
+                "auto_mode_paused",
+                serde_json::json!({
+                    "plan": plan,
+                    "task": task_id,
+                    "reason": "runner_version_mismatch",
+                    "runner_id": runner_id,
+                    "runner_version": block.runner_version,
+                    "server_version": server_version_owned,
+                }),
+            );
+        }
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET status = 'failed', \
+                 stop_reason = 'runner_version_mismatch', \
+                 finished_at = datetime('now') WHERE id = ?1",
+                params![agent_id],
+            )
+            .ok();
+        }
+        crate::ws::broadcast_event(
+            &state.broadcast_tx,
+            "agent_stopped",
+            serde_json::json!({
+                "id": agent_id,
+                "status": "failed",
+                "stop_reason": "runner_version_mismatch",
+                "runner_id": runner_id,
+                "runner_version": block.runner_version,
+                "server_version": server_version_owned,
+            }),
+        );
+        return agent_id;
+    }
+
     // Resolve per-runner override → server default for the two fields the
     // runner config covers today. The raw effort comes from the caller
     // (already merged with `state.effort`); skip_permissions is read off
@@ -482,6 +544,51 @@ fn runner_status(db: &crate::db::Db, runner_id: &str) -> Option<bool> {
     .map(|s| s == "online")
 }
 
+/// Snapshot returned by [`check_version_block`] when dispatch must refuse
+/// to send `StartAgent`. The caller embeds `runner_version` in the audit +
+/// paused-broadcast payload so an operator can see WHICH version got
+/// blocked without a follow-up query.
+struct VersionBlock {
+    runner_version: Option<String>,
+}
+
+/// Decide whether a runner's reported version is incompatible enough to
+/// refuse dispatch. Returns `Some(VersionBlock)` when severity is `Red`
+/// AND the operator has not flipped `version_mismatch_override = 1` for
+/// this runner. Returns `None` (allow dispatch) on every other state:
+/// Green, Amber, missing runner row (caller already gated), and explicit
+/// override.
+///
+/// The classifier and severity rule live in
+/// [`crate::saas::runner_ws::VersionMismatch::to_severity`] so a single
+/// place owns the green/amber/red decision; this helper is just the
+/// dispatcher-side glue that consults it.
+fn check_version_block(db: &crate::db::Db, runner_id: &str) -> Option<VersionBlock> {
+    let server_version = env!("CARGO_PKG_VERSION");
+    let (runner_version, override_flag): (Option<String>, bool) = {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT version, COALESCE(version_mismatch_override, 0) \
+             FROM runners WHERE id = ?1",
+            params![runner_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .ok()?
+    };
+    if override_flag {
+        return None;
+    }
+    let kind = crate::saas::runner_ws::classify_version_mismatch(
+        runner_version.as_deref(),
+        server_version,
+    );
+    if kind.to_severity(server_version) == crate::saas::runner_ws::Severity::Red {
+        Some(VersionBlock { runner_version })
+    } else {
+        None
+    }
+}
+
 /// Reliable delivery: enqueue first so an offline runner picks this up
 /// on reconnect via outbox replay; push immediately if currently online.
 async fn send_reliable_to_runner(
@@ -621,6 +728,24 @@ mod tests {
             "INSERT INTO runners (id, name, org_id, status, last_seen_at) \
              VALUES (?1, 'test', ?2, ?3, datetime('now'))",
             params![runner_id, org_id, status],
+        )
+        .unwrap();
+    }
+
+    /// Seed a runner with a specific `version` column populated — used by
+    /// the T1.3 dispatch-gate tests. Mirrors `seed_runner` otherwise.
+    fn seed_runner_with_version(
+        db: &crate::db::Db,
+        runner_id: &str,
+        org_id: &str,
+        status: &str,
+        version: &str,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO runners (id, name, org_id, status, last_seen_at, version) \
+             VALUES (?1, 'test', ?2, ?3, datetime('now'), ?4)",
+            params![runner_id, org_id, status, version],
         )
         .unwrap();
     }
@@ -1488,6 +1613,182 @@ mod tests {
             Some("runner_offline"),
             "sibling-failover with no sibling must fall back to pause"
         );
+    }
+
+    // ── T1.3: version-mismatch dispatch gate ─────────────────────────────
+
+    /// Acceptance criterion (the headline incident): connect a v0.3.0
+    /// runner to a v0.5.x server. Dispatch must REFUSE to send
+    /// `StartAgent` — the runner row's version_severity is `red` and the
+    /// operator hasn't opted in via the override column. The plan is
+    /// paused with `runner_version_mismatch` and the just-inserted agent
+    /// row is flipped to failed.
+    #[tokio::test]
+    async fn red_severity_runner_pauses_plan_and_does_not_dispatch() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        // The runner's reported version is v0.3.0; the server's compiled-in
+        // version is env!("CARGO_PKG_VERSION") which is in the 0.5.x range
+        // at the time of writing. Pre-1.0 minor diff ⇒ Severity::Red.
+        seed_runner_with_version(&db, "runner-old", org_id, "online", "0.3.0");
+
+        let runners = new_runner_registry();
+        let mut rx = install_capturing_runner(&runners, "runner-old").await;
+        let state = test_app_state(db.clone(), runners);
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        let opts = StartPtyOpts {
+            prompt: "do work".to_string(),
+            cwd: &cwd,
+            plan_name: Some("demo-plan"),
+            task_id: Some("1.1"),
+            effort: crate::config::Effort::Medium,
+            branch: Some("branchwork/demo-plan/1.1"),
+            is_continue: false,
+            max_budget_usd: None,
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+            runner_id: None,
+        };
+        let agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        // No envelope to the runner — the gate fired before send.
+        let leak = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
+        assert!(
+            leak.is_err(),
+            "no StartAgent envelope must reach a red-severity runner"
+        );
+
+        // Plan paused with the version-mismatch reason.
+        let paused: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT paused_reason FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["demo-plan"],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        assert_eq!(paused.as_deref(), Some("runner_version_mismatch"));
+
+        // Agent row marked failed with the matching stop_reason.
+        let (status, stop_reason): (String, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status, stop_reason FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(status, "failed");
+        assert_eq!(stop_reason.as_deref(), Some("runner_version_mismatch"));
+    }
+
+    /// Operator override lifts the gate: same red-severity runner now
+    /// dispatches normally. Mirrors the acceptance test above but with
+    /// `version_mismatch_override = 1` flipped on first.
+    #[tokio::test]
+    async fn override_lifts_red_severity_block() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        seed_runner_with_version(&db, "runner-old", org_id, "online", "0.3.0");
+        // Operator clicked "Connect anyway".
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE runners SET version_mismatch_override = 1 WHERE id = ?1",
+                params!["runner-old"],
+            )
+            .unwrap();
+        }
+
+        let runners = new_runner_registry();
+        let mut rx = install_capturing_runner(&runners, "runner-old").await;
+        let state = test_app_state(db.clone(), runners);
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        let opts = StartPtyOpts {
+            prompt: "do work".to_string(),
+            cwd: &cwd,
+            plan_name: Some("demo-plan"),
+            task_id: Some("1.1"),
+            effort: crate::config::Effort::Medium,
+            branch: Some("branchwork/demo-plan/1.1"),
+            is_continue: false,
+            max_budget_usd: None,
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+            runner_id: None,
+        };
+        let _agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        // The StartAgent envelope MUST land — the override is the
+        // operator saying "I accept the risk."
+        let payload = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("StartAgent envelope should arrive when override is set")
+            .expect("channel still open");
+        let envelope: Envelope = serde_json::from_str(&payload).unwrap();
+        assert!(matches!(envelope.message, WireMessage::StartAgent { .. }));
+
+        // Plan is NOT paused with the version-mismatch reason.
+        let paused: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT paused_reason FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["demo-plan"],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        assert!(
+            paused.is_none(),
+            "override must keep the plan unpaused: got {paused:?}"
+        );
+    }
+
+    /// A green-severity runner (exact-match version) dispatches normally
+    /// — sanity test ensuring the gate doesn't fire on the common case.
+    #[tokio::test]
+    async fn green_severity_runner_dispatches_normally() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        // Use the literal server version so severity is Green.
+        let server_version = env!("CARGO_PKG_VERSION");
+        seed_runner_with_version(&db, "runner-modern", org_id, "online", server_version);
+
+        let runners = new_runner_registry();
+        let mut rx = install_capturing_runner(&runners, "runner-modern").await;
+        let state = test_app_state(db.clone(), runners);
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        let opts = StartPtyOpts {
+            prompt: "do work".to_string(),
+            cwd: &cwd,
+            plan_name: Some("demo-plan"),
+            task_id: Some("1.1"),
+            effort: crate::config::Effort::Medium,
+            branch: Some("branchwork/demo-plan/1.1"),
+            is_continue: false,
+            max_budget_usd: None,
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+            runner_id: None,
+        };
+        let _agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        let payload = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("StartAgent envelope should arrive for green-severity runner")
+            .expect("channel still open");
+        let envelope: Envelope = serde_json::from_str(&payload).unwrap();
+        assert!(matches!(envelope.message, WireMessage::StartAgent { .. }));
     }
 
     /// Acceptance: an explicit `runner_id` override (e.g. from

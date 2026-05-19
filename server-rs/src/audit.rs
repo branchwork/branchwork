@@ -75,6 +75,13 @@ pub mod actions {
     /// row is soft-deleted via `removed_at`. Diff carries
     /// `{runner_id, runner_name, tokens_revoked: usize}`.
     pub const RUNNER_REVOKED: &str = "runner.revoked";
+    /// `POST /api/runners/{id}/version-mismatch-override` — operator opted in
+    /// to dispatching agents to a runner whose `version_severity` is `red`.
+    /// Diff carries `{runner_id, override: bool, runner_version, server_version}`.
+    /// Audit value is the operator's typed acknowledgement of the version
+    /// mismatch — if a future incident is rooted in protocol drift, this row
+    /// is what shows that the operator was warned and accepted the risk.
+    pub const RUNNER_VERSION_MISMATCH_OVERRIDE: &str = "runner.version_mismatch_override";
     /// `git_helpers::push_branch_local` was rejected as non-fast-forward
     /// and successfully rebased + retried. One row per retry attempt
     /// (so a 3-attempt push that succeeds on attempt 2 produces one

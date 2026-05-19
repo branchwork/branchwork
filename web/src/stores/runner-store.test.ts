@@ -690,6 +690,89 @@ describe("runner-store", () => {
     expect(chip.severity).toBe("none");
   });
 
+  // ── T1.3: version severity + override ─────────────────────────────────
+
+  it("applyHealth stores versionSeverity + versionMismatchOverride", () => {
+    useRunnerStore.setState({ runners: [seedRunner({ id: "r1" })] });
+    useRunnerStore.getState().applyHealth({
+      runner_id: "r1",
+      outbox_depth: 0,
+      ws_reconnects_24h: 0,
+      ci_poll_ms_p50: null,
+      ci_poll_ms_p99: null,
+      version_mismatch: "minor",
+      version_severity: "red",
+      version_mismatch_override: true,
+    });
+    const r = useRunnerStore.getState().runners[0];
+    expect(r.versionMismatch).toBe("minor");
+    expect(r.versionSeverity).toBe("red");
+    expect(r.versionMismatchOverride).toBe(true);
+  });
+
+  it("applyHealth coerces unknown version_severity values to green (forward-compat)", () => {
+    useRunnerStore.setState({ runners: [seedRunner({ id: "r1" })] });
+    useRunnerStore.getState().applyHealth({
+      runner_id: "r1",
+      outbox_depth: 0,
+      ws_reconnects_24h: 0,
+      ci_poll_ms_p50: null,
+      ci_poll_ms_p99: null,
+      version_mismatch: "ok",
+      version_severity: "future_bucket",
+    });
+    expect(useRunnerStore.getState().runners[0].versionSeverity).toBe("green");
+  });
+
+  it("applyHealth preserves existing override when payload omits it", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r1",
+          versionMismatchOverride: true,
+        }),
+      ],
+    });
+    useRunnerStore.getState().applyHealth({
+      runner_id: "r1",
+      outbox_depth: 0,
+      ws_reconnects_24h: 0,
+      ci_poll_ms_p50: null,
+      ci_poll_ms_p99: null,
+      version_mismatch: "ok",
+      // No version_mismatch_override field — older server build.
+    });
+    expect(useRunnerStore.getState().runners[0].versionMismatchOverride).toBe(true);
+  });
+
+  it("setVersionMismatchOverride POSTs to /version-mismatch-override and patches the row", async () => {
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1", versionMismatchOverride: false })],
+    });
+    let captured: { url: string; method: string; body: unknown } | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        captured = {
+          url,
+          method: init.method ?? "GET",
+          body: init.body ? JSON.parse(init.body as string) : null,
+        };
+        return new Response(JSON.stringify({ runnerId: "r1", override: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    const resp = await useRunnerStore.getState().setVersionMismatchOverride("r1", true);
+    expect(resp).toEqual({ runnerId: "r1", override: true });
+    expect(captured).not.toBeNull();
+    expect(captured!.url).toBe("/api/runners/r1/version-mismatch-override");
+    expect(captured!.method).toBe("POST");
+    expect(captured!.body).toEqual({ override: true });
+    expect(useRunnerStore.getState().runners[0].versionMismatchOverride).toBe(true);
+  });
+
   it("fetchRunners populates agentCounts + serverVersion", async () => {
     vi.stubGlobal(
       "fetch",

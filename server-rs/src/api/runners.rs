@@ -437,6 +437,95 @@ pub async fn delete_runner(
     .into_response()
 }
 
+/// Body for `POST /api/runners/{id}/version-mismatch-override`.
+#[derive(Deserialize)]
+pub struct VersionMismatchOverrideBody {
+    /// `true` ⇒ lift the dispatch block for this runner (operator opted
+    /// into "I know what I'm doing"). `false` ⇒ clear the override so
+    /// the block re-engages on the next dispatch.
+    pub r#override: bool,
+}
+
+/// `POST /api/runners/{id}/version-mismatch-override` — operator override
+/// that lifts the version-mismatch dispatch block on this runner.
+///
+/// When `runner.versionSeverity == "red"`, `spawn_ops::start_agent_via_runner`
+/// refuses to send `StartAgent` and pauses the plan with
+/// `paused_reason='runner_version_mismatch'`. Setting this override flips
+/// the block off; the operator has explicitly accepted the protocol-drift
+/// risk. The override is per-runner (not per-org) so the operator can
+/// selectively enable one specific runner without weakening the rule
+/// globally.
+///
+/// Response: `200 { runnerId, override }`. `404` when the runner does
+/// not belong to the caller's org.
+pub async fn set_version_mismatch_override(
+    State(state): State<AppState>,
+    Path(runner_id): Path<String>,
+    user: AuthUser,
+    Json(body): Json<VersionMismatchOverrideBody>,
+) -> impl IntoResponse {
+    if !runner_belongs_to_org(&state, &runner_id, &user.org_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "runner_not_found" })),
+        )
+            .into_response();
+    }
+
+    // Capture the current runner_version for the audit row so a future
+    // operator can see what version was running at the time of the
+    // override — useful when investigating why a misbehaving runner got
+    // green-lit.
+    let runner_version: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT version FROM runners WHERE id = ?1",
+            params![runner_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE runners SET version_mismatch_override = ?1 WHERE id = ?2",
+            params![if body.r#override { 1 } else { 0 }, runner_id],
+        )
+        .ok();
+    }
+
+    let server_version = env!("CARGO_PKG_VERSION");
+    let diff = serde_json::json!({
+        "runner_id": runner_id,
+        "override": body.r#override,
+        "runner_version": runner_version,
+        "server_version": server_version,
+    })
+    .to_string();
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            &user.org_id,
+            Some(&user.id),
+            Some(&user.email),
+            audit::actions::RUNNER_VERSION_MISMATCH_OVERRIDE,
+            audit::resources::RUNNER,
+            Some(&runner_id),
+            Some(&diff),
+        );
+    }
+
+    Json(serde_json::json!({
+        "runnerId": runner_id,
+        "override": body.r#override,
+    }))
+    .into_response()
+}
+
 /// Resolve the values the SaaS dispatcher should ship in `StartAgent`:
 /// per-runner override (if set) → caller-supplied default. Pure function so
 /// it can be unit-tested without a live `AppState`.
@@ -792,6 +881,113 @@ mod tests {
             StatusCode::NOT_FOUND,
             "second revoke must 404 because removed_at is set"
         );
+    }
+
+    // ── T1.3: version-mismatch override endpoint ─────────────────────────
+
+    #[tokio::test]
+    async fn version_mismatch_override_writes_column_and_audits() {
+        let (db, _td) = full_db();
+        let user_id = "tester-vmo";
+        seed_runner_with_token(&db, "runner-vmo", "default-org", user_id, "hash-vmo");
+        let runners = new_runner_registry();
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = set_version_mismatch_override(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("runner-vmo".to_string()),
+            auth_user("default-org", user_id),
+            axum::Json(VersionMismatchOverrideBody { r#override: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["override"], serde_json::json!(true));
+        assert_eq!(json["runnerId"], serde_json::json!("runner-vmo"));
+
+        // Column is set on the runners row.
+        let stored: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT version_mismatch_override FROM runners WHERE id = ?1",
+                params!["runner-vmo"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored, 1);
+
+        // Audit row exists with the matching action.
+        let action_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM audit_logs WHERE action = ?1 AND resource_id = ?2",
+                params![
+                    audit::actions::RUNNER_VERSION_MISMATCH_OVERRIDE,
+                    "runner-vmo"
+                ],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(action_count, 1);
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_override_can_clear_back_to_zero() {
+        let (db, _td) = full_db();
+        let user_id = "tester-vmo-2";
+        seed_runner_with_token(&db, "runner-vmo-2", "default-org", user_id, "hash-vmo-2");
+        // Pre-set the override to 1 so we can verify clearing works.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE runners SET version_mismatch_override = 1 WHERE id = ?1",
+                params!["runner-vmo-2"],
+            )
+            .unwrap();
+        }
+        let runners = new_runner_registry();
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = set_version_mismatch_override(
+            axum::extract::State(state),
+            axum::extract::Path("runner-vmo-2".to_string()),
+            auth_user("default-org", user_id),
+            axum::Json(VersionMismatchOverrideBody { r#override: false }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT version_mismatch_override FROM runners WHERE id = ?1",
+                params!["runner-vmo-2"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored, 0);
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_override_404s_for_unknown_runner() {
+        let (db, _td) = full_db();
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let resp = set_version_mismatch_override(
+            axum::extract::State(state),
+            axum::extract::Path("nope-such-runner".to_string()),
+            auth_user("default-org", "default-user"),
+            axum::Json(VersionMismatchOverrideBody { r#override: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

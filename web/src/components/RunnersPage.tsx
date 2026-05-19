@@ -257,6 +257,7 @@ function RunnerRow({ runner }: { runner: Runner }) {
         )}
       </dl>
       <ServerBinChip serverBin={runner.serverBin} />
+      <VersionSeverityChip runner={runner} />
       {settingsOpen && <RunnerSettings runnerId={runner.id} />}
       {/* Live tail of the runner's stdout/stderr (T11.1) + Health panel
           (T11.3). Rendered inline under the selected row instead of on a
@@ -887,4 +888,95 @@ export function ServerBinChip({ serverBin }: { serverBin?: ServerBinStatus }) {
   // Both fields null is a malformed payload (server should set one or the
   // other). Treat as "not reported" and render nothing rather than fake.
   return null;
+}
+
+/// T1.3 version-vs-server severity chip. Renders the operator-actionable
+/// color verdict (green / amber / red) the server-side `to_severity()`
+/// rule produced, with an inline "Connect anyway" override button on the
+/// red path so the operator can opt in to "I know what I'm doing" without
+/// leaving the row.
+///
+/// - `green` ⇒ Ok or Patch difference. Chip renders as a neutral note
+///   (not surfaced when no version is reported) so a healthy runner
+///   stays visually quiet.
+/// - `amber` ⇒ 1.x+ minor diff. Chip warns but does NOT block.
+/// - `red` ⇒ pre-1.0 minor diff OR cross-major. Chip blocks dispatch
+///   unless the operator clicks "Connect anyway", which sets
+///   `versionMismatchOverride` on the runner row and flips the chip to
+///   "Overridden" (still red palette so the risk stays visible).
+///
+/// Same back-compat rule as `ServerBinChip`: render nothing when the
+/// field is missing (older server build that hasn't shipped severity
+/// yet) rather than fake a verdict.
+export function VersionSeverityChip({ runner }: { runner: Runner }) {
+  const setOverride = useRunnerStore((s) => s.setVersionMismatchOverride);
+  const [busy, setBusy] = useState(false);
+  const severity = runner.versionSeverity;
+  if (!severity || severity === "green") return null;
+
+  const runnerVersion = runner.version ?? "?";
+  const isRed = severity === "red";
+  const isOverridden = runner.versionMismatchOverride === true;
+
+  // Color the chip from the canonical severity (not the override
+  // state). Even when overridden, the underlying mismatch is still red
+  // — surface that so the operator notices when they come back later.
+  const palette = isRed
+    ? "border-red-700/50 bg-red-900/30 text-red-300"
+    : "border-amber-700/50 bg-amber-900/30 text-amber-300";
+  const glyph = isRed ? "⛔" : "⚠";
+  const label = isRed
+    ? "runner too old — upgrade required"
+    : `runner version ${runnerVersion} differs from server`;
+
+  async function handleToggle() {
+    setBusy(true);
+    try {
+      await setOverride(runner.id, !isOverridden);
+    } catch (e) {
+      toastError(e, "Failed to update override");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-1 text-[11px]" data-testid="version-severity-chip">
+      <span
+        className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 ${palette}`}
+      >
+        <span aria-hidden="true">{glyph}</span>
+        <span className="font-mono break-all">{label}</span>
+        {isOverridden && (
+          <span
+            className="ml-1 rounded bg-red-950 px-1 text-[10px] text-red-200"
+            title="Operator opted into dispatching to this runner despite the version mismatch"
+          >
+            Overridden
+          </span>
+        )}
+      </span>
+      {isRed && (
+        <Button
+          variant="warn"
+          size="sm"
+          onClick={handleToggle}
+          disabled={busy}
+          className="ml-2"
+          data-testid={`version-mismatch-override-${runner.id}`}
+          title={
+            isOverridden
+              ? "Re-enable the dispatch block on this runner"
+              : "I know what I'm doing — connect anyway"
+          }
+        >
+          {isOverridden ? "Re-block" : "Connect anyway"}
+        </Button>
+      )}
+      <span className="sr-only">
+        Version severity {severity}; runner version {runnerVersion}
+        {isOverridden ? "; operator override active" : ""}
+      </span>
+    </div>
+  );
 }

@@ -378,4 +378,99 @@ describe("RunnersPage", () => {
     render(<RunnersPage />);
     expect(screen.queryByTestId("server-bin-chip")).toBeNull();
   });
+
+  // ── T1.3 version-mismatch severity chip ─────────────────────────────
+
+  it("version-severity chip surfaces red verdict with override button", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r1",
+          name: "laptop",
+          status: "online",
+          version: "0.3.0",
+          versionSeverity: "red",
+          versionMismatchOverride: false,
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    const chip = screen.getByTestId("version-severity-chip");
+    expect(chip).toBeTruthy();
+    expect(chip.textContent).toContain("runner too old — upgrade required");
+    const overrideBtn = screen.getByTestId("version-mismatch-override-r1") as HTMLButtonElement;
+    expect(overrideBtn).toBeTruthy();
+    expect(overrideBtn.textContent).toMatch(/Connect anyway/);
+  });
+
+  it("version-severity chip flips to Re-block when override is already set", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r1",
+          name: "laptop",
+          status: "online",
+          version: "0.3.0",
+          versionSeverity: "red",
+          versionMismatchOverride: true,
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    const chip = screen.getByTestId("version-severity-chip");
+    expect(chip.textContent).toContain("Overridden");
+    const overrideBtn = screen.getByTestId("version-mismatch-override-r1") as HTMLButtonElement;
+    expect(overrideBtn.textContent).toMatch(/Re-block/);
+  });
+
+  it("version-severity chip shows amber warning without override button", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r1",
+          name: "laptop",
+          status: "online",
+          version: "1.4.0",
+          versionSeverity: "amber",
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    const chip = screen.getByTestId("version-severity-chip");
+    expect(chip).toBeTruthy();
+    // Amber path warns but never blocks — no override affordance.
+    expect(screen.queryByTestId("version-mismatch-override-r1")).toBeNull();
+  });
+
+  it("version-severity chip is hidden on green verdict", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r1",
+          name: "laptop",
+          status: "online",
+          version: "0.5.0",
+          versionSeverity: "green",
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    expect(screen.queryByTestId("version-severity-chip")).toBeNull();
+  });
+
+  it("version-severity chip is hidden when the field is missing (older server)", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r1",
+          name: "laptop",
+          status: "online",
+          version: "0.3.0",
+          versionSeverity: undefined,
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    expect(screen.queryByTestId("version-severity-chip")).toBeNull();
+  });
 });

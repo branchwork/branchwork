@@ -810,6 +810,8 @@ function dispatch(msg: WsMessage) {
         ci_poll_ms_p50: d.ci_poll_ms_p50 ?? null,
         ci_poll_ms_p99: d.ci_poll_ms_p99 ?? null,
         version_mismatch: d.version_mismatch,
+        version_severity: d.version_severity,
+        version_mismatch_override: d.version_mismatch_override,
       });
       break;
     }

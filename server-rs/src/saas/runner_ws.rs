@@ -1219,18 +1219,19 @@ async fn handle_runner_message(
             // chip — green/yellow/red. Done server-side so the same rule
             // governs both /api/runners polling and live WS updates.
             let server_version = env!("CARGO_PKG_VERSION");
-            let runner_version: Option<String> = {
+            let (runner_version, version_mismatch_override): (Option<String>, bool) = {
                 let conn = state.db.lock().unwrap();
                 conn.query_row(
-                    "SELECT version FROM runners WHERE id = ?1",
+                    "SELECT version, COALESCE(version_mismatch_override, 0) \
+                     FROM runners WHERE id = ?1",
                     params![runner_id],
-                    |row| row.get::<_, Option<String>>(0),
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)? != 0)),
                 )
-                .ok()
-                .flatten()
+                .unwrap_or((None, false))
             };
             let version_mismatch =
                 classify_version_mismatch(runner_version.as_deref(), server_version);
+            let version_severity = version_mismatch.to_severity(server_version);
 
             broadcast_event(
                 &state.broadcast_tx,
@@ -1245,6 +1246,10 @@ async fn handle_runner_message(
                     "version": runner_version,
                     "server_version": server_version,
                     "version_mismatch": version_mismatch.as_str(),
+                    // T1.3: coarser color verdict the dashboard chip + dispatcher
+                    // consult. Same data, different precision.
+                    "version_severity": version_severity.as_str(),
+                    "version_mismatch_override": version_mismatch_override,
                 }),
             );
         }
@@ -1342,7 +1347,8 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
                 "SELECT id, name, status, hostname, version, last_seen_at, created_at, \
                         drivers_json, outbox_depth, ws_reconnects_24h, \
                         ci_poll_ms_p50, ci_poll_ms_p99, last_health_at, \
-                        orphans_reaped_24h, server_bin_path, server_bin_error \
+                        orphans_reaped_24h, server_bin_path, server_bin_error, \
+                        COALESCE(version_mismatch_override, 0) \
                  FROM runners WHERE org_id = ?1 AND removed_at IS NULL \
                  ORDER BY last_seen_at DESC",
             )
@@ -1361,11 +1367,15 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
             let runner_version: Option<String> = row.get(4)?;
             let version_mismatch =
                 classify_version_mismatch(runner_version.as_deref(), server_version);
+            let version_severity = version_mismatch.to_severity(server_version);
             // T1.2: server-bin self-diagnostic. `path` is set when the
             // runner resolved a real file; `error` is set when it didn't.
             // Both NULL ⇒ older runner that never reported the field.
             let server_bin_path: Option<String> = row.get(14)?;
             let server_bin_error: Option<String> = row.get(15)?;
+            // T1.3: operator-set override that lifts the version-mismatch
+            // dispatch block. Defaults to 0 for pre-migration rows.
+            let version_mismatch_override: bool = row.get::<_, i64>(16)? != 0;
             Ok(serde_json::json!({
                 "id": row.get::<_, Option<String>>(0)?,
                 "name": row.get::<_, Option<String>>(1)?,
@@ -1388,6 +1398,10 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
                     "error": server_bin_error,
                 },
                 "versionMismatch": version_mismatch.as_str(),
+                // T1.3: coarser color verdict the dashboard chip + dispatcher
+                // consult. Same data shape, different precision.
+                "versionSeverity": version_severity.as_str(),
+                "versionMismatchOverride": version_mismatch_override,
                 "serverVersion": server_version,
             }))
         })
@@ -1496,6 +1510,73 @@ impl VersionMismatch {
             VersionMismatch::Major => "major",
         }
     }
+
+    /// Map the (kind, server_version) pair to the operator-visible chip
+    /// color. Three buckets, deliberately coarser than [`VersionMismatch`]
+    /// because the chip has to be readable at a glance — the structured
+    /// kind stays available for tooltips / audit / forward-compat.
+    ///
+    /// Rule (cargo-semver / npm-semver flavour — pre-1.0 minor IS breaking):
+    ///
+    /// - **Green** ⇒ exact match OR patch-only difference. Protocol-
+    ///   compatible by convention; the runner can dispatch agents safely.
+    /// - **Amber** ⇒ same effective-major but different effective-minor.
+    ///   Only reachable in 1.x+ land (e.g. 1.4.x vs 1.5.x). The runner
+    ///   is dispatchable but the operator should plan an upgrade.
+    /// - **Red** ⇒ different effective-major. Pre-1.0 minor difference
+    ///   (e.g. v0.3.0 vs v0.5.x — the incident this severity exists for)
+    ///   AND 1.x vs 2.x both collapse here. The dispatcher refuses to
+    ///   send `StartAgent` to a red runner unless the operator has
+    ///   explicitly opted in via `runners.version_mismatch_override`.
+    ///
+    /// `server_version` is consulted because the "effective major" rule
+    /// differs by whether we're pre- or post-1.0: in 0.x.y the minor IS
+    /// the effective major (per cargo semver). The runner's own major is
+    /// not consulted independently — when classify returns `Minor` both
+    /// sides agree on the literal major; checking the server side is
+    /// enough.
+    pub fn to_severity(self, server_version: &str) -> Severity {
+        match self {
+            VersionMismatch::Ok | VersionMismatch::Patch => Severity::Green,
+            VersionMismatch::Major => Severity::Red,
+            VersionMismatch::Minor => {
+                // Pre-1.0 (major==0) treats minor as the effective major
+                // — protocol-breaking by convention. Anything 1.x+ keeps
+                // standard semver semantics (minor is non-breaking).
+                let pre_1_0 = parse_semver_lenient(server_version)
+                    .map(|s| s.0 == 0)
+                    .unwrap_or(false);
+                if pre_1_0 {
+                    Severity::Red
+                } else {
+                    Severity::Amber
+                }
+            }
+        }
+    }
+}
+
+/// Operator-visible chip color for the runner-vs-server version
+/// comparison. Coarser than [`VersionMismatch`] so the dashboard chip
+/// has three readable states (green / amber / red). The structured
+/// `VersionMismatch` value is still shipped on the wire as
+/// `versionMismatch` for tooltips and audit; `versionSeverity` is the
+/// dispatcher-actionable signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Green,
+    Amber,
+    Red,
+}
+
+impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Green => "green",
+            Severity::Amber => "amber",
+            Severity::Red => "red",
+        }
+    }
 }
 
 /// Parse `<major>.<minor>.<patch>` leniently — anything after the third dot
@@ -1547,7 +1628,7 @@ pub fn classify_version_mismatch(
 
 #[cfg(test)]
 mod version_mismatch_tests {
-    use super::{VersionMismatch, classify_version_mismatch};
+    use super::{Severity, VersionMismatch, classify_version_mismatch};
 
     #[test]
     fn exact_match_is_ok() {
@@ -1626,6 +1707,62 @@ mod version_mismatch_tests {
             classify_version_mismatch(Some("0.3"), "0.3.5"),
             VersionMismatch::Patch
         );
+    }
+
+    // ── to_severity (T1.3) ─────────────────────────────────────────────
+
+    #[test]
+    fn severity_ok_is_green() {
+        assert_eq!(VersionMismatch::Ok.to_severity("0.5.0"), Severity::Green);
+        assert_eq!(VersionMismatch::Ok.to_severity("1.4.0"), Severity::Green);
+    }
+
+    #[test]
+    fn severity_patch_is_green() {
+        // Patch is always green regardless of the server-major bucket:
+        // protocol-compatible by convention.
+        assert_eq!(VersionMismatch::Patch.to_severity("0.5.0"), Severity::Green);
+        assert_eq!(VersionMismatch::Patch.to_severity("1.4.0"), Severity::Green);
+    }
+
+    #[test]
+    fn severity_major_is_red() {
+        // Cross-major is always red regardless of where the boundary is.
+        assert_eq!(VersionMismatch::Major.to_severity("0.5.0"), Severity::Red);
+        assert_eq!(VersionMismatch::Major.to_severity("1.4.0"), Severity::Red);
+        assert_eq!(VersionMismatch::Major.to_severity("2.0.0"), Severity::Red);
+    }
+
+    /// Acceptance criterion from the T1.3 brief: connect a v0.3.0 runner to
+    /// a v0.5.x server and the panel must show red. Pre-1.0 minor diffs
+    /// ARE breaking by cargo-semver convention — that's the rule the
+    /// classifier already encodes, this test pins the color mapping too.
+    #[test]
+    fn severity_minor_in_pre_1_0_is_red() {
+        // Headline incident: v0.3.0 runner vs v0.5.x server.
+        let kind = classify_version_mismatch(Some("0.3.0"), "0.5.3");
+        assert_eq!(kind, VersionMismatch::Minor);
+        assert_eq!(kind.to_severity("0.5.3"), Severity::Red);
+        // And the symmetric case (newer runner than server).
+        let kind = classify_version_mismatch(Some("0.5.0"), "0.3.0");
+        assert_eq!(kind, VersionMismatch::Minor);
+        assert_eq!(kind.to_severity("0.3.0"), Severity::Red);
+    }
+
+    #[test]
+    fn severity_minor_in_post_1_0_is_amber() {
+        // 1.x land: minor diffs are non-breaking by semver convention.
+        // Warn but don't block — chip is amber.
+        let kind = classify_version_mismatch(Some("1.4.0"), "1.5.0");
+        assert_eq!(kind, VersionMismatch::Minor);
+        assert_eq!(kind.to_severity("1.5.0"), Severity::Amber);
+    }
+
+    #[test]
+    fn severity_as_str_round_trip() {
+        assert_eq!(Severity::Green.as_str(), "green");
+        assert_eq!(Severity::Amber.as_str(), "amber");
+        assert_eq!(Severity::Red.as_str(), "red");
     }
 }
 

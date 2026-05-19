@@ -1215,6 +1215,19 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE runners ADD COLUMN server_bin_error TEXT;")
         .ok();
 
+    // T1.3: operator-set override that lifts the version-mismatch dispatch
+    // block. When the runner's severity is `Red` the dispatcher refuses to
+    // send `StartAgent` unless this column is non-zero. The override is
+    // per-runner (not per-org) so an operator can selectively re-enable a
+    // known-old runner without weakening the rule everywhere. Cleared
+    // implicitly when severity returns to Amber/Green (the dispatcher just
+    // doesn't consult the column in that case). 0 = block (default),
+    // 1 = "I know what I'm doing — connect anyway".
+    conn.execute_batch(
+        "ALTER TABLE runners ADD COLUMN version_mismatch_override INTEGER NOT NULL DEFAULT 0;",
+    )
+    .ok();
+
     // Per-plan runner affinity (T11.4). One row per pinned plan: presence
     // of the row + `runner_id` set means "this runner only"; absent row
     // means "any online runner" (the historic `pick_runner_for_org`

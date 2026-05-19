@@ -10,6 +10,7 @@ import {
 } from "../stores/plan-store.js";
 import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
+import { useRunnerStore, type Runner } from "../stores/runner-store.js";
 
 const PLAN = "p1";
 
@@ -98,8 +99,28 @@ function seed(t: PlanTask | PlanTask[], extras: { agents?: Agent[] } = {}): void
 afterEach(() => {
   cleanup();
   useAgentStore.setState({ agents: [] });
-  usePlanStore.setState({ selectedPlan: null, autoModeRuntimes: {} });
+  usePlanStore.setState({ selectedPlan: null, autoModeRuntimes: {}, planConfigs: {} });
+  useRunnerStore.setState({ mode: "unknown", runners: [] });
 });
+
+/// Build a runner row for the version-gate tests (T1.3). Defaults to a
+/// SaaS-mode online runner with green severity so the "Start enabled"
+/// branch is the default; tests opt into red severity / override /
+/// offline by overriding the relevant fields.
+function runner(overrides: Partial<Runner> = {}): Runner {
+  return {
+    id: "r1",
+    name: "primary",
+    status: "online",
+    hostname: "host-1",
+    version: "0.5.0",
+    lastSeenAt: "2026-05-19T00:00:00Z",
+    createdAt: "2026-05-01T00:00:00Z",
+    versionSeverity: "green",
+    versionMismatchOverride: false,
+    ...overrides,
+  };
+}
 
 // The merge-button gate in TaskCard.tsx (line 99):
 //   const canMerge = task.producesCommit !== false;
@@ -779,5 +800,175 @@ describe("TaskCard awaiting-cadence pill", () => {
     expect(pill.textContent).toMatch(/Done/);
     expect(pill.textContent).not.toMatch(/Awaiting cadence|Merging/);
     expect(pill.className).toMatch(/emerald/);
+  });
+});
+
+describe("TaskCard runner-version dispatch gate (T1.3)", () => {
+  /// Acceptance criterion verbatim from the T1.3 brief: a v0.3.0 runner
+  /// connected to a v0.5.x server renders Start session disabled with
+  /// the tooltip "runner too old — upgrade required".
+  it("disables Start with tooltip when the chosen runner is red-severity", () => {
+    const t1 = task({ number: "1.1", status: "pending" });
+    seed(t1);
+    useRunnerStore.setState({
+      mode: "saas",
+      runners: [
+        runner({
+          id: "old-runner",
+          version: "0.3.0",
+          versionSeverity: "red",
+          versionMismatchOverride: false,
+        }),
+      ],
+    });
+
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+
+    const btn = screen.getByTestId("start-task-button") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(btn.title).toBe("runner too old — upgrade required");
+  });
+
+  it("re-enables Start when the operator has set versionMismatchOverride", () => {
+    const t1 = task({ number: "1.1", status: "pending" });
+    seed(t1);
+    useRunnerStore.setState({
+      mode: "saas",
+      runners: [
+        runner({
+          id: "old-runner",
+          version: "0.3.0",
+          versionSeverity: "red",
+          versionMismatchOverride: true,
+        }),
+      ],
+    });
+
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+
+    const btn = screen.getByTestId("start-task-button") as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    expect(btn.title).not.toBe("runner too old — upgrade required");
+  });
+
+  it("does not gate Start in standalone mode (no runners expected)", () => {
+    const t1 = task({ number: "1.1", status: "pending" });
+    seed(t1);
+    // mode='unknown' is the default afterEach reset; also covers the
+    // 'standalone' deployment shape.
+    useRunnerStore.setState({
+      mode: "standalone",
+      runners: [
+        runner({
+          id: "old-runner",
+          version: "0.3.0",
+          versionSeverity: "red",
+        }),
+      ],
+    });
+
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+    const btn = screen.getByTestId("start-task-button") as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+  });
+
+  it("does not gate Start when the chosen runner is amber (warn-only)", () => {
+    const t1 = task({ number: "1.1", status: "pending" });
+    seed(t1);
+    useRunnerStore.setState({
+      mode: "saas",
+      runners: [
+        runner({
+          id: "warn-runner",
+          version: "1.4.0",
+          versionSeverity: "amber",
+        }),
+      ],
+    });
+
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+    const btn = screen.getByTestId("start-task-button") as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+  });
+
+  it("respects the plan's pinned runner over the first-online fallback", () => {
+    const t1 = task({ number: "1.1", status: "pending" });
+    seed(t1);
+    // Two runners — the most-recently-seen is healthy, but the pin
+    // points at the old one. Gate must consult the pin.
+    useRunnerStore.setState({
+      mode: "saas",
+      runners: [
+        runner({ id: "fresh-runner", version: "0.5.0", versionSeverity: "green" }),
+        runner({ id: "old-runner", version: "0.3.0", versionSeverity: "red" }),
+      ],
+    });
+    usePlanStore.setState({
+      selectedPlan: plan(t1),
+      selectPlan: vi.fn().mockResolvedValue(undefined),
+      savePlan: vi.fn().mockResolvedValue(undefined),
+      fetchPlans: vi.fn().mockResolvedValue(undefined),
+      autoModeRuntimes: {},
+      planConfigs: {
+        [PLAN]: {
+          autoMode: false,
+          autoAdvance: false,
+          maxFixAttempts: 3,
+          pausedReason: null,
+          parallel: false,
+          mergeCadence: "phase",
+          runnerId: "old-runner",
+          runnerFailover: "pause",
+        },
+      },
+    });
+
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+    const btn = screen.getByTestId("start-task-button") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(btn.title).toBe("runner too old — upgrade required");
+  });
+
+  it("re-enables Start when the pinned runner is offline (other failure modes own the UX)", () => {
+    // Pinned + offline runner: the dispatcher pauses with
+    // 'runner_offline' on click. Pre-clicking Start should NOT also
+    // surface the version block — there's no online dispatch target to
+    // gate against.
+    const t1 = task({ number: "1.1", status: "pending" });
+    seed(t1);
+    useRunnerStore.setState({
+      mode: "saas",
+      runners: [
+        runner({
+          id: "old-runner",
+          status: "offline",
+          version: "0.3.0",
+          versionSeverity: "red",
+        }),
+      ],
+    });
+    usePlanStore.setState({
+      selectedPlan: plan(t1),
+      selectPlan: vi.fn().mockResolvedValue(undefined),
+      savePlan: vi.fn().mockResolvedValue(undefined),
+      fetchPlans: vi.fn().mockResolvedValue(undefined),
+      autoModeRuntimes: {},
+      planConfigs: {
+        [PLAN]: {
+          autoMode: false,
+          autoAdvance: false,
+          maxFixAttempts: 3,
+          pausedReason: null,
+          parallel: false,
+          mergeCadence: "phase",
+          runnerId: "old-runner",
+          runnerFailover: "pause",
+        },
+      },
+    });
+
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+    const btn = screen.getByTestId("start-task-button") as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
   });
 });

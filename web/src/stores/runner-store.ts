@@ -20,6 +20,16 @@ export type DeploymentMode = "standalone" | "saas" | "unknown";
 /// (`server-rs/src/saas/runner_ws.rs::VersionMismatch::as_str`).
 export type VersionMismatch = "ok" | "patch" | "minor" | "major";
 
+/// Coarser color verdict the dashboard chip + dispatcher gate consult
+/// (T1.3 of the runner-install-and-spawn-reliability plan). Mirrors
+/// `server-rs/src/saas/runner_ws.rs::Severity::as_str`. The rule:
+/// - `green` ⇒ Ok or Patch (protocol-compatible)
+/// - `amber` ⇒ pre-1.0 Patch (subsumed under Green) or 1.x+ Minor diff
+/// - `red`   ⇒ pre-1.0 Minor diff OR any Major diff. Dispatcher refuses
+///   to send StartAgent to a red runner unless `versionMismatchOverride`
+///   is set on the row.
+export type VersionSeverity = "green" | "amber" | "red";
+
 /// Snapshot of one runner's health metrics. Populated from
 /// `WireMessage::RunnerHealth` ticks (~30 s cadence) and persisted in the
 /// `runners` table — every field NULL until the runner has reported once.
@@ -76,6 +86,17 @@ export interface Runner {
   /// `CARGO_PKG_VERSION`. `ok` for an exact match OR an unparseable
   /// runner version (custom build).
   versionMismatch?: VersionMismatch;
+  /// T1.3: coarser color verdict the dashboard chip + dispatcher gate
+  /// consult. `green` / `amber` / `red`. Derived server-side from
+  /// `versionMismatch` + the server's own version (pre-1.0 minor diff
+  /// is red, 1.x+ minor diff is amber). `undefined` ⇒ older server build
+  /// that didn't ship the field; UI falls back to neutral.
+  versionSeverity?: VersionSeverity;
+  /// T1.3: operator-set override that lifts the version-mismatch dispatch
+  /// block. When `true`, `startTask` no longer refuses to dispatch even
+  /// if `versionSeverity === "red"`. Defaults to `false` for pre-T1.3
+  /// rows. Toggled via `POST /api/runners/{id}/version-mismatch-override`.
+  versionMismatchOverride?: boolean;
   /// T1.2 self-diagnostic: the runner's startup attempt to resolve
   /// `branchwork-server`. `path` is set when the runner found a real file;
   /// `error` is set when the lookup failed (e.g. `"not on $PATH:
@@ -314,7 +335,19 @@ interface RunnerStore {
     /// field. The store treats missing/null as 0 for chip purposes.
     orphans_reaped_24h?: number | null;
     version_mismatch: VersionMismatch | string;
+    /// T1.3: coarser color verdict. Optional for back-compat with older
+    /// server builds that haven't shipped the field yet.
+    version_severity?: VersionSeverity | string;
+    /// T1.3: operator-set override flag echoed back on every health tick
+    /// so the store stays in sync. Optional for back-compat.
+    version_mismatch_override?: boolean;
   }) => void;
+  /// T1.3: POST /api/runners/{id}/version-mismatch-override. Used by the
+  /// "Connect anyway" button on the runner row when severity is red.
+  setVersionMismatchOverride: (
+    runnerId: string,
+    override: boolean,
+  ) => Promise<{ runnerId: string; override: boolean }>;
   /// Deployment-wide agent counts surfaced by `/api/runners`. Updated on
   /// fetch; not driven by WS today (the existing `agent_started`/
   /// `agent_stopped` events update agent-store but the per-org tally
@@ -602,6 +635,13 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
         payload.version_mismatch === "major"
           ? payload.version_mismatch
           : "ok";
+      // Forward-compat: coerce unknown severity values to green so a
+      // future server build that adds another bucket doesn't paint red
+      // by accident on the rollback half of an asymmetric deploy.
+      const severity: VersionSeverity =
+        payload.version_severity === "amber" || payload.version_severity === "red"
+          ? payload.version_severity
+          : "green";
       const now = Date.now();
       const nowIso = new Date(now).toISOString();
       // Always extend the per-runner sparkline ring, even if the runner
@@ -633,6 +673,11 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
       next[idx] = {
         ...next[idx],
         versionMismatch: verdict,
+        versionSeverity: severity,
+        versionMismatchOverride:
+          typeof payload.version_mismatch_override === "boolean"
+            ? payload.version_mismatch_override
+            : next[idx].versionMismatchOverride,
         health: {
           outboxDepth: payload.outbox_depth,
           wsReconnects24h: payload.ws_reconnects_24h,
@@ -644,6 +689,27 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
       };
       return { runners: next, healthHistoryByRunnerId: nextHistory };
     });
+  },
+
+  setVersionMismatchOverride: async (runnerId, override) => {
+    const resp = await postJson<{ runnerId: string; override: boolean }>(
+      `/api/runners/${encodeURIComponent(runnerId)}/version-mismatch-override`,
+      { override },
+    );
+    // Optimistically patch the row so the chip flips immediately; the
+    // next runner_health tick will reconcile if the user changes their
+    // mind in another tab.
+    set((s) => {
+      const idx = s.runners.findIndex((r) => r.id === runnerId);
+      if (idx < 0) return {};
+      const next = s.runners.slice();
+      next[idx] = {
+        ...next[idx],
+        versionMismatchOverride: resp.override,
+      };
+      return { runners: next };
+    });
+    return resp;
   },
 
   pushRunnerLog: (runnerId, entry) => {
