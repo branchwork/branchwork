@@ -525,16 +525,43 @@ async fn handle_runner_message(
             version,
             drivers,
             active_agents,
+            server_bin,
         } => {
             let drivers_json = serde_json::to_string(drivers).ok();
+
+            // T1.2: split the wire diagnostic into the two persisted
+            // columns. Found ⇒ (path=Some, error=NULL); NotFound ⇒
+            // (path=NULL, error="<reason>: <searched>") so the dashboard
+            // can render a green check + path or a red cross + reason
+            // without re-parsing the enum. None (older runners) ⇒ both
+            // columns NULL, dashboard renders a neutral chip.
+            let (server_bin_path, server_bin_error): (Option<String>, Option<String>) =
+                match server_bin {
+                    Some(crate::saas::runner_protocol::ServerBinDiagnostic::Found { path }) => {
+                        (Some(path.clone()), None)
+                    }
+                    Some(crate::saas::runner_protocol::ServerBinDiagnostic::NotFound {
+                        searched,
+                        reason,
+                    }) => (None, Some(format!("{reason}: {searched}"))),
+                    None => (None, None),
+                };
 
             // Update runner metadata.
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
-                    "UPDATE runners SET hostname = ?1, version = ?2, drivers_json = ?3 \
-                     WHERE id = ?4",
-                    params![hostname, version, drivers_json, runner_id],
+                    "UPDATE runners SET hostname = ?1, version = ?2, drivers_json = ?3, \
+                                       server_bin_path = ?4, server_bin_error = ?5 \
+                     WHERE id = ?6",
+                    params![
+                        hostname,
+                        version,
+                        drivers_json,
+                        server_bin_path,
+                        server_bin_error,
+                        runner_id
+                    ],
                 )
                 .ok();
             }
@@ -1315,7 +1342,7 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
                 "SELECT id, name, status, hostname, version, last_seen_at, created_at, \
                         drivers_json, outbox_depth, ws_reconnects_24h, \
                         ci_poll_ms_p50, ci_poll_ms_p99, last_health_at, \
-                        orphans_reaped_24h \
+                        orphans_reaped_24h, server_bin_path, server_bin_error \
                  FROM runners WHERE org_id = ?1 AND removed_at IS NULL \
                  ORDER BY last_seen_at DESC",
             )
@@ -1334,6 +1361,11 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
             let runner_version: Option<String> = row.get(4)?;
             let version_mismatch =
                 classify_version_mismatch(runner_version.as_deref(), server_version);
+            // T1.2: server-bin self-diagnostic. `path` is set when the
+            // runner resolved a real file; `error` is set when it didn't.
+            // Both NULL ⇒ older runner that never reported the field.
+            let server_bin_path: Option<String> = row.get(14)?;
+            let server_bin_error: Option<String> = row.get(15)?;
             Ok(serde_json::json!({
                 "id": row.get::<_, Option<String>>(0)?,
                 "name": row.get::<_, Option<String>>(1)?,
@@ -1350,6 +1382,10 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
                     "ciPollMsP99": row.get::<_, Option<i64>>(11)?,
                     "lastHealthAt": row.get::<_, Option<String>>(12)?,
                     "orphansReaped24h": row.get::<_, Option<i64>>(13)?,
+                },
+                "serverBin": {
+                    "path": server_bin_path,
+                    "error": server_bin_error,
                 },
                 "versionMismatch": version_mismatch.as_str(),
                 "serverVersion": server_version,

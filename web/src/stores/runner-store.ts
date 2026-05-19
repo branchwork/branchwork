@@ -76,6 +76,29 @@ export interface Runner {
   /// `CARGO_PKG_VERSION`. `ok` for an exact match OR an unparseable
   /// runner version (custom build).
   versionMismatch?: VersionMismatch;
+  /// T1.2 self-diagnostic: the runner's startup attempt to resolve
+  /// `branchwork-server`. `path` is set when the runner found a real file;
+  /// `error` is set when the lookup failed (e.g. `"not on $PATH:
+  /// branchwork-server"`). BOTH null ⇒ older runner that never reported
+  /// the field; dashboard renders a neutral chip in that case rather
+  /// than faking a green check.
+  serverBin?: ServerBinStatus;
+}
+
+/// Server-bin self-diagnostic shipped on `RunnerHello` and surfaced on
+/// the runner row next to the version chip. Lets the operator see at a
+/// glance whether the runner can actually spawn session daemons —
+/// closes the silent gap where a missing `branchwork-server` only
+/// surfaced via `AgentSpawnFailed` after the first Start session click.
+export interface ServerBinStatus {
+  /// Absolute (canonicalised when possible) path to the resolved
+  /// binary. Set on success. `null` on the not-found path.
+  path: string | null;
+  /// Short human label describing the resolution failure, e.g.
+  /// `"not on $PATH: branchwork-server"` or `"path does not exist:
+  /// /usr/local/bin/branchwork-server"`. Set on failure; `null` on
+  /// success.
+  error: string | null;
 }
 
 /// Deployment-wide agent counts grouped by `agents.status`. Populated by

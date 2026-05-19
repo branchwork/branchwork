@@ -614,9 +614,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let server_bin = cli.server_bin.unwrap_or_else(|| {
-        which("branchwork-server").unwrap_or_else(|| PathBuf::from("branchwork-server"))
-    });
+    // T1.2 self-diagnostic. `resolve_server_bin` returns both the path the
+    // runner will hand to `Command::spawn` AND a structured diagnostic shipped
+    // on `RunnerHello`. The dashboard surfaces the diagnostic next to the
+    // version chip so a missing `branchwork-server` shows up as a red cross
+    // BEFORE the first Start session click — no more silent gap.
+    let server_bin_resolution = resolve_server_bin(cli.server_bin.as_deref());
+    let server_bin = server_bin_resolution.spawn_target.clone();
+    let server_bin_diagnostic = server_bin_resolution.diagnostic.clone();
+    match &server_bin_diagnostic {
+        runner_protocol::ServerBinDiagnostic::Found { path } => {
+            println!("[runner] server-bin resolved: {path}");
+        }
+        runner_protocol::ServerBinDiagnostic::NotFound { searched, reason } => {
+            eprintln!(
+                "[runner] WARNING server-bin unresolved: searched={searched} reason={reason}"
+            );
+        }
+    }
 
     // Init local DB.
     let conn = Connection::open(&db_path)?;
@@ -663,6 +678,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             &runner_id,
             &cwd,
             &server_bin,
+            server_bin_diagnostic.clone(),
             db.clone(),
             shutdown.clone(),
         )
@@ -718,6 +734,7 @@ async fn connect_and_run(
     runner_id: &str,
     cwd: &Path,
     server_bin: &Path,
+    server_bin_diagnostic: runner_protocol::ServerBinDiagnostic,
     db: Arc<Mutex<Connection>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -788,6 +805,11 @@ async fn connect_and_run(
         version: env!("CARGO_PKG_VERSION").to_string(),
         drivers: drivers.clone(),
         active_agents,
+        // T1.2: hand the dashboard the runner's startup self-diagnostic for
+        // the spawn target. Same value across reconnects (resolved once at
+        // runner boot), so the dashboard chip reflects the runner's current
+        // capability to spawn session daemons regardless of WS flap.
+        server_bin: Some(server_bin_diagnostic.clone()),
     };
     send_reliable(&state, hello).await;
 
@@ -3224,6 +3246,90 @@ fn which(binary: &str) -> Option<PathBuf> {
     })
 }
 
+// ── Server-bin self-diagnostic (T1.2) ───────────────────────────────────────
+
+/// Resolution returned by [`resolve_server_bin`]. Carries both the path the
+/// runner will hand to `Command::spawn` (`spawn_target`) and a structured
+/// diagnostic shipped on `RunnerHello`. They are reported together so the
+/// runner can still attempt a doomed spawn (preserving the existing
+/// `AgentSpawnFailed` path on the first session) — the chip just turns red
+/// up front instead of staying neutral until that first failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerBinResolution {
+    spawn_target: PathBuf,
+    diagnostic: runner_protocol::ServerBinDiagnostic,
+}
+
+/// Resolve the `branchwork-server` binary the runner will use to spawn
+/// session daemons. Returns both the spawn target (used by
+/// `Command::spawn`) and a structured diagnostic surfaced on the
+/// dashboard via `RunnerHello.server_bin`.
+///
+/// Resolution order:
+///   1. `--server-bin <path>` (operator override).
+///   2. `which("branchwork-server")` on `$PATH`.
+///   3. Bare `branchwork-server` literal — likely-broken fallback the
+///      pre-T1.2 code accepted silently. Surfaces as `NotFound { reason:
+///      "not on $PATH" }` so the dashboard chip catches this case before
+///      the first spawn attempt.
+///
+/// For case 1, missing files / non-files surface as `NotFound` with a
+/// matching reason (the operator typed a bad path; the dashboard should
+/// say so rather than waiting for the inevitable spawn `ENOENT`).
+fn resolve_server_bin(explicit: Option<&Path>) -> ServerBinResolution {
+    if let Some(path) = explicit {
+        let display = path.display().to_string();
+        // `metadata()` follows symlinks; `is_file()` would return false for
+        // a symlink whose target doesn't exist, which gives the wrong
+        // reason ("not a file" vs "does not exist"). Branch on the metadata
+        // error explicitly for that finer-grained signal.
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => {
+                let canonical = std::fs::canonicalize(path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or(display);
+                ServerBinResolution {
+                    spawn_target: path.to_path_buf(),
+                    diagnostic: runner_protocol::ServerBinDiagnostic::Found { path: canonical },
+                }
+            }
+            Ok(_) => ServerBinResolution {
+                spawn_target: path.to_path_buf(),
+                diagnostic: runner_protocol::ServerBinDiagnostic::NotFound {
+                    searched: display,
+                    reason: "path is not a file".to_string(),
+                },
+            },
+            Err(_) => ServerBinResolution {
+                spawn_target: path.to_path_buf(),
+                diagnostic: runner_protocol::ServerBinDiagnostic::NotFound {
+                    searched: display,
+                    reason: "path does not exist".to_string(),
+                },
+            },
+        }
+    } else if let Some(found) = which("branchwork-server") {
+        let canonical = std::fs::canonicalize(&found)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| found.display().to_string());
+        ServerBinResolution {
+            spawn_target: found,
+            diagnostic: runner_protocol::ServerBinDiagnostic::Found { path: canonical },
+        }
+    } else {
+        // Pre-T1.2 behaviour: hand `Command::spawn` the bare literal and let
+        // it fail later. Now the dashboard learns about this up front via
+        // the structured diagnostic.
+        ServerBinResolution {
+            spawn_target: PathBuf::from("branchwork-server"),
+            diagnostic: runner_protocol::ServerBinDiagnostic::NotFound {
+                searched: "branchwork-server".to_string(),
+                reason: "not on $PATH".to_string(),
+            },
+        }
+    }
+}
+
 fn build_ws_url(saas_url: &str, token: &str) -> String {
     let base = saas_url.trim_end_matches('/');
     // Convert http(s) to ws(s) if needed.
@@ -5293,5 +5399,113 @@ mod tests {
         let (errno, tag) = classify_spawn_io_error(&io);
         assert_eq!(errno, None);
         assert_eq!(tag, "IO_ERROR");
+    }
+
+    // ── resolve_server_bin (T1.2) ───────────────────────────────────────
+
+    /// `--server-bin` pointing at a real executable file resolves to
+    /// `Found` carrying the canonical absolute path.
+    #[test]
+    fn resolve_server_bin_explicit_existing_file_is_found() {
+        // tempfile + Unix executable bit — `is_file()` only checks file-
+        // ness, not the executable bit. The diagnostic does NOT validate
+        // executability (the OS will surface a clearer EACCES later); we
+        // just need a file that exists.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("branchwork-server");
+        std::fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let res = resolve_server_bin(Some(&target));
+        match res.diagnostic {
+            runner_protocol::ServerBinDiagnostic::Found { path } => {
+                // Canonical form may differ from `target.display()` (symlinks
+                // resolved, trailing components normalized); the path must
+                // at minimum point at the file the runner will spawn.
+                assert!(
+                    path.ends_with("branchwork-server"),
+                    "expected canonical path to end with branchwork-server, got {path}"
+                );
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+        assert_eq!(res.spawn_target, target);
+    }
+
+    /// `--server-bin` pointing at a missing path surfaces `NotFound` with
+    /// the literal user-supplied string and a `path does not exist` reason.
+    /// Distinguishing this from `not on $PATH` lets the operator see at a
+    /// glance that they typed a bad path vs forgot to install the binary.
+    #[test]
+    fn resolve_server_bin_explicit_missing_file_is_not_found() {
+        let res = resolve_server_bin(Some(Path::new("/does/not/exist/branchwork-server")));
+        match res.diagnostic {
+            runner_protocol::ServerBinDiagnostic::NotFound { searched, reason } => {
+                assert_eq!(searched, "/does/not/exist/branchwork-server");
+                assert_eq!(reason, "path does not exist");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert_eq!(
+            res.spawn_target,
+            PathBuf::from("/does/not/exist/branchwork-server")
+        );
+    }
+
+    /// `--server-bin` pointing at a directory (file system entry exists but
+    /// isn't a file) lands on `NotFound { reason: "path is not a file" }`.
+    /// Operators sometimes hand the runner the build dir by mistake; the
+    /// reason should distinguish from a typo.
+    #[test]
+    fn resolve_server_bin_explicit_directory_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let res = resolve_server_bin(Some(dir.path()));
+        match res.diagnostic {
+            runner_protocol::ServerBinDiagnostic::NotFound { reason, .. } => {
+                assert_eq!(reason, "path is not a file");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// No `--server-bin` flag and no `branchwork-server` on `$PATH`
+    /// surfaces `NotFound { searched: "branchwork-server", reason: "not on $PATH" }`.
+    /// This is the headline acceptance criterion: installing the runner
+    /// without `branchwork-server` on `$PATH` must show the dashboard
+    /// "not found" state BEFORE the user clicks Start session.
+    #[test]
+    fn resolve_server_bin_falls_back_to_not_found_when_path_empty() {
+        // Snapshot the host PATH, blank it for the test, restore on exit.
+        // `cargo test` is parallel by default; mutating env is unsafe but
+        // we're inside a single test fn so the window is small. Use the
+        // unsafe-set guard pattern (Edition 2024) and bail on poisoning.
+        struct PathGuard(Option<String>);
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(prev) => std::env::set_var("PATH", prev),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+        let _guard = PathGuard(std::env::var("PATH").ok());
+        unsafe {
+            std::env::set_var("PATH", "/nonexistent-dir-for-t1-2-tests");
+        }
+
+        let res = resolve_server_bin(None);
+        match res.diagnostic {
+            runner_protocol::ServerBinDiagnostic::NotFound { searched, reason } => {
+                assert_eq!(searched, "branchwork-server");
+                assert_eq!(reason, "not on $PATH");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        // Fallback spawn_target is the bare literal — preserves the pre-T1.2
+        // behaviour (let `Command::spawn` fail with ENOENT on the first
+        // session) so the structured diagnostic surfaces independently
+        // without changing the spawn-side error path.
+        assert_eq!(res.spawn_target, PathBuf::from("branchwork-server"));
     }
 }

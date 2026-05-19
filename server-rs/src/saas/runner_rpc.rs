@@ -540,6 +540,7 @@ mod tests {
                 version: "0.0.0".into(),
                 drivers: vec![],
                 active_agents: vec![],
+                server_bin: None,
             },
         );
         ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))

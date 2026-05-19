@@ -1201,6 +1201,20 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE runners ADD COLUMN orphans_reaped_24h INTEGER;")
         .ok();
 
+    // runner-install-and-spawn-reliability T1.2: server-bin self-diagnostic.
+    // Populated from `RunnerHello.server_bin` (added in T1.2) so the
+    // dashboard can render a green check + path or red cross + reason next
+    // to the runner row, surfacing a missing `branchwork-server` BEFORE
+    // the first Start session click. Mutually exclusive in practice (the
+    // wire enum is tagged `Found`/`NotFound`), but stored in two columns
+    // so a NULL on either side keeps the back-compat path (older runners
+    // that don't send the field) trivially representable. Older rows
+    // pre-T1.2 leave both NULL and the dashboard renders a neutral chip.
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN server_bin_path TEXT;")
+        .ok();
+    conn.execute_batch("ALTER TABLE runners ADD COLUMN server_bin_error TEXT;")
+        .ok();
+
     // Per-plan runner affinity (T11.4). One row per pinned plan: presence
     // of the row + `runner_id` set means "this runner only"; absent row
     // means "any online runner" (the historic `pick_runner_for_org`

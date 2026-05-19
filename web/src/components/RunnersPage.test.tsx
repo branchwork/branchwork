@@ -319,4 +319,63 @@ describe("RunnersPage", () => {
     );
     expect(screen.getByTestId("runner-shutdown-fallback-revoke-r1")).toBeTruthy();
   });
+
+  // ── T1.2 server-bin self-diagnostic chip ───────────────────────────
+
+  it("server-bin chip renders the resolved path with a green check", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r1",
+          name: "laptop",
+          status: "online",
+          serverBin: { path: "/usr/local/bin/branchwork-server", error: null },
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    const chip = screen.getByTestId("server-bin-chip");
+    expect(chip).toBeTruthy();
+    expect(chip.textContent).toContain("/usr/local/bin/branchwork-server");
+    // Green-emerald palette signals "found". The exact class chain isn't
+    // pinned (Tailwind reflows would break it); assert the chip's
+    // accessibility label and the SR-only text instead.
+    expect(chip.textContent).toContain("branchwork-server found");
+  });
+
+  it("server-bin chip renders the resolution error with a red cross", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r1",
+          name: "laptop",
+          status: "online",
+          serverBin: { path: null, error: "not on $PATH: branchwork-server" },
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    const chip = screen.getByTestId("server-bin-chip");
+    expect(chip).toBeTruthy();
+    expect(chip.textContent).toContain("not on $PATH: branchwork-server");
+    expect(chip.textContent).toContain("branchwork-server not found");
+  });
+
+  it("server-bin chip is hidden when the runner has not reported the field", () => {
+    // T1.2 back-compat: older runners pre-T1.2 don't ship `server_bin`
+    // on RunnerHello, so `serverBin` lands as undefined on the row. The
+    // chip must render nothing rather than fake a verdict.
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r1",
+          name: "laptop",
+          status: "online",
+          serverBin: undefined,
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    expect(screen.queryByTestId("server-bin-chip")).toBeNull();
+  });
 });

@@ -6,6 +6,7 @@ import {
   type Runner,
   type RunnerDriverInfo,
   type RunnerDriverState,
+  type ServerBinStatus,
 } from "../stores/runner-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useToastStore } from "../stores/toast-store.js";
@@ -255,6 +256,7 @@ function RunnerRow({ runner }: { runner: Runner }) {
           </div>
         )}
       </dl>
+      <ServerBinChip serverBin={runner.serverBin} />
       {settingsOpen && <RunnerSettings runnerId={runner.id} />}
       {/* Live tail of the runner's stdout/stderr (T11.1) + Health panel
           (T11.3). Rendered inline under the selected row instead of on a
@@ -846,4 +848,43 @@ function driverStateLabel(s: RunnerDriverState): string {
     default:
       return "unknown";
   }
+}
+
+/// T1.2 server-bin self-diagnostic chip. Renders inline under the runner
+/// row right after the host/version table so a missing `branchwork-server`
+/// surfaces BEFORE the user clicks Start session — no more silent gap
+/// where the operator has to wait for the inevitable `AgentSpawnFailed`.
+///
+/// Three states:
+///   - `found`: green check + absolute path (monospace).
+///   - `not found`: red cross + reason ("not on $PATH: branchwork-server").
+///   - neutral / hidden: serverBin undefined (older runner that doesn't
+///     report the field) — render nothing rather than fake a verdict.
+export function ServerBinChip({ serverBin }: { serverBin?: ServerBinStatus }) {
+  if (!serverBin) return null;
+  if (serverBin.path) {
+    return (
+      <div className="mt-1 text-[11px]" data-testid="server-bin-chip">
+        <span className="inline-flex items-center gap-1 rounded border border-emerald-700/50 bg-emerald-900/30 px-2 py-0.5 text-emerald-300">
+          <span aria-hidden="true">✓</span>
+          <span className="font-mono break-all">{serverBin.path}</span>
+        </span>
+        <span className="sr-only">branchwork-server found at {serverBin.path}</span>
+      </div>
+    );
+  }
+  if (serverBin.error) {
+    return (
+      <div className="mt-1 text-[11px]" data-testid="server-bin-chip">
+        <span className="inline-flex items-center gap-1 rounded border border-red-700/50 bg-red-900/30 px-2 py-0.5 text-red-300">
+          <span aria-hidden="true">✗</span>
+          <span className="font-mono break-all">{serverBin.error}</span>
+        </span>
+        <span className="sr-only">branchwork-server not found: {serverBin.error}</span>
+      </div>
+    );
+  }
+  // Both fields null is a malformed payload (server should set one or the
+  // other). Treat as "not reported" and render nothing rather than fake.
+  return null;
 }

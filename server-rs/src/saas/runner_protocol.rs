@@ -57,6 +57,21 @@ pub enum WireMessage {
         drivers: Vec<DriverAuthInfo>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         active_agents: Vec<String>,
+        /// T1.2: Self-diagnostic for the `branchwork-server` spawn target.
+        /// Set at runner startup based on the result of `--server-bin`
+        /// override or `which("branchwork-server")` on `$PATH`. Persisted
+        /// on the server and surfaced on the dashboard runner row so the
+        /// operator sees a green check + path or red cross + reason BEFORE
+        /// clicking Start session — closes the silent gap where a missing
+        /// `branchwork-server` only surfaces via `AgentSpawnFailed` after
+        /// the first spawn attempt.
+        ///
+        /// `#[serde(default)]` keeps older runners (which don't send the
+        /// field) wire-compatible — they degrade to a neutral chip and
+        /// the operator still has to wait for a spawn failure to learn
+        /// the bad state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_bin: Option<ServerBinDiagnostic>,
     },
 
     /// An agent was spawned on the runner.
@@ -845,6 +860,40 @@ pub enum DriverAuthStatus {
     Unknown,
 }
 
+// ── Server-bin self-diagnostic (T1.2) ───────────────────────────────────────
+
+/// Result of the runner's startup attempt to resolve the `branchwork-server`
+/// binary it will use to spawn session daemons. Shipped on `RunnerHello` so
+/// the dashboard runner row can surface a green check + path or red cross +
+/// reason BEFORE the operator tries to start a session — saves the next
+/// operator from running `strings` on the binary to figure out the spawn
+/// target.
+///
+/// Resolution order on the runner side:
+///   1. `--server-bin <path>` CLI flag.
+///   2. `which("branchwork-server")` on `$PATH`.
+///   3. Bare `branchwork-server` literal (likely-broken fallback that the
+///      pre-T1.2 code silently accepted — now surfaces as `NotFound`).
+///
+/// Cases 1 & 2 land on `Found`; case 3 (and any explicit `--server-bin`
+/// pointing at a non-existent file) lands on `NotFound`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ServerBinDiagnostic {
+    /// The runner resolved the spawn target to an existing file. `path` is
+    /// the absolute path (canonicalised when possible) so the dashboard
+    /// can render it verbatim and grep / `ls -l` against it match.
+    Found { path: String },
+    /// The runner could NOT resolve the spawn target. `searched` is the
+    /// literal string the runner attempted to spawn (e.g.
+    /// `"branchwork-server"` for the bare-PATH lookup, or the operator-
+    /// supplied `--server-bin` path). `reason` is a short human label
+    /// describing how the resolution failed (`"not on $PATH"`,
+    /// `"path does not exist"`, `"path is not a file"`); the dashboard
+    /// renders it inline next to the red cross.
+    NotFound { searched: String, reason: String },
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 impl WireMessage {
@@ -980,6 +1029,7 @@ mod tests {
                     status: DriverAuthStatus::ApiKey,
                 }],
                 active_agents: vec![],
+                server_bin: None,
             },
         );
         let json = serde_json::to_string(&env).unwrap();
@@ -1079,6 +1129,106 @@ mod tests {
                 assert_eq!(command, "/usr/local/bin/branchwork-server");
                 assert_eq!(errno, Some(2));
                 assert_eq!(errno_str, "ENOENT");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_hello_server_bin_found_round_trip() {
+        // T1.2 pin: the `server_bin` field on `RunnerHello` round-trips
+        // through serde and surfaces the resolved absolute path so the
+        // dashboard can render a green check next to the runner row.
+        let msg = WireMessage::RunnerHello {
+            hostname: "laptop".into(),
+            version: "0.5.0".into(),
+            drivers: vec![],
+            active_agents: vec![],
+            server_bin: Some(ServerBinDiagnostic::Found {
+                path: "/usr/local/bin/branchwork-server".into(),
+            }),
+        };
+        let env = Envelope::reliable("r1".into(), 1, msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"server_bin\""));
+        assert!(json.contains("\"state\":\"found\""));
+        assert!(json.contains("\"path\":\"/usr/local/bin/branchwork-server\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::RunnerHello { server_bin, .. } => {
+                assert_eq!(
+                    server_bin,
+                    Some(ServerBinDiagnostic::Found {
+                        path: "/usr/local/bin/branchwork-server".into(),
+                    })
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_hello_server_bin_not_found_round_trip() {
+        // T1.2 pin: the `NotFound` arm carries the literal string the
+        // runner tried to spawn + a short reason label, both rendered
+        // verbatim on the dashboard.
+        let msg = WireMessage::RunnerHello {
+            hostname: "laptop".into(),
+            version: "0.5.0".into(),
+            drivers: vec![],
+            active_agents: vec![],
+            server_bin: Some(ServerBinDiagnostic::NotFound {
+                searched: "branchwork-server".into(),
+                reason: "not on $PATH".into(),
+            }),
+        };
+        let env = Envelope::reliable("r1".into(), 1, msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"state\":\"not_found\""));
+        assert!(json.contains("\"searched\":\"branchwork-server\""));
+        assert!(json.contains("\"reason\":\"not on $PATH\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::RunnerHello { server_bin, .. } => match server_bin {
+                Some(ServerBinDiagnostic::NotFound { searched, reason }) => {
+                    assert_eq!(searched, "branchwork-server");
+                    assert_eq!(reason, "not on $PATH");
+                }
+                other => panic!("expected NotFound, got: {other:?}"),
+            },
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_hello_server_bin_omitted_when_none() {
+        // Back-compat: old runners pre-T1.2 don't send the field, so the
+        // serializer must skip the key when the value is None. Round-trip
+        // from a JSON literal that lacks the key (i.e. an older runner)
+        // must deserialise with `server_bin: None`.
+        let msg = WireMessage::RunnerHello {
+            hostname: "laptop".into(),
+            version: "0.5.0".into(),
+            drivers: vec![],
+            active_agents: vec![],
+            server_bin: None,
+        };
+        let env = Envelope::reliable("r1".into(), 1, msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(
+            !json.contains("\"server_bin\""),
+            "server_bin must be omitted when None for back-compat with older runners"
+        );
+
+        // Older-runner JSON shape (no server_bin key) must deserialise to None.
+        let old_json = r#"{"seq":1,"runner_id":"r1","type":"runner_hello","hostname":"old","version":"0.4.0","drivers":[]}"#;
+        let back: Envelope = serde_json::from_str(old_json).unwrap();
+        match back.message {
+            WireMessage::RunnerHello { server_bin, .. } => {
+                assert_eq!(
+                    server_bin, None,
+                    "missing field must default to None for older runners"
+                );
             }
             other => panic!("unexpected variant: {other:?}"),
         }
