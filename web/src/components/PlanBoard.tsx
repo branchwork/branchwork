@@ -243,6 +243,7 @@ export function PlanBoard() {
           <BudgetBadge plan={plan} />
           <AutoModeStatusPill planName={plan.name} />
           <AutoPushRebasedPill planName={plan.name} />
+          <AwaitingCadenceChip planName={plan.name} />
         </div>
         <div className="flex items-center gap-3 mt-2">
           <div className="text-sm text-gray-400 max-w-3xl flex-1">
@@ -1509,6 +1510,98 @@ export function AutoPushRebaseConflictBanner({ planName }: { planName: string })
         </div>
       </div>
     </div>
+  );
+}
+
+/// Compact split-button chip that lives in the plan title bar alongside
+/// `AutoModeStatusPill` and `AutoPushRebasedPill`. Mirrors the gating
+/// logic of `DeferredMergesBanner` (Task 2.3) — both surfaces drain to
+/// the same `/api/plans/:name/flush-merges` endpoint — but presents the
+/// information in a single horizontal row suitable for the header
+/// (Task 3.2). The detailed banner sits below the header and adds the
+/// collapsible task list; the two coexist following the
+/// `AutoModeStatusPill` + `UncommittedWorkBanner` precedent (header
+/// pill + below-banner with detail).
+///
+/// Purple palette matches the per-task `awaiting_cadence` pill in
+/// `TaskCard.tsx` (Task 3.1) so the user sees a consistent visual
+/// language between the row-level pill and the plan-level chip. This
+/// deliberately diverges from the `DeferredMergesBanner` indigo to
+/// keep the header signal distinct from the more-verbose banner; the
+/// banner remains the informational/action surface, the chip is the
+/// at-a-glance indicator.
+export function AwaitingCadenceChip({ planName }: { planName: string }) {
+  const agents = useAgentStore((s) => s.agents);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [flushing, setFlushing] = useState(false);
+
+  const count = useMemo(
+    () =>
+      agents.reduce(
+        (n, a) =>
+          a.plan_name === planName && a.merge_status === "deferred_for_cadence" ? n + 1 : n,
+        0,
+      ),
+    [agents, planName],
+  );
+
+  if (count === 0) return null;
+
+  const plural = count === 1 ? "" : "s";
+
+  async function handleFlush() {
+    setFlushing(true);
+    try {
+      const res = await postJson<{
+        ok: boolean;
+        merged: { agentId: string; taskId: string }[];
+        count: number;
+        paused: boolean;
+        ciTriggered: boolean;
+        message: string;
+      }>(`/api/plans/${encodeURIComponent(planName)}/flush-merges`, {});
+      if (res.paused) {
+        toastError(new Error(res.message), "Flush paused");
+      }
+    } catch (e) {
+      toastError(e, "Flush failed");
+    } finally {
+      setFlushing(false);
+      setConfirmOpen(false);
+    }
+  }
+
+  return (
+    <>
+      <span className="flex-shrink-0 inline-flex items-center gap-1.5 text-xs">
+        <span
+          className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-l border border-purple-700/60 bg-purple-900/30 text-purple-200"
+          title={`${count} task${plural} finished cleanly but the auto-mode merge is waiting for the next cadence boundary`}
+        >
+          <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-purple-400" />
+          {count} task{plural} awaiting cadence
+        </span>
+        <button
+          type="button"
+          onClick={() => setConfirmOpen(true)}
+          disabled={flushing}
+          className="px-2 py-0.5 -ml-1.5 rounded-r border border-l-0 border-purple-700/60 bg-purple-900/40 text-purple-100 hover:bg-purple-800/50 hover:text-white disabled:opacity-50 transition"
+          title="Force-merge every deferred task right now and trigger a build outside the cadence"
+        >
+          {flushing ? "Flushing..." : "Flush now"}
+        </button>
+      </span>
+      <ConfirmDialog
+        open={confirmOpen}
+        title="Flush deferred merges"
+        description={`Merge ${count} deferred task${plural} to master now? This will trigger a build + deploy outside the configured cadence.`}
+        confirmLabel={flushing ? "Flushing..." : `Merge ${count} now`}
+        confirmVariant="primary"
+        confirmDisabled={flushing}
+        onConfirm={handleFlush}
+        onCancel={() => setConfirmOpen(false)}
+      />
+    </>
   );
 }
 
