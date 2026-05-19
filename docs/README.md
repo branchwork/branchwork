@@ -115,6 +115,12 @@ Deployment, upgrades, day-2 ops.
   tracked-and-frozen status of the root `.mcp.json`, where it points,
   and how to override on non-default ports without dirtying the
   tracked file.
+- [operations/auto-mode.md](operations/auto-mode.md) — the two
+  cross-cutting auto-mode knobs you tune **before** turning the
+  toggle on: merge cadence (`task` / `phase` / `plan`) and the
+  dirty-tree allowlist, with trade-offs (bisectability, conflict
+  surface, version semantics) and a decision table for picking a
+  cadence on a new plan.
 
 ## Troubleshooting & glossary
 
