@@ -760,9 +760,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
               variant="primary"
               size="sm"
               onClick={() => handleStart("start")}
-              disabled={
-                starting || blocked || !authReady || taskLocked || runnerBlock !== null
-              }
+              disabled={starting || blocked || !authReady || taskLocked || runnerBlock !== null}
               title={
                 taskLocked
                   ? "Agent running — wait for it to finish"

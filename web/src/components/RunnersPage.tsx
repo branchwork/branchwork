@@ -942,9 +942,7 @@ export function VersionSeverityChip({ runner }: { runner: Runner }) {
 
   return (
     <div className="mt-1 text-[11px]" data-testid="version-severity-chip">
-      <span
-        className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 ${palette}`}
-      >
+      <span className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 ${palette}`}>
         <span aria-hidden="true">{glyph}</span>
         <span className="font-mono break-all">{label}</span>
         {isOverridden && (
