@@ -107,6 +107,20 @@ const AutoModeMergeDeferred = v.object({
   }),
 });
 
+/// Operator clicked Flush deferred merges on the dashboard. Fires once
+/// at the end of the flush regardless of how many merges landed (the
+/// per-merge `auto_mode_merged` events still fire inside the batch).
+/// `count` is how many landed before the loop stopped; `paused` is
+/// true when a merge failure aborted the flush mid-batch.
+const AutoModeFlushedDeferred = v.object({
+  type: v.literal("auto_mode_flushed_deferred"),
+  data: v.object({
+    plan: v.string(),
+    count: v.number(),
+    paused: v.boolean(),
+  }),
+});
+
 const AutoFinishTriggered = v.object({
   type: v.literal("auto_finish_triggered"),
   data: v.object({
@@ -407,6 +421,7 @@ export const WsMessageSchema = v.variant("type", [
   AgentBranchCleared,
   AutoModeMerged,
   AutoModeMergeDeferred,
+  AutoModeFlushedDeferred,
   AutoFinishTriggered,
   AutoModeState,
   AutoModeFixSpawned,

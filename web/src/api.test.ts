@@ -206,6 +206,7 @@ describe("fetchJson session-expiry interceptor", () => {
             source_branch: null,
             cost_usd: null,
             driver: null,
+            merge_status: null,
           },
         ],
         agentsFetched: true,

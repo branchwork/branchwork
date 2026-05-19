@@ -91,6 +91,7 @@ function seedAllStores() {
         source_branch: null,
         cost_usd: null,
         driver: null,
+        merge_status: null,
       },
     ],
     selectedAgentId: "agent-a-1",

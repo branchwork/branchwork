@@ -5525,6 +5525,57 @@ pub async fn reset_plan_status(
     }))
 }
 
+// ── POST /api/plans/:name/flush-merges — force-merge deferred batch (Task 2.3) ─
+
+/// Operator escape hatch for the cadence batch. Unconditionally merges
+/// every `merge_status='deferred_for_cadence'` agent in the plan
+/// regardless of the configured cadence (`task` / `phase` / `plan`).
+/// The final merge in the batch triggers CI so the user gets exactly
+/// one master build + deploy out the other end.
+///
+/// Idempotent — running it with zero deferred rows is a no-op + clear
+/// response. The audit log carries the operator intent as a single
+/// `auto_mode.flushed_deferred` row even when individual merges each
+/// emit their own `auto_mode.merged` audit rows.
+pub async fn flush_deferred_merges(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let org_id = auth.org_id().to_string();
+    let outcome = crate::auto_mode::flush_deferred_merges(&state, &org_id, &name).await;
+
+    let count = outcome.merged.len();
+    let ci_triggered = !outcome.paused && count > 0;
+    let message = if outcome.paused {
+        format!(
+            "Flushed {count} deferred task{plural} before pausing on a merge failure. \
+             Resume the plan from the dashboard once the conflict is resolved.",
+            count = count,
+            plural = if count == 1 { "" } else { "s" },
+        )
+    } else if count == 0 {
+        "No deferred merges to flush.".to_string()
+    } else {
+        format!(
+            "Flushed {count} deferred task{plural} to master.",
+            count = count,
+            plural = if count == 1 { "" } else { "s" },
+        )
+    };
+
+    Json(serde_json::json!({
+        "ok": !outcome.paused,
+        "plan": name,
+        "merged": outcome.merged,
+        "count": count,
+        "paused": outcome.paused,
+        "ciTriggered": ci_triggered,
+        "message": message,
+    }))
+    .into_response()
+}
+
 // ── POST /api/plans/:name/tasks/:task/reset-status — unwedge a single task ──
 
 /// Clear the task's `task_status` row so it reverts to "derived / unknown"

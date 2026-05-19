@@ -313,6 +313,7 @@ describe("auth-store logout", () => {
             source_branch: null,
             cost_usd: null,
             driver: null,
+            merge_status: null,
           },
         ],
         agentsFetched: true,

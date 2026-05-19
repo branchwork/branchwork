@@ -356,6 +356,7 @@ export function PlanBoard() {
       <RunnerOfflineBanner planName={plan.name} />
       <AutoPushRebaseConflictBanner planName={plan.name} />
       <BlockingWorkflowStalledBanner planName={plan.name} />
+      <DeferredMergesBanner planName={plan.name} />
 
       {/* Tabs: Board (phase cards + filter) vs Settings (per-plan
           ci_blocking_workflows + phase_verification overrides + repo
@@ -1508,6 +1509,124 @@ export function AutoPushRebaseConflictBanner({ planName }: { planName: string })
         </div>
       </div>
     </div>
+  );
+}
+
+/// Banner that appears when one or more task agents in the plan have
+/// completed cleanly but are sitting on `merge_status='deferred_for_cadence'`
+/// — the cadence boundary hasn't been crossed yet (phase / plan).
+///
+/// Surfaces a Flush now button that POSTs to
+/// `/api/plans/:name/flush-merges` and unconditionally drains every
+/// deferred row (Task 2.3). The final merge in the batch triggers a
+/// build + deploy outside the configured cadence; the confirm dialog
+/// spells that out so the operator opts into the build cost
+/// explicitly.
+///
+/// Indigo palette (informational, not error) to distinguish from the
+/// red "paused on dirty tree" banner and the amber operator-recovery
+/// banners (runner offline, rebase conflict, blocking workflow).
+export function DeferredMergesBanner({ planName }: { planName: string }) {
+  const agents = useAgentStore((s) => s.agents);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [flushing, setFlushing] = useState(false);
+
+  const deferred = useMemo(
+    () =>
+      agents.filter((a) => a.plan_name === planName && a.merge_status === "deferred_for_cadence"),
+    [agents, planName],
+  );
+
+  if (deferred.length === 0) return null;
+
+  const count = deferred.length;
+  const plural = count === 1 ? "" : "s";
+
+  async function handleFlush() {
+    setFlushing(true);
+    try {
+      const res = await postJson<{
+        ok: boolean;
+        merged: { agentId: string; taskId: string }[];
+        count: number;
+        paused: boolean;
+        ciTriggered: boolean;
+        message: string;
+      }>(`/api/plans/${encodeURIComponent(planName)}/flush-merges`, {});
+      // Per-merge `auto_mode_merged` events refresh the agent list as
+      // each row's `merge_status` flips from `deferred_for_cadence` to
+      // NULL — the banner disappears naturally once the list is empty.
+      // The single `auto_mode_flushed_deferred` broadcast at the end
+      // also lands but is informational (UI doesn't need to react to it
+      // beyond the natural agent-list refresh).
+      if (res.paused) {
+        toastError(new Error(res.message), "Flush paused");
+      }
+    } catch (e) {
+      toastError(e, "Flush failed");
+    } finally {
+      setFlushing(false);
+      setConfirmOpen(false);
+    }
+  }
+
+  return (
+    <>
+      <div
+        role="status"
+        className="mb-4 flex items-start gap-3 rounded border border-indigo-700/50 bg-indigo-900/20 px-4 py-3 text-sm"
+      >
+        <span
+          aria-hidden="true"
+          className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-indigo-700/60 text-xs font-bold text-indigo-100"
+        >
+          {count}
+        </span>
+        <div className="flex-1 text-indigo-100">
+          <div className="font-medium">
+            {count} task{plural} deferred for cadence
+          </div>
+          <div className="mt-0.5 text-indigo-200/80">
+            {count === 1
+              ? "An agent has finished, but the auto-mode merge is waiting for the next cadence boundary."
+              : "Agents have finished, but their merges are batched until the next cadence boundary."}
+          </div>
+          <details className="mt-2 text-indigo-200/90">
+            <summary className="cursor-pointer select-none text-xs font-medium text-indigo-100/90 hover:text-white">
+              Deferred task{plural} ({count})
+            </summary>
+            <ul className="mt-1.5 space-y-0.5">
+              {deferred.map((a) => (
+                <li key={a.id} className="font-mono text-xs text-indigo-100/90">
+                  {a.task_id ?? "(unknown task)"}
+                </li>
+              ))}
+            </ul>
+          </details>
+        </div>
+        <div className="flex flex-shrink-0 items-center">
+          <button
+            type="button"
+            onClick={() => setConfirmOpen(true)}
+            disabled={flushing}
+            className="flex-shrink-0 rounded border border-indigo-700/60 bg-indigo-900/40 px-3 py-1 text-xs text-indigo-100 transition hover:bg-indigo-800/50 hover:text-white disabled:opacity-50 disabled:hover:bg-indigo-900/40 disabled:hover:text-indigo-100"
+            title="Force-merge every deferred task right now and trigger a build outside the cadence"
+          >
+            {flushing ? "Flushing..." : "Flush now"}
+          </button>
+        </div>
+      </div>
+      <ConfirmDialog
+        open={confirmOpen}
+        title="Flush deferred merges"
+        description={`Merge ${count} deferred task${plural} to master now? This will trigger a build + deploy outside the configured cadence.`}
+        confirmLabel={flushing ? "Flushing..." : `Merge ${count} now`}
+        confirmVariant="primary"
+        confirmDisabled={flushing}
+        onConfirm={handleFlush}
+        onCancel={() => setConfirmOpen(false)}
+      />
+    </>
   );
 }
 

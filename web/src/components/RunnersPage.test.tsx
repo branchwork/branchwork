@@ -40,6 +40,7 @@ function seedAgent(overrides: Partial<Agent> = {}): Agent {
     source_branch: null,
     cost_usd: null,
     driver: "claude",
+    merge_status: null,
     ...overrides,
   };
 }

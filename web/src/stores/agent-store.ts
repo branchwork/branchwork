@@ -26,6 +26,13 @@ export interface Agent {
   source_branch: string | null;
   cost_usd: number | null;
   driver: string | null;
+  /// Lifecycle hint set by the auto-mode loop when a task agent
+  /// completed cleanly but the configured cadence said it isn't time
+  /// to merge yet (Task 2.2). When `'deferred_for_cadence'`, the
+  /// branch is intact and the next cadence boundary (or a manual
+  /// flush via POST /api/plans/:name/flush-merges, Task 2.3) drains
+  /// the row. `null` on every non-deferred agent.
+  merge_status: string | null;
 }
 
 export interface AgentDiff {

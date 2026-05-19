@@ -63,6 +63,13 @@ pub mod actions {
     /// stashed them) — the loop auto-resumed without operator input.
     /// Diff carries `{plan, last_completed_task, poll_count}`.
     pub const AUTO_RESUMED_TREE_CLEAN: &str = "auto_mode.auto_resumed_tree_clean";
+    /// The operator clicked Flush deferred merges on the dashboard — the
+    /// server unconditionally drained every `merge_status='deferred_for_cadence'`
+    /// row in the plan regardless of the configured cadence. Diff carries
+    /// `{plan, count, paused}`. Individual merges still emit their own
+    /// `AUTO_MODE_MERGED` rows; this one bookends the flush as a whole
+    /// so the audit log carries the operator intent.
+    pub const AUTO_MODE_FLUSHED_DEFERRED: &str = "auto_mode.flushed_deferred";
 }
 
 // ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
@@ -743,6 +750,166 @@ async fn drain_deferred_for_cadence(
         }
     }
     Some(())
+}
+
+// ── Operator-driven flush (Task 2.3) ────────────────────────────────────────
+
+/// One merged agent in a flush batch. Returned to the HTTP caller so the
+/// UI can show a "merged tasks 1.1, 1.2, 1.3" toast.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlushedAgent {
+    pub agent_id: String,
+    pub task_id: String,
+}
+
+/// Outcome of [`flush_deferred_merges`]. `merged` is the list of agents
+/// that successfully landed; `paused` is true when a merge inside the
+/// batch failed and the plan was paused mid-flush (the failed agent is
+/// **not** in `merged`). The HTTP handler maps this into a JSON response
+/// shape with `ok`, `merged`, `paused`, and a human-friendly `message`.
+#[derive(Debug, Clone)]
+pub struct FlushMergesOutcome {
+    pub merged: Vec<FlushedAgent>,
+    pub paused: bool,
+}
+
+/// List every `merge_status='deferred_for_cadence'` agent in `plan_name`
+/// ordered by YAML declaration order (phase 1 task 1, phase 1 task 2,
+/// …). Differs from [`list_deferred_for_cadence_in_order`] in two ways:
+///   1. No cadence scoping — every deferred agent in the plan is
+///      returned regardless of phase.
+///   2. No trigger-agent exclusion — there is no trigger when an
+///      operator manually flushes; the whole batch is the work.
+///
+/// The most-recent `started_at` row wins per task (last-write-wins on
+/// retries) — same posture as the cadence-batch helper.
+fn list_all_deferred_in_order(state: &AppState, plan_name: &str) -> Vec<(String, String)> {
+    let plan = match plan_parser::find_plan_file(&state.plans_dir, plan_name)
+        .and_then(|p| plan_parser::parse_plan_file(&p).ok())
+    {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    let task_order: Vec<String> = plan
+        .phases
+        .iter()
+        .flat_map(|p| p.tasks.iter().map(|t| t.number.clone()))
+        .collect();
+
+    let mut per_task: HashMap<String, String> = HashMap::new();
+    {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, task_id FROM agents \
+             WHERE plan_name = ?1 \
+               AND merge_status = 'deferred_for_cadence' \
+               AND branch IS NOT NULL \
+             ORDER BY started_at ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![plan_name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for r in rows.flatten() {
+                // Last-write-wins per task: ORDER BY started_at ASC means
+                // the most-recent row's agent_id ends up in the map.
+                per_task.insert(r.1, r.0);
+            }
+        }
+    }
+
+    task_order
+        .into_iter()
+        .filter_map(|t| per_task.remove(&t).map(|agent_id| (agent_id, t)))
+        .collect()
+}
+
+/// Operator escape hatch — drain every `merge_status='deferred_for_cadence'`
+/// row in `plan_name` regardless of the configured cadence. The final
+/// merge in the batch is the one that triggers CI (push + `ci_runs`
+/// row) so the user gets exactly one master build + deploy out the
+/// other end. Earlier merges in the batch land locally with
+/// `trigger_ci=false`, same as the cadence-boundary drain.
+///
+/// Idempotent: zero deferred rows is a clean no-op. A flush emitted
+/// against a plan that has no deferred work doesn't broadcast or
+/// audit-log a merge — it returns `{merged: [], paused: false}`. The
+/// HTTP handler turns that into a 200 with a clear "no deferred merges
+/// to flush" message.
+///
+/// On a merge failure inside the batch: [`run_merge_step`] already
+/// pauses the plan and audit-logs its own `AUTO_MODE_PAUSED`. The
+/// flush returns `{merged: <successful so far>, paused: true}` so the
+/// HTTP handler can echo that back to the UI. The plan's auto-mode
+/// pill flips to `paused` via the existing `auto_mode_paused` event.
+///
+/// Emits a single `auto_mode_flushed_deferred` broadcast at the end
+/// (alongside the per-merge `auto_mode_merged` events that fire
+/// naturally inside `run_merge_step`) and a matching audit row so the
+/// operator intent is captured separately from the individual merges.
+pub async fn flush_deferred_merges(
+    state: &AppState,
+    org_id: &str,
+    plan_name: &str,
+) -> FlushMergesOutcome {
+    let deferred = list_all_deferred_in_order(state, plan_name);
+    if deferred.is_empty() {
+        return FlushMergesOutcome {
+            merged: Vec::new(),
+            paused: false,
+        };
+    }
+
+    let last_idx = deferred.len() - 1;
+    let mut merged: Vec<FlushedAgent> = Vec::with_capacity(deferred.len());
+    let mut paused = false;
+    for (i, (agent_id, task_id)) in deferred.into_iter().enumerate() {
+        // Only the FINAL merge in the batch triggers CI (push + ci_runs).
+        // Earlier merges land locally so the whole batch ships as one
+        // master build, matching the cadence-boundary drain shape.
+        let trigger_ci = i == last_idx;
+        match run_merge_step(state, org_id, &agent_id, plan_name, &task_id, trigger_ci).await {
+            MergeStepOutcome::Merged(_) => {
+                merged.push(FlushedAgent { agent_id, task_id });
+            }
+            MergeStepOutcome::Paused => {
+                // run_merge_step has already paused + audit-logged.
+                paused = true;
+                break;
+            }
+        }
+    }
+
+    let payload = serde_json::json!({
+        "plan": plan_name,
+        "count": merged.len(),
+        "paused": paused,
+    });
+    broadcast_event(
+        &state.broadcast_tx,
+        "auto_mode_flushed_deferred",
+        payload.clone(),
+    );
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            actions::AUTO_MODE_FLUSHED_DEFERRED,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(&payload.to_string()),
+        );
+    }
+
+    FlushMergesOutcome { merged, paused }
 }
 
 /// State-machine driver: wraps the merge step in a CI poll + advance

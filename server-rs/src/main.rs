@@ -380,6 +380,10 @@ async fn run_server(cli: Cli) {
             post(api::plans::reset_plan_status),
         )
         .route(
+            "/api/plans/{name}/flush-merges",
+            post(api::plans::flush_deferred_merges),
+        )
+        .route(
             "/api/plans/{name}/tasks/{task_number}/reset-status",
             post(api::plans::reset_task_status),
         )
