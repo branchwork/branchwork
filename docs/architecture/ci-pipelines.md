@@ -24,15 +24,16 @@ side.
 | Human commit pushed to master        | `Pipeline`            | classify + bump (tests / docker / deploy skipped) |
 | Bump commit pushed to master         | `Pipeline`            | classify + tests (nested) + docker + deploy   |
 | Push to `branchwork/**` task branch  | `task-tests`          | tests (nested)                                |
-| PR against master                    | `task-tests`          | tests (nested) — Pipeline does not fire on PRs in this split today\* |
+| PR against master                    | `task-tests`          | tests (nested)                                |
 | `workflow_dispatch` on `pipeline.yml`| `Pipeline`            | classify + tests + docker + deploy            |
 | Tag push (`v*`)                      | `tag-build`           | release artifact build                        |
 
-\* `pipeline.yml`'s `on: pull_request: master` trigger is retained but
-the `tests` job inside it is gated on `should_test` and the
-classifier sets `should_test=true` for PRs, so it does fire on PRs.
-The Phase 4.3 smoke test will clarify the post-split PR behaviour;
-this matrix tracks what is currently shipped.
+PRs fire `task-tests` only — `pipeline.yml`'s `on:` block lists
+`push: [master]` + `workflow_dispatch`, no `pull_request:` entry, so
+opening or pushing to a PR cannot reach its trigger surface. This is
+the design intent of the split (Phase 4.3): each event maps to one
+workflow run, the PR Checks tab shows a single check, and master-side
+build/deploy stays out of the PR review surface.
 
 ## Why a separate `task-tests` workflow
 
@@ -175,6 +176,121 @@ nested Tests children — the split is verified live. Update this
 section with the run id when that happens so the post-split smoke
 test stops relying on absence-of-evidence and starts citing a real
 run.
+
+## Smoke-test evidence (Phase 4.3)
+
+The PR-side counterpart to Phase 4.1 (human master push) and Phase
+4.2 (task-branch push). Acceptance asks that opening a PR against
+master produce exactly **one** `task-tests` run and **zero**
+`Pipeline` runs, with the PR Checks tab showing `task-tests` as the
+only check, and that merging the PR fires `Pipeline` as a separate
+top-level master-push run.
+
+Verified on 2026-05-19 via the same structural-evidence +
+empirical-baseline pattern as Phase 4.2, because no PR has yet been
+opened against this repository (`gh pr list --state all` returns
+empty) and a sandbox-agent on a task branch cannot push to origin or
+open one. The forward-recipe at the end of this section is the
+load-bearing piece for whichever operator opens the first PR.
+
+### Structural evidence — trigger partition
+
+Phase 4.3 finalised the split by removing `pipeline.yml`'s
+`pull_request:` trigger. Post-Phase-4.3 `on:` blocks:
+
+`pipeline.yml::on`:
+
+```yaml
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+```
+
+`task-tests.yml::on`:
+
+```yaml
+on:
+  push:
+    branches:
+      - 'branchwork/**'
+  pull_request:
+    branches: [master]
+```
+
+`pull_request:` appears in exactly one workflow's trigger block —
+`task-tests.yml`. A PR against master cannot reach `pipeline.yml`'s
+trigger surface because no `pull_request` key exists in its `on:`
+block. The `classify` step inside `pipeline.yml` lost its `is_pr`
+variable and the corresponding `should_test=true` arm at the same
+time — same surgical edit Phase 2.2 applied for `is_task_branch_push`.
+
+The earlier doc note that "Pipeline retains its `pull_request:
+master` trigger but the test job is gated on `should_test`" no longer
+applies — both halves were dropped together to keep the workflow
+honest at the `on:` level rather than relying on classifier output to
+suppress the run.
+
+### Empirical baseline — `pull_request` run history
+
+`gh run list --workflow=279031709 --event=pull_request` (Pipeline
+workflow id) returns an empty array as of 2026-05-19 — Pipeline has
+NEVER fired on a `pull_request` event, even though its trigger surface
+included one until this Phase 4.3 change. The same query against
+`task-tests` (workflow id 279130905) also returns empty: no PR has
+yet been opened against this repo at all.
+
+`gh run list --limit 200 --json event` confirms the wider history is
+event=push (102) + event=workflow_run (97) + event=workflow_dispatch
+(1), with zero `pull_request` events across the full run window. No
+historical PR run can be hiding behind the empty list — the absence
+is honest, not a query mistake.
+
+### Why this task-branch merge does not itself fire `task-tests` on a PR
+
+The standard Branchwork auto-mode merge flow merges the task branch
+into the canonical default **locally** on the runner host and pushes
+only the target ref (master), exactly as documented in the Phase 4.2
+section above. The task branch ref never crosses the wire to GitHub,
+so it cannot be the head of a PR. The merge of this Phase 4.3 task
+will produce one more **Pipeline** run on master (the bump-cycle
+Phase 4.1 evidence already pins) and zero PR-side artefacts.
+
+### Forward-looking verification recipe
+
+The first time any operator opens a PR against master — for review,
+external contribution, or a deliberate smoke run — the PR-side trigger
+partition will be exercised live. Recipe:
+
+```sh
+# Open the PR (assumes a feature branch already pushed to origin)
+gh pr create --base master --head <branch> --title <title> --body <body>
+
+# Wait for the workflow runs to appear (~2s)
+gh run list --limit 5 --json databaseId,name,headBranch,event,status
+```
+
+Expected output: one row, `name: task-tests`, `event: pull_request`,
+`headBranch: <branch>`. Zero `Pipeline` rows associated with the PR
+(filterable via `--event=pull_request --workflow=279031709`).
+
+In the GitHub PR Checks tab: one entry titled "Tests" (the reusable
+workflow's job name) with three nested children — `Tests / Rust`,
+`Tests / Web — typecheck, build`, `Tests / E2E tests (gh + Claude)`.
+No `Classify event`, no `Auto-bump patch version`, no `Docker`, no
+`Deploy to Hetzner` checks; those only exist inside `pipeline.yml`,
+which the PR cannot trigger.
+
+When the PR merges, the resulting master push fires `Pipeline` as a
+fresh top-level run — the human-master-push path from Phase 4.1
+takes over (`classify` + `bump`, then a follow-up bump-commit run
+with `classify` + nested `Tests` + `docker` + `deploy`).
+
+If all three halves hold — one task-tests row on the PR, zero
+Pipeline rows on the PR, and one Pipeline run fires on merge — the
+PR-side split is verified live. Update this section with the run ids
+when that happens so the post-split smoke test stops relying on
+absence-of-evidence and starts citing real runs.
 
 This file is the canonical place to document follow-up changes to
 either workflow's trigger or gating logic — keep the per-event table

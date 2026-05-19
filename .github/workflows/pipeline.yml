@@ -1,6 +1,6 @@
 name: Pipeline
 
-# Single workflow for the whole master + PR cycle. Replaces the
+# Single workflow for the master build pipeline. Replaces the
 # Bump → CI → Docker → Deploy chain of separate workflows that fired
 # off each other via `workflow_run`. The chained model produced 4
 # top-level runs per master push with 3+ Skipped/Cancelled rows in
@@ -12,9 +12,13 @@ name: Pipeline
 # parts of the pipeline apply to the current event. Skipped jobs stay
 # scoped to this run rather than spawning sibling runs.
 #
+# PR-side tests are handled by `task-tests.yml`, NOT this file (Phase
+# 4.3 of the CI split). `pipeline.yml` listens on master pushes and
+# `workflow_dispatch` only — opening or pushing to a PR fires
+# `task-tests.yml` and nothing else, so the PR Checks tab shows a
+# single check.
+#
 # Per-event behaviour:
-#   - PR (any commit on the PR branch):
-#       classify → tests (via workflow_call → tests.yml)
 #   - Master push, *non*-bump commit (i.e. a human push):
 #       classify → bump
 #       (bump pushes a `chore: auto-bump to vX.Y.Z` commit using a PAT,
@@ -37,8 +41,6 @@ name: Pipeline
 
 on:
   push:
-    branches: [master]
-  pull_request:
     branches: [master]
   workflow_dispatch:
 
@@ -84,7 +86,6 @@ jobs:
           ref="${{ github.ref }}"
 
           is_master_push=false
-          is_pr=false
           is_dispatch=false
           is_bump=false
           if [[ "$event" == "push" ]]; then
@@ -92,7 +93,6 @@ jobs:
               is_master_push=true
             fi
           fi
-          [[ "$event" == "pull_request" ]]                                     && is_pr=true
           [[ "$event" == "workflow_dispatch" ]]                                && is_dispatch=true
           [[ "$msg"   == "chore: auto-bump to v"* ]]                           && is_bump=true
 
@@ -100,11 +100,10 @@ jobs:
           should_bump=false
           [[ "$is_master_push" == "true" && "$is_bump" != "true" ]] && should_bump=true
 
-          # Run server/web/e2e for: PRs, the bump commit on master,
-          # workflow_dispatch. Task-branch pushes are handled by
-          # `task-tests.yml`, which calls the same `tests.yml`.
+          # Run server/web/e2e on the bump commit on master and on
+          # explicit dispatch. PRs and task-branch pushes are handled
+          # by `task-tests.yml`, which calls the same `tests.yml`.
           should_test=false
-          [[ "$is_pr" == "true" ]] && should_test=true
           [[ "$is_master_push" == "true" && "$is_bump" == "true" ]] && should_test=true
           [[ "$is_dispatch" == "true" ]] && should_test=true
 
@@ -126,7 +125,7 @@ jobs:
 
           cat <<SUMMARY
           event=$event ref=$ref msg='$msg'
-            is_master_push=$is_master_push is_pr=$is_pr is_dispatch=$is_dispatch is_bump=$is_bump
+            is_master_push=$is_master_push is_dispatch=$is_dispatch is_bump=$is_bump
             should_bump=$should_bump should_test=$should_test should_build=$should_build should_deploy=$should_deploy
           SUMMARY
 
