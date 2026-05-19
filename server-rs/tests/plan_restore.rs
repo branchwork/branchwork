@@ -38,13 +38,18 @@ fn seed_cascade_rows(d: &TestDashboard, plan: &str) {
         params![plan],
     )
     .unwrap();
+    // UPSERT-safe to tolerate the grandfather merge_cadence migration
+    // race (see plan_delete.rs::seed_cascade_rows_with_suffix for the
+    // canonical explanation).
     conn.execute(
-        "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+        "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1) \
+         ON CONFLICT(plan_name) DO UPDATE SET enabled = excluded.enabled",
         params![plan],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+        "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1) \
+         ON CONFLICT(plan_name) DO UPDATE SET enabled = excluded.enabled",
         params![plan],
     )
     .unwrap();

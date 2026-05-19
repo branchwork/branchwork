@@ -38,13 +38,22 @@ fn seed_cascade_rows_with_suffix(d: &TestDashboard, plan: &str, agent_suffix: &s
         params![plan],
     )
     .unwrap();
+    // UPSERT so the seed is robust against concurrent inserts from the
+    // grandfather merge_cadence migration (cadence plan T1.2): the
+    // migration walks `plans_dir/*.yaml` and INSERTs a plan_auto_mode
+    // row for every plan it sees, racing with this helper. The plain
+    // INSERT would trip the PK constraint when the migration wins the
+    // race. ON CONFLICT DO UPDATE keeps the test's `enabled=1` intent
+    // regardless of order.
     conn.execute(
-        "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+        "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1) \
+         ON CONFLICT(plan_name) DO UPDATE SET enabled = excluded.enabled",
         params![plan],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+        "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1) \
+         ON CONFLICT(plan_name) DO UPDATE SET enabled = excluded.enabled",
         params![plan],
     )
     .unwrap();

@@ -1486,6 +1486,13 @@ struct RepoDefaults {
     ci_blocking_workflows_skip: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase_verification: Option<String>,
+    /// `[auto_mode] merge_cadence` from the project `branchwork.toml`.
+    /// `None` when the project carries no override — readers should
+    /// substitute `phase` (the [`MergeCadence::default`] for new plans).
+    /// Surfaced alongside the plan-level pin so the UI can render the
+    /// inherited choice without a second fetch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_cadence: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1497,13 +1504,19 @@ struct PlanSettings {
     /// Plan-level `phase_verification` field from the YAML; `None`
     /// when unset.
     phase_verification: Option<String>,
+    /// Plan-level merge-cadence override stored in
+    /// `plan_auto_mode.merge_cadence`. `None` means "inherit the project
+    /// default" — the UI should fall back to `repoDefaults.mergeCadence`
+    /// (and ultimately the hard-coded `phase`). Allowed wire values:
+    /// `"task"` / `"phase"` / `"plan"`.
+    merge_cadence: Option<String>,
     /// Workflow names enumerated from `<project>/.github/workflows/*.yml|*.yaml`
     /// top-level `name:` field, with the filename stem as fallback. Empty
     /// when the project has no workflows directory or none parse.
     available_workflows: Vec<String>,
-    /// `[ci]` + `[phase]` view of the project-level `branchwork.toml`
-    /// (when present) so the UI can render a "default: …" hint next to
-    /// each editable field.
+    /// `[ci]` + `[phase]` + `[auto_mode]` view of the project-level
+    /// `branchwork.toml` (when present) so the UI can render a
+    /// "default: …" hint next to each editable field.
     repo_defaults: RepoDefaults,
 }
 
@@ -1518,6 +1531,15 @@ pub struct PlanSettingsBody {
     ci_blocking_workflows: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     phase_verification: Option<Option<String>>,
+    /// Three-state for the plan-level cadence override (Task 1.2 of the
+    /// cadence plan): `Absent` (None) leaves the DB column untouched,
+    /// `ExplicitNull` (Some(None)) clears the override (back to "inherit
+    /// project default"), `ExplicitValue` (Some(Some(v))) writes the
+    /// explicit pin. The string must deserialize cleanly to
+    /// [`MergeCadence`] via [`crate::db::parse_merge_cadence`]; anything
+    /// else is rejected with 400.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    merge_cadence: Option<Option<String>>,
 }
 
 /// Read `<project>/.github/workflows/*.yml|*.yaml`, returning each
@@ -1572,6 +1594,19 @@ fn repo_defaults_for(project_dir: Option<&std::path::Path>) -> RepoDefaults {
             ci_blocking_workflows: cfg.ci.blocking_workflows,
             ci_blocking_workflows_skip: cfg.ci.blocking_workflows_skip,
             phase_verification: cfg.phase.verification,
+            // `auto_mode.merge_cadence` is non-Option in `RepoConfig`
+            // (default = `MergeCadence::Phase`). Only surface it on the
+            // wire when the file actually changes it from the default —
+            // matching the "skip when None" hints next to the other
+            // fields. The UI's fallback chain (plan → repo → hard-coded
+            // 'phase') reads `undefined` as "no repo override".
+            merge_cadence: if cfg.auto_mode.merge_cadence
+                == crate::repo_config::MergeCadence::default()
+            {
+                None
+            } else {
+                Some(crate::db::merge_cadence_wire(cfg.auto_mode.merge_cadence).to_string())
+            },
         },
         None => RepoDefaults::default(),
     }
@@ -1625,10 +1660,13 @@ pub async fn get_plan_settings(
         .map(enumerate_available_workflows)
         .unwrap_or_default();
     let repo_defaults = repo_defaults_for(project_dir.as_deref());
+    let merge_cadence = crate::db::plan_merge_cadence(&state.db, &name)
+        .map(|c| crate::db::merge_cadence_wire(c).to_string());
 
     let body = PlanSettings {
         ci_blocking_workflows: plan.ci_blocking_workflows,
         phase_verification: plan.phase_verification,
+        merge_cadence,
         available_workflows,
         repo_defaults,
     };
@@ -1641,6 +1679,32 @@ pub async fn put_plan_settings(
     Path(name): Path<String>,
     Json(body): Json<PlanSettingsBody>,
 ) -> axum::response::Response {
+    // Validate the cadence value FIRST so a bad string aborts the request
+    // before we touch the YAML or the DB. Two-state outcome: `None` means
+    // "leave the DB untouched" (Absent on the wire); `Some(None)` means
+    // "clear back to inherit" (ExplicitNull); `Some(Some(c))` carries the
+    // parsed enum. Anything that fails parse_merge_cadence is 400.
+    let cadence_write: Option<Option<crate::repo_config::MergeCadence>> = match body
+        .merge_cadence
+        .as_ref()
+    {
+        None => None,             // Absent — don't touch
+        Some(None) => Some(None), // ExplicitNull — clear
+        Some(Some(s)) => match crate::db::parse_merge_cadence(s) {
+            Some(c) => Some(Some(c)),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_merge_cadence",
+                        "message": "mergeCadence must be 'task', 'phase', or 'plan' (or null to inherit).",
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
+
     {
         let conn = state.db.lock().unwrap();
         if !orgs::plan_belongs_to_org(&conn, &name, auth.org_id()) {
@@ -1663,13 +1727,18 @@ pub async fn put_plan_settings(
         }
     };
 
-    // Markdown plans cannot express these fields. Reject up front instead
-    // of pretending the PUT applied — the Markdown parser silently drops
-    // ci_blocking_workflows / phase_verification on read.
-    if !matches!(
+    // YAML-touching fields. The markdown-format gate fires only when the
+    // body asks for a YAML edit — `merge_cadence` is a DB-backed field and
+    // is safe to edit on .md plans (the migration grandfathers them and
+    // the auto-mode loop reads cadence from the DB, not the YAML).
+    let wants_yaml_edit = body.ci_blocking_workflows.is_some() || body.phase_verification.is_some();
+
+    let yaml_is_supported = matches!(
         plan_path.extension().and_then(|e| e.to_str()),
         Some("yaml") | Some("yml")
-    ) {
+    );
+
+    if wants_yaml_edit && !yaml_is_supported {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
@@ -1680,100 +1749,112 @@ pub async fn put_plan_settings(
             .into_response();
     }
 
-    let raw = match std::fs::read_to_string(&plan_path) {
-        Ok(s) => s,
-        Err(e) => {
+    // YAML write path — only when the body actually carries a YAML edit.
+    if wants_yaml_edit {
+        let raw = match std::fs::read_to_string(&plan_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "read_failed",
+                        "message": format!("Failed to read plan file: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        // Validate the YAML parses BEFORE we touch it. A malformed plan
+        // must surface as 4xx, never 5xx (Task 3.1 contract).
+        if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&raw) {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({
-                    "error": "read_failed",
-                    "message": format!("Failed to read plan file: {e}"),
+                    "error": "parse_error",
+                    "message": format!("Failed to parse plan YAML: {e}"),
                 })),
             )
                 .into_response();
         }
-    };
 
-    // Validate the YAML parses BEFORE we touch it. A malformed plan must
-    // surface as 4xx, never 5xx (Task 3.1 contract).
-    if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&raw) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "parse_error",
-                "message": format!("Failed to parse plan YAML: {e}"),
-            })),
-        )
-            .into_response();
-    }
+        let mut updated = raw.clone();
 
-    let mut updated = raw.clone();
+        if let Some(opt) = body.ci_blocking_workflows.as_ref() {
+            let new_value = opt.as_ref().map(|list| {
+                serde_yaml::Value::Sequence(
+                    list.iter()
+                        .map(|s| serde_yaml::Value::String(s.clone()))
+                        .collect(),
+                )
+            });
+            match update_yaml_top_level_key(&updated, "ci_blocking_workflows", new_value.as_ref()) {
+                Ok(s) => updated = s,
+                Err(e) => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(serde_json::json!({
+                            "error": "edit_failed",
+                            "message": format!("Failed to edit ci_blocking_workflows: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
 
-    if let Some(opt) = body.ci_blocking_workflows.as_ref() {
-        let new_value = opt.as_ref().map(|list| {
-            serde_yaml::Value::Sequence(
-                list.iter()
-                    .map(|s| serde_yaml::Value::String(s.clone()))
-                    .collect(),
+        if let Some(opt) = body.phase_verification.as_ref() {
+            let new_value = opt.as_ref().map(|s| serde_yaml::Value::String(s.clone()));
+            match update_yaml_top_level_key(&updated, "phase_verification", new_value.as_ref()) {
+                Ok(s) => updated = s,
+                Err(e) => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(serde_json::json!({
+                            "error": "edit_failed",
+                            "message": format!("Failed to edit phase_verification: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        // Sanity round-trip: parse the post-edit YAML before writing so
+        // a bug in the line-based editor surfaces as 4xx + the file
+        // untouched on disk, rather than a corrupted plan that breaks
+        // every later GET.
+        if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&updated) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "edit_invalidated_yaml",
+                    "message": format!("Edit produced invalid YAML: {e}"),
+                })),
             )
-        });
-        match update_yaml_top_level_key(&updated, "ci_blocking_workflows", new_value.as_ref()) {
-            Ok(s) => updated = s,
-            Err(e) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({
-                        "error": "edit_failed",
-                        "message": format!("Failed to edit ci_blocking_workflows: {e}"),
-                    })),
-                )
-                    .into_response();
-            }
+                .into_response();
+        }
+
+        if updated != raw
+            && let Err(e) = atomic_write(&plan_path, &updated)
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "write_failed",
+                    "message": format!("Failed to write plan file: {e}"),
+                })),
+            )
+                .into_response();
         }
     }
 
-    if let Some(opt) = body.phase_verification.as_ref() {
-        let new_value = opt.as_ref().map(|s| serde_yaml::Value::String(s.clone()));
-        match update_yaml_top_level_key(&updated, "phase_verification", new_value.as_ref()) {
-            Ok(s) => updated = s,
-            Err(e) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({
-                        "error": "edit_failed",
-                        "message": format!("Failed to edit phase_verification: {e}"),
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // Sanity round-trip: parse the post-edit YAML before writing so a bug
-    // in the line-based editor surfaces as 4xx + the file untouched on
-    // disk, rather than a corrupted plan that breaks every later GET.
-    if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&updated) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "edit_invalidated_yaml",
-                "message": format!("Edit produced invalid YAML: {e}"),
-            })),
-        )
-            .into_response();
-    }
-
-    if updated != raw
-        && let Err(e) = atomic_write(&plan_path, &updated)
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "write_failed",
-                "message": format!("Failed to write plan file: {e}"),
-            })),
-        )
-            .into_response();
+    // DB write for the cadence (Task 1.2 of cadence plan). Runs even when
+    // the YAML edit was a no-op — caller can flip the cadence without
+    // touching any other field. `Some(None)` clears the override (back to
+    // "inherit project default"); `Some(Some(c))` writes the explicit pin.
+    if let Some(opt) = cadence_write {
+        crate::db::set_plan_merge_cadence(&state.db, &name, opt);
     }
 
     // Audit the change so settings edits show in the per-plan history.
@@ -1792,6 +1873,15 @@ pub async fn put_plan_settings(
             "phaseVerification".into(),
             match opt {
                 Some(v) => serde_json::json!(v),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    if let Some(opt) = cadence_write {
+        payload.insert(
+            "mergeCadence".into(),
+            match opt {
+                Some(c) => serde_json::json!(crate::db::merge_cadence_wire(c)),
                 None => serde_json::Value::Null,
             },
         );
@@ -1831,10 +1921,13 @@ pub async fn put_plan_settings(
         .map(enumerate_available_workflows)
         .unwrap_or_default();
     let repo_defaults = repo_defaults_for(project_dir.as_deref());
+    let merge_cadence = crate::db::plan_merge_cadence(&state.db, &name)
+        .map(|c| crate::db::merge_cadence_wire(c).to_string());
 
     let response = PlanSettings {
         ci_blocking_workflows: plan.ci_blocking_workflows,
         phase_verification: plan.phase_verification,
+        merge_cadence,
         available_workflows,
         repo_defaults,
     };

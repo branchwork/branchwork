@@ -320,3 +320,226 @@ fn put_rejects_markdown_plan() {
         "expected 4xx for markdown plan, got {s}: {body}"
     );
 }
+
+// ── merge_cadence (Task 1.2 of cadence plan) ─────────────────────────
+
+#[test]
+fn get_returns_null_merge_cadence_when_unset() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cadence-fresh",
+        &yaml_without_settings("cadence-fresh", &d.project),
+    );
+
+    // NOTE: the grandfather migration (`plan_merge_cadence_grandfather_v1_done`)
+    // runs as a `tokio::spawn` at server boot — under TestDashboard it can
+    // race with `create_plan` and end up pinning the brand-new plan to
+    // `task`. The contract under test ("fresh plans inherit project
+    // default") is preserved by explicitly clearing the override first,
+    // which mirrors what a real user would do on a freshly-upgraded box.
+    let (s, _) = d.put(
+        "/api/plans/cadence-fresh/settings",
+        json!({"mergeCadence": null}),
+    );
+    assert_eq!(s, 200);
+
+    let (s, body) = d.get("/api/plans/cadence-fresh/settings");
+    assert_eq!(s, 200, "body: {body}");
+    assert!(
+        body["mergeCadence"].is_null(),
+        "fresh plans inherit project default (null on wire): {body}"
+    );
+}
+
+#[test]
+fn put_round_trips_each_explicit_merge_cadence() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cadence-rt",
+        &yaml_without_settings("cadence-rt", &d.project),
+    );
+
+    for cadence in ["task", "phase", "plan"] {
+        let (s, body) = d.put(
+            "/api/plans/cadence-rt/settings",
+            json!({"mergeCadence": cadence}),
+        );
+        assert_eq!(s, 200, "body: {body}");
+        assert_eq!(body["mergeCadence"], cadence, "got: {body}");
+
+        let (s2, body2) = d.get("/api/plans/cadence-rt/settings");
+        assert_eq!(s2, 200, "body: {body2}");
+        assert_eq!(body2["mergeCadence"], cadence, "GET after PUT: {body2}");
+    }
+}
+
+#[test]
+fn put_explicit_null_clears_merge_cadence_back_to_inherit() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cadence-null",
+        &yaml_without_settings("cadence-null", &d.project),
+    );
+
+    let (s, _) = d.put(
+        "/api/plans/cadence-null/settings",
+        json!({"mergeCadence": "plan"}),
+    );
+    assert_eq!(s, 200);
+
+    let (s, body) = d.put(
+        "/api/plans/cadence-null/settings",
+        json!({"mergeCadence": null}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert!(
+        body["mergeCadence"].is_null(),
+        "explicit null must clear back to inherit: {body}"
+    );
+}
+
+#[test]
+fn put_rejects_invalid_merge_cadence_value_with_400() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cadence-bad",
+        &yaml_without_settings("cadence-bad", &d.project),
+    );
+
+    for bad in ["weekly", "Task", "TASK", " plan", ""] {
+        let (s, body) = d.put(
+            "/api/plans/cadence-bad/settings",
+            json!({"mergeCadence": bad}),
+        );
+        assert_eq!(s, 400, "expected 400 for {bad:?}, got {s}: {body}");
+        assert_eq!(body["error"], "invalid_merge_cadence");
+    }
+}
+
+#[test]
+fn put_merge_cadence_is_partial_and_does_not_clobber_yaml_fields() {
+    let d = TestDashboard::new();
+    let path = d.plans_dir.join("cadence-partial.yaml");
+    std::fs::write(&path, yaml_with_settings("cadence-partial", &d.project)).unwrap();
+
+    // Cadence-only PUT must preserve the existing YAML-side fields.
+    let (s, body) = d.put(
+        "/api/plans/cadence-partial/settings",
+        json!({"mergeCadence": "plan"}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["mergeCadence"], "plan");
+    assert_eq!(body["ciBlockingWorkflows"], json!(["CI", "lint"]));
+    assert_eq!(body["phaseVerification"], "bash scripts/verify.sh");
+
+    // YAML file untouched on disk.
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("ci_blocking_workflows"));
+    assert!(after.contains("phase_verification:"));
+}
+
+#[test]
+fn put_can_combine_yaml_and_cadence_edits_atomically() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cadence-combo",
+        &yaml_without_settings("cadence-combo", &d.project),
+    );
+
+    let (s, body) = d.put(
+        "/api/plans/cadence-combo/settings",
+        json!({
+            "phaseVerification": "bash verify.sh",
+            "mergeCadence": "task"
+        }),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["phaseVerification"], "bash verify.sh");
+    assert_eq!(body["mergeCadence"], "task");
+}
+
+#[test]
+fn put_merge_cadence_on_markdown_plan_is_allowed() {
+    // merge_cadence is a DB-backed field. Markdown plans should NOT be
+    // rejected just because they can't express YAML-side settings — the
+    // rejection only applies when the body asks for a YAML edit.
+    let d = TestDashboard::new();
+    let path = d.plans_dir.join("cadence-md.md");
+    std::fs::write(
+        &path,
+        "# Cadence MD\n\n## Phase 1\n\n### Task 1.1\n\nDo a thing.\n",
+    )
+    .unwrap();
+
+    let (s, body) = d.put(
+        "/api/plans/cadence-md/settings",
+        json!({"mergeCadence": "plan"}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["mergeCadence"], "plan");
+
+    // YAML-side fields are NULL because the plan is markdown — no
+    // unexpected side-effects on the markdown body.
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("# Cadence MD"));
+}
+
+#[test]
+fn get_surfaces_repo_default_merge_cadence_when_branchwork_toml_overrides_it() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cadence-repo",
+        &yaml_without_settings("cadence-repo", &d.project),
+    );
+
+    // `[auto_mode] merge_cadence = "plan"` is the non-default project
+    // override — `phase` (the hard-coded default) is omitted from the
+    // wire to keep the GET shape unchanged for projects with no
+    // branchwork.toml.
+    std::fs::write(
+        d.project.join("branchwork.toml"),
+        "[auto_mode]\nmerge_cadence = \"plan\"\n",
+    )
+    .unwrap();
+    // The repo_config cache is keyed by canonical project path; each
+    // TestDashboard creates a unique temp dir, so there's no cache
+    // collision with concurrent or sequential tests.
+    // NOTE: the grandfather migration ran at server boot and pinned
+    // every plan to `task`. Clear the plan-level override explicitly so
+    // the GET shape reflects the "fresh plan, inheriting" scenario.
+    let (s, _) = d.put(
+        "/api/plans/cadence-repo/settings",
+        json!({"mergeCadence": null}),
+    );
+    assert_eq!(s, 200);
+
+    let (s, body) = d.get("/api/plans/cadence-repo/settings");
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["repoDefaults"]["mergeCadence"], "plan", "{body}");
+    // Plan-level value is now null — inheriting.
+    assert!(body["mergeCadence"].is_null(), "{body}");
+}
+
+#[test]
+fn get_omits_repo_default_merge_cadence_when_branchwork_toml_matches_hardcoded_default() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cadence-repo-phase",
+        &yaml_without_settings("cadence-repo-phase", &d.project),
+    );
+    // Explicit `phase` matches the hard-coded default — omitted on wire.
+    std::fs::write(
+        d.project.join("branchwork.toml"),
+        "[auto_mode]\nmerge_cadence = \"phase\"\n",
+    )
+    .unwrap();
+    // (See note above.)
+
+    let (s, body) = d.get("/api/plans/cadence-repo-phase/settings");
+    assert_eq!(s, 200, "body: {body}");
+    assert!(
+        body["repoDefaults"]["mergeCadence"].is_null()
+            || body["repoDefaults"].get("mergeCadence").is_none(),
+        "default repo cadence must be omitted from wire: {body}"
+    );
+}

@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
 import {
+  DEFAULT_MERGE_CADENCE,
   getPlanSettings,
   putPlanSettings,
+  resolveMergeCadence,
   resolveWorkflows,
+  type MergeCadence,
   type PlanSettings as PlanSettingsT,
   type ResolvedWorkflow,
   type WorkflowSource,
@@ -10,6 +13,28 @@ import {
 import { Button } from "./ui/Button.js";
 import { toastError } from "../lib/toast.js";
 import { HttpError } from "../api.js";
+
+const MERGE_CADENCE_OPTIONS: ReadonlyArray<{
+  value: MergeCadence;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: "task",
+    label: "Task",
+    description: "Merge after every completed task (fastest feedback, highest CI volume).",
+  },
+  {
+    value: "phase",
+    label: "Phase",
+    description: "Merge once at each phase boundary (default for new plans).",
+  },
+  {
+    value: "plan",
+    label: "Plan",
+    description: "Merge once at the end of the plan (one shipped version per plan).",
+  },
+];
 
 interface Props {
   planName: string;
@@ -56,6 +81,10 @@ export function PlanSettings({ planName }: Props) {
   /// in flight while the user clicks another row.
   const [savingVerify, setSavingVerify] = useState(false);
   const [savingWorkflows, setSavingWorkflows] = useState(false);
+  /// In-flight save tracker for the merge-cadence radio. Independent of
+  /// the other rows so the user can click a different field while the
+  /// cadence write is in flight.
+  const [savingCadence, setSavingCadence] = useState(false);
   /// Local state for the verify-command text input. Server is the source
   /// of truth; we mirror it here so the user can edit without every
   /// keystroke firing a PUT.
@@ -184,6 +213,28 @@ export function PlanSettings({ planName }: Props) {
       toastError(e, "Failed to clear phase verification override");
     } finally {
       setSavingVerify(false);
+    }
+  }
+
+  async function selectCadence(value: MergeCadence): Promise<void> {
+    setSavingCadence(true);
+    try {
+      await applyAndRefresh({ mergeCadence: value });
+    } catch (e) {
+      toastError(e, "Failed to save merge cadence");
+    } finally {
+      setSavingCadence(false);
+    }
+  }
+
+  async function inheritCadence(): Promise<void> {
+    setSavingCadence(true);
+    try {
+      await applyAndRefresh({ mergeCadence: null });
+    } catch (e) {
+      toastError(e, "Failed to clear merge-cadence override");
+    } finally {
+      setSavingCadence(false);
     }
   }
 
@@ -342,6 +393,14 @@ export function PlanSettings({ planName }: Props) {
         </div>
       </section>
 
+      {/* Merge cadence (Task 1.2 of cadence plan) */}
+      <MergeCadenceSection
+        settings={settings}
+        saving={savingCadence}
+        onSelect={selectCadence}
+        onInherit={inheritCadence}
+      />
+
       {/* Repo defaults (read-only) */}
       <section>
         <SectionHeader
@@ -351,6 +410,102 @@ export function PlanSettings({ planName }: Props) {
         <RepoDefaultsTable settings={settings} />
       </section>
     </div>
+  );
+}
+
+interface MergeCadenceSectionProps {
+  settings: PlanSettingsT;
+  saving: boolean;
+  onSelect: (v: MergeCadence) => void;
+  onInherit: () => void;
+}
+
+function MergeCadenceSection({ settings, saving, onSelect, onInherit }: MergeCadenceSectionProps) {
+  const planOverrideActive = settings.mergeCadence !== null;
+  const resolved = resolveMergeCadence(settings);
+  const inheritedLabel =
+    resolved.source === "default"
+      ? `the built-in default (${DEFAULT_MERGE_CADENCE})`
+      : `${resolved.source}: ${resolved.value}`;
+
+  return (
+    <section>
+      <SectionHeader
+        title="Merge cadence"
+        description="When auto-mode merges completed work back into the default branch. Inherits from the project's branchwork.toml when no plan-level pin is set."
+        right={
+          planOverrideActive ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={onInherit}
+              disabled={saving}
+              title="Remove the plan-level pin and inherit from the project default."
+            >
+              Inherit
+            </Button>
+          ) : null
+        }
+      />
+      <fieldset
+        className="mt-3 border border-gray-800 rounded divide-y divide-gray-800"
+        aria-label="Merge cadence"
+        disabled={saving}
+      >
+        {MERGE_CADENCE_OPTIONS.map((opt) => {
+          const id = `merge-cadence-${opt.value}`;
+          const isActive = resolved.value === opt.value;
+          const isExplicit = settings.mergeCadence === opt.value;
+          return (
+            <label
+              key={opt.value}
+              htmlFor={id}
+              className={`flex items-start gap-3 px-3 py-2 ${
+                saving ? "cursor-wait" : "cursor-pointer"
+              } ${isActive ? "bg-gray-900/40" : ""}`}
+            >
+              <input
+                id={id}
+                type="radio"
+                name="merge-cadence"
+                value={opt.value}
+                checked={isActive}
+                onChange={() => onSelect(opt.value)}
+                disabled={saving}
+                className="mt-1 w-4 h-4 accent-indigo-500"
+              />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-semibold text-gray-200">{opt.label}</span>
+                  {isExplicit && (
+                    <span
+                      className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-indigo-900/40 text-indigo-300 border border-indigo-700/50"
+                      title="Set explicitly at the plan level."
+                    >
+                      plan
+                    </span>
+                  )}
+                  {isActive && !isExplicit && (
+                    <span
+                      className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-900/30 text-amber-300 border border-amber-700/50"
+                      title="Inherited from the project default."
+                    >
+                      inherited
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-500 mt-0.5">{opt.description}</p>
+              </div>
+            </label>
+          );
+        })}
+      </fieldset>
+      <p className="text-xs text-gray-500 mt-2">
+        {planOverrideActive
+          ? "Plan-level cadence pin is active."
+          : `Resolved cadence: ${inheritedLabel}.`}
+      </p>
+    </section>
   );
 }
 
@@ -426,7 +581,8 @@ function RepoDefaultsTable({ settings }: { settings: PlanSettingsT }) {
   const empty =
     repoDefaults.ciBlockingWorkflows === undefined &&
     repoDefaults.ciBlockingWorkflowsSkip === undefined &&
-    repoDefaults.phaseVerification === undefined;
+    repoDefaults.phaseVerification === undefined &&
+    repoDefaults.mergeCadence === undefined;
   if (empty) {
     return (
       <p className="text-sm text-gray-500 italic mt-3">
@@ -440,6 +596,7 @@ function RepoDefaultsTable({ settings }: { settings: PlanSettingsT }) {
       <DefaultRow label="ci.blocking_workflows" value={repoDefaults.ciBlockingWorkflows} />
       <DefaultRow label="ci.blocking_workflows_skip" value={repoDefaults.ciBlockingWorkflowsSkip} />
       <DefaultRow label="phase.verification" value={repoDefaults.phaseVerification} />
+      <DefaultRow label="auto_mode.merge_cadence" value={repoDefaults.mergeCadence} />
     </dl>
   );
 }

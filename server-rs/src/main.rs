@@ -241,6 +241,15 @@ async fn run_server(cli: Cli) {
     // skip the directory walk.
     migrations::spawn_pipeline_to_task_tests_rename(state.clone());
 
+    // One-shot grandfather (cadence plan Task 1.2): write
+    // `plan_auto_mode.merge_cadence='task'` on every plan known at
+    // upgrade time, so the legacy per-task merge behaviour survives the
+    // column landing as NULLable. Plans created after this migration
+    // leave the column NULL and inherit the project default (`phase`).
+    // Settings-gated (`plan_merge_cadence_grandfather_v1_done`) so
+    // subsequent boots skip the directory walk + bulk UPDATE.
+    migrations::spawn_grandfather_merge_cadence(state.clone());
+
     // Start the auto-mode idle poller (drivers without a Stop hook fall
     // back to a 60 s tick + idle threshold). Off by default; set
     // `BRANCHWORK_AUTO_FINISH_IDLE=1` to enable. Env vars are read once

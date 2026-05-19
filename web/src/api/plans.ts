@@ -7,7 +7,23 @@ export interface RepoDefaults {
   ciBlockingWorkflows?: string[];
   ciBlockingWorkflowsSkip?: string[];
   phaseVerification?: string;
+  /// `[auto_mode] merge_cadence` from the project `branchwork.toml`.
+  /// Omitted when the file is absent OR when it carries the hard-coded
+  /// default (`phase`) — the UI's fallback chain treats `undefined` as
+  /// "use the hard-coded default".
+  mergeCadence?: MergeCadence;
 }
+
+/// The three legal cadences for `plan_auto_mode.merge_cadence` /
+/// `[auto_mode] merge_cadence` in `branchwork.toml`. Mirrors the Rust
+/// `MergeCadence` enum (see server-rs/src/repo_config.rs).
+export type MergeCadence = "task" | "phase" | "plan";
+
+/// Hard-coded fallback used by both the server-side
+/// `RepoConfig::default()` and the client when nothing else in the
+/// resolution chain (`plan -> repo -> default`) sets a value. Kept in
+/// lockstep with `MergeCadence::Phase` as the `#[default]` variant.
+export const DEFAULT_MERGE_CADENCE: MergeCadence = "phase";
 
 /// Mirrors the Rust `PlanSettings` shape returned by GET
 /// `/api/plans/:name/settings`. `ciBlockingWorkflows` and
@@ -16,6 +32,10 @@ export interface RepoDefaults {
 export interface PlanSettings {
   ciBlockingWorkflows: string[] | null;
   phaseVerification: string | null;
+  /// Plan-level merge-cadence override. `null` (or absent) means
+  /// "inherit the project default" — UI falls back to
+  /// `repoDefaults.mergeCadence`, then `DEFAULT_MERGE_CADENCE`.
+  mergeCadence: MergeCadence | null;
   /// Workflow names enumerated from `<project>/.github/workflows/*.yml|*.yaml`.
   /// Empty when the project has no workflows directory or none parse.
   availableWorkflows: string[];
@@ -30,6 +50,27 @@ export type Tristate<T> = T | null | undefined;
 export interface PlanSettingsBody {
   ciBlockingWorkflows?: Tristate<string[]>;
   phaseVerification?: Tristate<string>;
+  /// Tristate cadence override. `undefined` leaves the DB column
+  /// untouched, `null` clears the override back to "inherit project
+  /// default", a value writes the explicit pin.
+  mergeCadence?: Tristate<MergeCadence>;
+}
+
+/// Resolve which level of the cadence inheritance chain provides the
+/// active value, mirroring how the auto-mode loop will read it
+/// server-side. Plan-level explicit pin → repo default → hard-coded
+/// `DEFAULT_MERGE_CADENCE` (`phase`).
+export type MergeCadenceSource = "plan" | "repo default" | "default";
+
+export function resolveMergeCadence(s: PlanSettings): {
+  value: MergeCadence;
+  source: MergeCadenceSource;
+} {
+  if (s.mergeCadence !== null) return { value: s.mergeCadence, source: "plan" };
+  if (s.repoDefaults.mergeCadence !== undefined) {
+    return { value: s.repoDefaults.mergeCadence, source: "repo default" };
+  }
+  return { value: DEFAULT_MERGE_CADENCE, source: "default" };
 }
 
 export function getPlanSettings(planName: string): Promise<PlanSettings> {

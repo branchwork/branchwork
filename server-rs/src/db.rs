@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, params};
 
+use crate::repo_config::MergeCadence;
+
 /// Thread-safe handle to the SQLite database.
 pub type Db = Arc<Mutex<Connection>>;
 
@@ -110,16 +112,22 @@ pub struct AutoModeConfig {
     /// [`auto_mode_pause`] handed in — trimmed at the call site to match
     /// the broadcast payload (5 files today).
     pub paused_files: Option<Vec<String>>,
+    /// Per-plan merge-cadence override. `None` means "inherit the project
+    /// default" (the `[auto_mode] merge_cadence` value from the project's
+    /// `branchwork.toml`, which itself defaults to `phase`). `Some(_)` is
+    /// an explicit plan-level pin (`task` / `phase` / `plan`).
+    pub merge_cadence: Option<MergeCadence>,
 }
 
 /// Read the full `plan_auto_mode` row for `plan_name`. Defaults to
 /// `enabled=false`, `max_fix_attempts=3`, `paused_reason=None`,
-/// `parallel=false`, `paused_files=None` when no row exists.
+/// `parallel=false`, `paused_files=None`, `merge_cadence=None` when no
+/// row exists.
 #[allow(dead_code)] // wired in by 3.5.3 worktrees gate + later loop callers
 pub fn auto_mode_config(db: &Db, plan_name: &str) -> AutoModeConfig {
     let conn = db.lock().unwrap();
     conn.query_row(
-        "SELECT enabled, max_fix_attempts, paused_reason, parallel, paused_files \
+        "SELECT enabled, max_fix_attempts, paused_reason, parallel, paused_files, merge_cadence \
          FROM plan_auto_mode WHERE plan_name = ?1",
         params![plan_name],
         |row| {
@@ -131,6 +139,9 @@ pub fn auto_mode_config(db: &Db, plan_name: &str) -> AutoModeConfig {
                 paused_files: row
                     .get::<_, Option<String>>(4)?
                     .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()),
+                merge_cadence: row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|s| parse_merge_cadence(&s)),
             })
         },
     )
@@ -140,7 +151,67 @@ pub fn auto_mode_config(db: &Db, plan_name: &str) -> AutoModeConfig {
         paused_reason: None,
         parallel: false,
         paused_files: None,
+        merge_cadence: None,
     })
+}
+
+/// Parse a stored merge-cadence string (`'task'` / `'phase'` / `'plan'`)
+/// into the typed enum. Unknown values collapse to `None` so a corrupted
+/// row (manual SQL UPDATE, future schema reshuffle) silently inherits
+/// the project default rather than 500ing the config endpoint. Mirrors
+/// the lenient parse the runner-failover column uses.
+pub fn parse_merge_cadence(s: &str) -> Option<MergeCadence> {
+    match s {
+        "task" => Some(MergeCadence::Task),
+        "phase" => Some(MergeCadence::Phase),
+        "plan" => Some(MergeCadence::Plan),
+        _ => None,
+    }
+}
+
+/// Wire form of [`MergeCadence`]: lowercase variant name matching the
+/// `[auto_mode] merge_cadence` TOML serialisation and the DB column.
+/// Kept in lockstep with [`parse_merge_cadence`].
+pub fn merge_cadence_wire(c: MergeCadence) -> &'static str {
+    match c {
+        MergeCadence::Task => "task",
+        MergeCadence::Phase => "phase",
+        MergeCadence::Plan => "plan",
+    }
+}
+
+/// Read the per-plan merge-cadence override. Returns `None` when the
+/// row carries no explicit cadence ("inherit project default"). Returns
+/// `Some(_)` when an explicit cadence has been written.
+#[allow(dead_code)] // wired in by the auto-mode loop in a later task
+pub fn plan_merge_cadence(db: &Db, plan_name: &str) -> Option<MergeCadence> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT merge_cadence FROM plan_auto_mode WHERE plan_name = ?1",
+        params![plan_name],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .and_then(|s| parse_merge_cadence(&s))
+}
+
+/// Persist (or clear) the per-plan merge-cadence override. `Some(_)`
+/// UPSERTs the explicit cadence; `None` clears the column back to NULL
+/// (inherit the project default). Other columns on the row are left
+/// untouched on conflict — partial updates do not clobber sibling
+/// settings (matches the partial-update pattern in `put_plan_config`).
+#[allow(dead_code)] // wired in by `put_plan_settings` in this same task
+pub fn set_plan_merge_cadence(db: &Db, plan_name: &str, cadence: Option<MergeCadence>) {
+    let wire: Option<&'static str> = cadence.map(merge_cadence_wire);
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO plan_auto_mode (plan_name, merge_cadence) \
+         VALUES (?1, ?2) \
+         ON CONFLICT(plan_name) DO UPDATE SET merge_cadence = excluded.merge_cadence",
+        params![plan_name, wire],
+    )
+    .ok();
 }
 
 /// Snapshot of `plan_auto_advance` for `plan_name`. All fields fall back
@@ -1176,6 +1247,18 @@ fn migrate(conn: &Connection) {
     // at the call site (5 files today) to match the broadcast payload;
     // helper stores whatever it's handed.
     conn.execute_batch("ALTER TABLE plan_auto_mode ADD COLUMN paused_files TEXT;")
+        .ok();
+
+    // Per-plan merge-cadence override (Task 1.2 of the
+    // ci-cadence-build-vs-test-configurable plan). Nullable: NULL means
+    // "inherit the project default from `branchwork.toml` [auto_mode]
+    // merge_cadence" (which itself defaults to `phase`). Allowed values:
+    // 'task' | 'phase' | 'plan'. The one-shot grandfather migration in
+    // `migrations::spawn_grandfather_merge_cadence` writes 'task' on every
+    // plan known at upgrade time so legacy auto-mode behaviour (merge after
+    // every task) is preserved; plans created after that migration leave
+    // the column NULL and inherit the project default ('phase').
+    conn.execute_batch("ALTER TABLE plan_auto_mode ADD COLUMN merge_cadence TEXT;")
         .ok();
 
     // Seed the default org and migrate orphaned users/plans into it.
@@ -2277,6 +2360,138 @@ mod tests {
             )
             .unwrap();
         assert_eq!(max, 5, "user-set max_fix_attempts survives re-init");
+    }
+
+    // ── merge_cadence (Task 1.2 of the cadence plan) ────────────────────
+
+    #[test]
+    fn merge_cadence_defaults_to_none_for_missing_or_unset_rows() {
+        // Missing row entirely: helper falls back to None (inherit project default).
+        let (db, _dir) = test_db();
+        assert_eq!(plan_merge_cadence(&db, "missing"), None);
+        assert!(auto_mode_config(&db, "missing").merge_cadence.is_none());
+
+        // Row exists, merge_cadence omitted from INSERT: column NULL by
+        // default — also None (inherit project default).
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+                params!["plan-no-cadence"],
+            )
+            .unwrap();
+        }
+        assert_eq!(plan_merge_cadence(&db, "plan-no-cadence"), None);
+        assert!(
+            auto_mode_config(&db, "plan-no-cadence")
+                .merge_cadence
+                .is_none(),
+            "NULL merge_cadence column must surface as inherit (None)"
+        );
+    }
+
+    #[test]
+    fn set_plan_merge_cadence_round_trips_each_variant() {
+        let (db, _dir) = test_db();
+        for cadence in [MergeCadence::Task, MergeCadence::Phase, MergeCadence::Plan] {
+            set_plan_merge_cadence(&db, "plan-a", Some(cadence));
+            assert_eq!(
+                plan_merge_cadence(&db, "plan-a"),
+                Some(cadence),
+                "set/get must round-trip {cadence:?}"
+            );
+            // And via the snapshot helper too.
+            assert_eq!(auto_mode_config(&db, "plan-a").merge_cadence, Some(cadence));
+        }
+    }
+
+    #[test]
+    fn set_plan_merge_cadence_clear_resets_to_inherit() {
+        let (db, _dir) = test_db();
+        set_plan_merge_cadence(&db, "plan-a", Some(MergeCadence::Plan));
+        assert_eq!(plan_merge_cadence(&db, "plan-a"), Some(MergeCadence::Plan));
+        // Explicit None must NULL the column — back to "inherit project default".
+        set_plan_merge_cadence(&db, "plan-a", None);
+        assert_eq!(plan_merge_cadence(&db, "plan-a"), None);
+    }
+
+    #[test]
+    fn set_plan_merge_cadence_preserves_sibling_columns() {
+        // Critical: the partial-update UPSERT must not clobber `enabled`,
+        // `max_fix_attempts`, or `paused_reason` — those belong to other
+        // editor flows and the cadence write happens via its own button.
+        let (db, _dir) = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode \
+                   (plan_name, enabled, max_fix_attempts, paused_reason) \
+                 VALUES (?1, 1, 7, 'merge_conflict')",
+                params!["plan-a"],
+            )
+            .unwrap();
+        }
+        set_plan_merge_cadence(&db, "plan-a", Some(MergeCadence::Plan));
+        let cfg = auto_mode_config(&db, "plan-a");
+        assert!(cfg.enabled, "enabled must survive cadence write");
+        assert_eq!(cfg.max_fix_attempts, 7, "max_fix_attempts must survive");
+        assert_eq!(cfg.paused_reason.as_deref(), Some("merge_conflict"));
+        assert_eq!(cfg.merge_cadence, Some(MergeCadence::Plan));
+    }
+
+    #[test]
+    fn parse_merge_cadence_accepts_lowercase_and_rejects_others() {
+        assert_eq!(parse_merge_cadence("task"), Some(MergeCadence::Task));
+        assert_eq!(parse_merge_cadence("phase"), Some(MergeCadence::Phase));
+        assert_eq!(parse_merge_cadence("plan"), Some(MergeCadence::Plan));
+        // Unknown / mis-cased values collapse to None — caller treats as
+        // inherit so a corrupt row never 500s the config endpoint.
+        assert_eq!(parse_merge_cadence("Task"), None);
+        assert_eq!(parse_merge_cadence("WEEKLY"), None);
+        assert_eq!(parse_merge_cadence(""), None);
+    }
+
+    #[test]
+    fn merge_cadence_wire_round_trips_through_parse() {
+        for cadence in [MergeCadence::Task, MergeCadence::Phase, MergeCadence::Plan] {
+            assert_eq!(
+                parse_merge_cadence(merge_cadence_wire(cadence)),
+                Some(cadence)
+            );
+        }
+    }
+
+    #[test]
+    fn merge_cadence_migration_is_idempotent_and_preserves_existing_value() {
+        // Same idempotency contract as the parallel column: re-running
+        // `init` on a DB that already has merge_cadence written must
+        // preserve the value (no DROP/RESET).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let db = init(&path);
+            set_plan_merge_cadence(&db, "plan-pinned", Some(MergeCadence::Plan));
+            // Another plan with NULL — verifies NULL survives unchanged too.
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+                params!["plan-inherits"],
+            )
+            .unwrap();
+        }
+
+        let db2 = init(&path);
+        assert_eq!(
+            plan_merge_cadence(&db2, "plan-pinned"),
+            Some(MergeCadence::Plan),
+            "user-set merge_cadence must survive re-init"
+        );
+        assert_eq!(
+            plan_merge_cadence(&db2, "plan-inherits"),
+            None,
+            "NULL merge_cadence must remain NULL after re-init"
+        );
     }
 
     // ── runner_config ────────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_MERGE_CADENCE,
   isWorkflowBlockingByDefault,
+  resolveMergeCadence,
   resolvePhaseVerification,
   resolveWorkflows,
   type PhaseSettings,
@@ -11,6 +13,7 @@ function settingsWith(overrides: Partial<PlanSettings>): PlanSettings {
   return {
     ciBlockingWorkflows: null,
     phaseVerification: null,
+    mergeCadence: null,
     availableWorkflows: [],
     repoDefaults: {},
     ...overrides,
@@ -136,5 +139,41 @@ describe("resolvePhaseVerification", () => {
       ps({ phaseVerification: "", planVerification: "plan.sh" }),
     );
     expect(got).toEqual({ value: "", source: "phase" });
+  });
+});
+
+describe("resolveMergeCadence", () => {
+  it("falls back to the built-in default when nothing is set", () => {
+    expect(resolveMergeCadence(settingsWith({}))).toEqual({
+      value: DEFAULT_MERGE_CADENCE,
+      source: "default",
+    });
+  });
+
+  it("uses repo default when plan is null but repo is set", () => {
+    expect(
+      resolveMergeCadence(
+        settingsWith({
+          repoDefaults: { mergeCadence: "task" },
+        }),
+      ),
+    ).toEqual({ value: "task", source: "repo default" });
+  });
+
+  it("uses plan override when set, even when repo disagrees", () => {
+    expect(
+      resolveMergeCadence(
+        settingsWith({
+          mergeCadence: "plan",
+          repoDefaults: { mergeCadence: "task" },
+        }),
+      ),
+    ).toEqual({ value: "plan", source: "plan" });
+  });
+
+  it("DEFAULT_MERGE_CADENCE matches the Rust default", () => {
+    // Sanity: must stay in lockstep with `MergeCadence::Phase` as the
+    // `#[default]` variant of the Rust enum in repo_config.rs.
+    expect(DEFAULT_MERGE_CADENCE).toBe("phase");
   });
 });

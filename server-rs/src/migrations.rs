@@ -225,6 +225,150 @@ fn set_gate(db: &Db, key: &str) {
     .ok();
 }
 
+// ── Task 1.2 (cadence plan): grandfather merge_cadence='task' ───────────────
+//
+// `plan_auto_mode.merge_cadence` lands NULLable (NULL = inherit project
+// default, which itself defaults to `phase`). The new default for fresh
+// plans is therefore `phase`, but every plan that already existed when
+// this column shipped used the legacy per-task-merge behaviour and would
+// silently flip cadence on the first auto-mode tick after upgrade. To
+// preserve behaviour, this one-shot migration writes `task` on every
+// plan known at upgrade time:
+//
+//   - For every YAML/MD plan file at `<plans_dir>/*` we UPSERT a
+//     `plan_auto_mode` row with `merge_cadence='task'` (without touching
+//     `enabled` / `max_fix_attempts` / sibling columns).
+//   - Existing `plan_auto_mode` rows whose `merge_cadence IS NULL` are
+//     bulk-UPDATEd to `task` even if the plan file no longer exists,
+//     so a plan that was deleted from disk but still carries audit
+//     state stays consistent.
+//
+// Once [`MERGE_CADENCE_GRANDFATHER_GATE_KEY`] is set, subsequent boots
+// skip the directory walk. New plans created post-migration go through
+// the normal API flow (no implicit write of `task`) and inherit the
+// project default. Bump the suffix only if a downstream change forces a
+// re-run on already-migrated databases.
+
+const MERGE_CADENCE_GRANDFATHER_GATE_KEY: &str = "plan_merge_cadence_grandfather_v1_done";
+const LEGACY_MERGE_CADENCE: &str = "task";
+
+/// Spawn the one-shot grandfather pass. Detached via `tokio::spawn` so
+/// the HTTP listener readiness probe is not blocked by the directory
+/// walk; gated by [`MERGE_CADENCE_GRANDFATHER_GATE_KEY`] in the
+/// `settings` table so subsequent boots return immediately.
+pub fn spawn_grandfather_merge_cadence(state: AppState) {
+    tokio::spawn(async move {
+        grandfather_merge_cadence(state).await;
+    });
+}
+
+/// Result of a single grandfather pass — useful for tests that want to
+/// assert on counts without re-scanning the directory.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct GrandfatherSummary {
+    /// Plan-file basenames discovered in `<plans_dir>/*`.
+    pub scanned: usize,
+    /// New `plan_auto_mode` rows created (or rows whose
+    /// `merge_cadence` was just freshly set on UPSERT).
+    pub written: usize,
+}
+
+pub async fn grandfather_merge_cadence(state: AppState) {
+    if gate_is_set(&state.db, MERGE_CADENCE_GRANDFATHER_GATE_KEY) {
+        eprintln!("[migrations] merge_cadence grandfather already applied, skipping");
+        return;
+    }
+
+    let plans_dir = state.plans_dir.clone();
+    let summary = match grandfather_merge_cadence_inner(&state.db, &plans_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[migrations] merge_cadence grandfather: failed to walk plans dir: {e}");
+            return;
+        }
+    };
+
+    eprintln!(
+        "[migrations] merge_cadence grandfather: scanned {} plans, wrote 'task' to {} \
+         row(s) (existing plans pinned to legacy behaviour; new plans inherit project default)",
+        summary.scanned, summary.written,
+    );
+
+    set_gate(&state.db, MERGE_CADENCE_GRANDFATHER_GATE_KEY);
+}
+
+/// Pure helper used by both production [`grandfather_merge_cadence`] and
+/// the unit tests. Touches only `plan_auto_mode.merge_cadence` — never
+/// `enabled` / `max_fix_attempts` / sibling columns, so a plan that was
+/// already opted into auto-mode survives untouched modulo the cadence
+/// write.
+pub(crate) fn grandfather_merge_cadence_inner(
+    db: &Db,
+    plans_dir: &std::path::Path,
+) -> std::io::Result<GrandfatherSummary> {
+    let mut summary = GrandfatherSummary::default();
+    let entries = std::fs::read_dir(plans_dir)?;
+    let mut plan_names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Archives live under `<plans_dir>/archive/<name>.<utc>.yaml`;
+        // never touch a snapshot, only live top-level plan files.
+        if !path.is_file() {
+            continue;
+        }
+        if !plan_parser::is_plan_ext(&path) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        plan_names.push(stem.to_string());
+    }
+    summary.scanned = plan_names.len();
+
+    let conn = db.lock().unwrap();
+
+    // Pass 1: UPSERT one row per plan file with merge_cadence='task'.
+    // We use ON CONFLICT DO UPDATE so any existing row gets its cadence
+    // pinned to 'task' WITHOUT touching `enabled`, `max_fix_attempts`,
+    // etc. — the partial-update pattern matches `set_plan_merge_cadence`.
+    // Tracking the inserts/updates as one bucket here is intentional: a
+    // plan that was already opted into auto-mode (row exists, cadence
+    // NULL) needs the same treatment as a plan with no row at all.
+    for name in &plan_names {
+        let n = conn
+            .execute(
+                "INSERT INTO plan_auto_mode (plan_name, merge_cadence) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(plan_name) DO UPDATE SET \
+                    merge_cadence = excluded.merge_cadence \
+                  WHERE plan_auto_mode.merge_cadence IS NULL",
+                params![name, LEGACY_MERGE_CADENCE],
+            )
+            .unwrap_or(0);
+        if n > 0 {
+            summary.written += 1;
+        }
+    }
+
+    // Pass 2: catch orphan rows — plans whose YAML file was deleted but
+    // whose `plan_auto_mode` row still carries audit state (paused_reason,
+    // fix attempts, etc.). Pin those too so the legacy contract holds
+    // uniformly: "every plan that existed when this column shipped is
+    // pinned to 'task'".
+    let n = conn
+        .execute(
+            "UPDATE plan_auto_mode \
+                SET merge_cadence = ?1 \
+              WHERE merge_cadence IS NULL",
+            params![LEGACY_MERGE_CADENCE],
+        )
+        .unwrap_or(0);
+    summary.written += n;
+
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,5 +598,248 @@ mod tests {
         // Re-set is idempotent — UPSERT path keeps value at '1'.
         set_gate(&db, PIPELINE_RENAME_GATE_KEY);
         assert!(gate_is_set(&db, PIPELINE_RENAME_GATE_KEY));
+    }
+
+    // ── grandfather_merge_cadence (Task 1.2 of cadence plan) ───────
+
+    fn count_cadence_rows(db: &crate::db::Db, cadence: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM plan_auto_mode WHERE merge_cadence = ?1",
+            params![cadence],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn count_null_cadence_rows(db: &crate::db::Db) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM plan_auto_mode WHERE merge_cadence IS NULL",
+            params![],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn grandfather_writes_task_on_every_existing_plan_file() {
+        // Headline acceptance criterion: a 100-plan DB after migration
+        // has every existing row at `merge_cadence='task'`.
+        let dir = TempDir::new().unwrap();
+        let plans_dir = dir.path();
+        for i in 0..100 {
+            write_plan(
+                plans_dir,
+                &format!("plan-{i:03}.yaml"),
+                "title: T\nphases: []\n",
+            );
+        }
+        let db = crate::db::init(std::path::Path::new(":memory:"));
+        let summary = grandfather_merge_cadence_inner(&db, plans_dir).unwrap();
+        assert_eq!(summary.scanned, 100);
+        assert_eq!(summary.written, 100);
+        assert_eq!(count_cadence_rows(&db, "task"), 100);
+        assert_eq!(count_null_cadence_rows(&db), 0);
+    }
+
+    #[test]
+    fn grandfather_preserves_existing_auto_mode_state() {
+        // The cadence write must NOT clobber enabled / max_fix_attempts /
+        // parallel / paused_reason — those belong to user-driven toggles.
+        let dir = TempDir::new().unwrap();
+        write_plan(dir.path(), "plan-a.yaml", "title: T\nphases: []\n");
+        let db = crate::db::init(std::path::Path::new(":memory:"));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode \
+                   (plan_name, enabled, max_fix_attempts, parallel, paused_reason) \
+                 VALUES (?1, 1, 7, 1, 'merge_conflict')",
+                params!["plan-a"],
+            )
+            .unwrap();
+        }
+
+        let summary = grandfather_merge_cadence_inner(&db, dir.path()).unwrap();
+        assert_eq!(summary.scanned, 1);
+        // One write: the UPDATE that set cadence on the existing row.
+        assert_eq!(summary.written, 1);
+
+        let cfg = crate::db::auto_mode_config(&db, "plan-a");
+        assert!(cfg.enabled, "enabled must survive grandfather");
+        assert_eq!(cfg.max_fix_attempts, 7);
+        assert!(cfg.parallel);
+        assert_eq!(cfg.paused_reason.as_deref(), Some("merge_conflict"));
+        assert_eq!(
+            cfg.merge_cadence,
+            Some(crate::repo_config::MergeCadence::Task)
+        );
+    }
+
+    #[test]
+    fn grandfather_skips_rows_with_explicit_cadence_already_set() {
+        // A user who set 'plan' explicitly between upgrades must not be
+        // bulk-rewritten to 'task'. The WHERE filter on the DO UPDATE
+        // gates that case.
+        let dir = TempDir::new().unwrap();
+        write_plan(dir.path(), "plan-pinned.yaml", "title: T\nphases: []\n");
+        let db = crate::db::init(std::path::Path::new(":memory:"));
+        crate::db::set_plan_merge_cadence(
+            &db,
+            "plan-pinned",
+            Some(crate::repo_config::MergeCadence::Plan),
+        );
+
+        let summary = grandfather_merge_cadence_inner(&db, dir.path()).unwrap();
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(
+            summary.written, 0,
+            "explicit cadence must NOT be overwritten by grandfather"
+        );
+        assert_eq!(
+            crate::db::plan_merge_cadence(&db, "plan-pinned"),
+            Some(crate::repo_config::MergeCadence::Plan),
+            "user-set cadence must be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn grandfather_catches_orphan_rows_without_a_yaml_on_disk() {
+        // A plan that was deleted from disk but still carries
+        // `plan_auto_mode` state (paused_reason etc.) must also be
+        // grandfathered to 'task' so the legacy contract holds uniformly.
+        let dir = TempDir::new().unwrap();
+        // No YAML on disk for plan-orphan.
+        let db = crate::db::init(std::path::Path::new(":memory:"));
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+                params!["plan-orphan"],
+            )
+            .unwrap();
+        }
+        let summary = grandfather_merge_cadence_inner(&db, dir.path()).unwrap();
+        assert_eq!(summary.scanned, 0);
+        // Pass 2 catches the orphan.
+        assert_eq!(summary.written, 1);
+        assert_eq!(
+            crate::db::plan_merge_cadence(&db, "plan-orphan"),
+            Some(crate::repo_config::MergeCadence::Task)
+        );
+    }
+
+    #[test]
+    fn grandfather_is_idempotent_on_repeated_runs() {
+        // Re-running the inner helper after the first pass writes nothing
+        // (every row already has merge_cadence set). The settings-table
+        // gate is checked by the public wrapper; the inner pass is
+        // intrinsically idempotent.
+        let dir = TempDir::new().unwrap();
+        for i in 0..3 {
+            write_plan(
+                dir.path(),
+                &format!("plan-{i}.yaml"),
+                "title: T\nphases: []\n",
+            );
+        }
+        let db = crate::db::init(std::path::Path::new(":memory:"));
+
+        let first = grandfather_merge_cadence_inner(&db, dir.path()).unwrap();
+        assert_eq!(first.written, 3);
+
+        let second = grandfather_merge_cadence_inner(&db, dir.path()).unwrap();
+        assert_eq!(
+            second.written, 0,
+            "second pass must write nothing — every row already has cadence set"
+        );
+        assert_eq!(second.scanned, 3, "directory walk still happens");
+    }
+
+    #[test]
+    fn fresh_plans_after_migration_still_inherit_default() {
+        // Acceptance criterion: a freshly-created plan inherits `phase`
+        // from the project. The grandfather migration writes 'task' to
+        // every plan known AT THE TIME OF UPGRADE. Plans created after
+        // the gate is set never see the migration and must default to
+        // NULL (= inherit project default).
+        let dir = TempDir::new().unwrap();
+        write_plan(dir.path(), "plan-original.yaml", "title: T\nphases: []\n");
+        let db = crate::db::init(std::path::Path::new(":memory:"));
+
+        // First boot: grandfather every plan on disk.
+        let summary = grandfather_merge_cadence_inner(&db, dir.path()).unwrap();
+        assert_eq!(summary.written, 1);
+
+        // Simulate a freshly-created plan via the normal API flow: the
+        // user toggles auto-mode on, which UPSERTs a plan_auto_mode row
+        // with `enabled=1` and merge_cadence column omitted from the
+        // INSERT — column NULL by default.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled) VALUES (?1, 1)",
+                params!["plan-fresh"],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            crate::db::plan_merge_cadence(&db, "plan-fresh"),
+            None,
+            "fresh plan must NOT inherit the legacy 'task' grandfather — it inherits the project default"
+        );
+
+        // The original grandfathered plan stays at 'task'.
+        assert_eq!(
+            crate::db::plan_merge_cadence(&db, "plan-original"),
+            Some(crate::repo_config::MergeCadence::Task)
+        );
+    }
+
+    #[test]
+    fn grandfather_gate_blocks_repeated_runs() {
+        // Public wrapper: settings-table gate makes the second run a no-op
+        // even if the underlying state could still be mutated.
+        // Driven via the inner helper + explicit gate manipulation since
+        // the public wrapper just wraps the gate read/inner/gate set
+        // sequence — the gate semantics are the only new contract here.
+        let dir = TempDir::new().unwrap();
+        write_plan(dir.path(), "plan-a.yaml", "title: T\nphases: []\n");
+
+        let db = crate::db::init(std::path::Path::new(":memory:"));
+        assert!(!gate_is_set(&db, MERGE_CADENCE_GRANDFATHER_GATE_KEY));
+
+        // First boot equivalent: inner pass + gate set (matches the
+        // `grandfather_merge_cadence` wrapper body).
+        let summary = grandfather_merge_cadence_inner(&db, dir.path()).unwrap();
+        assert_eq!(summary.written, 1);
+        set_gate(&db, MERGE_CADENCE_GRANDFATHER_GATE_KEY);
+        assert!(gate_is_set(&db, MERGE_CADENCE_GRANDFATHER_GATE_KEY));
+        assert_eq!(
+            crate::db::plan_merge_cadence(&db, "plan-a"),
+            Some(crate::repo_config::MergeCadence::Task)
+        );
+
+        // Roll the value on disk to 'plan' → re-invoking the wrapper
+        // would early-return on the gate and the value must stay 'plan'.
+        crate::db::set_plan_merge_cadence(
+            &db,
+            "plan-a",
+            Some(crate::repo_config::MergeCadence::Plan),
+        );
+        assert!(
+            gate_is_set(&db, MERGE_CADENCE_GRANDFATHER_GATE_KEY),
+            "gate is sticky across writes — wrapper short-circuits next call"
+        );
+        // Sanity: the inner helper is intrinsically idempotent — even
+        // bypassing the gate, the WHERE filter on the DO UPDATE preserves
+        // the explicit choice.
+        let summary = grandfather_merge_cadence_inner(&db, dir.path()).unwrap();
+        assert_eq!(summary.written, 0, "explicit cadence is preserved");
+        assert_eq!(
+            crate::db::plan_merge_cadence(&db, "plan-a"),
+            Some(crate::repo_config::MergeCadence::Plan)
+        );
     }
 }
