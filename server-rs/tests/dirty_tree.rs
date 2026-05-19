@@ -181,6 +181,81 @@ fn dirty_tree_check_returns_clean_for_dirty_bob_dir_with_canonical_branchwork_to
     );
 }
 
+/// Pin the dirty-tree gate scope to `completed` only.
+///
+/// `PUT /api/plans/:n/tasks/:num/status` rejects `body.status ==
+/// "completed"` on a dirty working tree with 409 `working_tree_dirty`.
+/// Every other status (`skipped`, `failed`, `in_progress`, …) is an
+/// explicit operator write that MUST persist regardless of tree state
+/// — those are the recovery exits operators reach for precisely when
+/// the work didn't land cleanly. Acceptance criterion for Task 5.2 of
+/// `dirty-tree-check-stop-pausing-on-write-noise`: reverting the
+/// `body.status == "completed"` check in `set_task_status` to
+/// e.g. `body.status != "pending"` widens the gate to cover
+/// `skipped`/`failed` too — this test then fails on the first PUT
+/// because `skipped` would 409. The dropdown shipped in Task 5.1 is
+/// only safe while this scope holds; if it ever drifts, every menu
+/// item below `completed` silently inherits the 409.
+#[test]
+fn tree_clean_gate_only_applies_to_completed_status() {
+    let d = TestDashboard::new();
+
+    // Dirty the tree with a tracked file outside any allowlist — no
+    // `branchwork.toml` is copied into the project, so nothing filters
+    // the porcelain output and the dirty check WILL trip on
+    // `body.status == "completed"`.
+    std::fs::write(d.project.join("note.txt"), "baseline\n").unwrap();
+    run_git(&["add", "note.txt"], &d.project);
+    run_git(&["commit", "-q", "-m", "track note.txt"], &d.project);
+    std::fs::write(d.project.join("note.txt"), "dirtied by operator\n").unwrap();
+
+    let plan_name = "tree-clean-gate-scope";
+    d.create_plan(plan_name, &single_task_plan(plan_name, &d.project));
+
+    let status_url = format!("/api/plans/{plan_name}/tasks/1.1/status");
+    let statuses_url = format!("/api/plans/{plan_name}/statuses");
+
+    // `skipped` — operator opts out; tree state is irrelevant.
+    let (status, body) = d.put(&status_url, json!({"status": "skipped"}));
+    assert_eq!(
+        status, 200,
+        "expected 200 on skipped (gate must not apply); body={body}"
+    );
+    let (_, statuses) = d.get(&statuses_url);
+    let row = statuses
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["task_number"] == "1.1"))
+        .unwrap_or_else(|| panic!("skipped not persisted; statuses={statuses}"));
+    assert_eq!(
+        row["status"], "skipped",
+        "skipped row not persisted; row={row}"
+    );
+
+    // `failed` — operator records a hard failure; tree state irrelevant.
+    let (status, body) = d.put(&status_url, json!({"status": "failed"}));
+    assert_eq!(
+        status, 200,
+        "expected 200 on failed (gate must not apply); body={body}"
+    );
+    let (_, statuses) = d.get(&statuses_url);
+    let row = statuses
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["task_number"] == "1.1"))
+        .unwrap_or_else(|| panic!("failed not persisted; statuses={statuses}"));
+    assert_eq!(
+        row["status"], "failed",
+        "failed row not persisted; row={row}"
+    );
+
+    // `completed` — the one case the gate exists for.
+    let (status, body) = d.put(&status_url, json!({"status": "completed"}));
+    assert_eq!(
+        status, 409,
+        "expected 409 on completed (gate must apply); body={body}"
+    );
+    assert_eq!(body["error"], "working_tree_dirty", "body={body}");
+}
+
 /// Sanity test for the canonical TOML itself: it parses, and the two
 /// patterns we depend on (`*.log`, `.bob/**`) are both present. Catches
 /// a regression where the file is reformatted/replaced in a way that
