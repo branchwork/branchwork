@@ -8,7 +8,7 @@ import {
   type ParsedPlan,
   type PlanTask,
 } from "../stores/plan-store.js";
-import { useAgentStore } from "../stores/agent-store.js";
+import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 
 const PLAN = "p1";
@@ -33,7 +33,8 @@ function ci(overrides: Partial<CiStatus> = {}): CiStatus {
   };
 }
 
-function plan(t: PlanTask): ParsedPlan {
+function plan(tOrTasks: PlanTask | PlanTask[]): ParsedPlan {
+  const tasks = Array.isArray(tOrTasks) ? tOrTasks : [tOrTasks];
   return {
     name: PLAN,
     filePath: "/tmp/p1.yaml",
@@ -47,19 +48,46 @@ function plan(t: PlanTask): ParsedPlan {
         number: 1,
         title: "Phase 1",
         description: "",
-        tasks: [t],
+        tasks,
       },
     ],
   };
 }
 
-function seed(t: PlanTask): void {
-  useAgentStore.setState({ agents: [], selectAgent: vi.fn() });
+function agent(overrides: Partial<Agent> = {}): Agent {
+  return {
+    id: "agent-1",
+    session_id: "sess-1",
+    pid: null,
+    parent_agent_id: null,
+    plan_name: PLAN,
+    task_id: "1.1",
+    cwd: "/tmp",
+    status: "completed",
+    mode: "pty",
+    prompt: null,
+    started_at: new Date().toISOString(),
+    finished_at: new Date().toISOString(),
+    last_tool: null,
+    last_activity_at: null,
+    base_commit: null,
+    branch: "branchwork/p1/1.1",
+    source_branch: "master",
+    cost_usd: null,
+    driver: null,
+    merge_status: null,
+    ...overrides,
+  };
+}
+
+function seed(t: PlanTask | PlanTask[], extras: { agents?: Agent[] } = {}): void {
+  useAgentStore.setState({ agents: extras.agents ?? [], selectAgent: vi.fn() });
   usePlanStore.setState({
     selectedPlan: plan(t),
     selectPlan: vi.fn().mockResolvedValue(undefined),
     savePlan: vi.fn().mockResolvedValue(undefined),
     fetchPlans: vi.fn().mockResolvedValue(undefined),
+    autoModeRuntimes: {},
   });
   // Default settings-store initial state already has effort/drivers/defaultDriver.
   // Force loaded=true so any conditional gating on it stays neutral.
@@ -69,7 +97,7 @@ function seed(t: PlanTask): void {
 afterEach(() => {
   cleanup();
   useAgentStore.setState({ agents: [] });
-  usePlanStore.setState({ selectedPlan: null });
+  usePlanStore.setState({ selectedPlan: null, autoModeRuntimes: {} });
 });
 
 // The merge-button gate in TaskCard.tsx (line 99):
@@ -554,5 +582,199 @@ describe("TaskCard status dropdown", () => {
     await waitFor(() => {
       expect(screen.queryByRole("status")).toBeNull();
     });
+  });
+});
+
+describe("TaskCard awaiting-cadence pill", () => {
+  function findPill(taskNumber = "1.1"): HTMLElement {
+    return screen.getByRole("button", { name: new RegExp(`Status menu for task ${taskNumber}`) });
+  }
+
+  it("shows the muted-purple pill when the matching agent has merge_status=deferred_for_cadence", () => {
+    const t1 = task({ number: "1.1", status: "completed" });
+    const t2 = task({ number: "1.2", status: "in_progress" });
+    const t3 = task({ number: "1.3", status: "pending" });
+    const t4 = task({ number: "1.4", status: "pending" });
+    seed([t1, t2, t3, t4], {
+      agents: [
+        agent({
+          id: "a-1.1",
+          task_id: "1.1",
+          status: "completed",
+          branch: "branchwork/p1/1.1",
+          merge_status: "deferred_for_cadence",
+        }),
+      ],
+    });
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+
+    const pill = findPill("1.1");
+    expect(pill.textContent).toMatch(/Awaiting cadence/);
+    // Purple palette — distinguishes from the regular completed (emerald)
+    // pill and from the indigo `merging` transient.
+    expect(pill.className).toMatch(/purple/);
+    // Tooltip names the phase progress so the user knows how many sibling
+    // tasks still need to finish before the drain.
+    expect(pill.getAttribute("title")).toBe(
+      "Completed; waiting for phase boundary to merge (1 of 4 tasks done).",
+    );
+  });
+
+  it("counts skipped tasks toward the phase progress in the tooltip", () => {
+    // should_merge_now (Task 2.1) treats skipped as done — keep the
+    // tooltip honest about it.
+    const t1 = task({ number: "1.1", status: "completed" });
+    const t2 = task({ number: "1.2", status: "skipped" });
+    const t3 = task({ number: "1.3", status: "completed" });
+    const t4 = task({ number: "1.4", status: "pending" });
+    seed([t1, t2, t3, t4], {
+      agents: [
+        agent({
+          id: "a-1.1",
+          task_id: "1.1",
+          status: "completed",
+          branch: "branchwork/p1/1.1",
+          merge_status: "deferred_for_cadence",
+        }),
+      ],
+    });
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+
+    expect(findPill("1.1").getAttribute("title")).toBe(
+      "Completed; waiting for phase boundary to merge (3 of 4 tasks done).",
+    );
+  });
+
+  it("does NOT show the awaiting-cadence pill when merge_status is null", () => {
+    // A merged task — agent row still exists but merge_status was cleared
+    // by run_merge_step. Pill must drop back to the regular `Done` label.
+    const t1 = task({ number: "1.1", status: "completed" });
+    seed(t1, {
+      agents: [
+        agent({
+          id: "a-1.1",
+          task_id: "1.1",
+          status: "completed",
+          branch: null,
+          merge_status: null,
+        }),
+      ],
+    });
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+
+    const pill = findPill("1.1");
+    expect(pill.textContent).toMatch(/Done/);
+    expect(pill.textContent).not.toMatch(/Awaiting cadence/);
+    expect(pill.className).not.toMatch(/purple/);
+  });
+
+  it("does NOT show the awaiting-cadence pill when task.status is not completed", () => {
+    // Defensive: agents row could carry the deferred flag in some race
+    // window even before the server flips task_status. Until the canonical
+    // status row says `completed`, the pill defers to the regular label.
+    const t1 = task({ number: "1.1", status: "in_progress" });
+    seed(t1, {
+      agents: [
+        agent({
+          id: "a-1.1",
+          task_id: "1.1",
+          status: "completed",
+          branch: "branchwork/p1/1.1",
+          merge_status: "deferred_for_cadence",
+        }),
+      ],
+    });
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+
+    const pill = findPill("1.1");
+    expect(pill.textContent).toMatch(/In Progress/);
+    expect(pill.textContent).not.toMatch(/Awaiting cadence/);
+  });
+
+  it("overrides the awaiting-cadence pill with `Merging...` while the drain is running this task", () => {
+    // Drain in flight for this task — the auto_mode_state WS event landed
+    // with state=merging and task=1.1. Replace the purple pill with the
+    // indigo transient label.
+    const t1 = task({ number: "1.1", status: "completed" });
+    seed(t1, {
+      agents: [
+        agent({
+          id: "a-1.1",
+          task_id: "1.1",
+          status: "completed",
+          branch: "branchwork/p1/1.1",
+          merge_status: "deferred_for_cadence",
+        }),
+      ],
+    });
+    usePlanStore.setState({
+      autoModeRuntimes: { [PLAN]: { state: "merging", task: "1.1" } },
+    });
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+
+    const pill = findPill("1.1");
+    expect(pill.textContent).toMatch(/Merging\.\.\./);
+    expect(pill.textContent).not.toMatch(/Awaiting cadence/);
+    expect(pill.className).toMatch(/indigo/);
+    expect(pill.getAttribute("title")).toMatch(/merging this branch/i);
+  });
+
+  it("does NOT show `Merging...` on sibling tasks while a different task is mid-merge", () => {
+    // Drain processes agents sequentially. Only the task whose number
+    // matches the auto-mode runtime gets the indigo pill — the others
+    // keep showing awaiting-cadence (still deferred) or Done (already
+    // merged on a prior tick).
+    const t1 = task({ number: "1.1", status: "completed" });
+    const t2 = task({ number: "1.2", status: "completed" });
+    seed([t1, t2], {
+      agents: [
+        agent({
+          id: "a-1.1",
+          task_id: "1.1",
+          status: "completed",
+          branch: "branchwork/p1/1.1",
+          merge_status: "deferred_for_cadence",
+        }),
+        agent({
+          id: "a-1.2",
+          task_id: "1.2",
+          status: "completed",
+          branch: "branchwork/p1/1.2",
+          merge_status: "deferred_for_cadence",
+        }),
+      ],
+    });
+    usePlanStore.setState({
+      autoModeRuntimes: { [PLAN]: { state: "merging", task: "1.1" } },
+    });
+    render(<TaskCard task={t2} planName={PLAN} phaseNumber={1} />);
+
+    const pill = findPill("1.2");
+    expect(pill.textContent).toMatch(/Awaiting cadence/);
+    expect(pill.textContent).not.toMatch(/Merging/);
+  });
+
+  it("clears back to the regular Done pill once the drain finishes (branch + merge_status both null)", () => {
+    // Post-merge state: run_merge_step set branch=null and merge_status=null
+    // on the row, and the auto_mode_state event flipped state=advancing
+    // (which ws-store maps to runtime=null). Pill must read as plain Done.
+    const t1 = task({ number: "1.1", status: "completed" });
+    seed(t1, {
+      agents: [
+        agent({
+          id: "a-1.1",
+          task_id: "1.1",
+          status: "completed",
+          branch: null,
+          merge_status: null,
+        }),
+      ],
+    });
+    render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
+
+    const pill = findPill("1.1");
+    expect(pill.textContent).toMatch(/Done/);
+    expect(pill.textContent).not.toMatch(/Awaiting cadence|Merging/);
+    expect(pill.className).toMatch(/emerald/);
   });
 });

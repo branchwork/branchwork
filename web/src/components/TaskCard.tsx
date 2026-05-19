@@ -77,6 +77,43 @@ const statusConfig: Record<string, { label: string; bg: string; dot: string }> =
   },
 };
 
+/// Derived pill states that sit BETWEEN the canonical `task.status` row
+/// in the DB and the merged-into-default state. Not picked from a
+/// dropdown — TaskCard renders these instead of the matching status
+/// pill whenever the auto-mode loop signals a transient cadence event
+/// (Task 2.2 deferred, Task 2.3 flush, Task 3.1 visual).
+///
+/// `awaiting-cadence`: task agent completed cleanly under a `phase` or
+/// `plan` merge cadence, but the cadence boundary hasn't been crossed
+/// yet (Task 2.2). The agent is sitting on
+/// `merge_status='deferred_for_cadence'` with its branch intact; the
+/// pill is muted purple so the user can distinguish "done, will merge
+/// later" from regular `Done` (already merged) without poking the
+/// agent row. Tooltip surfaces phase progress so the user knows how
+/// many siblings still need to finish before the drain runs.
+///
+/// `merging`: live transient label driven by the per-plan auto-mode
+/// state machine when `auto_mode_state.state === "merging"` AND
+/// `task === this task`. Replaces the awaiting-cadence pill for the
+/// few seconds each task spends inside `run_merge_step` during a
+/// drain (or a non-cadence merge), then naturally drops back to the
+/// completed pill once the branch clears.
+const derivedStateConfig: Record<
+  "awaiting_cadence" | "merging",
+  { label: string; bg: string; dot: string }
+> = {
+  awaiting_cadence: {
+    label: "Awaiting cadence",
+    bg: "bg-purple-700/25 text-purple-300/90",
+    dot: "bg-purple-400/80",
+  },
+  merging: {
+    label: "Merging...",
+    bg: "bg-indigo-600/25 text-indigo-300",
+    dot: "bg-indigo-400 animate-pulse",
+  },
+};
+
 /// Short human-readable label for the auth blocker — used as a button
 /// tooltip so users know why Start is disabled without opening settings.
 function authStatusLabel(auth: AuthStatus | undefined): string {
@@ -178,7 +215,66 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
   }
 
   const status = task.status ?? "pending";
-  const cfg = statusConfig[status] ?? statusConfig.pending;
+
+  // Derived pill state for the cadence transient labels. Reads two
+  // separate signals:
+  //
+  //   1. `branchAgent.merge_status === 'deferred_for_cadence'` — set by
+  //      the auto-mode loop at the moment it decides not to merge yet
+  //      (Task 2.2). Survives reloads because it lives on the agents
+  //      row, so refreshing the page keeps the purple pill until the
+  //      drain runs.
+  //
+  //   2. `autoModeRuntimes[plan].state === 'merging'` + `task === this
+  //      task` — live transient label driven by `auto_mode_state` WS
+  //      events fired from `run_merge_step`. The drain merges agents
+  //      sequentially so this label hops from task to task during a
+  //      flush; each pill shows it for the few seconds it takes the
+  //      server to land that merge, then naturally drops back to the
+  //      regular `Done` pill once `agent_branch_merged` clears
+  //      `branch` on the agents row.
+  //
+  // Order matters: `merging` overrides `awaiting-cadence` so a task in
+  // mid-merge looks transient even though its branchAgent still carries
+  // the deferred flag for a few ms before run_merge_step clears it.
+  const autoModeRuntime = usePlanStore((s) => s.autoModeRuntimes[planName] ?? null);
+  const isMergingNow = autoModeRuntime?.state === "merging" && autoModeRuntime.task === task.number;
+  const isAwaitingCadence =
+    status === "completed" && !isMergingNow && branchAgent?.merge_status === "deferred_for_cadence";
+
+  // Phase progress counts for the awaiting-cadence tooltip. Computed
+  // from the selected plan's phase tasks (we already subscribed to
+  // `plan` above for plan-level edits). Skipped counts as done because
+  // `should_merge_now` (Task 2.1) treats it that way — surfacing the
+  // same number here keeps the tooltip honest about when the drain
+  // will actually fire.
+  const currentPhase = plan?.phases.find((p) => p.number === phaseNumber);
+  const phaseTaskCount = currentPhase?.tasks.length ?? 0;
+  const phaseDoneCount =
+    currentPhase?.tasks.filter((t) => t.status === "completed" || t.status === "skipped").length ??
+    0;
+
+  // Final pill config. `cfg` is what the pill DISPLAYS — the dropdown
+  // continues to operate on the canonical `status` value, so picking
+  // "Skipped" while the pill shows "Awaiting cadence" still writes the
+  // intended status and the purple label evaporates on the next render.
+  const derivedKey: "awaiting_cadence" | "merging" | null = isMergingNow
+    ? "merging"
+    : isAwaitingCadence
+      ? "awaiting_cadence"
+      : null;
+  const derivedCfg = derivedKey ? derivedStateConfig[derivedKey] : null;
+  const cfg = derivedCfg ?? statusConfig[status] ?? statusConfig.pending;
+
+  // Pill tooltip — only set when a derived state is active so the
+  // default behaviour (no tooltip on the regular pill) is preserved.
+  // Phrasing matches the Task 3.1 brief verbatim except for the live
+  // count substitution.
+  const pillTooltip = isMergingNow
+    ? "Auto-mode is merging this branch into the default branch now."
+    : isAwaitingCadence
+      ? `Completed; waiting for phase boundary to merge (${phaseDoneCount} of ${phaseTaskCount} tasks done).`
+      : "Open status menu";
 
   // Dependency gate: any declared dep not completed/skipped blocks Start.
   // The plan-wide done/skipped Set is built once at PlanBoard and shared
@@ -364,7 +460,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
                   {...props}
                   type="button"
                   aria-label={`Status menu for task ${task.number}`}
-                  title="Open status menu"
+                  title={pillTooltip}
                   className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer hover:opacity-80 flex items-center gap-1 ${cfg.bg}`}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
