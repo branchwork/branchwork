@@ -21,6 +21,13 @@
 //! # Shell command run by the phase-end Check agent.
 //! verification = "bash scripts/verify.sh"
 //!
+//! [auto_mode]
+//! # When auto-mode should merge a task's branch into master:
+//! #   "task"  — every completed task (legacy, fastest feedback)
+//! #   "phase" — at phase boundary (default for new plans)
+//! #   "plan"  — only at end of plan (one shipped version per plan)
+//! merge_cadence = "phase"
+//!
 //! [auto_mode.dirty_tree]
 //! # Paths whose dirty state should NOT trigger the
 //! # "agent_left_uncommitted_work" pause. Globs supported.
@@ -72,10 +79,41 @@ pub struct PhaseConfig {
     pub verification: Option<String>,
 }
 
+/// When auto-mode should merge a task's branch into the canonical default
+/// (typically `master`). Drives the merge-cadence state machine added by
+/// the `ci-cadence-build-vs-test-configurable` plan.
+///
+/// Wire form is lowercase (`"task"` / `"phase"` / `"plan"`). Any other
+/// string fails to deserialize — at the file level that surfaces as a
+/// `[branchwork] warning: failed to parse …` plus the load returning
+/// `None`, which matches the existing malformed-TOML contract; future
+/// HTTP surfaces (`POST /api/projects` and friends) should map the
+/// `toml::de::Error` to a 400 with the deserializer's own field-pinned
+/// message ("unknown variant `X`, expected one of `task`, `phase`,
+/// `plan`").
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeCadence {
+    /// Merge after every completed task (legacy auto-mode behaviour;
+    /// fastest feedback, highest CI volume).
+    Task,
+    /// Merge once at each phase boundary. Default for new plans.
+    #[default]
+    Phase,
+    /// Merge once at the end of the plan (one shipped version per plan).
+    Plan,
+}
+
 /// `[auto_mode]` table — auto-mode loop tuning.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AutoModeConfig {
+    /// See [`MergeCadence`]. Defaults to [`MergeCadence::Phase`] for new
+    /// plans; the day-1 migration in task 1.2 of the cadence plan back-
+    /// fills existing plans to [`MergeCadence::Task`] so behaviour is
+    /// unchanged immediately after the field lands.
+    #[serde(default)]
+    pub merge_cadence: MergeCadence,
     pub dirty_tree: DirtyTreeConfig,
 }
 
@@ -132,6 +170,7 @@ impl RepoConfig {
             && self.ci.blocking_workflows_skip.is_none()
             && self.phase.verification.is_none()
             && self.auto_mode.dirty_tree.ignore.is_none()
+            && self.auto_mode.merge_cadence == MergeCadence::default()
     }
 }
 
@@ -515,6 +554,7 @@ blocking_workflows = ["CI"]
 
         let with_auto_mode = RepoConfig {
             auto_mode: AutoModeConfig {
+                merge_cadence: MergeCadence::Phase,
                 dirty_tree: DirtyTreeConfig {
                     ignore: Some(vec!["*.log".into()]),
                 },
@@ -522,6 +562,127 @@ blocking_workflows = ["CI"]
             ..Default::default()
         };
         assert!(!with_auto_mode.is_empty());
+
+        // A non-default merge_cadence alone counts as non-empty.
+        let with_cadence_only = RepoConfig {
+            auto_mode: AutoModeConfig {
+                merge_cadence: MergeCadence::Task,
+                dirty_tree: DirtyTreeConfig::default(),
+            },
+            ..Default::default()
+        };
+        assert!(!with_cadence_only.is_empty());
+    }
+
+    // ---- merge_cadence ------------------------------------------
+
+    #[test]
+    fn merge_cadence_defaults_to_phase_when_absent() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        // Empty file → default config, cadence is phase.
+        write(dir.path(), "branchwork.toml", "");
+        let cfg = load_for_project_dir(dir.path()).expect("empty TOML is valid");
+        assert_eq!(cfg.auto_mode.merge_cadence, MergeCadence::Phase);
+
+        // `[auto_mode]` table present but no `merge_cadence` key → still phase.
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            r#"
+[auto_mode.dirty_tree]
+ignore = ["*.log"]
+"#,
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert_eq!(cfg.auto_mode.merge_cadence, MergeCadence::Phase);
+    }
+
+    #[test]
+    fn merge_cadence_parses_each_valid_variant() {
+        for (literal, expected) in [
+            ("task", MergeCadence::Task),
+            ("phase", MergeCadence::Phase),
+            ("plan", MergeCadence::Plan),
+        ] {
+            clear_cache_for_tests();
+            let dir = TempDir::new().unwrap();
+            write(
+                dir.path(),
+                "branchwork.toml",
+                &format!("[auto_mode]\nmerge_cadence = \"{literal}\"\n"),
+            );
+            let cfg = load_for_project_dir(dir.path())
+                .unwrap_or_else(|| panic!("merge_cadence = \"{literal}\" should parse"));
+            assert_eq!(cfg.auto_mode.merge_cadence, expected);
+        }
+    }
+
+    #[test]
+    fn merge_cadence_round_trips_via_default() {
+        // Default config is silent on the wire (toml omits the key when
+        // the value equals the field default — but `MergeCadence` has no
+        // `skip_serializing_if`, so it always emits). Round-trip is the
+        // important property: serialize the default → parse → still phase.
+        let default = RepoConfig::default();
+        let text = toml::to_string(&default).unwrap();
+        let reparsed: RepoConfig = toml::from_str(&text).unwrap();
+        assert_eq!(reparsed.auto_mode.merge_cadence, MergeCadence::Phase);
+        assert_eq!(reparsed, default);
+    }
+
+    #[test]
+    fn merge_cadence_invalid_value_fails_to_parse() {
+        // Direct parse path: the toml deserializer rejects unknown
+        // variants with a field-pinned error message. This is the same
+        // surface a hypothetical `POST /api/projects` validator would
+        // consume to produce a 400 — the error string already names the
+        // expected variants, so callers can echo it back to the user
+        // verbatim.
+        let err = toml::from_str::<RepoConfig>("[auto_mode]\nmerge_cadence = \"weekly\"\n")
+            .expect_err("unknown variant must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant") && msg.contains("weekly"),
+            "expected toml error to name the bad variant, got: {msg}"
+        );
+        assert!(
+            msg.contains("task") && msg.contains("phase") && msg.contains("plan"),
+            "expected toml error to enumerate accepted variants, got: {msg}"
+        );
+
+        // File-level path: malformed values are folded into the existing
+        // "warn + return None" contract by `parse_file`, matching how
+        // every other invalid-toml case already behaves.
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            "[auto_mode]\nmerge_cadence = \"weekly\"\n",
+        );
+        assert!(
+            load_for_project_dir(dir.path()).is_none(),
+            "invalid merge_cadence should be rejected like any other malformed TOML"
+        );
+    }
+
+    #[test]
+    fn merge_cadence_is_case_sensitive() {
+        // `#[serde(rename_all = "lowercase")]` rejects "Phase", "PHASE",
+        // etc. — guards against accidental typos sneaking through with
+        // host-OS case-insensitive matching.
+        for bad in ["Phase", "PHASE", "Task", "Plan "] {
+            let err =
+                toml::from_str::<RepoConfig>(&format!("[auto_mode]\nmerge_cadence = \"{bad}\"\n"))
+                    .expect_err("non-lowercase variant must be rejected");
+            assert!(
+                err.to_string().contains("unknown variant"),
+                "expected unknown-variant error for {bad:?}, got: {err}"
+            );
+        }
     }
 
     #[test]
