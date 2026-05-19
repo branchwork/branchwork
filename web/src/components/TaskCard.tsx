@@ -11,6 +11,7 @@ import { Dropdown, DropdownItem, DropdownSeparator } from "./ui/Dropdown.js";
 import { TouchTarget } from "./ui/TouchTarget.js";
 import { formatRelative } from "../lib/time.js";
 import { toastError } from "../lib/toast.js";
+import { httpErrorBody } from "../lib/error.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
 import { useCompletedTasks } from "../lib/plan-context.js";
 
@@ -19,8 +20,6 @@ interface Props {
   planName: string;
   phaseNumber: number;
 }
-
-const STATUS_ORDER = ["pending", "in_progress", "completed", "skipped"] as const;
 
 const ciConfig: Record<string, { label: string; bg: string; dot: string; title: string }> = {
   pending: {
@@ -130,6 +129,13 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
   // second commits. Auto-disarms after 4 s so a stale armed state can't fire
   // accidentally when the user reopens the menu later.
   const [resetArmed, setResetArmed] = useState(false);
+  // Inline message inside the status dropdown when the server rejects
+  // `completed` because the working tree is dirty. Critically NOT a toast
+  // and NOT a roadblock: the dropdown stays open so the operator can pick
+  // a different status (e.g. `skipped`) without re-opening the menu. The
+  // server returns 409 with body `{error: "working_tree_dirty", message,
+  // files}` from `api/plans.rs::set_task_status`.
+  const [dirtyTreeError, setDirtyTreeError] = useState<string | null>(null);
 
   // undefined/true → show Merge; false → hide Merge (task not expected to produce a commit)
   const canMerge = task.producesCommit !== false;
@@ -256,7 +262,29 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
         status: newStatus,
       });
       await selectPlan(planName);
+      // Any successful status write clears a stale "completed blocked"
+      // hint — even when the new status is not `completed`, the user
+      // has moved on.
+      setDirtyTreeError(null);
     } catch (e) {
+      // 409 working_tree_dirty is operator-recoverable: surface it
+      // inline inside the dropdown rather than toasting + closing the
+      // menu, so the operator can pick a different status (e.g.
+      // `skipped`) without re-opening it.
+      const body = httpErrorBody<{
+        error?: string;
+        message?: string;
+        files?: unknown;
+      }>(e);
+      if (body?.error === "working_tree_dirty") {
+        const fileCount = Array.isArray(body.files) ? body.files.length : null;
+        const suffix =
+          fileCount != null
+            ? ` ${fileCount} uncommitted file${fileCount === 1 ? "" : "s"} in the project.`
+            : "";
+        setDirtyTreeError(`Can't mark completed yet — commit working-tree changes first.${suffix}`);
+        return;
+      }
       toastError(e, "Status update failed");
     }
   }
@@ -283,12 +311,6 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
     const t = setTimeout(() => setResetArmed(false), 4000);
     return () => clearTimeout(t);
   }, [resetArmed]);
-
-  async function cycleStatus() {
-    const idx = STATUS_ORDER.indexOf(status as (typeof STATUS_ORDER)[number]);
-    const next = STATUS_ORDER[(idx + 1) % STATUS_ORDER.length];
-    await updateStatus(next);
-  }
 
   // Click anywhere on the card to open the running agent's terminal in
   // the right rail. Only active when an agent is actually running for this
@@ -326,17 +348,15 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-[10px] font-mono text-gray-500">{task.number}</span>
-            {/* Status badge — left-click cycles, kebab opens the menu.
-                Right-click context menu was removed (audit §8: hidden
-                keyboard interaction). */}
-            <button
-              onClick={cycleStatus}
-              className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer hover:opacity-80 flex items-center gap-1 ${cfg.bg}`}
-              title="Click to cycle status"
-            >
-              <span className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
-              {cfg.label}
-            </button>
+            {/* Status pill IS the dropdown trigger — replaces the prior
+                click-to-cycle pill + separate kebab. Click cycling
+                through 6 states was past the cognitive ceiling (users
+                couldn't predict where the next click landed and a 409
+                on `completed` for a dirty tree silently blocked the
+                cycle from reaching `skipped`). Dropdown lists every
+                valid status verbatim so each transition is a single
+                explicit pick; keyboard a11y (arrow keys + Enter) comes
+                free from the `Dropdown` primitive. */}
             <Dropdown
               label={`Set status for task ${task.number}`}
               trigger={(props) => (
@@ -345,24 +365,32 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
                   type="button"
                   aria-label={`Status menu for task ${task.number}`}
                   title="Open status menu"
-                  className="text-[10px] px-1 py-0.5 rounded text-gray-400 hover:text-gray-200 hover:bg-gray-700/60 transition leading-none"
+                  className={`text-[10px] px-1.5 py-0.5 rounded cursor-pointer hover:opacity-80 flex items-center gap-1 ${cfg.bg}`}
                 >
-                  <span aria-hidden="true">&#x22EE;</span>
+                  <span className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
+                  {cfg.label}
                 </button>
               )}
             >
-              {Object.entries(statusConfig)
-                .filter(([k]) => k !== "checking")
-                .map(([key, val]) => (
-                  <DropdownItem
-                    key={key}
-                    onSelect={() => updateStatus(key)}
-                    className={key === status ? "text-white" : ""}
-                  >
-                    <span className={`w-1.5 h-1.5 rounded-full ${val.dot}`} />
-                    {val.label}
-                  </DropdownItem>
-                ))}
+              {dirtyTreeError && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="px-2 py-1.5 mx-1 mb-1 text-[11px] text-amber-300 bg-amber-950/40 border border-amber-900/40 rounded"
+                >
+                  {dirtyTreeError}
+                </div>
+              )}
+              {Object.entries(statusConfig).map(([key, val]) => (
+                <DropdownItem
+                  key={key}
+                  onSelect={() => updateStatus(key)}
+                  className={key === status ? "text-white font-medium" : ""}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${val.dot}`} />
+                  {val.label}
+                </DropdownItem>
+              ))}
               <DropdownSeparator />
               {/* Reset — clears the task_status row entirely. Useful when
                   a task has ended up stuck in `checking` or similar from

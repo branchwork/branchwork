@@ -382,3 +382,177 @@ describe("TaskCard Reset confirm-click", () => {
     expect(screen.getByRole("menuitem", { name: /Reset task status/ })).toBeTruthy();
   });
 });
+
+describe("TaskCard status dropdown", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  // Captures every fetch call + the JSON body so tests can assert exact
+  // requests. Tests pass a per-test response builder for the status PUT
+  // so we can drive both the happy path and a 409 working_tree_dirty.
+  interface StatusCall {
+    url: string;
+    method: string;
+    body: unknown;
+  }
+  function installStatusFetch(statusResponder: (body: { status: string }) => Response): {
+    calls: StatusCall[];
+  } {
+    const calls: StatusCall[] = [];
+    const fn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.pathname + input.search
+            : input.url;
+      const method = init?.method ?? "GET";
+      const parsed = init?.body ? JSON.parse(init.body as string) : undefined;
+      calls.push({ url, method, body: parsed });
+      if (url.match(/\/api\/plans\/[^/]+\/tasks\/[^/]+\/status$/) && method === "PUT") {
+        return statusResponder(parsed as { status: string });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fn);
+    return { calls };
+  }
+
+  function openMenu() {
+    const trigger = screen.getByRole("button", { name: /Status menu for task 1\.1/ });
+    fireEvent.click(trigger);
+  }
+
+  it("clicking the pill opens the dropdown listing every valid status", () => {
+    const t = task({ status: "pending" });
+    seed(t);
+    installStatusFetch(() => new Response("{}", { status: 200 }));
+
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    openMenu();
+
+    // All six statuses are listed — `checking` used to be filtered out
+    // because it represented a transient state set by check agents, but
+    // the dropdown is now the explicit no-cycle replacement for the
+    // 6-state click cycle and operators may need to set it manually to
+    // recover from a stuck agent.
+    expect(screen.getByRole("menuitem", { name: /Pending/ })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /In Progress/ })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /Done/ })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /Failed/ })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /Skipped/ })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /Checking/ })).toBeTruthy();
+  });
+
+  it("picking a status POSTs that exact status — no cycle through intermediates", async () => {
+    const t = task({ status: "pending" });
+    seed(t);
+    const { calls } = installStatusFetch(
+      () => new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Skipped/ }));
+
+    await waitFor(() => {
+      const put = calls.find(
+        (c) => c.url.match(/\/api\/plans\/[^/]+\/tasks\/[^/]+\/status$/) && c.method === "PUT",
+      );
+      expect(put).toBeDefined();
+      expect(put?.body).toEqual({ status: "skipped" });
+    });
+    // No intermediate `in_progress` / `completed` PUTs.
+    const puts = calls.filter((c) => c.method === "PUT");
+    expect(puts.length).toBe(1);
+  });
+
+  it(
+    "409 working_tree_dirty on `completed` shows an inline message and " +
+      "still allows picking `skipped` in the same menu",
+    async () => {
+      const t = task({ status: "pending" });
+      seed(t);
+      const { calls } = installStatusFetch((body) => {
+        if (body.status === "completed") {
+          return new Response(
+            JSON.stringify({
+              error: "working_tree_dirty",
+              message: "tree is dirty",
+              files: ["a.rs", "b.rs"],
+            }),
+            { status: 409, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+      });
+
+      render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+      openMenu();
+
+      // Pick `Done` → 409. Inline message must surface AND the menu
+      // must stay open so the operator can pick a different status
+      // without re-clicking the pill.
+      fireEvent.click(screen.getByRole("menuitem", { name: /Done/ }));
+
+      await waitFor(() => {
+        expect(screen.getByRole("status")).toBeTruthy();
+      });
+      expect(screen.getByRole("status").textContent).toMatch(/commit working-tree changes/i);
+      expect(screen.getByRole("status").textContent).toMatch(/2 uncommitted file/i);
+      // Menu still open.
+      expect(screen.getByRole("menu")).toBeTruthy();
+
+      // Now pick Skipped — must succeed without re-opening the menu
+      // (acceptance criterion: two clicks total to set skipped).
+      fireEvent.click(screen.getByRole("menuitem", { name: /Skipped/ }));
+
+      await waitFor(() => {
+        const skipped = calls.find(
+          (c) => c.method === "PUT" && (c.body as { status: string }).status === "skipped",
+        );
+        expect(skipped).toBeDefined();
+      });
+    },
+  );
+
+  it("clears the inline working_tree_dirty message after a successful pick", async () => {
+    const t = task({ status: "pending" });
+    seed(t);
+    installStatusFetch((body) => {
+      if (body.status === "completed") {
+        return new Response(
+          JSON.stringify({
+            error: "working_tree_dirty",
+            message: "tree is dirty",
+            files: ["a.rs"],
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Done/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Skipped/ }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).toBeNull();
+    });
+  });
+});
