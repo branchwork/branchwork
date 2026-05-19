@@ -23,6 +23,8 @@
 mod git_helpers;
 #[path = "../saas/outbox.rs"]
 mod outbox;
+#[path = "../project_scaffold.rs"]
+mod project_scaffold;
 #[path = "../saas/runner_protocol.rs"]
 pub mod runner_protocol;
 #[path = "../agents/session_protocol.rs"]
@@ -1979,8 +1981,21 @@ fn check_or_create_folder(
     let resolved = resolve_runner_path(path);
     let resolved_str = Some(resolved.display().to_string());
     if create_if_missing {
+        // T4.2 cadence plan: scaffold `branchwork.toml` with
+        // `merge_cadence = "phase"` ONLY when we just made the folder.
+        // `existed_before` is captured pre-`create_dir_all` so the
+        // `mkdir -p`'s built-in idempotence doesn't mask the "already
+        // there" case. Pre-existing folders keep their existing
+        // `branchwork.toml` (or inherit `MergeCadence::default() =
+        // phase` when absent) per the acceptance criterion.
+        let existed_before = resolved.exists();
         match std::fs::create_dir_all(&resolved) {
-            Ok(()) if resolved.is_dir() => (true, resolved_str, None),
+            Ok(()) if resolved.is_dir() => {
+                if !existed_before {
+                    project_scaffold::scaffold_branchwork_toml_if_missing(&resolved);
+                }
+                (true, resolved_str, None)
+            }
             Ok(()) => (
                 false,
                 resolved_str,
@@ -3514,6 +3529,75 @@ mod tests {
             assert!(ok);
             assert!(error.is_none());
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// T4.2 cadence plan: a freshly-created project folder gets a
+    /// `branchwork.toml` pinning `merge_cadence = "phase"`. The
+    /// scaffold lives on the host that actually owns the working tree,
+    /// so the runner branch of `CreateFolder` is the canonical place
+    /// to verify this in SaaS mode.
+    #[test]
+    fn check_or_create_folder_scaffolds_branchwork_toml_on_fresh_folder() {
+        let tmp =
+            std::env::temp_dir().join(format!("branchwork-cof-scaffold-{}", uuid::Uuid::new_v4()));
+        let (ok, _, error) = check_or_create_folder(&tmp.display().to_string(), true);
+        assert!(ok);
+        assert!(error.is_none());
+        let toml_path = tmp.join("branchwork.toml");
+        assert!(
+            toml_path.exists(),
+            "branchwork.toml must be scaffolded into a freshly-created project folder"
+        );
+        let body = std::fs::read_to_string(&toml_path).expect("read scaffolded toml");
+        assert!(
+            body.contains("merge_cadence = \"phase\""),
+            "scaffolded body must pin merge_cadence to phase: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Pre-existing project folders keep their on-disk `branchwork.toml`
+    /// (or its absence) untouched per the acceptance criterion
+    /// "Pre-existing projects keep their explicit (or grandfathered)
+    /// setting." We seed the folder with a `merge_cadence = "task"`
+    /// override and verify the runner does NOT overwrite it.
+    #[test]
+    fn check_or_create_folder_does_not_overwrite_existing_branchwork_toml() {
+        let tmp =
+            std::env::temp_dir().join(format!("branchwork-cof-preserve-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("seed");
+        let toml_path = tmp.join("branchwork.toml");
+        let user_body = "[auto_mode]\nmerge_cadence = \"task\"\n";
+        std::fs::write(&toml_path, user_body).expect("seed branchwork.toml");
+        let (ok, _, error) = check_or_create_folder(&tmp.display().to_string(), true);
+        assert!(ok);
+        assert!(error.is_none());
+        let body = std::fs::read_to_string(&toml_path).expect("read");
+        assert_eq!(
+            body, user_body,
+            "pre-existing branchwork.toml must be preserved verbatim"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Pre-existing project folders without a `branchwork.toml` stay
+    /// untouched — the runner only scaffolds when it actually created
+    /// the directory. The folder is considered "the user's" and we
+    /// don't drop a file into it unannounced.
+    #[test]
+    fn check_or_create_folder_does_not_scaffold_pre_existing_empty_folder() {
+        let tmp =
+            std::env::temp_dir().join(format!("branchwork-cof-untouched-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("seed dir");
+        let (ok, _, error) = check_or_create_folder(&tmp.display().to_string(), true);
+        assert!(ok);
+        assert!(error.is_none());
+        let toml_path = tmp.join("branchwork.toml");
+        assert!(
+            !toml_path.exists(),
+            "scaffold must not fire on a pre-existing project folder"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

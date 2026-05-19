@@ -4237,7 +4237,8 @@ pub async fn create_plan(
         let home = dirs::home_dir().unwrap();
         let resolved = resolve_folder_path(&body.folder, &home);
 
-        if !resolved.exists() {
+        let folder_existed = resolved.exists();
+        if !folder_existed {
             if body.create_folder != Some(true) {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -4266,6 +4267,16 @@ pub async fn create_plan(
         // Skipped on the runner branch above: the runner host owns the
         // working tree, and the agent runs `git init` itself when needed.
         ensure_git_initialized(&resolved);
+
+        // T4.2 cadence plan: scaffold a `branchwork.toml` pinning
+        // `merge_cadence = "phase"` only when we just created the
+        // folder ourselves. Pre-existing folders keep their explicit
+        // (or absent → default-phase) setting per the acceptance
+        // criterion. Best-effort: a write failure is logged and
+        // ignored — project creation still succeeds.
+        if !folder_existed {
+            crate::project_scaffold::scaffold_branchwork_toml_if_missing(&resolved);
+        }
 
         resolved
     };

@@ -15,6 +15,7 @@ mod notifications;
 mod persisted_settings;
 mod plan_curate;
 mod plan_parser;
+mod project_scaffold;
 mod repo_config;
 mod saas;
 mod state;

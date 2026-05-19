@@ -160,6 +160,18 @@ merge_cadence = "phase"
 Plans in this project that don't pin a value at the plan level
 inherit `phase`. Plans that **do** pin a value still override.
 
+> **Note (cadence plan T4.2).** Newly-created projects ship with this
+> file already on disk: when Branchwork creates the project folder
+> for you (`POST /api/plans/create` with `createFolder: true`,
+> standalone or via the runner), it drops a minimal
+> `branchwork.toml` next to the `mkdir`'d directory that pins
+> `merge_cadence = "phase"` explicitly. Pre-existing projects are
+> left untouched — they keep their explicit `branchwork.toml` (or
+> inherit the `phase` default when absent). Implementation lives in
+> [`server-rs/src/project_scaffold.rs`](../../server-rs/src/project_scaffold.rs);
+> the helper is idempotent and best-effort (a write failure logs to
+> stderr and does not block project creation).
+
 An invalid value (`merge_cadence = "weekly"`) fails the TOML parse
 and the whole file is treated as malformed — Branchwork falls back
 to its defaults, logs a one-line warning to stderr
