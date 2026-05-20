@@ -70,6 +70,13 @@ pub mod actions {
     /// `AUTO_MODE_MERGED` rows; this one bookends the flush as a whole
     /// so the audit log carries the operator intent.
     pub const AUTO_MODE_FLUSHED_DEFERRED: &str = "auto_mode.flushed_deferred";
+    /// A pre-merge gate check failed (or the whole-gate ceiling fired)
+    /// before the merge could land. The plan is paused with reason
+    /// `pre_merge_gate_failed: <check.name>`; diff carries
+    /// `{plan, task, agent_id, check, exit_code, output}` so the
+    /// dashboard can render the offending output. Phase 1 of the
+    /// `pre-merge-gate` plan.
+    pub const AUTO_MODE_PRE_MERGE_GATE_FAILED: &str = "auto_mode.pre_merge_gate_failed";
 }
 
 // ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
@@ -420,6 +427,428 @@ fn resolve_effective_cadence(state: &AppState, plan_name: &str) -> MergeCadence 
         return cfg.auto_mode.merge_cadence;
     }
     MergeCadence::default()
+}
+
+// ── Pre-merge gate (Phase 1 of the pre-merge-gate plan) ─────────────────────
+//
+// The gate runs each configured `[auto_mode.pre_merge_checks]` entry in a
+// fresh detached-HEAD worktree at the agent's branch tip before any merge
+// happens. A failing check pauses auto-mode with reason
+// `pre_merge_gate_failed: <check.name>`; a passing (or absent) gate is a
+// no-op so plans without the section keep their pre-1.2 behaviour.
+//
+// Wired into [`run_state_machine`] between [`should_merge_now`] returning
+// true and [`drain_deferred_for_cadence`] — the cadence drain itself may
+// land several merges on trunk locally, so the gate has to run BEFORE
+// that batch starts. The gate runs on the trigger agent's branch only;
+// drained siblings are not re-gated (the brief explicitly keeps Phase 1
+// minimal; per-sibling gates can land in a later phase).
+//
+// 50 KB output cap matches the brief verbatim. The middle-truncation
+// marker (`[…truncated…]`) means a long log keeps both its beginning
+// (compile target / setup banner) and end (actual error) — the most
+// useful slices for triage.
+
+/// Maximum captured bytes per check output. Anything longer is collapsed
+/// to `<first half> [...truncated...] <last half>` so the audit row and
+/// dashboard payload stay bounded.
+pub(crate) const PRE_MERGE_CHECK_OUTPUT_CAP_BYTES: usize = 50 * 1024;
+
+/// Marker inserted in the middle of a truncated capture.
+pub(crate) const PRE_MERGE_TRUNCATION_MARKER: &str = "\n[…truncated…]\n";
+
+/// Outcome of [`run_pre_merge_gate`].
+///
+/// `Pass` is the common case: gate absent OR every configured check
+/// exited 0 within its per-check `timeout_secs`. The caller proceeds to
+/// the merge step exactly as before.
+///
+/// `Fail` carries enough context for the pause / audit row / dashboard
+/// payload — the check's `name` (the unique identifier from
+/// `branchwork.toml`), the exit code (`None` if killed by timeout), and
+/// the captured combined stdout+stderr (50 KB cap, middle-truncated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateOutcome {
+    Pass,
+    Fail {
+        check: String,
+        exit_code: Option<i32>,
+        output: String,
+    },
+}
+
+/// Run the pre-merge gate for `agent_id` on its task branch in a fresh
+/// temporary `git worktree`. Each configured check runs to completion or
+/// its `timeout_secs`; the first failure wins and short-circuits the
+/// rest.
+///
+/// Resolution chain for the check config: load `branchwork.toml` from
+/// the plan's project directory (via [`crate::ci::project_dir_for`]); if
+/// the section is empty or the file absent, return [`GateOutcome::Pass`]
+/// immediately — the feature is strictly opt-in.
+///
+/// Worktree cleanup is intrinsic: [`crate::agents::worktree::TempWorktree`]
+/// drops via `git worktree remove --force` (with a `remove_dir_all`
+/// fallback) the moment the function returns, regardless of outcome.
+///
+/// Errors that prevent the gate from running (missing project dir,
+/// agent row gone, branch column NULL, worktree creation fails) collapse
+/// to a synthetic [`GateOutcome::Fail`] with `check = "_gate_setup_"` so
+/// the caller pauses on the same code path as a real check failure
+/// — auto-mode never half-merges on incomplete metadata.
+pub(crate) async fn run_pre_merge_gate(
+    state: &AppState,
+    plan_name: &str,
+    task_id: &str,
+    agent_id: &str,
+) -> GateOutcome {
+    // Resolve the project directory FIRST so we can short-circuit on
+    // missing config without touching the DB or the filesystem.
+    let project_dir = match crate::ci::project_dir_for(&state.plans_dir, &state.db, plan_name) {
+        Some(d) => d,
+        None => {
+            // No project → no config → no gate. Gate is opt-in; absent
+            // config is success.
+            return GateOutcome::Pass;
+        }
+    };
+    let Some(repo_cfg) = crate::repo_config::load_for_project_dir(&project_dir) else {
+        return GateOutcome::Pass;
+    };
+    let checks = &repo_cfg.auto_mode.pre_merge_checks;
+    if checks.is_empty() {
+        return GateOutcome::Pass;
+    }
+    let total_timeout = Duration::from_secs(repo_cfg.auto_mode.pre_merge_total_timeout_secs as u64);
+
+    // Resolve the agent's branch.
+    let branch: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT branch FROM agents WHERE id = ?1",
+            params![agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+    let Some(branch) = branch else {
+        // No branch column → nothing to gate against. Same shape as
+        // worktree creation failing — pause the loop so the operator
+        // notices instead of silently skipping the gate.
+        return GateOutcome::Fail {
+            check: "_gate_setup_".to_string(),
+            exit_code: None,
+            output: format!("agent {agent_id} has no branch column set"),
+        };
+    };
+
+    // Create the temporary worktree at `branch`'s tip. Drop guard cleans
+    // up unconditionally below.
+    let worktree =
+        match crate::agents::worktree::TempWorktree::create(&project_dir, agent_id, &branch) {
+            Ok(w) => w,
+            Err(e) => {
+                return GateOutcome::Fail {
+                    check: "_gate_setup_".to_string(),
+                    exit_code: None,
+                    output: format!("worktree add failed: {e}"),
+                };
+            }
+        };
+    let worktree_path = worktree.path().to_path_buf();
+
+    // Track start time for the whole-gate ceiling. We don't subtract
+    // it from the per-check budget directly — the brief says fail
+    // CLOSED if the cumulative time exceeds the cap.
+    let started = Instant::now();
+
+    for check in checks {
+        // Compute the cwd for this check: `<worktree>/<check.cwd or .>`.
+        let cwd = match check.cwd.as_deref() {
+            Some(sub) if !sub.is_empty() => worktree_path.join(sub),
+            _ => worktree_path.clone(),
+        };
+
+        // Honor the whole-gate ceiling: if we're already past it,
+        // fail closed without running another check. (Plan name is
+        // synthetic so the audit row + pause reason both name the
+        // explicit ceiling rather than the check that happened to be
+        // next in line — easier to triage.)
+        if started.elapsed() >= total_timeout {
+            broadcast_state(state, plan_name, task_id, state_labels::PAUSED, None, None);
+            return GateOutcome::Fail {
+                check: "_total_timeout_".to_string(),
+                exit_code: None,
+                output: format!(
+                    "pre-merge gate exceeded total timeout of {}s before \
+                     running {:?}",
+                    total_timeout.as_secs(),
+                    check.name
+                ),
+            };
+        }
+
+        let per_check_timeout = Duration::from_secs(check.timeout_secs as u64);
+        let outcome = run_single_check(&check.cmd, &cwd, per_check_timeout).await;
+        match outcome {
+            SingleCheckOutcome::Passed => {
+                // Continue to the next check.
+            }
+            SingleCheckOutcome::Failed { exit_code, output } => {
+                return GateOutcome::Fail {
+                    check: check.name.clone(),
+                    exit_code,
+                    output,
+                };
+            }
+        }
+    }
+
+    // Every check passed.
+    GateOutcome::Pass
+}
+
+/// Outcome of a single configured check — internal to the gate runner.
+#[derive(Debug)]
+enum SingleCheckOutcome {
+    Passed,
+    Failed {
+        exit_code: Option<i32>,
+        output: String,
+    },
+}
+
+/// Run one configured check via `sh -c`, capturing combined stdout +
+/// stderr, with `timeout` as the per-check wall-clock cap.
+///
+/// `exit_code = None` on Failed means the timeout fired (or the process
+/// died from a signal, which surfaces here as `code.is_none()` too — the
+/// audit shape is honest about the uncertainty).
+///
+/// On Unix, the child is placed in a new session via `setsid` so a
+/// `killpg(SIGKILL)` reaches every descendant — without this, killing
+/// `sh` orphans whatever it spawned (e.g. `sleep`) and leaves the pipe
+/// FDs open, which would block our stdout/stderr drain past the
+/// timeout.
+async fn run_single_check(
+    cmd: &str,
+    cwd: &std::path::Path,
+    timeout: Duration,
+) -> SingleCheckOutcome {
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command as TokioCommand;
+
+    let mut cmd_builder = TokioCommand::new("sh");
+    cmd_builder
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // tokio's process API: a child whose handle is dropped before
+        // it exits stays as a zombie unless `kill_on_drop(true)` is
+        // set. We always wait explicitly below, but the safety net is
+        // cheap.
+        .kill_on_drop(true);
+
+    // Unix: put the child in its own process group so we can kill the
+    // whole tree on timeout. `sh -c` propagates SIGKILL to children
+    // only when they share its pgid — `setsid` gives the child a
+    // brand-new pgid equal to its pid. `tokio::process::Command::pre_exec`
+    // is the passthrough to `std::os::unix::process::CommandExt::pre_exec`.
+    //
+    // SAFETY: `pre_exec` runs in the post-fork pre-exec window where the
+    // only safe operations are async-signal-safe; `setsid` is on the
+    // POSIX safe list. The closure does not touch any shared state from
+    // the parent.
+    #[cfg(unix)]
+    unsafe {
+        cmd_builder.pre_exec(|| {
+            // setsid never fails on a newly-forked process where the
+            // pid != session leader's pid (which is the case here).
+            // Ignore the return value: even if it failed, the worst
+            // case is the timeout path falls back to single-process
+            // kill semantics (same as Windows).
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let mut child = match cmd_builder.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return SingleCheckOutcome::Failed {
+                exit_code: None,
+                output: format!("failed to spawn `sh -c {cmd:?}`: {e}"),
+            };
+        }
+    };
+
+    // Capture the child's pid for the process-group kill on Unix.
+    #[cfg(unix)]
+    let child_pid = child.id().map(|p| p as i32);
+
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout.take() {
+            let _ = s.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr.take() {
+            let _ = s.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+    match wait_result {
+        Ok(Ok(status)) => {
+            let out_bytes = stdout_task.await.unwrap_or_default();
+            let err_bytes = stderr_task.await.unwrap_or_default();
+            let combined = combine_streams(&out_bytes, &err_bytes);
+            let output = truncate_output(&combined, PRE_MERGE_CHECK_OUTPUT_CAP_BYTES);
+            if status.success() {
+                SingleCheckOutcome::Passed
+            } else {
+                SingleCheckOutcome::Failed {
+                    exit_code: status.code(),
+                    output,
+                }
+            }
+        }
+        Ok(Err(e)) => SingleCheckOutcome::Failed {
+            exit_code: None,
+            output: format!("failed to await child: {e}"),
+        },
+        Err(_elapsed) => {
+            // Timed out. Kill the whole process group on Unix so child
+            // processes (e.g. `sleep` under `sh -c`) die too — otherwise
+            // they keep the pipe FDs open and block stdout/stderr drain.
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                unsafe {
+                    // `-pid` targets the process group whose pgid == pid.
+                    // Safe per `man 2 kill`; on failure (e.g. group
+                    // already gone) we silently fall through to the
+                    // single-process kill below.
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            // Single-process kill as a portable fallback (Unix sends a
+            // second SIGKILL to the leader, which is a no-op; Windows
+            // uses TerminateProcess on the lone child).
+            let _ = child.start_kill();
+            // Give the kill a brief moment so the io tasks can drain
+            // whatever the child managed to emit before SIGKILL. Bounded
+            // by 500ms so a truly stuck pipe can't wedge the gate.
+            let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+            let out_bytes = tokio::time::timeout(Duration::from_millis(500), stdout_task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let err_bytes = tokio::time::timeout(Duration::from_millis(500), stderr_task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let mut combined = combine_streams(&out_bytes, &err_bytes);
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&format!(
+                "[killed by gate: exceeded per-check timeout of {}s]\n",
+                timeout.as_secs()
+            ));
+            SingleCheckOutcome::Failed {
+                exit_code: None,
+                output: truncate_output(&combined, PRE_MERGE_CHECK_OUTPUT_CAP_BYTES),
+            }
+        }
+    }
+}
+
+/// Combine stdout + stderr into a single lossy-UTF8 string for the audit
+/// payload. We just concatenate (stdout, then stderr) — the byte streams
+/// were captured separately by `tokio::process::ChildStd*`, and the
+/// audit row is for human review, not log parsing.
+fn combine_streams(stdout: &[u8], stderr: &[u8]) -> String {
+    let so = String::from_utf8_lossy(stdout);
+    let se = String::from_utf8_lossy(stderr);
+    match (so.is_empty(), se.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => so.into_owned(),
+        (true, false) => se.into_owned(),
+        (false, false) => {
+            // Keep stdout first; stderr usually carries the actual
+            // failure on UNIX toolchains. Newline separator so the
+            // boundary is visible.
+            let mut s = so.into_owned();
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str(&se);
+            s
+        }
+    }
+}
+
+/// Trim `s` to `cap` bytes, dropping the middle of the string and
+/// replacing it with [`PRE_MERGE_TRUNCATION_MARKER`].
+///
+/// Truncation respects char boundaries (we only ever split at byte
+/// indices that we walk back to a UTF-8 leading byte) so we don't emit
+/// invalid UTF-8 in the audit payload.
+fn truncate_output(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let marker_len = PRE_MERGE_TRUNCATION_MARKER.len();
+    if cap <= marker_len + 2 {
+        // Pathological cap: just show the marker.
+        return PRE_MERGE_TRUNCATION_MARKER.to_string();
+    }
+    let half = (cap - marker_len) / 2;
+    let head_end = floor_char_boundary(s, half);
+    let tail_start = ceil_char_boundary(s, s.len() - half);
+    let mut out = String::with_capacity(head_end + marker_len + (s.len() - tail_start));
+    out.push_str(&s[..head_end]);
+    out.push_str(PRE_MERGE_TRUNCATION_MARKER);
+    out.push_str(&s[tail_start..]);
+    out
+}
+
+/// Walk `idx` back to the nearest UTF-8 char boundary at or below `idx`.
+/// `std::str::floor_char_boundary` is unstable, hence the hand-rolled
+/// version. Identical semantics, scoped to ASCII-or-multi-byte UTF-8
+/// (no SIMD nuance — gate outputs are typically log text).
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Walk `idx` forward to the nearest UTF-8 char boundary at or above
+/// `idx`. Mirror of [`floor_char_boundary`].
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
 }
 
 /// Outcome of [`run_merge_step`] — what the orchestrator should do next.
@@ -975,6 +1404,72 @@ async fn run_state_machine(
         )
         .await;
         return;
+    }
+
+    // Pre-merge gate (Phase 1 of pre-merge-gate plan, T1.2): run each
+    // configured `[auto_mode.pre_merge_checks]` entry in a fresh worktree
+    // checked out at the agent's branch tip BEFORE any merge happens.
+    // The gate is opt-in — when the section is missing or empty, this
+    // call returns `Pass` immediately without touching disk. We emit the
+    // `merging` pill AFTER the gate runs so a long-running gate doesn't
+    // make the UI claim a merge is in progress; the gate paused-pause
+    // path emits its own `paused` pill update.
+    match run_pre_merge_gate(state, plan_name, task_id, agent_id).await {
+        GateOutcome::Pass => {}
+        GateOutcome::Fail {
+            check,
+            exit_code,
+            output,
+        } => {
+            // Pause the plan with a structured reason so the dashboard
+            // banner can render the offending check name + output. The
+            // dirty-tree-watcher / runner-offline-style auto-resume
+            // paths intentionally do NOT cover this — fixing a failing
+            // build requires a human in the loop.
+            let reason = format!("pre_merge_gate_failed: {check}");
+            db::auto_mode_pause(&state.db, plan_name, &reason, None);
+
+            let payload = serde_json::json!({
+                "plan": plan_name,
+                "task": task_id,
+                "agent_id": agent_id,
+                "check": check,
+                "exit_code": exit_code,
+                "output": output,
+            });
+            broadcast_event(
+                &state.broadcast_tx,
+                "auto_mode_pre_merge_gate_failed",
+                payload.clone(),
+            );
+            // Also surface a paused pill so the existing AutoModeStatusPill
+            // path catches it (the gate-failed event is new wire — the
+            // pill listener is already wired to auto_mode_paused).
+            broadcast_event(
+                &state.broadcast_tx,
+                "auto_mode_paused",
+                serde_json::json!({
+                    "plan": plan_name,
+                    "task": task_id,
+                    "reason": reason,
+                }),
+            );
+            {
+                let conn = state.db.lock().unwrap();
+                audit::log(
+                    &conn,
+                    org_id,
+                    None,
+                    Some("branchwork-auto-mode"),
+                    actions::AUTO_MODE_PRE_MERGE_GATE_FAILED,
+                    audit::resources::PLAN,
+                    Some(plan_name),
+                    Some(&payload.to_string()),
+                );
+            }
+            broadcast_state(state, plan_name, task_id, state_labels::PAUSED, None, None);
+            return;
+        }
     }
 
     broadcast_state(state, plan_name, task_id, state_labels::MERGING, None, None);
@@ -7449,6 +7944,456 @@ mod tests {
             got,
             vec![("a-1.1-retry".to_string(), "1.1".to_string())],
             "most-recent agent per task must win the drain slot"
+        );
+    }
+
+    // ── Pre-merge gate (Phase 1 of pre-merge-gate plan, T1.2) ──────────────────
+
+    /// Build a minimal plan YAML at `<plans_dir>/<plan_name>.yaml` pointing
+    /// at an absolute `project_dir` so the gate's project resolution
+    /// (`ci::project_dir_for` → `home.join(p)` with `p` absolute) collapses
+    /// to the tempdir we control. Same trick as `write_six_task_plan` — see
+    /// its doc comment for the absolute-path rationale.
+    fn write_one_task_plan(plans_dir: &Path, name: &str, project_dir: &Path) {
+        std::fs::create_dir_all(plans_dir).unwrap();
+        let yaml = format!(
+            "title: Pre-merge gate test\n\
+             project: {project}\n\
+             phases:\n  \
+               - number: 0\n    \
+                 title: Phase 0\n    \
+                 tasks:\n      \
+                   - number: \"0.1\"\n        \
+                     title: 0.1\n",
+            project = project_dir.display(),
+        );
+        std::fs::write(plans_dir.join(format!("{name}.yaml")), yaml).unwrap();
+    }
+
+    /// Write a `branchwork.toml` at `project_dir` carrying the
+    /// `[auto_mode.pre_merge_checks]` array. Cache must be cleared
+    /// because the static repo-config cache is keyed by canonical path
+    /// and persists across tests run in the same process.
+    fn write_branchwork_toml(project_dir: &Path, contents: &str) {
+        std::fs::write(project_dir.join("branchwork.toml"), contents).unwrap();
+        crate::repo_config::clear_cache_for_tests();
+    }
+
+    /// Confirm a clean branch passes the gate, the temp worktree is
+    /// removed, and the state machine reaches the merge step. This is
+    /// the negative half of the T1.2 acceptance: plant a clean branch +
+    /// passing checks, then call `run_state_machine` and assert
+    /// `auto_mode_merged` fires + the worktree path was cleaned up on
+    /// the happy path too.
+    #[tokio::test]
+    async fn pre_merge_gate_passes_for_clean_branch_and_runs_to_merge() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        // Bare origin so the merge inner's trigger_after_merge can push
+        // master without exploding the test.
+        let origin = dir.path().join("origin.git");
+        let init = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&origin)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        run_git(
+            &project_dir,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
+        run_git(&project_dir, &["push", "-q", "-u", "origin", "master"]);
+
+        // Branch with a trivial commit.
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        // `true` here is the trivially-passing check. Single check keeps
+        // the test fast.
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               { name = \"trivial\", cmd = \"true\", timeout_secs = 5 },\n\
+             ]\n",
+        );
+
+        let agent_id = "agent-pre-merge-pass";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, mut _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        // Drive the gate directly first to assert the cleanup contract
+        // (path created, path gone after return) — `run_state_machine`
+        // hides that signal behind the `merging` -> `awaiting_ci`
+        // transitions.
+        let expected_path = std::path::PathBuf::from(format!("/tmp/bw-gate-{agent_id}"));
+        // If a previous failing test left it behind, clean up first so
+        // the create succeeds.
+        let _ = std::fs::remove_dir_all(&expected_path);
+        let outcome = run_pre_merge_gate(&state, "p", "0.1", agent_id).await;
+        assert_eq!(outcome, GateOutcome::Pass, "expected Pass for clean branch");
+        assert!(
+            !expected_path.exists(),
+            "worktree path {} should be cleaned up via Drop guard",
+            expected_path.display()
+        );
+
+        // Plan stays unpaused on a passing gate.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "passing gate should not pause the plan"
+        );
+    }
+
+    /// Headline T1.2 acceptance: plant a branch with a Cargo.toml syntax
+    /// error, configure the gate with a `cargo build`-shaped check, run
+    /// the gate, and assert a `GateOutcome::Fail` is returned with the
+    /// check name + non-zero exit code + diagnostic in `output`. We use
+    /// a stub `cargo` shell script instead of real Cargo so the test
+    /// doesn't pay a compile cost — the contract under test is "shell
+    /// command exits non-zero ⇒ gate fails", which doesn't require an
+    /// honest-to-goodness rustc invocation.
+    #[tokio::test]
+    async fn pre_merge_gate_fails_when_check_exits_nonzero() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        // Plant a Cargo.toml with a deliberate syntax error.
+        std::fs::write(
+            project_dir.join("Cargo.toml"),
+            "[package\nname = \"broken\"\n",
+        )
+        .unwrap();
+        run_git(&project_dir, &["add", "Cargo.toml"]);
+        run_git(
+            &project_dir,
+            &["commit", "-q", "-m", "add broken Cargo.toml"],
+        );
+        // Create the task branch off this commit so the worktree
+        // checkout carries the broken file.
+        run_git(&project_dir, &["checkout", "-q", "-b", "branchwork/p/0.1"]);
+        std::fs::write(project_dir.join("work.txt"), "task work").unwrap();
+        run_git(&project_dir, &["add", "work.txt"]);
+        run_git(&project_dir, &["commit", "-q", "-m", "task work"]);
+        run_git(&project_dir, &["checkout", "-q", "master"]);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        // The shell-script `cargo build` stub: `grep` is a binary that
+        // ships everywhere and exits non-zero with a diagnostic when its
+        // pattern doesn't match in stdin. We pipe `Cargo.toml` through
+        // it looking for the (missing) closing bracket; mismatched
+        // bracket means non-zero exit with the offending line in
+        // stderr, which is what we want the gate to capture.
+        //
+        // The cmd is intentionally chained so stdout AND stderr land in
+        // the combined buffer: `sh -c` runs `<cmd>` so `2>&1` would be
+        // syntactically valid, but the gate captures stdout + stderr
+        // separately on the Tokio side. Simplest portable failure:
+        // `false` + a preceding diagnostic via stderr.
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               { name = \"cargo build\", cmd = \"echo 'fake rustc: error: expected one of `]`, found `[package`' >&2 && exit 101\", timeout_secs = 10 },\n\
+             ]\n",
+        );
+
+        let agent_id = "agent-pre-merge-fail";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        let expected_path = std::path::PathBuf::from(format!("/tmp/bw-gate-{agent_id}"));
+        let _ = std::fs::remove_dir_all(&expected_path);
+
+        let outcome = run_pre_merge_gate(&state, "p", "0.1", agent_id).await;
+        match outcome {
+            GateOutcome::Fail {
+                check,
+                exit_code,
+                output,
+            } => {
+                assert_eq!(check, "cargo build", "first-failure wins, name preserved");
+                assert_eq!(
+                    exit_code,
+                    Some(101),
+                    "exit code from the shell must propagate"
+                );
+                assert!(
+                    output.contains("expected one of"),
+                    "captured output must include the stderr diagnostic; got {output:?}"
+                );
+            }
+            GateOutcome::Pass => panic!("expected Fail, got Pass"),
+        }
+
+        // Worktree was created (via `git worktree add`) but the Drop
+        // guard cleaned it up.
+        assert!(
+            !expected_path.exists(),
+            "worktree path {} should be removed even on Fail",
+            expected_path.display()
+        );
+    }
+
+    /// First-failure-wins contract: if the first check fails, the
+    /// second check must NOT run. Verified by configuring the second
+    /// check to write to a sentinel file the test polls for.
+    #[tokio::test]
+    async fn pre_merge_gate_short_circuits_on_first_failure() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+
+        let sentinel = dir.path().join("ran-second-check.flag");
+        let sentinel_str = sentinel.to_string_lossy().to_string();
+        // First check fails; second would write the sentinel. If the
+        // sentinel exists after the gate, the second check ran (bug).
+        let toml = format!(
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               {{ name = \"first\", cmd = \"false\", timeout_secs = 5 }},\n  \
+               {{ name = \"second\", cmd = \"touch {sentinel_str}\", timeout_secs = 5 }},\n\
+             ]\n"
+        );
+        write_branchwork_toml(&project_dir, &toml);
+
+        let agent_id = "agent-short-circuit";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        let expected_path = std::path::PathBuf::from(format!("/tmp/bw-gate-{agent_id}"));
+        let _ = std::fs::remove_dir_all(&expected_path);
+
+        let outcome = run_pre_merge_gate(&state, "p", "0.1", agent_id).await;
+        match outcome {
+            GateOutcome::Fail { check, .. } => assert_eq!(check, "first"),
+            GateOutcome::Pass => panic!("expected Fail"),
+        }
+        assert!(
+            !sentinel.exists(),
+            "second check must not run after first failure"
+        );
+    }
+
+    /// When no `[auto_mode.pre_merge_checks]` section is present, the
+    /// gate is a no-op pass. Absent file ⇒ Pass. Empty array ⇒ Pass.
+    #[tokio::test]
+    async fn pre_merge_gate_returns_pass_when_no_checks_configured() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+
+        // No branchwork.toml at all → Pass.
+        crate::repo_config::clear_cache_for_tests();
+        let agent_id = "agent-no-config";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        let outcome = run_pre_merge_gate(&state, "p", "0.1", agent_id).await;
+        assert_eq!(outcome, GateOutcome::Pass);
+
+        // Now write an empty `pre_merge_checks` array → also Pass, no
+        // worktree creation.
+        write_branchwork_toml(&project_dir, "[auto_mode]\npre_merge_checks = []\n");
+        let outcome2 = run_pre_merge_gate(&state, "p", "0.1", agent_id).await;
+        assert_eq!(outcome2, GateOutcome::Pass);
+        let expected_path = std::path::PathBuf::from(format!("/tmp/bw-gate-{agent_id}"));
+        assert!(
+            !expected_path.exists(),
+            "no checks ⇒ no worktree should be created"
+        );
+    }
+
+    /// A check that exceeds its `timeout_secs` is killed and counts as
+    /// a fail with `exit_code = None`. The captured output carries a
+    /// `[killed by gate]` marker so the audit row distinguishes timeout
+    /// from non-zero exit.
+    #[tokio::test]
+    async fn pre_merge_gate_fails_on_per_check_timeout() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        // 1 s timeout, sleep 30 s → must time out and kill the child.
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               { name = \"slowpoke\", cmd = \"sleep 30\", timeout_secs = 1 },\n\
+             ]\n",
+        );
+
+        let agent_id = "agent-per-check-timeout";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        let expected_path = std::path::PathBuf::from(format!("/tmp/bw-gate-{agent_id}"));
+        let _ = std::fs::remove_dir_all(&expected_path);
+
+        let started = Instant::now();
+        let outcome = run_pre_merge_gate(&state, "p", "0.1", agent_id).await;
+        let elapsed = started.elapsed();
+
+        match outcome {
+            GateOutcome::Fail {
+                check,
+                exit_code,
+                output,
+            } => {
+                assert_eq!(check, "slowpoke");
+                assert!(exit_code.is_none(), "timeout ⇒ exit_code = None");
+                assert!(
+                    output.contains("killed by gate"),
+                    "output must mark the timeout kill; got {output:?}"
+                );
+            }
+            GateOutcome::Pass => panic!("expected Fail (timed out)"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "gate must return promptly after timeout; took {elapsed:?}"
+        );
+        assert!(
+            !expected_path.exists(),
+            "worktree should be cleaned up even when a check times out"
+        );
+    }
+
+    /// Output truncation: a check that prints > 50 KB of stdout should
+    /// have its captured output collapsed to roughly the cap, with the
+    /// `[…truncated…]` marker in the middle.
+    #[test]
+    fn truncate_output_collapses_middle_with_marker() {
+        // 60 KB string: should truncate.
+        let big = "a".repeat(60_000);
+        let truncated = truncate_output(&big, PRE_MERGE_CHECK_OUTPUT_CAP_BYTES);
+        assert!(
+            truncated.contains(PRE_MERGE_TRUNCATION_MARKER.trim()),
+            "marker must appear in truncated output"
+        );
+        assert!(
+            truncated.len() <= PRE_MERGE_CHECK_OUTPUT_CAP_BYTES + PRE_MERGE_TRUNCATION_MARKER.len(),
+            "truncated output must stay within cap (+marker): len={}",
+            truncated.len()
+        );
+
+        // 10 KB string: no truncation, identity round-trip.
+        let small = "b".repeat(10_000);
+        assert_eq!(
+            truncate_output(&small, PRE_MERGE_CHECK_OUTPUT_CAP_BYTES),
+            small
+        );
+    }
+
+    /// A failing gate inside `run_state_machine` must pause the plan,
+    /// audit the failure, broadcast `auto_mode_pre_merge_gate_failed`,
+    /// and SKIP the merge step entirely.
+    #[tokio::test]
+    async fn run_state_machine_pauses_when_pre_merge_gate_fails() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+        let master_before = git_head_sha(&project_dir);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               { name = \"always-fails\", cmd = \"echo broken && false\", timeout_secs = 5 },\n\
+             ]\n",
+        );
+
+        let agent_id = "agent-gate-pauses";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+        // Phase cadence: with a one-task plan, the boundary fires
+        // immediately so `should_merge_now` returns true and the gate
+        // runs.
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        let expected_path = std::path::PathBuf::from(format!("/tmp/bw-gate-{agent_id}"));
+        let _ = std::fs::remove_dir_all(&expected_path);
+
+        run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
+
+        // Plan must be paused with the structured reason.
+        let reason = paused_reason(&db, "p").expect("plan should be paused after gate failure");
+        assert!(
+            reason.starts_with("pre_merge_gate_failed:"),
+            "paused_reason should carry gate failure; got {reason:?}"
+        );
+        assert!(
+            reason.contains("always-fails"),
+            "paused_reason should include check name; got {reason:?}"
+        );
+
+        // Merge must NOT have run — master unchanged.
+        let master_after = git_head_sha(&project_dir);
+        assert_eq!(
+            master_before, master_after,
+            "merge must be skipped when gate fails"
+        );
+
+        // Audit row landed.
+        let actions = {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT action FROM audit_logs WHERE resource_id = ?1 ORDER BY id")
+                .unwrap();
+            stmt.query_map(params!["p"], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            actions
+                .iter()
+                .any(|a| a == actions::AUTO_MODE_PRE_MERGE_GATE_FAILED),
+            "expected {} in {actions:?}",
+            actions::AUTO_MODE_PRE_MERGE_GATE_FAILED
+        );
+
+        // Broadcast event landed.
+        let events = drain_event_types(&mut rx);
+        assert!(
+            events.contains(&"auto_mode_pre_merge_gate_failed".to_string()),
+            "expected auto_mode_pre_merge_gate_failed in {events:?}"
+        );
+        // The merging pill is suppressed on a gate fail (we never enter
+        // the merging state), so `auto_mode_merged` must NOT have fired.
+        assert!(
+            !events.contains(&"auto_mode_merged".to_string()),
+            "merging step must not run; got events {events:?}"
+        );
+
+        // Worktree cleaned up.
+        assert!(
+            !expected_path.exists(),
+            "worktree {} should be removed on gate failure",
+            expected_path.display()
         );
     }
 }

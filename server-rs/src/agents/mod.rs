@@ -9,6 +9,7 @@ pub mod session_settings;
 pub mod spawn_ops;
 pub mod supervisor;
 pub mod terminal_ws;
+pub mod worktree;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
