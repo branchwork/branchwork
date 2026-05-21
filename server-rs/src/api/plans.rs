@@ -1467,6 +1467,296 @@ pub async fn put_plan_config(
     (StatusCode::OK, Json(cfg)).into_response()
 }
 
+// ── POST /api/plans/:name/resume (Task 2.1 of pre-merge-gate plan) ───────────
+//
+// Dedicated resume endpoint for the `pre_merge_check_failed` banner. The
+// existing PUT `/api/plans/:name/config` + `pausedReason: null` path still
+// drives the [`AutoModeStatusPill`] Resume button — that one resumes by
+// calling [`crate::agents::try_auto_advance`] from the last completed
+// task, which is the right behaviour for merge-conflict / CI-red /
+// runner-offline / dirty-tree pauses (the operator fixed something
+// upstream, the loop now advances).
+//
+// The pre-merge gate is different: the agent's work is on its branch,
+// the gate failed, the operator fixed the branch locally (e.g.
+// `prettier --write` + commit + push), and now wants the loop to
+// re-run the gate. `try_auto_advance` is wrong for that — it would
+// spawn the next task. We need [`crate::auto_mode::run_state_machine`]
+// instead so the gate → merge → CI → advance chain re-runs against
+// the same trigger agent.
+//
+// Wire shape: `POST /api/plans/<name>/resume` with optional body
+// `{ retry_gate?: bool }` (default false). `retry_gate=false` (or
+// absent) falls through to the standard resume path so callers can use
+// the same endpoint uniformly; `retry_gate=true` is only valid when
+// the current paused reason is `pre_merge_check_failed` (409 otherwise
+// so a confused click on a stale banner can't run the gate on a
+// non-gate pause).
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeBody {
+    /// When `true`, re-enter [`crate::auto_mode::run_state_machine`] at
+    /// the gate step instead of calling
+    /// [`crate::agents::try_auto_advance`]. Only valid when the current
+    /// `paused_reason` is `pre_merge_check_failed`.
+    #[serde(default)]
+    retry_gate: bool,
+}
+
+/// Find the trigger agent for a `pre_merge_check_failed` pause. The
+/// state machine entered the gate step for an agent that had just
+/// completed its work with the branch intact, so the most recently
+/// completed task agent (not a fix agent) with a non-null branch is
+/// the canonical candidate. Returns `(agent_id, task_id, org_id)`.
+///
+/// Skips fix agents (`task_id LIKE '%-fix-%'`) because the
+/// fix-completion path goes through
+/// [`crate::auto_mode::on_fix_agent_completed`], which has its own
+/// post-merge poll — a pre_merge_check_failed pause can only arise on
+/// the trigger merge of the main task agent, never on a fix's re-merge.
+fn find_pre_merge_trigger_agent(
+    db: &rusqlite::Connection,
+    plan_name: &str,
+) -> Option<(String, String, String)> {
+    db.query_row(
+        "SELECT id, task_id, org_id FROM agents \
+         WHERE plan_name = ?1 \
+           AND branch IS NOT NULL \
+           AND status = 'completed' \
+           AND task_id IS NOT NULL \
+           AND task_id NOT LIKE '%-fix-%' \
+         ORDER BY started_at DESC LIMIT 1",
+        params![plan_name],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )
+    .ok()
+}
+
+pub async fn resume_plan(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(name): Path<String>,
+    body: Option<Json<ResumeBody>>,
+) -> Response {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    if !body.retry_gate {
+        // Standard resume path: clear the pause and let try_auto_advance
+        // spawn the next task. Mirrors the existing PUT /config +
+        // pausedReason: null path so callers that don't care about
+        // gate-retry can use this endpoint uniformly.
+        return do_standard_resume(&state, &auth, &name).await;
+    }
+
+    // retry_gate=true: only valid when the current pause is the
+    // pre-merge-gate one. Other pause reasons (merge_failed, ci_failed,
+    // runner_offline, agent_left_uncommitted_work, push_lock_unavailable)
+    // have different resume semantics — refusing here surfaces a clear
+    // 409 instead of silently doing the wrong thing.
+    let current_paused_reason: Option<String> = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT paused_reason FROM plan_auto_mode WHERE plan_name = ?1",
+            params![name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+
+    if current_paused_reason.as_deref() != Some("pre_merge_check_failed") {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "not_pre_merge_pause",
+                "message": "retry_gate is only valid when the plan is paused with pre_merge_check_failed.",
+                "currentPausedReason": current_paused_reason,
+            })),
+        )
+            .into_response();
+    }
+
+    // Find the trigger agent: the row whose branch was about to be
+    // merged when the gate failed. If we can't find one (rare —
+    // implies the agent row was deleted or the branch column was
+    // nulled out), refuse with 409: the operator should fall back to
+    // the standard Resume (PUT /config + pausedReason: null) which
+    // re-spawns from the last completed task instead of trying to
+    // re-merge an agent that no longer exists.
+    let trigger = {
+        let db = state.db.lock().unwrap();
+        find_pre_merge_trigger_agent(&db, &name)
+    };
+
+    let (agent_id, task_id, org_id) = match trigger {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "no_trigger_agent",
+                    "message": "Couldn't find the agent that triggered the pre-merge pause. Use the standard Resume (PUT /api/plans/:name/config with pausedReason: null) to advance from the last completed task instead.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Clear the pause BEFORE spawning the state machine so the
+    // defense-in-depth `db::auto_mode_enabled` check at the top of
+    // run_state_machine doesn't bail early.
+    crate::db::auto_mode_resume(&state.db, &name);
+
+    let payload = serde_json::json!({
+        "plan": name,
+        "task": task_id,
+        "agent_id": agent_id,
+    });
+
+    {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::auto_mode::actions::AUTO_MODE_PRE_MERGE_GATE_RETRIED,
+            crate::audit::resources::PLAN,
+            Some(&name),
+            Some(&payload.to_string()),
+        );
+    }
+
+    // Broadcast `auto_mode_resumed` so the existing dashboard listener
+    // clears the pause pill. Carry `trigger: "retry_gate"` so a future
+    // UI surface can distinguish a gate-retry from a standard resume
+    // without re-reading the audit log.
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "auto_mode_resumed",
+        serde_json::json!({
+            "plan": name,
+            "task": task_id,
+            "trigger": "retry_gate",
+        }),
+    );
+
+    // Spawn run_state_machine on a detached task so the HTTP response
+    // returns before the gate (which can run for minutes) starts. The
+    // worker re-uses the same agent_id + task_id, so all subsequent
+    // broadcasts/audits correlate with the prior pause row.
+    let state_clone = state.clone();
+    let plan_owned = name.clone();
+    let task_owned = task_id.clone();
+    let agent_owned = agent_id.clone();
+    let org_owned = org_id.clone();
+    tokio::spawn(async move {
+        crate::auto_mode::run_state_machine(
+            &state_clone,
+            &org_owned,
+            &agent_owned,
+            &plan_owned,
+            &task_owned,
+        )
+        .await;
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "plan": name,
+            "task": task_id,
+            "agentId": agent_id,
+            "trigger": "retry_gate",
+        })),
+    )
+        .into_response()
+}
+
+/// Shared implementation of the "standard" Resume path — clear the
+/// pause, audit, broadcast `auto_mode_resumed`, then call
+/// [`crate::agents::try_auto_advance`] from the most recently
+/// completed task. Mirrors the existing inline branch in
+/// [`put_plan_config`] so both callers (`PUT /config` with explicit
+/// null paused reason, and `POST /resume` with `retry_gate=false`)
+/// converge on a single implementation.
+async fn do_standard_resume(state: &AppState, auth: &OptionalAuthUser, name: &str) -> Response {
+    crate::db::auto_mode_resume(&state.db, name);
+
+    let last_completed: Option<String> = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT task_number FROM task_status \
+             WHERE plan_name = ?1 AND status IN ('completed', 'skipped') \
+             ORDER BY updated_at DESC LIMIT 1",
+            params![name],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+
+    {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::AUTO_MODE_RESUMED,
+            crate::audit::resources::PLAN,
+            Some(name),
+            Some(
+                &serde_json::json!({
+                    "last_completed_task": last_completed,
+                })
+                .to_string(),
+            ),
+        );
+    }
+
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "auto_mode_resumed",
+        serde_json::json!({
+            "plan": name,
+            "last_completed_task": last_completed,
+        }),
+    );
+
+    if let Some(task) = last_completed.clone() {
+        let registry = state.registry.clone();
+        let plans_dir = state.plans_dir.clone();
+        let plan_name = name.to_string();
+        let effort = *state.effort.lock().unwrap();
+        let port = state.config_port();
+        tokio::spawn(async move {
+            crate::agents::try_auto_advance(
+                registry, plans_dir, plan_name, task, effort, port, None,
+            )
+            .await;
+        });
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "plan": name,
+            "lastCompletedTask": last_completed,
+            "trigger": "standard",
+        })),
+    )
+        .into_response()
+}
+
 // ── GET/PUT /api/plans/:name/settings (Task 3.1) ─────────────────────────────
 //
 // Plan-level settings panel API: surface the per-plan

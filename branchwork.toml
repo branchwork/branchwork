@@ -32,3 +32,70 @@ ignore = [
     # Only .bob/README.md is tracked — the rest is per-host state.
     ".bob/**",
 ]
+
+# Pre-merge gate. Each entry runs (via `sh -c`) in a detached-HEAD
+# worktree off the task branch tip before auto-mode merges into master.
+# Any non-zero exit pauses the plan with reason `pre_merge_check_failed`
+# and surfaces the failing check name + output in the dashboard (see
+# pre-merge-gate plan T1.3).
+#
+# Ordering matters: checks run sequentially in declared order and the
+# gate short-circuits on the first failure, so cheap checks come first
+# and the install step that downstream web checks depend on runs before
+# them.
+#
+# Why each check is here:
+# - cargo-fmt: subsecond, catches formatting drift before it ever hits CI.
+# - web-install: populates node_modules in the fresh worktree so the
+#   web-* checks below have something to run against. pnpm's CAS store
+#   makes this cheap on a warm host (~5-15s).
+# - web-lint / web-format / web-build / web-test / web-bundle: mirror
+#   the steps in .github/workflows/tests.yml::web. `web-build`
+#   (`tsc -b && vite build`) is the one that would have caught the
+#   2026-05-21 master failure where `TaskCard.test.tsx` referenced a
+#   `mergeCadence` field that no longer exists on `PlanConfig` —
+#   tsc -b typechecks .test.tsx files alongside .tsx ones.
+# - web-test is intentionally listed even though tests.yml does not
+#   currently run vitest; the gate is the right place to catch a
+#   broken test before merging while we close that CI gap separately.
+#
+# Heavier Rust checks (clippy, cargo test) intentionally stay in CI
+# (`task-tests.yml`) for now — they cold-rebuild in a fresh worktree
+# and would blow the 600s/check ceiling. Revisit once the gate runner
+# learns to share a CARGO_TARGET_DIR across runs.
+
+[[auto_mode.pre_merge_checks]]
+name = "cargo-fmt"
+cmd  = "cargo fmt --check"
+cwd  = "server-rs"
+timeout_secs = 60
+
+[[auto_mode.pre_merge_checks]]
+name = "web-install"
+cmd  = "pnpm install --frozen-lockfile"
+timeout_secs = 120
+
+[[auto_mode.pre_merge_checks]]
+name = "web-lint"
+cmd  = "pnpm --filter @branchwork/web lint"
+timeout_secs = 60
+
+[[auto_mode.pre_merge_checks]]
+name = "web-format"
+cmd  = "pnpm --filter @branchwork/web format:check"
+timeout_secs = 60
+
+[[auto_mode.pre_merge_checks]]
+name = "web-build"
+cmd  = "pnpm --filter @branchwork/web build"
+timeout_secs = 180
+
+[[auto_mode.pre_merge_checks]]
+name = "web-test"
+cmd  = "pnpm --filter @branchwork/web test"
+timeout_secs = 180
+
+[[auto_mode.pre_merge_checks]]
+name = "web-bundle"
+cmd  = "pnpm --filter @branchwork/web bundle:check"
+timeout_secs = 60

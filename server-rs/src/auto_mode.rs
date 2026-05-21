@@ -80,6 +80,14 @@ pub mod actions {
     /// plan; the constant name follows the task spec verbatim (CHECK,
     /// not GATE — T1.3 renamed from the placeholder T1.2 wired in).
     pub const AUTO_MODE_PRE_MERGE_CHECK_FAILED: &str = "auto_mode.pre_merge_check_failed";
+    /// The operator clicked Resume on the `pre_merge_check_failed`
+    /// banner (T2.1 of the `pre-merge-gate` plan). The pause is cleared
+    /// and the state machine re-enters at the gate step — if the gate
+    /// passes this time, the merge proceeds; if it fails again the
+    /// pause cycle repeats. Diff carries `{plan, task, agent_id}` so a
+    /// post-mortem can correlate the retry with the prior
+    /// `AUTO_MODE_PRE_MERGE_CHECK_FAILED` row that triggered it.
+    pub const AUTO_MODE_PRE_MERGE_GATE_RETRIED: &str = "auto_mode.pre_merge_gate_retried";
 }
 
 // ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
@@ -1385,7 +1393,7 @@ pub async fn flush_deferred_merges(
 /// completion that flips `should_merge_now` to true drains every
 /// deferred sibling in dependency order (no per-merge push), then
 /// merges itself (the one push that lands the whole batch).
-async fn run_state_machine(
+pub(crate) async fn run_state_machine(
     state: &AppState,
     org_id: &str,
     agent_id: &str,

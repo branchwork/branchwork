@@ -352,6 +352,7 @@ async fn run_server(cli: Cli) {
             "/api/plans/{name}/config",
             get(api::plans::get_plan_config).put(api::plans::put_plan_config),
         )
+        .route("/api/plans/{name}/resume", post(api::plans::resume_plan))
         .route(
             "/api/plans/{name}/settings",
             get(api::plans::get_plan_settings).put(api::plans::put_plan_settings),

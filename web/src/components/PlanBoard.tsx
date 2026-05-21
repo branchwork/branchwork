@@ -1514,7 +1514,7 @@ export function AutoPushRebaseConflictBanner({ planName }: { planName: string })
   );
 }
 
-/// Plan-pause banner for `pre_merge_check_failed` (T1.3 of the
+/// Plan-pause banner for `pre_merge_check_failed` (T1.3 + T2.1 of the
 /// `pre-merge-gate` plan). Renders only when the persistent half
 /// (`planConfigs[plan].pausedReason === "pre_merge_check_failed"`)
 /// matches; the transient detail (check name, exit code, output
@@ -1524,8 +1524,24 @@ export function AutoPushRebaseConflictBanner({ planName }: { planName: string })
 /// Detail is broadcast-only — the server persists the audit row + the
 /// `paused_reason` column, but NOT the snippet column. A reload after
 /// the pause renders the banner with a generic "see Activity log"
-/// hint. Resume is wired through the existing `AutoModeStatusPill`
-/// (PUT `pausedReason: null` on `/api/plans/:name/config`).
+/// hint.
+///
+/// T2.1: Resume button posts to the dedicated `POST /api/plans/:name/resume`
+/// endpoint with `{retryGate: true}`. That endpoint re-enters
+/// `run_state_machine` at the gate step against the same trigger
+/// agent — if the gate passes this time the merge proceeds; if it
+/// fails again the pause cycle repeats. Distinct from the
+/// `AutoModeStatusPill`'s standard Resume (`PUT /config` with
+/// `pausedReason: null`) which calls `try_auto_advance` to spawn the
+/// next task — wrong for this pause because the work is already on
+/// the branch waiting to be merged.
+///
+/// The output snippet renders inside `<details>` so it stays
+/// collapsed by default — operators usually only need the failing
+/// check name + exit code to know what to fix; expand-on-click for
+/// the actual log. Native `<details>`/`<summary>` gives keyboard
+/// accessibility and aria semantics for free (precedent: T3.2 of the
+/// dirty-tree-check plan).
 ///
 /// The captured output is middle-truncated to 4 KB upstream
 /// (`PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES`); the banner additionally
@@ -1535,6 +1551,8 @@ export function AutoPushRebaseConflictBanner({ planName }: { planName: string })
 export function PreMergeCheckFailedBanner({ planName }: { planName: string }) {
   const config = usePlanStore((s) => s.planConfigs[planName] ?? null);
   const failure = usePlanStore((s) => s.preMergeCheckFailures[planName] ?? null);
+  const setPlanConfig = usePlanStore((s) => s.setPlanConfig);
+  const [resuming, setResuming] = useState(false);
 
   if (config?.pausedReason !== "pre_merge_check_failed") return null;
 
@@ -1552,6 +1570,31 @@ export function PreMergeCheckFailedBanner({ planName }: { planName: string }) {
     snippet && snippet.length > BANNER_SNIPPET_CAP
       ? `${snippet.slice(0, BANNER_SNIPPET_CAP)}\n[…truncated for banner — see Activity log…]`
       : snippet;
+
+  const handleResume = async () => {
+    setResuming(true);
+    try {
+      await postJson<{ ok: boolean; plan: string; task: string; agentId: string }>(
+        `/api/plans/${planName}/resume`,
+        { retryGate: true },
+      );
+      // Don't optimistically clear `pausedReason` — the server
+      // broadcasts `auto_mode_resumed` immediately AND
+      // run_state_machine spawns on a detached task. If the gate
+      // fails again, the WS handler will set `pausedReason` back to
+      // `pre_merge_check_failed` and we surface the new snippet. The
+      // `auto_mode_resumed` WS handler in ws-store clears the
+      // PlanConfig.pausedReason and preMergeCheckFailures slices.
+      // Fetch the fresh config so the banner disappears even if the
+      // WS event lands after this returns.
+      const cfg = await fetchJson<PlanConfig>(`/api/plans/${planName}/config`);
+      setPlanConfig(planName, cfg);
+    } catch (e) {
+      toastError(e, "Resume failed");
+    } finally {
+      setResuming(false);
+    }
+  };
 
   return (
     <div
@@ -1585,16 +1628,36 @@ export function PreMergeCheckFailedBanner({ planName }: { planName: string }) {
           )}
         </div>
         {clippedSnippet ? (
-          <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded bg-red-950/50 px-3 py-2 font-mono text-xs text-red-200/90">
-            {clippedSnippet}
-          </pre>
+          <details className="mt-2">
+            <summary className="cursor-pointer select-none text-red-200/90 hover:text-red-100">
+              Show output
+            </summary>
+            <pre
+              data-testid="pre-merge-check-failed-snippet"
+              className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded bg-red-950/50 px-3 py-2 font-mono text-xs text-red-200/90"
+            >
+              {clippedSnippet}
+            </pre>
+          </details>
         ) : (
           <div className="mt-1 text-red-200/90">
             Output snippet not in memory (reload?) — see the Activity log for the captured stderr.
           </div>
         )}
-        <div className="mt-2 text-red-200/80">
-          Fix the branch and click <span className="font-medium">Resume</span> to re-run the gate.
+        <div className="mt-3 flex items-center gap-3">
+          <button
+            type="button"
+            onClick={handleResume}
+            disabled={resuming}
+            data-testid="pre-merge-check-failed-resume"
+            className="rounded border border-red-700/60 bg-red-900/40 px-3 py-1 text-red-100 hover:bg-red-800/50 hover:text-red-50 disabled:opacity-50 transition"
+            title="Re-run the pre-merge gate against the current branch tip"
+          >
+            {resuming ? "Resuming..." : "Resume"}
+          </button>
+          <span className="text-red-200/80">
+            Fix the branch locally, push, then click Resume to re-run the gate.
+          </span>
         </div>
       </div>
     </div>
