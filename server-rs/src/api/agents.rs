@@ -220,9 +220,78 @@ pub async fn kill_agent(
     }
 }
 
+/// Minimum runner version that handles the `AgentInput` wire variant
+/// (T5.9 of the saas-folder-listing-via-runner plan). Older runners
+/// (notably the v0.3.0 production runner whose `runner_protocol.rs`
+/// predates the variant) silently drop the envelope — graceful exit
+/// silently fails and the operator has to fall back to Kill.
+///
+/// The minimum is conservative: `AgentInput` actually landed during
+/// v0.3.0's lifespan in commit 279407a, but we can't tell at runtime
+/// which v0.3.0 build a runner came from. v0.4.0 is the first version
+/// that is guaranteed to carry the handler (the variant + handler had
+/// both shipped well before the 0.4.0 bump).
+const MIN_RUNNER_VERSION_FOR_FINISH: (u32, u32, u32) = (0, 4, 0);
+
+/// Lenient `<major>.<minor>.<patch>` parser. Anything after the third
+/// dot or a `-`/`+` is ignored (so `0.4.0-rc1` and `0.4.0+sha` both
+/// parse the same as `0.4.0`). Mirrors `runner_ws::parse_semver_lenient`
+/// — duplicated here so the comparison stays local to the Finish
+/// gate; the runner_ws helper is private.
+fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
+    let head = s.split(['-', '+']).next().unwrap_or(s);
+    let mut parts = head.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// `true` when `version` is at least [`MIN_RUNNER_VERSION_FOR_FINISH`].
+/// Unparseable strings return `false` so a runner that fails to report
+/// its version cleanly is treated as too old — the conservative choice
+/// when the alternative is a silent 200 + dead Finish button.
+fn runner_meets_min_version_for_finish(version: Option<&str>) -> bool {
+    match version.and_then(parse_semver) {
+        Some(v) => v >= MIN_RUNNER_VERSION_FOR_FINISH,
+        None => false,
+    }
+}
+
+/// Render `MIN_RUNNER_VERSION_FOR_FINISH` for body / log strings.
+fn min_version_for_finish_str() -> String {
+    let (a, b, c) = MIN_RUNNER_VERSION_FOR_FINISH;
+    format!("{a}.{b}.{c}")
+}
+
 /// `POST /api/agents/:id/finish` — send the CLI's graceful-exit sequence
 /// (e.g. `/exit` for Claude Code) so the agent shuts down cleanly. Unlike
 /// Kill this preserves any in-flight commit/cleanup the agent wants to do.
+///
+/// **SaaS-mode fix-loud contract (Task 5.5,
+/// runner-install-and-spawn-reliability plan).** Pre-fix the SaaS path
+/// looked up the "most recently seen online runner" via
+/// `pick_runner_for_org` and shipped a `WireMessage::AgentInput`
+/// envelope to that runner via `command_tx.send`, then returned 200.
+/// Three failure modes silently dropped graceful exit:
+///   - **Wrong runner targeted** if the org had multiple runners — the
+///     in-flight session daemon lives only on the runner that spawned
+///     it, so an `AgentInput` to a different runner is a no-op (the
+///     runner-side handler looks up `state.agents[id]` and bails on
+///     miss).
+///   - **Version too old** — runners pre-AgentInput (v0.3.x) have no
+///     handler and silently drop the envelope.
+///   - **Spawning runner offline** — the envelope landed on the wire
+///     but the daemon was unreachable; the runner-side outbox doesn't
+///     replay `AgentInput` (it's best-effort).
+///
+/// Post-fix Finish targets the runner pinned on `agents.runner_id` (the
+/// runner that received the `StartAgent` envelope at spawn time), and
+/// refuses with 409 when that runner is unavailable or below
+/// [`MIN_RUNNER_VERSION_FOR_FINISH`].
 pub async fn finish_agent(
     State(state): State<AppState>,
     auth: OptionalAuthUser,
@@ -245,30 +314,35 @@ pub async fn finish_agent(
         return (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response();
     }
 
-    // SaaS path (T5.9): the supervisor lives in the runner container so
-    // the in-process registry has nothing for `id`. Look up the agent's
-    // driver, ask the driver registry for the exit byte sequence, and
-    // ship it as a `WireMessage::AgentInput` envelope through the
-    // runner's `command_tx`. The runner's existing `AgentInput` handler
-    // forwards the bytes into the daemon's PTY; the agent then exits
-    // cleanly on its own and the runner emits `AgentStopped` shortly
-    // after — same observable behaviour as standalone, just routed.
+    // SaaS path: the supervisor lives in the runner container so the
+    // in-process registry has nothing for `id`. Look up the agent's
+    // driver and pinned runner_id, ask the driver registry for the
+    // exit byte sequence, and ship it as a `WireMessage::AgentInput`
+    // envelope through THE SPAWNING runner's `command_tx`.
     let default_driver = crate::persisted_settings::PersistedSettings::load(&state.settings_path)
         .default_driver()
         .to_string();
-    let row: Option<(String, String, String)> = {
+    let row: Option<(String, String, String, Option<String>)> = {
         let db = state.db.lock().unwrap();
         db.query_row(
             &format!(
-                "SELECT mode, COALESCE(driver, '{}'), org_id FROM agents WHERE id = ?",
+                "SELECT mode, COALESCE(driver, '{}'), org_id, runner_id \
+                 FROM agents WHERE id = ?",
                 default_driver
             ),
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
         )
         .ok()
     };
-    let Some((mode, driver_name, org_id)) = row else {
+    let Some((mode, driver_name, org_id, spawning_runner_id)) = row else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Agent not found"})),
@@ -297,6 +371,103 @@ pub async fn finish_agent(
         }
     };
 
+    // Resolve the runner to dispatch to. Honour `agents.runner_id` when
+    // set (Task 5.5 — the runner that actually spawned the daemon), and
+    // fall back to `pick_runner_for_org` only for legacy rows that
+    // predate the column. The fallback is intentionally narrow: any new
+    // SaaS spawn populates the column, so the fallback only runs on
+    // rows that existed before this migration.
+    let dispatch_target_runner_id = match spawning_runner_id {
+        Some(rid) => rid,
+        None => {
+            let conn = state.db.lock().unwrap();
+            match conn
+                .query_row(
+                    "SELECT id FROM runners WHERE org_id = ?1 \
+                     ORDER BY (status = 'online') DESC, last_seen_at DESC LIMIT 1",
+                    params![org_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            {
+                Some(rid) => rid,
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": "no_runner_connected"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    // Read the target runner's status + version BEFORE acquiring the
+    // (async) runners-registry lock so we can 409 with a fully-formed
+    // body without holding any locks.
+    let (runner_status, runner_version): (Option<String>, Option<String>) = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT status, version FROM runners WHERE id = ?1",
+            params![dispatch_target_runner_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .ok()
+        .unwrap_or((None, None))
+    };
+
+    // Spawning runner missing (deleted) or offline ⇒ 409
+    // spawn_runner_unavailable. Pre-fix this would 200 silently after
+    // shipping an envelope to a different (online) runner that had no
+    // PTY for this agent.
+    let is_online = runner_status.as_deref() == Some("online");
+    if !is_online {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "spawn_runner_unavailable",
+                "code": "spawn_runner_unavailable",
+                "message": format!(
+                    "the runner that spawned this agent ({dispatch_target_runner_id}) is not online — \
+                     either bring it back online or kill the agent",
+                ),
+                "runnerId": dispatch_target_runner_id,
+                "runnerStatus": runner_status.unwrap_or_else(|| "unknown".to_string()),
+            })),
+        )
+            .into_response();
+    }
+
+    // Spawning runner online but below the minimum version ⇒ 409
+    // spawn_runner_too_old. This is the production scenario the brief
+    // calls out: a v0.3.0 runner whose `runner_protocol.rs` has no
+    // `AgentInput` variant.
+    if !runner_meets_min_version_for_finish(runner_version.as_deref()) {
+        let min = min_version_for_finish_str();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "spawn_runner_too_old",
+                "code": "spawn_runner_too_old",
+                "message": format!(
+                    "the runner that spawned this agent ({dispatch_target_runner_id}) is too old to \
+                     handle Finish — runner reports {actual} but Finish requires >= {min}; \
+                     upgrade the runner or kill the agent",
+                    actual = runner_version.as_deref().unwrap_or("(unknown)"),
+                ),
+                "runnerId": dispatch_target_runner_id,
+                "runnerVersion": runner_version,
+                "minimumVersion": min,
+            })),
+        )
+            .into_response();
+    }
+
     use base64::Engine;
     let envelope = crate::saas::runner_protocol::Envelope::best_effort(
         "server".to_string(),
@@ -316,31 +487,23 @@ pub async fn finish_agent(
         }
     };
 
-    // Pick the most recently-seen online runner for this org — same
-    // heuristic as `pick_runner_for_org` in spawn_ops, which is what
-    // dispatched the agent in the first place.
-    let runner_id: Option<String> = {
-        let conn = state.db.lock().unwrap();
-        conn.query_row(
-            "SELECT id FROM runners WHERE org_id = ?1 \
-             ORDER BY (status = 'online') DESC, last_seen_at DESC LIMIT 1",
-            params![org_id],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-    };
-    let Some(runner_id) = runner_id else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "no_runner_connected"})),
-        )
-            .into_response();
-    };
+    // Look up the live WS handle for the spawning runner. Status=online
+    // (above) is what's in the DB, but the actual WS handle could have
+    // disconnected since — the runners-registry lookup is the
+    // authoritative live check.
     let runners = state.runners.lock().await;
-    let Some(runner) = runners.get(&runner_id) else {
+    let Some(runner) = runners.get(&dispatch_target_runner_id) else {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "no_runner_connected"})),
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "spawn_runner_unavailable",
+                "code": "spawn_runner_unavailable",
+                "message": format!(
+                    "the runner that spawned this agent ({dispatch_target_runner_id}) is not currently \
+                     connected — either bring it back online or kill the agent",
+                ),
+                "runnerId": dispatch_target_runner_id,
+            })),
         )
             .into_response();
     };
@@ -1233,4 +1396,80 @@ pub async fn get_events(State(state): State<AppState>) -> impl IntoResponse {
         .collect();
 
     Json(rows)
+}
+
+#[cfg(test)]
+mod finish_version_gate_tests {
+    use super::*;
+
+    /// Pinned by Task 5.5. The exact constant matters for the wire
+    /// contract: the 409 response body advertises this value as
+    /// `minimumVersion`, and the dashboard's upgrade banner reads it.
+    /// A future bump (e.g. once an Aider/Codex Finish path needs a
+    /// newer minimum) MUST update tests/finish_agent_spawn_runner.rs
+    /// at the same time.
+    #[test]
+    fn minimum_version_is_0_4_0() {
+        assert_eq!(MIN_RUNNER_VERSION_FOR_FINISH, (0, 4, 0));
+        assert_eq!(min_version_for_finish_str(), "0.4.0");
+    }
+
+    #[test]
+    fn parses_simple_semver() {
+        assert_eq!(parse_semver("0.5.70"), Some((0, 5, 70)));
+        assert_eq!(parse_semver("1.0.0"), Some((1, 0, 0)));
+        assert_eq!(parse_semver("0.4.0"), Some((0, 4, 0)));
+    }
+
+    #[test]
+    fn parses_two_component_semver_as_patch_zero() {
+        // The classifier permits "0.5" as a shorthand — same as
+        // `runner_ws::parse_semver_lenient` so a Cargo.toml-style
+        // `version = "0.5"` doesn't accidentally trigger too_old.
+        assert_eq!(parse_semver("0.5"), Some((0, 5, 0)));
+    }
+
+    #[test]
+    fn strips_pre_release_and_build_metadata() {
+        // `0.5.70-rc1` and `0.5.70+sha1234` must compare as `0.5.70`,
+        // mirroring the upstream version classifier so a runner built
+        // from a tagged pre-release isn't refused on Finish.
+        assert_eq!(parse_semver("0.5.70-rc1"), Some((0, 5, 70)));
+        assert_eq!(parse_semver("0.5.70+sha1234"), Some((0, 5, 70)));
+    }
+
+    #[test]
+    fn rejects_unparseable_strings() {
+        assert_eq!(parse_semver("custom-build"), None);
+        assert_eq!(parse_semver("v0.5.70"), None); // leading `v` not stripped
+        assert_eq!(parse_semver(""), None);
+    }
+
+    #[test]
+    fn meets_min_version_when_above_minimum() {
+        assert!(runner_meets_min_version_for_finish(Some("0.4.0")));
+        assert!(runner_meets_min_version_for_finish(Some("0.4.1")));
+        assert!(runner_meets_min_version_for_finish(Some("0.5.70")));
+        assert!(runner_meets_min_version_for_finish(Some("1.0.0")));
+    }
+
+    #[test]
+    fn does_not_meet_min_version_when_below_minimum() {
+        // The headline regression: v0.3.0 (the prod runner that
+        // surfaced the 2026-05-19 silent-200 bug) must NOT meet the
+        // minimum so Finish refuses to dispatch.
+        assert!(!runner_meets_min_version_for_finish(Some("0.3.0")));
+        assert!(!runner_meets_min_version_for_finish(Some("0.3.99")));
+        assert!(!runner_meets_min_version_for_finish(Some("0.2.0")));
+    }
+
+    #[test]
+    fn does_not_meet_min_version_for_unparseable() {
+        // Conservative: an unparseable version string is treated as
+        // too old. Better a 409 + upgrade prompt than a silent 200
+        // when we can't be sure the runner has the AgentInput handler.
+        assert!(!runner_meets_min_version_for_finish(Some("custom-build")));
+        assert!(!runner_meets_min_version_for_finish(Some("")));
+        assert!(!runner_meets_min_version_for_finish(None));
+    }
 }

@@ -371,6 +371,23 @@ async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOp
     let (effort_resolved, skip_resolved) =
         crate::api::runners::resolve_for_dispatch(&cfg, &effort.to_string(), server_skip);
 
+    // Pin the spawning runner onto the agents row (Task 5.5) so
+    // `finish_agent` can target it explicitly later instead of falling
+    // back to `pick_runner_for_org`. We write AFTER the
+    // `resolve_runner_for_spawn` + `check_version_block` decisions land
+    // so a refused dispatch (PinnedRunnerOffline / version_mismatch)
+    // leaves the column NULL — pinning a runner we never actually sent
+    // `StartAgent` to would mislead Finish into 409-ing on the
+    // wrong context.
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET runner_id = ?1 WHERE id = ?2",
+            params![runner_id, agent_id],
+        )
+        .ok();
+    }
+
     let message = WireMessage::StartAgent {
         agent_id: agent_id.clone(),
         plan_name: plan_name.unwrap_or("").to_string(),

@@ -1331,6 +1331,23 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE agents ADD COLUMN spawn_error TEXT;")
         .ok();
 
+    // Spawning runner identity (Task 5.5,
+    // runner-install-and-spawn-reliability plan). Populated by
+    // `spawn_ops::start_agent_via_runner` in SaaS mode with the runner
+    // that received the `StartAgent` envelope (after sibling-failover
+    // resolution); NULL on standalone-mode rows (no runner involved) and
+    // on legacy rows that predate this column.
+    //
+    // Read by `api::agents::finish_agent` so graceful-exit targets the
+    // runner that actually owns the session daemon, instead of falling
+    // back to `pick_runner_for_org` ("most recently seen online") which
+    // could ship `AgentInput` to a runner that has no PTY for this agent.
+    // The same column is what the version-mismatch gate at Finish time
+    // consults to refuse dispatch when the spawning runner is below the
+    // minimum that handles `AgentInput`.
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN runner_id TEXT;")
+        .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 
@@ -1731,6 +1748,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(drv2.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn agents_table_has_runner_id_column() {
+        // Pinned by Task 5.5 of the runner-install-and-spawn-reliability
+        // plan. The column carries the runner that owned the spawn so
+        // `finish_agent` can target it (and the version-mismatch gate
+        // there can consult it) rather than falling back to
+        // `pick_runner_for_org`, which can pick a runner that has no PTY
+        // for this agent.
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, runner_id) VALUES (?1, ?2, ?3, ?4)",
+            params!["a1", "/tmp", "running", "runner-abc"],
+        )
+        .unwrap();
+        let rid: Option<String> = conn
+            .query_row(
+                "SELECT runner_id FROM agents WHERE id = ?1",
+                params!["a1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rid.as_deref(), Some("runner-abc"));
+
+        // NULL when not provided (e.g. standalone-mode rows / legacy rows).
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status) VALUES (?1, ?2, ?3)",
+            params!["a2", "/tmp", "running"],
+        )
+        .unwrap();
+        let rid2: Option<String> = conn
+            .query_row(
+                "SELECT runner_id FROM agents WHERE id = ?1",
+                params!["a2"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rid2, None);
     }
 
     #[test]
