@@ -474,6 +474,110 @@ describe("RunnersPage", () => {
     expect(screen.queryByTestId("version-severity-chip")).toBeNull();
   });
 
+  // ── T4.3 Upgrade-available pill ─────────────────────────────────────
+
+  /// Acceptance criterion: a runner that reports `upgradeAvailable=true`
+  /// at green severity (patch-only drift) shows the auto-detected pill
+  /// + the Upgrade button. The severity chip is hidden in this slot
+  /// because the severity is green — no dispatch block to render.
+  it("renders upgrade-available pill on green severity when runner self-reports upgrade", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-patch",
+          name: "laptop",
+          status: "online",
+          version: "0.5.41",
+          versionSeverity: "green",
+          upgradeAvailable: true,
+        }),
+      ],
+      serverVersion: "0.5.42",
+    });
+    render(<RunnersPage />);
+    // The severity chip stays hidden; the upgrade pill takes its slot.
+    expect(screen.queryByTestId("version-severity-chip")).toBeNull();
+    const pill = screen.getByTestId("upgrade-available-pill");
+    expect(pill).toBeTruthy();
+    expect(pill.textContent).toMatch(/Upgrade available/);
+    expect(pill.textContent).toMatch(/0\.5\.42/);
+    const btn = screen.getByTestId("runner-upgrade-r-patch") as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(false);
+  });
+
+  /// The pill is gated on online status — an offline runner can't
+  /// upgrade itself (the wire message is outbox-backed but the runner
+  /// has no live WS to receive it on). Surface the pill but disable
+  /// the button so the operator sees the drift without a misleading
+  /// "queued" affordance.
+  it("upgrade-available pill button is disabled when runner is offline", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-offline",
+          name: "laptop",
+          status: "offline",
+          version: "0.5.41",
+          versionSeverity: "green",
+          upgradeAvailable: true,
+        }),
+      ],
+      serverVersion: "0.5.42",
+    });
+    render(<RunnersPage />);
+    const pill = screen.getByTestId("upgrade-available-pill");
+    expect(pill).toBeTruthy();
+    const btn = screen.getByTestId("runner-upgrade-r-offline") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  /// The pill is hidden on green severity when `upgradeAvailable` is
+  /// false or undefined — the dashboard does not invent a Upgrade
+  /// affordance from thin air. Pre-T4.3 server builds that don't ship
+  /// the field also fall through to "no pill".
+  it("upgrade-available pill is hidden on green severity without the flag", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-clean",
+          name: "laptop",
+          status: "online",
+          version: "0.5.42",
+          versionSeverity: "green",
+          upgradeAvailable: false,
+        }),
+      ],
+      serverVersion: "0.5.42",
+    });
+    render(<RunnersPage />);
+    expect(screen.queryByTestId("upgrade-available-pill")).toBeNull();
+    expect(screen.queryByTestId("version-severity-chip")).toBeNull();
+  });
+
+  /// When BOTH severity is amber/red AND `upgradeAvailable` is true,
+  /// the existing severity chip wins (it carries the dispatch-block
+  /// signal). The auto-detected pill is suppressed to avoid two
+  /// upgrade buttons in one row.
+  it("severity chip wins over upgrade-available pill on amber+upgrade-available", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-amber-upgrade",
+          name: "laptop",
+          status: "online",
+          version: "1.4.0",
+          versionSeverity: "amber",
+          upgradeAvailable: true,
+        }),
+      ],
+      serverVersion: "1.5.0",
+    });
+    render(<RunnersPage />);
+    expect(screen.getByTestId("version-severity-chip")).toBeTruthy();
+    expect(screen.queryByTestId("upgrade-available-pill")).toBeNull();
+  });
+
   // ── T4.1 Upgrade button ─────────────────────────────────────────────
 
   /// Acceptance criterion from the plan brief: "amber or red" severity

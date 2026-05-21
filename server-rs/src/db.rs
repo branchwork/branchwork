@@ -1228,6 +1228,21 @@ fn migrate(conn: &Connection) {
     )
     .ok();
 
+    // T4.3: runner-detected upgrade availability. Written by the
+    // `RunnerHello` handler from the wire `upgrade_available` field; the
+    // runner sets the local flag either after a `Resume` whose embedded
+    // `server_version` is higher than its own `CARGO_PKG_VERSION`, or
+    // after the periodic `install-runner.sh` poll (for offline-ish
+    // runners) discovers a newer binary on offer. Lets the dashboard
+    // light up the Upgrade pill without the operator having to spot
+    // drift manually. 0 = no upgrade, 1 = upgrade available. NOT NULL
+    // with default 0 so pre-T4.3 rows (and runners that don't send the
+    // field) stay quiet.
+    conn.execute_batch(
+        "ALTER TABLE runners ADD COLUMN upgrade_available INTEGER NOT NULL DEFAULT 0;",
+    )
+    .ok();
+
     // Per-plan runner affinity (T11.4). One row per pinned plan: presence
     // of the row + `runner_id` set means "this runner only"; absent row
     // means "any online runner" (the historic `pick_runner_for_org`

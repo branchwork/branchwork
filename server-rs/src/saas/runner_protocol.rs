@@ -72,6 +72,26 @@ pub enum WireMessage {
         /// the bad state.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server_bin: Option<ServerBinDiagnostic>,
+        /// T4.3: Runner-detected upgrade availability. Set on the runner
+        /// when either (a) the per-connect check after `Resume` sees the
+        /// server's reported version is higher than the runner's compiled
+        /// `CARGO_PKG_VERSION`, or (b) the periodic `install-runner.sh`
+        /// poll (for offline-ish runners that haven't received a recent
+        /// `Resume`) sees a newer binary on offer. The server persists
+        /// this on the `runners` row so the dashboard can render the
+        /// "Upgrade runner" pill + button without waiting for the
+        /// operator to spot drift manually.
+        ///
+        /// Distinct from `version_severity` (which gates dispatch): a
+        /// patch-only drift is `severity=green` (dispatch is safe) but
+        /// `upgrade_available=true` (operator should still update).
+        ///
+        /// `#[serde(default)]` defaults to `false` so older runners
+        /// without the field stay wire-compatible — they just never set
+        /// the flag, and the dashboard fall-through is the existing
+        /// server-side `version_severity` chip from T1.3.
+        #[serde(default, skip_serializing_if = "is_false")]
+        upgrade_available: bool,
     },
 
     /// An agent was spawned on the runner.
@@ -717,6 +737,15 @@ pub enum WireMessage {
     Resume {
         /// Last seq the sender successfully processed from this peer.
         last_seen_seq: u64,
+        /// T4.3: Server-side companion field — the dashboard server's own
+        /// `CARGO_PKG_VERSION`, filled in only when the SaaS server sends
+        /// `Resume` (runner→server `Resume` leaves it `None`). The runner
+        /// reads this on every reconnect and compares it against its own
+        /// compiled-in version to set `upgrade_available` on the next
+        /// `RunnerHello`. Optional so older servers (and the runner-side
+        /// resume direction) wire-compatibly omit the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_version: Option<String>,
     },
 }
 
@@ -1065,6 +1094,7 @@ mod tests {
                 }],
                 active_agents: vec![],
                 server_bin: None,
+                upgrade_available: false,
             },
         );
         let json = serde_json::to_string(&env).unwrap();
@@ -1233,6 +1263,7 @@ mod tests {
             server_bin: Some(ServerBinDiagnostic::Found {
                 path: "/usr/local/bin/branchwork-server".into(),
             }),
+            upgrade_available: false,
         };
         let env = Envelope::reliable("r1".into(), 1, msg);
         let json = serde_json::to_string(&env).unwrap();
@@ -1267,6 +1298,7 @@ mod tests {
                 searched: "branchwork-server".into(),
                 reason: "not on $PATH".into(),
             }),
+            upgrade_available: false,
         };
         let env = Envelope::reliable("r1".into(), 1, msg);
         let json = serde_json::to_string(&env).unwrap();
@@ -1298,6 +1330,7 @@ mod tests {
             drivers: vec![],
             active_agents: vec![],
             server_bin: None,
+            upgrade_available: false,
         };
         let env = Envelope::reliable("r1".into(), 1, msg);
         let json = serde_json::to_string(&env).unwrap();
@@ -1315,6 +1348,103 @@ mod tests {
                     server_bin, None,
                     "missing field must default to None for older runners"
                 );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_hello_upgrade_available_round_trip_and_omitted_when_false() {
+        // T4.3 pin: `upgrade_available` is the runner-side signal that drives
+        // the dashboard's auto-detected Upgrade pill. The default (false)
+        // must be omitted from the wire so older consumers (server builds
+        // pre-T4.3) don't trip on an unexpected field. `true` round-trips.
+        let off = WireMessage::RunnerHello {
+            hostname: "h".into(),
+            version: "0.5.0".into(),
+            drivers: vec![],
+            active_agents: vec![],
+            server_bin: None,
+            upgrade_available: false,
+        };
+        let off_json = serde_json::to_string(&Envelope::reliable("r".into(), 1, off)).unwrap();
+        assert!(
+            !off_json.contains("\"upgrade_available\""),
+            "upgrade_available=false must be skipped on the wire: {off_json}"
+        );
+
+        let on = WireMessage::RunnerHello {
+            hostname: "h".into(),
+            version: "0.3.0".into(),
+            drivers: vec![],
+            active_agents: vec![],
+            server_bin: None,
+            upgrade_available: true,
+        };
+        let on_json = serde_json::to_string(&Envelope::reliable("r".into(), 1, on)).unwrap();
+        assert!(
+            on_json.contains("\"upgrade_available\":true"),
+            "upgrade_available=true must be on the wire: {on_json}"
+        );
+        let back: Envelope = serde_json::from_str(&on_json).unwrap();
+        match back.message {
+            WireMessage::RunnerHello {
+                upgrade_available, ..
+            } => assert!(upgrade_available),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Older-runner JSON without the field must deserialise to false.
+        let old_json = r#"{"seq":1,"runner_id":"r","type":"runner_hello","hostname":"h","version":"0.5.0","drivers":[]}"#;
+        let back: Envelope = serde_json::from_str(old_json).unwrap();
+        match back.message {
+            WireMessage::RunnerHello {
+                upgrade_available, ..
+            } => assert!(!upgrade_available, "missing field must default to false"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_server_version_round_trip_and_omitted_when_none() {
+        // T4.3 pin: the server stamps its `CARGO_PKG_VERSION` on `Resume`
+        // so the runner can detect drift on every reconnect without a
+        // dedicated endpoint. The field is optional so:
+        //  - the runner→server direction (which leaves it None) does not
+        //    inject a stale value into the server-side resume code path,
+        //  - older servers (pre-T4.3) that omit the field stay
+        //    wire-compatible.
+        let with = WireMessage::Resume {
+            last_seen_seq: 42,
+            server_version: Some("0.5.42".into()),
+        };
+        let with_json = serde_json::to_string(&Envelope::best_effort("r".into(), with)).unwrap();
+        assert!(
+            with_json.contains("\"server_version\":\"0.5.42\""),
+            "server_version must serialise: {with_json}"
+        );
+
+        let without = WireMessage::Resume {
+            last_seen_seq: 7,
+            server_version: None,
+        };
+        let without_json =
+            serde_json::to_string(&Envelope::best_effort("r".into(), without)).unwrap();
+        assert!(
+            !without_json.contains("\"server_version\""),
+            "server_version=None must be skipped: {without_json}"
+        );
+
+        // Pre-T4.3 Resume frame without the field must deserialise.
+        let old_json = r#"{"runner_id":"r","type":"resume","last_seen_seq":99}"#;
+        let back: Envelope = serde_json::from_str(old_json).unwrap();
+        match back.message {
+            WireMessage::Resume {
+                last_seen_seq,
+                server_version,
+            } => {
+                assert_eq!(last_seen_seq, 99);
+                assert_eq!(server_version, None, "missing field must default to None");
             }
             other => panic!("unexpected variant: {other:?}"),
         }

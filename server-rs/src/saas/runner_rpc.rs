@@ -541,6 +541,7 @@ mod tests {
                 drivers: vec![],
                 active_agents: vec![],
                 server_bin: None,
+                upgrade_available: false,
             },
         );
         ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
@@ -622,6 +623,160 @@ mod tests {
             "disconnect-wake took {elapsed:?}, should be < 2s"
         );
 
+        server_handle.abort();
+    }
+
+    /// T4.3 acceptance pin: after the runner sends `RunnerHello`, the
+    /// server must reply with a `Resume` whose `server_version` is the
+    /// server's compile-time `CARGO_PKG_VERSION`. The server must also
+    /// persist `upgrade_available=true` from the Hello onto the
+    /// `runners.upgrade_available` column so the dashboard pill can
+    /// light up on the next /api/runners poll.
+    #[tokio::test]
+    async fn ws_handshake_stamps_server_version_on_resume_and_persists_upgrade_available() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::path::PathBuf;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::init(&tempdir.path().join("test.db"));
+        let user_id = "test-user-t43";
+        let token = "test-token-t43";
+        let org_id = "default-org";
+        let runner_id = "test-runner-t43";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                params![user_id, "t43@test", "x"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runner_tokens (token_hash, runner_name, org_id, created_by) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![token, "test-runner-t43", org_id, user_id],
+            )
+            .unwrap();
+        }
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/branchwork-test-t43"),
+            0,
+            true,
+        );
+        let runners = new_runner_registry();
+        let state = crate::state::AppState {
+            db: db.clone(),
+            plans_dir: PathBuf::from("/tmp"),
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners: runners.clone(),
+            settings_path: PathBuf::from("/tmp/branchwork-test-t43-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            started_at: std::time::Instant::now(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/ws/runner",
+                axum::routing::get(crate::saas::runner_ws::runner_ws_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/ws/runner?token={token}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect");
+        // Hello carries upgrade_available=true so we can confirm the
+        // server persists the flag through to the runners table.
+        let hello = Envelope::reliable(
+            runner_id.into(),
+            1,
+            WireMessage::RunnerHello {
+                hostname: "test-host".into(),
+                version: "0.3.0".into(),
+                drivers: vec![],
+                active_agents: vec![],
+                server_bin: None,
+                upgrade_available: true,
+            },
+        );
+        ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+            .await
+            .unwrap();
+
+        // Read incoming frames until we see the Resume — the server may
+        // also send Ack frames first.
+        let resume = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) => {
+                        let env: Envelope = serde_json::from_str(&t).expect("parse envelope");
+                        if let WireMessage::Resume {
+                            last_seen_seq,
+                            server_version,
+                        } = env.message
+                        {
+                            return (last_seen_seq, server_version);
+                        }
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => panic!("ws read error: {e}"),
+                    None => panic!("ws closed before Resume"),
+                }
+            }
+        })
+        .await
+        .expect("Resume did not arrive within 2s");
+        let expected = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            resume.1.as_deref(),
+            Some(expected),
+            "server must stamp its CARGO_PKG_VERSION on Resume; got {:?}",
+            resume.1
+        );
+
+        // Wait for the server to persist the Hello's upgrade_available
+        // flag (the handler writes inside the registry-update branch).
+        let mut attempts = 0;
+        let persisted = loop {
+            let v: Option<i64> = {
+                let conn = db.lock().unwrap();
+                conn.query_row(
+                    "SELECT upgrade_available FROM runners WHERE id = ?1",
+                    params![runner_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            };
+            if let Some(v) = v
+                && v != 0
+            {
+                break v;
+            }
+            attempts += 1;
+            if attempts > 200 {
+                panic!(
+                    "upgrade_available did not persist after RunnerHello (last observed value: {v:?})"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(persisted, 1, "upgrade_available must round-trip true");
+
+        drop(ws);
         server_handle.abort();
     }
 }

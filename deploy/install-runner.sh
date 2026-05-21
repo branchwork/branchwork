@@ -1,5 +1,15 @@
 #!/bin/sh
+# BRANCHWORK_SERVER_VERSION=__SERVER_VERSION__
 # Branchwork runner installer (idempotent).
+#
+# The line above is a sentinel parsed by the runner's periodic
+# version-drift poll (T4.3): the server substitutes its own
+# CARGO_PKG_VERSION for __SERVER_VERSION__ on every GET so a runner
+# that hasn't received a `Resume` recently can still discover the
+# version the dashboard would have it install. DO NOT rename or move
+# this line — `version_poll::SERVER_VERSION_MARKER` in
+# `server-rs/src/bin/branchwork_runner.rs` greps for the literal
+# prefix.
 #
 # Usage:
 #   curl -fsSL <SAAS_URL>/install-runner.sh | sh -s -- <TOKEN>

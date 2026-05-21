@@ -341,6 +341,9 @@ async fn handle_runner_ws(
                     );
 
                     // Send Resume with our last_seen_seq so the runner replays.
+                    // T4.3: also include the server's own CARGO_PKG_VERSION so the
+                    // runner can detect version drift per-connect without needing
+                    // a separate endpoint round-trip.
                     let last_seq = {
                         let conn = state.db.lock().unwrap();
                         outbox::init_seq_tracker(&conn);
@@ -350,6 +353,7 @@ async fn handle_runner_ws(
                         "server".into(),
                         WireMessage::Resume {
                             last_seen_seq: last_seq,
+                            server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                         },
                     );
                     let _ = cmd_tx.send(serde_json::to_string(&resume).unwrap_or_default());
@@ -526,6 +530,7 @@ async fn handle_runner_message(
             drivers,
             active_agents,
             server_bin,
+            upgrade_available,
         } => {
             let drivers_json = serde_json::to_string(drivers).ok();
 
@@ -548,18 +553,25 @@ async fn handle_runner_message(
                 };
 
             // Update runner metadata.
+            // T4.3: also persist `upgrade_available` (set by the runner's
+            // per-connect drift check or periodic `install-runner.sh`
+            // poll). Older runners without the field default to `false`
+            // — back-compat is symmetric since the dashboard already
+            // computes server-side `version_severity` from `version`.
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
                     "UPDATE runners SET hostname = ?1, version = ?2, drivers_json = ?3, \
-                                       server_bin_path = ?4, server_bin_error = ?5 \
-                     WHERE id = ?6",
+                                       server_bin_path = ?4, server_bin_error = ?5, \
+                                       upgrade_available = ?6 \
+                     WHERE id = ?7",
                     params![
                         hostname,
                         version,
                         drivers_json,
                         server_bin_path,
                         server_bin_error,
+                        *upgrade_available as i64,
                         runner_id
                     ],
                 )
@@ -981,8 +993,14 @@ async fn handle_runner_message(
             outbox::mark_server_acked(&conn, *ack_seq);
         }
 
-        WireMessage::Resume { last_seen_seq } => {
+        WireMessage::Resume {
+            last_seen_seq,
+            server_version: _,
+        } => {
             // Runner is asking us to replay commands from this seq.
+            // T4.3: the `server_version` field is only meaningful when the
+            // SERVER sends `Resume` (runner reads it to detect drift); the
+            // runner→server direction leaves it `None`.
             let pending = {
                 let conn = state.db.lock().unwrap();
                 outbox::replay_server_commands(&conn, runner_id, *last_seen_seq)
@@ -1349,7 +1367,8 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
                         drivers_json, outbox_depth, ws_reconnects_24h, \
                         ci_poll_ms_p50, ci_poll_ms_p99, last_health_at, \
                         orphans_reaped_24h, server_bin_path, server_bin_error, \
-                        COALESCE(version_mismatch_override, 0) \
+                        COALESCE(version_mismatch_override, 0), \
+                        COALESCE(upgrade_available, 0) \
                  FROM runners WHERE org_id = ?1 AND removed_at IS NULL \
                  ORDER BY last_seen_at DESC",
             )
@@ -1377,6 +1396,12 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
             // T1.3: operator-set override that lifts the version-mismatch
             // dispatch block. Defaults to 0 for pre-migration rows.
             let version_mismatch_override: bool = row.get::<_, i64>(16)? != 0;
+            // T4.3: runner-detected upgrade availability. Distinct from
+            // `versionSeverity` (which gates dispatch on amber/red); a
+            // patch-only drift is severity=green but upgrade_available=true,
+            // letting the dashboard offer the Upgrade button without
+            // blocking dispatch.
+            let upgrade_available: bool = row.get::<_, i64>(17)? != 0;
             Ok(serde_json::json!({
                 "id": row.get::<_, Option<String>>(0)?,
                 "name": row.get::<_, Option<String>>(1)?,
@@ -1403,6 +1428,7 @@ pub async fn list_runners(State(state): State<AppState>, user: crate::auth::Auth
                 // consult. Same data shape, different precision.
                 "versionSeverity": version_severity.as_str(),
                 "versionMismatchOverride": version_mismatch_override,
+                "upgradeAvailable": upgrade_available,
                 "serverVersion": server_version,
             }))
         })

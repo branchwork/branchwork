@@ -64,7 +64,7 @@ mod ci {
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -382,6 +382,357 @@ mod runner_health {
     }
 }
 
+/// T4.3: Periodic install-runner.sh poll for runners whose WS has been
+/// stuck flapping or who have been idle long enough that the live
+/// `Resume`-driven drift check never fired. Lives next to `runner_log`
+/// and `runner_health` because it follows the same pattern (background
+/// task spawned once at process start, low-frequency tick, mutates a
+/// shared atomic the next `RunnerHello` reads).
+mod version_poll {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// Sentinel string the dashboard server templates into
+    /// `install-runner.sh` (T4.3) at GET time. The runner greps for
+    /// this prefix and parses the trailing semver. Kept verbatim
+    /// between server-side template and runner-side parser; renaming
+    /// breaks the wire.
+    pub const SERVER_VERSION_MARKER: &str = "# BRANCHWORK_SERVER_VERSION=";
+
+    /// Env-var gate. Default ON because the poll is cheap (one HTTP GET
+    /// per tick, ~24h cadence by default) and the offline-ish case is
+    /// exactly what T4.3 is meant to cover. Set to "0" to fully
+    /// disable; any other value enables.
+    pub const ENABLE_ENV: &str = "BRANCHWORK_VERSION_POLL_ENABLED";
+
+    /// Env-var override for the freshness threshold (hours). Below this,
+    /// the live `Resume` signal is assumed sufficient and the poll
+    /// skips. Default 12 — matches the task brief's "N hours
+    /// (configurable, default 12)" knob.
+    pub const POLL_HOURS_ENV: &str = "BRANCHWORK_VERSION_POLL_HOURS";
+
+    /// Env-var override for the poll tick interval (seconds). Default
+    /// 3600s (1h) — the threshold check is the gate, so a 1h tick
+    /// just means "wake up hourly and decide whether to actually
+    /// fetch". Tests override this to drive the loop synchronously.
+    pub const TICK_SECS_ENV: &str = "BRANCHWORK_VERSION_POLL_TICK_SECS";
+
+    /// Decision-only helper, pure for testability: given the last
+    /// server-contact timestamp (Unix seconds, 0 = never) and the
+    /// freshness threshold in seconds, returns `true` when the runner
+    /// should fall back to the install-script poll.
+    pub fn should_poll(now_secs: u64, last_contact_secs: u64, threshold_secs: u64) -> bool {
+        // `last_contact_secs == 0` means we've never seen the server
+        // since process start. Trigger the poll so a freshly-launched
+        // runner with a broken WS still gets the signal.
+        if last_contact_secs == 0 {
+            return true;
+        }
+        now_secs.saturating_sub(last_contact_secs) >= threshold_secs
+    }
+
+    /// Pure version comparison: returns `true` when `candidate > current`
+    /// under lenient-semver rules (trim at first `-`/`+`, parse three
+    /// dot-separated u64s, missing parts default to 0).
+    pub fn version_is_newer(candidate: &str, current: &str) -> bool {
+        match (parse_semver(candidate), parse_semver(current)) {
+            (Some(cand), Some(curr)) => cand > curr,
+            _ => false,
+        }
+    }
+
+    /// Lenient semver parse: strips the first `-` or `+` suffix, splits
+    /// on `.`, defaults missing components to 0. `1.2.3-rc1` -> (1,2,3).
+    /// `1.2` -> (1,2,0). Returns None when no numeric components parse.
+    pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+        let s = s.trim();
+        let s = s.split_once('-').map(|(p, _)| p).unwrap_or(s);
+        let s = s.split_once('+').map(|(p, _)| p).unwrap_or(s);
+        let mut parts = s.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+        let major = parts.next()?;
+        let minor = parts.next().unwrap_or(0);
+        let patch = parts.next().unwrap_or(0);
+        Some((major, minor, patch))
+    }
+
+    /// Pure helper: scan an install-runner.sh body for the
+    /// `# BRANCHWORK_SERVER_VERSION=<semver>` marker and return the
+    /// semver string. Tolerant of leading/trailing whitespace and
+    /// optional quoting. Returns `None` when the marker is absent
+    /// (older server build that hasn't shipped the line yet).
+    pub fn parse_server_version_from_install_script(body: &str) -> Option<String> {
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix(SERVER_VERSION_MARKER) {
+                let rest = rest.trim();
+                let unquoted = rest
+                    .trim_start_matches(['"', '\''])
+                    .trim_end_matches(['"', '\'']);
+                if !unquoted.is_empty() {
+                    return Some(unquoted.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve `ws[s]://...` -> `http[s]://...` so the curl GET hits
+    /// the same server the WS connection went to. The runner's
+    /// `--saas-url` flag is documented as the WS URL (per `Cli::saas_url`
+    /// help), but the install-runner.sh endpoint is HTTP, so we
+    /// translate. Idempotent on bare `http[s]://` inputs.
+    pub fn http_url_from_saas(saas_url: &str) -> String {
+        let trimmed = saas_url.trim_end_matches('/');
+        if let Some(rest) = trimmed.strip_prefix("ws://") {
+            format!("http://{rest}")
+        } else if let Some(rest) = trimmed.strip_prefix("wss://") {
+            format!("https://{rest}")
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// Compose the install-runner.sh URL the periodic poll fetches.
+    pub fn install_script_url(saas_url: &str) -> String {
+        format!("{}/install-runner.sh", http_url_from_saas(saas_url))
+    }
+
+    /// Body of one poll tick: GET `install-runner.sh`, parse the server
+    /// version sentinel, compare against the runner's compiled
+    /// `CARGO_PKG_VERSION`. Sets `upgrade_available` accordingly. No-op
+    /// if the marker is absent (older server) or the fetch fails.
+    pub async fn run_one_poll(
+        saas_url: &str,
+        upgrade_available: &Arc<AtomicBool>,
+    ) -> Result<bool, String> {
+        let url = install_script_url(saas_url);
+        let body = fetch_install_script(&url).await?;
+        let Some(remote_version) = parse_server_version_from_install_script(&body) else {
+            return Ok(false);
+        };
+        let runner_version = env!("CARGO_PKG_VERSION");
+        let drift = version_is_newer(&remote_version, runner_version);
+        let prev = upgrade_available.swap(drift, Ordering::Relaxed);
+        Ok(drift != prev)
+    }
+
+    /// HTTP GET via the `reqwest`-free path: shell out to `curl` so we
+    /// don't pull an extra TLS stack into the runner binary just for
+    /// one polite poll. Returns the response body on success.
+    async fn fetch_install_script(url: &str) -> Result<String, String> {
+        let url = url.to_string();
+        tokio::task::spawn_blocking(move || {
+            let output = std::process::Command::new("curl")
+                .args([
+                    "-fsSL",
+                    "--max-time",
+                    "30",
+                    "--retry",
+                    "0",
+                    "--silent",
+                    &url,
+                ])
+                .output()
+                .map_err(|e| format!("curl spawn failed: {e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "curl {url} failed: exit={:?} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+    }
+
+    /// Background-task entry point. Spawned once at process start;
+    /// runs for the lifetime of the runner. Quietly drops if disabled.
+    pub fn spawn_version_poll_task(
+        saas_url: String,
+        upgrade_available: Arc<AtomicBool>,
+        last_server_contact_at: Arc<AtomicU64>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let enabled = std::env::var(ENABLE_ENV).map(|v| v != "0").unwrap_or(true);
+        if !enabled {
+            return None;
+        }
+        let threshold_hours: u64 = std::env::var(POLL_HOURS_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let tick_secs: u64 = std::env::var(TICK_SECS_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
+        let threshold_secs = threshold_hours.saturating_mul(3600);
+
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(tick_secs.max(1)));
+            // Skip the immediate-fire first tick so a freshly-launched
+            // runner doesn't race with the WS handshake; the live
+            // `Resume` path runs first and sets `last_server_contact_at`
+            // if reachable.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let last = last_server_contact_at.load(Ordering::Relaxed);
+                if !should_poll(now, last, threshold_secs) {
+                    continue;
+                }
+                match run_one_poll(&saas_url, &upgrade_available).await {
+                    Ok(changed) => {
+                        if changed {
+                            // The next RunnerHello reads the flag, so
+                            // by the time the WS comes back the
+                            // dashboard sees it. No fresh hello here
+                            // because the WS path is the cold-start
+                            // case for this branch.
+                            eprintln!(
+                                "[runner] version-poll: upgrade_available flipped to {} via install-runner.sh",
+                                upgrade_available.load(Ordering::Relaxed)
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[runner] version-poll: install-runner.sh fetch failed: {e}");
+                    }
+                }
+            }
+        }))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn should_poll_fires_on_zero_contact() {
+            assert!(should_poll(1_000_000, 0, 43_200));
+        }
+
+        #[test]
+        fn should_poll_fires_when_threshold_exceeded() {
+            // last contact 13h ago > 12h threshold
+            assert!(should_poll(1_000_000, 1_000_000 - 13 * 3600, 12 * 3600));
+        }
+
+        #[test]
+        fn should_poll_skips_under_threshold() {
+            // last contact 1h ago, 12h threshold => skip
+            assert!(!should_poll(1_000_000, 1_000_000 - 3600, 12 * 3600));
+        }
+
+        #[test]
+        fn version_is_newer_pre_release_drift() {
+            // The v0.3.0 → v0.5.x acceptance criterion.
+            assert!(version_is_newer("0.5.42", "0.3.0"));
+            assert!(!version_is_newer("0.5.0", "0.5.0"));
+            assert!(!version_is_newer("0.3.0", "0.5.42"));
+        }
+
+        #[test]
+        fn version_is_newer_handles_pre_release_suffix() {
+            // `0.5.0-rc1` and `0.5.0` are equal under lenient parse.
+            assert!(!version_is_newer("0.5.0-rc1", "0.5.0"));
+            assert!(version_is_newer("0.5.1-rc1", "0.5.0"));
+            assert!(version_is_newer("1.0.0", "0.5.99"));
+        }
+
+        #[test]
+        fn parse_marker_round_trip() {
+            let body = "#!/bin/sh\n# BRANCHWORK_SERVER_VERSION=0.5.42\necho hi";
+            assert_eq!(
+                parse_server_version_from_install_script(body).as_deref(),
+                Some("0.5.42")
+            );
+        }
+
+        #[test]
+        fn parse_marker_handles_quotes_and_indent() {
+            let body = "   # BRANCHWORK_SERVER_VERSION=\"0.5.42\"\n";
+            assert_eq!(
+                parse_server_version_from_install_script(body).as_deref(),
+                Some("0.5.42")
+            );
+        }
+
+        #[test]
+        fn parse_marker_returns_none_when_absent() {
+            let body = "#!/bin/sh\necho no marker here";
+            assert!(parse_server_version_from_install_script(body).is_none());
+        }
+
+        #[test]
+        fn http_url_from_saas_translates_ws_scheme() {
+            assert_eq!(
+                http_url_from_saas("wss://branchwork.dev"),
+                "https://branchwork.dev"
+            );
+            assert_eq!(
+                http_url_from_saas("ws://localhost:3100"),
+                "http://localhost:3100"
+            );
+            assert_eq!(
+                http_url_from_saas("https://example.com"),
+                "https://example.com"
+            );
+            assert_eq!(
+                http_url_from_saas("https://example.com/"),
+                "https://example.com"
+            );
+        }
+
+        #[test]
+        fn install_script_url_appends_path() {
+            assert_eq!(
+                install_script_url("wss://branchwork.dev"),
+                "https://branchwork.dev/install-runner.sh"
+            );
+            assert_eq!(
+                install_script_url("http://localhost:3100/"),
+                "http://localhost:3100/install-runner.sh"
+            );
+        }
+    }
+}
+
+/// Pure helper at crate root so the per-connect drift check in
+/// `handle_server_message` (Resume arm) can compare versions without
+/// importing the whole `version_poll` module surface. Same lenient
+/// semver semantics as `version_poll::version_is_newer`.
+fn version_is_newer(candidate: &str, current: &str) -> bool {
+    version_poll::version_is_newer(candidate, current)
+}
+
+/// T4.3: send a fresh `RunnerHello` mid-connection so the dashboard
+/// picks up an `upgrade_available` transition without waiting for the
+/// next WS reconnect. Uses the same channel + envelope shape as the
+/// initial Hello; the server's `RunnerHello` handler is idempotent
+/// (UPSERT-shape) so a duplicate is harmless. The `server_bin`
+/// diagnostic is read from `RunnerState` (stashed at startup) so the
+/// re-send preserves the column the dashboard chip relies on.
+async fn send_fresh_runner_hello(state: &Arc<RunnerState>) {
+    let drivers = collect_driver_auth();
+    let active_agents: Vec<String> = state.agents.lock().await.keys().cloned().collect();
+    let hello = WireMessage::RunnerHello {
+        hostname: hostname(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        drivers,
+        active_agents,
+        server_bin: Some(state.server_bin_diagnostic.clone()),
+        upgrade_available: state.upgrade_available.load(AtomicOrdering::Relaxed),
+    };
+    send_reliable(state, hello).await;
+}
+
 /// Print to stdout AND ship as `RunnerLogLine` (level=info). Mirrors the
 /// existing `[runner] ...` prefix convention; callers keep their format
 /// strings unchanged.
@@ -485,6 +836,36 @@ struct RunnerState {
     /// asked to drain. Shared via `Arc` so the main loop sees the same flag
     /// the message handler flips.
     shutdown_requested: Arc<AtomicBool>,
+    /// T4.3: runner-detected upgrade availability. Two paths feed this:
+    ///   (a) **Per-connect** — the `Resume` handler compares the
+    ///       server-side `CARGO_PKG_VERSION` (now stamped on the Resume
+    ///       wire frame) against `env!("CARGO_PKG_VERSION")`. Sets to
+    ///       `true` when the server is strictly newer.
+    ///   (b) **Periodic poll** — for runners that haven't seen the
+    ///       server in `BRANCHWORK_VERSION_POLL_HOURS` hours, a
+    ///       background task GETs `<saas-url>/install-runner.sh` and
+    ///       greps for the server version sentinel. Same comparison.
+    ///
+    /// Shipped on every `RunnerHello` (new field, default `false` for
+    /// older runners). Persisted across connect cycles via `Arc<AtomicBool>`
+    /// — the value survives WS flap so a transition detected on connect N
+    /// is reported on RunnerHello N+1 even if the flag was set just
+    /// before the disconnect.
+    upgrade_available: Arc<AtomicBool>,
+    /// T4.3: Unix-epoch seconds of the last successful interaction with
+    /// the SaaS server (currently bumped on every `Resume` reception).
+    /// The periodic poll task only fires when this is older than the
+    /// configured `BRANCHWORK_VERSION_POLL_HOURS` threshold — connected
+    /// runners use the live `Resume` signal exclusively. `0` means "no
+    /// contact yet" (poll fires on first tick).
+    last_server_contact_at: Arc<AtomicU64>,
+    /// T4.3: stashed copy of the server-bin self-diagnostic so a
+    /// mid-connection fresh `RunnerHello` (used to push an
+    /// `upgrade_available` transition without waiting for natural
+    /// reconnect) ships the same payload the initial Hello did.
+    /// Resolved once at startup; identical across reconnects so the
+    /// value is stable.
+    server_bin_diagnostic: runner_protocol::ServerBinDiagnostic,
 }
 
 struct AgentHandle {
@@ -671,6 +1052,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // `RunnerState` sees the same atomic.
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // T4.3: cross-connect runner state that the version-drift check writes
+    // and the next `RunnerHello` reads. Lives outside `connect_and_run`
+    // because the natural cycle is "Resume in connect N sets the flag,
+    // RunnerHello in connect N+1 ships it" — a per-connection state would
+    // lose the value across the disconnect.
+    let upgrade_available = Arc::new(AtomicBool::new(false));
+    let last_server_contact_at = Arc::new(AtomicU64::new(0));
+
+    // T4.3: spawn the periodic install-runner.sh poll (offline-ish runners
+    // that have not received a `Resume` in N hours). Runs for the lifetime
+    // of the runner process; cheap when the WS is alive because the
+    // freshness check trivially passes. The task quietly drops if the
+    // env-var gate is off.
+    let _version_poll_handle = version_poll::spawn_version_poll_task(
+        cli.saas_url.clone(),
+        upgrade_available.clone(),
+        last_server_contact_at.clone(),
+    );
+
     // Reconnect loop with exponential backoff.
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
@@ -690,6 +1090,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             server_bin_diagnostic.clone(),
             db.clone(),
             shutdown.clone(),
+            upgrade_available.clone(),
+            last_server_contact_at.clone(),
         )
         .await
         {
@@ -748,6 +1150,8 @@ async fn connect_and_run(
     server_bin_diagnostic: runner_protocol::ServerBinDiagnostic,
     db: Arc<Mutex<Connection>>,
     shutdown: Arc<AtomicBool>,
+    upgrade_available: Arc<AtomicBool>,
+    last_server_contact_at: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Connect via tokio-tungstenite.
     let (ws_stream, _response) = tokio_tungstenite::connect_async(ws_url).await?;
@@ -783,6 +1187,9 @@ async fn connect_and_run(
         plan_cwd: Arc::new(Mutex::new(HashMap::new())),
         ci_cache: Arc::new(Mutex::new(CiAggregateCache::default())),
         shutdown_requested: shutdown.clone(),
+        upgrade_available: upgrade_available.clone(),
+        last_server_contact_at: last_server_contact_at.clone(),
+        server_bin_diagnostic: server_bin_diagnostic.clone(),
     });
 
     // ── Reattach to surviving session daemons (Task 11.6) ────────────────
@@ -822,6 +1229,11 @@ async fn connect_and_run(
         // runner boot), so the dashboard chip reflects the runner's current
         // capability to spawn session daemons regardless of WS flap.
         server_bin: Some(server_bin_diagnostic.clone()),
+        // T4.3: ship the current upgrade-available flag (set on the
+        // previous cycle's `Resume` drift check OR by the periodic
+        // `install-runner.sh` poll). The dashboard lights up the
+        // Upgrade pill within one WS reconnect cycle.
+        upgrade_available: upgrade_available.load(AtomicOrdering::Relaxed),
     };
     send_reliable(&state, hello).await;
 
@@ -839,6 +1251,11 @@ async fn connect_and_run(
             runner_id.to_string(),
             WireMessage::Resume {
                 last_seen_seq: last_seq,
+                // Runner→server Resume direction does not carry a version.
+                // The server-side handler ignores the field; runners that
+                // populate it would mistakenly trigger their own peer's
+                // drift check (server has no drift to detect).
+                server_version: None,
             },
         );
         let _ = ws_tx.send(serde_json::to_string(&resume)?);
@@ -1554,7 +1971,10 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             }
         }
 
-        WireMessage::Resume { last_seen_seq } => {
+        WireMessage::Resume {
+            last_seen_seq,
+            server_version,
+        } => {
             // SaaS wants us to replay from this seq.
             let events = {
                 let conn = state.db.lock().await;
@@ -1566,6 +1986,47 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                     let _ = state
                         .ws_tx
                         .send(serde_json::to_string(&env).unwrap_or_default());
+                }
+            }
+
+            // T4.3 per-connect version drift check. The server stamps its
+            // `CARGO_PKG_VERSION` on Resume so the runner can flip its
+            // local `upgrade_available` flag without a separate endpoint
+            // round-trip. The flag is reported on the *next* RunnerHello
+            // (which the runner sends on every reconnect, so the
+            // dashboard sees it within one WS cycle ≈30 s). We also
+            // bump `last_server_contact_at` so the periodic poll
+            // fallback knows the WS is alive and skips fetching the
+            // install script.
+            state.last_server_contact_at.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                AtomicOrdering::Relaxed,
+            );
+            if let Some(sv) = server_version.as_deref() {
+                let runner_version = env!("CARGO_PKG_VERSION");
+                let drift = version_is_newer(sv, runner_version);
+                let prev = state
+                    .upgrade_available
+                    .swap(drift, AtomicOrdering::Relaxed);
+                if drift && !prev {
+                    log_info!(
+                        "[runner] upgrade-available: server={sv} > runner={runner_version} — will report on next RunnerHello"
+                    );
+                    // Snap-shot push: send an immediate fresh RunnerHello
+                    // with the flag set so the dashboard pill lights up
+                    // without waiting for the next reconnect.
+                    send_fresh_runner_hello(state).await;
+                } else if !drift && prev {
+                    // Server caught up to the runner (e.g. operator
+                    // rolled back). Clear the flag and push a refresh
+                    // so the dashboard pill turns off.
+                    log_info!(
+                        "[runner] upgrade-available cleared: server={sv} ≤ runner={runner_version}"
+                    );
+                    send_fresh_runner_hello(state).await;
                 }
             }
         }
@@ -4019,6 +4480,11 @@ mod tests {
             plan_cwd: Arc::new(Mutex::new(HashMap::new())),
             ci_cache: Arc::new(Mutex::new(CiAggregateCache::default())),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            upgrade_available: Arc::new(AtomicBool::new(false)),
+            last_server_contact_at: Arc::new(AtomicU64::new(0)),
+            server_bin_diagnostic: runner_protocol::ServerBinDiagnostic::Found {
+                path: "/usr/bin/true".into(),
+            },
         });
         (state, ws_rx)
     }
@@ -5682,5 +6148,123 @@ mod tests {
         // session) so the structured diagnostic surfaces independently
         // without changing the spawn-side error path.
         assert_eq!(res.spawn_target, PathBuf::from("branchwork-server"));
+    }
+
+    /// T4.3 pin: when the server sends `Resume { server_version }` where
+    /// the embedded version is strictly newer than the runner's
+    /// `CARGO_PKG_VERSION`, the runner flips `upgrade_available` to
+    /// `true` AND pushes a fresh `RunnerHello` so the dashboard pill
+    /// lights up without waiting for the next reconnect.
+    #[tokio::test]
+    async fn resume_with_newer_server_version_sets_flag_and_pushes_hello() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+
+        let envelope = Envelope::best_effort(
+            "server".into(),
+            WireMessage::Resume {
+                last_seen_seq: 0,
+                // Anything strictly larger than this build's CARGO_PKG_VERSION
+                // works; bump the major so the bound is unambiguous across
+                // future version bumps.
+                server_version: Some("99.0.0".into()),
+            },
+        );
+        handle_server_message(&state, &envelope).await;
+
+        // Per-connect drift detected → flag flipped on, AND a fresh
+        // RunnerHello was sent so the dashboard updates within one
+        // reconnect cycle.
+        assert!(
+            state.upgrade_available.load(AtomicOrdering::Relaxed),
+            "upgrade_available must be set after Resume with newer server_version"
+        );
+        let raw = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("expected fresh RunnerHello within 1s after Resume drift")
+            .expect("ws_tx channel closed");
+        let env: Envelope = serde_json::from_str(&raw).expect("hello parses");
+        match env.message {
+            WireMessage::RunnerHello {
+                upgrade_available, ..
+            } => assert!(
+                upgrade_available,
+                "fresh RunnerHello must carry upgrade_available=true"
+            ),
+            other => panic!("expected RunnerHello, got {other:?}"),
+        }
+    }
+
+    /// T4.3 pin: when the server sends `Resume` with NO `server_version`
+    /// (older server build) the runner must NOT flip the flag — silent
+    /// back-compat with pre-T4.3 servers.
+    #[tokio::test]
+    async fn resume_without_server_version_leaves_flag_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, mut rx) = make_test_state(dir.path().to_path_buf());
+
+        let envelope = Envelope::best_effort(
+            "server".into(),
+            WireMessage::Resume {
+                last_seen_seq: 0,
+                server_version: None,
+            },
+        );
+        handle_server_message(&state, &envelope).await;
+        assert!(
+            !state.upgrade_available.load(AtomicOrdering::Relaxed),
+            "missing server_version must not flip the flag"
+        );
+        // No fresh hello was pushed.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "no fresh RunnerHello should be pushed when server_version is absent"
+        );
+    }
+
+    /// T4.3 pin: `Resume` with `server_version` equal to or older than
+    /// the runner's own build is a no-op — the flag stays false and no
+    /// fresh hello fires. Guards against a buggy server claiming
+    /// downgrade and lighting up the operator's dashboard for nothing.
+    #[tokio::test]
+    async fn resume_with_same_or_older_server_version_is_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _rx) = make_test_state(dir.path().to_path_buf());
+
+        let envelope = Envelope::best_effort(
+            "server".into(),
+            WireMessage::Resume {
+                last_seen_seq: 0,
+                server_version: Some("0.0.0".into()),
+            },
+        );
+        handle_server_message(&state, &envelope).await;
+        assert!(!state.upgrade_available.load(AtomicOrdering::Relaxed));
+    }
+
+    /// T4.3 pin: `last_server_contact_at` is bumped on every Resume
+    /// reception so the periodic install-runner.sh poll knows to skip.
+    #[tokio::test]
+    async fn resume_bumps_last_server_contact_at() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _rx) = make_test_state(dir.path().to_path_buf());
+
+        assert_eq!(
+            state.last_server_contact_at.load(AtomicOrdering::Relaxed),
+            0
+        );
+        let envelope = Envelope::best_effort(
+            "server".into(),
+            WireMessage::Resume {
+                last_seen_seq: 0,
+                server_version: None,
+            },
+        );
+        handle_server_message(&state, &envelope).await;
+        let now = state.last_server_contact_at.load(AtomicOrdering::Relaxed);
+        assert!(now > 0, "last_server_contact_at must be set, got {now}");
     }
 }

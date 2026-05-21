@@ -919,7 +919,24 @@ export function VersionSeverityChip({ runner }: { runner: Runner }) {
   const [busy, setBusy] = useState(false);
   const [upgradeOpen, setUpgradeOpen] = useState(false);
   const severity = runner.versionSeverity;
-  if (!severity || severity === "green") return null;
+  // T4.3: when severity is green but the runner self-reported
+  // `upgradeAvailable` (auto-detected via the per-connect Resume drift
+  // check or the periodic `install-runner.sh` poll), render the
+  // upgrade-available pill in this chip's place. Same Upgrade button
+  // from T4.1, just lit up without the operator having to spot drift.
+  if (!severity || severity === "green") {
+    if (runner.upgradeAvailable === true) {
+      return (
+        <UpgradeAvailablePill
+          runner={runner}
+          upgradeRequestedAt={upgradeRequestedAt}
+          upgradeOpen={upgradeOpen}
+          setUpgradeOpen={setUpgradeOpen}
+        />
+      );
+    }
+    return null;
+  }
 
   const runnerVersion = runner.version ?? "?";
   const isRed = severity === "red";
@@ -1012,6 +1029,78 @@ export function VersionSeverityChip({ runner }: { runner: Runner }) {
       <span className="sr-only">
         Version severity {severity}; runner version {runnerVersion}
         {isOverridden ? "; operator override active" : ""}
+      </span>
+      <UpgradeRunnerModal
+        open={upgradeOpen}
+        runner={runner}
+        onClose={() => setUpgradeOpen(false)}
+      />
+    </div>
+  );
+}
+
+/// T4.3 auto-detected upgrade pill. Rendered in place of
+/// `VersionSeverityChip` when the runner is on a patch-level drift the
+/// classifier considers safe to dispatch (severity = green) but the
+/// runner has self-reported `upgradeAvailable=true` via either the
+/// per-connect `Resume.server_version` check or the periodic
+/// `install-runner.sh` poll. Surfaces a sky-toned pill + the same
+/// Upgrade button from T4.1 so the operator can swap binaries with one
+/// click instead of comparing version strings by eye.
+///
+/// Sits in the same DOM slot as the severity chip so the layout stays
+/// stable across drift states — the runner row never grows/shrinks.
+export function UpgradeAvailablePill({
+  runner,
+  upgradeRequestedAt,
+  upgradeOpen,
+  setUpgradeOpen,
+}: {
+  runner: Runner;
+  upgradeRequestedAt: number | null;
+  upgradeOpen: boolean;
+  setUpgradeOpen: (b: boolean) => void;
+}) {
+  const serverVersion = useRunnerStore((s) => s.serverVersion);
+  const isOnline = runner.status === "online";
+  const runnerVersion = runner.version ?? "?";
+  const targetVersion = serverVersion ?? "latest";
+  return (
+    <div className="mt-1 text-[11px]" data-testid="upgrade-available-pill">
+      <span className="inline-flex items-center gap-1 rounded border border-sky-700/50 bg-sky-900/30 px-2 py-0.5 text-sky-300">
+        <span aria-hidden="true">⬆</span>
+        <span className="font-mono break-all">
+          Upgrade available → v{targetVersion}
+        </span>
+      </span>
+      <Button
+        variant="primary"
+        size="sm"
+        onClick={() => setUpgradeOpen(true)}
+        disabled={!isOnline || upgradeRequestedAt !== null}
+        className="ml-2"
+        data-testid={`runner-upgrade-${runner.id}`}
+        title={
+          !isOnline
+            ? "Runner is offline — reconnect to upgrade"
+            : upgradeRequestedAt !== null
+              ? "Upgrade already in flight — waiting for the runner to restart"
+              : `Swap this runner's binaries from v${runnerVersion} to v${targetVersion}`
+        }
+      >
+        Upgrade runner
+      </Button>
+      {upgradeRequestedAt !== null && (
+        <span
+          className="ml-2 text-[11px] px-2 py-0.5 rounded border border-blue-700/50 bg-blue-900/30 text-blue-200"
+          data-testid={`runner-upgrade-requested-${runner.id}`}
+        >
+          Upgrade requested {formatRelative(new Date(upgradeRequestedAt).toISOString())}
+        </span>
+      )}
+      <span className="sr-only">
+        Upgrade available: runner version {runnerVersion} differs from server version{" "}
+        {targetVersion}.
       </span>
       <UpgradeRunnerModal
         open={upgradeOpen}

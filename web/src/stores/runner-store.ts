@@ -104,6 +104,17 @@ export interface Runner {
   /// the field; dashboard renders a neutral chip in that case rather
   /// than faking a green check.
   serverBin?: ServerBinStatus;
+  /// T4.3: runner-detected upgrade availability. Set by the runner via
+  /// (a) the per-connect `Resume.server_version` drift check, or (b) the
+  /// periodic `install-runner.sh` poll for offline-ish runners. Distinct
+  /// from `versionSeverity` (which gates dispatch) — a patch-only drift
+  /// is `severity=green` but `upgradeAvailable=true`, letting the
+  /// dashboard offer the Upgrade button without blocking dispatch.
+  ///
+  /// `undefined`/`false` ⇒ no upgrade signal; UI hides the
+  /// auto-detected pill (but the existing T1.3 severity chip still
+  /// renders independently on amber/red drift).
+  upgradeAvailable?: boolean;
 }
 
 /// Server-bin self-diagnostic shipped on `RunnerHello` and surfaced on

@@ -32,6 +32,21 @@ use super::runner_ws::sha256_hex;
 /// assert the substitution actually fires.
 pub const SAAS_URL_PLACEHOLDER: &str = "__SAAS_URL__";
 
+/// T4.3: Sentinel the install script template carries on a top-level
+/// comment line. The server substitutes `env!("CARGO_PKG_VERSION")` for
+/// it on every GET so the runner's periodic poll can grep for the
+/// server's currently-on-offer version without having to download a
+/// binary first.
+///
+/// Lives outside the install-script TEMPLATE replacement loop because
+/// the runner's parser greps for the literal prefix
+/// `# BRANCHWORK_SERVER_VERSION=` (defined in
+/// `bin/branchwork_runner.rs::version_poll::SERVER_VERSION_MARKER`) —
+/// the template carries the same prefix with `__SERVER_VERSION__`
+/// after the `=` sign so the runner sees the marker even before the
+/// substitution fires.
+pub const SERVER_VERSION_PLACEHOLDER: &str = "__SERVER_VERSION__";
+
 /// Embedded copy of `deploy/install-runner.sh`. Compiled in so the binary
 /// is self-contained — no on-disk asset path to worry about at runtime.
 const INSTALL_SCRIPT_TEMPLATE: &str = include_str!("../../../deploy/install-runner.sh");
@@ -95,8 +110,16 @@ pub fn resolve_public_url(
 
 /// Render the install script with the placeholder replaced by `saas_url`.
 /// Pure function so unit tests can drive it without a live server.
+///
+/// T4.3 also substitutes `__SERVER_VERSION__` with `env!("CARGO_PKG_VERSION")`
+/// so the runner's periodic poll can grep the script body for the
+/// server's currently-on-offer version sentinel
+/// (`# BRANCHWORK_SERVER_VERSION=<semver>`) without downloading any
+/// binaries first.
 pub fn render_install_script(template: &str, saas_url: &str) -> String {
-    template.replace(SAAS_URL_PLACEHOLDER, saas_url)
+    template
+        .replace(SAAS_URL_PLACEHOLDER, saas_url)
+        .replace(SERVER_VERSION_PLACEHOLDER, env!("CARGO_PKG_VERSION"))
 }
 
 /// Build the curl-pipe-sh command surfaced in the modal. Token is
@@ -274,6 +297,40 @@ mod tests {
         assert!(
             !rendered.contains(&format!("[ \"$SAAS_URL\" = \"{url}\" ]")),
             "rendered script must not compare $SAAS_URL to the substituted URL — that's the T5.22 bug"
+        );
+    }
+
+    #[test]
+    fn rendered_script_carries_server_version_sentinel() {
+        // T4.3 pin: the rendered script must contain the literal
+        // `# BRANCHWORK_SERVER_VERSION=<semver>` line so the runner's
+        // periodic poll can parse it. The semver must match the
+        // server-binary's compile-time CARGO_PKG_VERSION (we
+        // substitute `__SERVER_VERSION__` for `env!("CARGO_PKG_VERSION")`).
+        let rendered = render_install_script(INSTALL_SCRIPT_TEMPLATE, "https://example.com");
+        let expected_marker = format!("# BRANCHWORK_SERVER_VERSION={}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            rendered.contains(&expected_marker),
+            "rendered install-runner.sh must contain `{expected_marker}` so the runner's \
+             version-poll can grep it; got first 200 chars: {first}",
+            first = &rendered.chars().take(200).collect::<String>()
+        );
+        // The placeholder must be fully substituted — no `__SERVER_VERSION__`
+        // remains anywhere in the rendered output.
+        assert!(
+            !rendered.contains(SERVER_VERSION_PLACEHOLDER),
+            "render_install_script must replace every {SERVER_VERSION_PLACEHOLDER}"
+        );
+    }
+
+    #[test]
+    fn embedded_template_carries_server_version_placeholder() {
+        // Guards against the script being rewritten without the
+        // placeholder; the runner's periodic poll would then see a stale
+        // server-version string baked in at build time.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(SERVER_VERSION_PLACEHOLDER),
+            "install-runner.sh must embed {SERVER_VERSION_PLACEHOLDER} for the server to substitute"
         );
     }
 
