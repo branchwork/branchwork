@@ -426,10 +426,7 @@ interface RunnerStore {
   /// `versionSeverity` flips to green; until then the row stays where
   /// it was, so a no-op click against an already-up-to-date runner is
   /// silent (the install script exits 0 without restarting the unit).
-  upgradeRunner: (
-    runnerId: string,
-    body?: { reason?: string },
-  ) => Promise<RunnerUpgradeResponse>;
+  upgradeRunner: (runnerId: string, body?: { reason?: string }) => Promise<RunnerUpgradeResponse>;
   /// Stamp the time of the most recent `upgradeRunner` call so the row
   /// can render "Upgrade requested <Xm ago>" while the script is fetching
   /// + installing. Cleared when the runner reconnects with a fresh

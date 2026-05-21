@@ -913,9 +913,7 @@ export function VersionSeverityChip({ runner }: { runner: Runner }) {
   // T4.1: stamp set by `upgradeRunner`, cleared by `applyConnected` when
   // the runner reconnects with new binaries. Surfaces an inline
   // "Upgrade requested" label so a stuck button is obvious.
-  const upgradeRequestedAt = useRunnerStore(
-    (s) => s.upgradeRequestedAt[runner.id] ?? null,
-  );
+  const upgradeRequestedAt = useRunnerStore((s) => s.upgradeRequestedAt[runner.id] ?? null);
   const [busy, setBusy] = useState(false);
   const [upgradeOpen, setUpgradeOpen] = useState(false);
   const severity = runner.versionSeverity;
@@ -1069,9 +1067,7 @@ export function UpgradeAvailablePill({
     <div className="mt-1 text-[11px]" data-testid="upgrade-available-pill">
       <span className="inline-flex items-center gap-1 rounded border border-sky-700/50 bg-sky-900/30 px-2 py-0.5 text-sky-300">
         <span aria-hidden="true">⬆</span>
-        <span className="font-mono break-all">
-          Upgrade available → v{targetVersion}
-        </span>
+        <span className="font-mono break-all">Upgrade available → v{targetVersion}</span>
       </span>
       <Button
         variant="primary"
