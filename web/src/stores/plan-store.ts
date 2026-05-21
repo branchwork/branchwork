@@ -201,6 +201,32 @@ export interface AutoPushRebaseConflictState {
   fileCount: number;
 }
 
+/// Transient state for the `pre_merge_check_failed` banner (T1.3 of
+/// the `pre-merge-gate` plan). Driven by the `auto_mode_pre_merge_check_failed`
+/// WS event; the persistent half (the pause itself) lives in
+/// `planConfigs[plan].pausedReason === 'pre_merge_check_failed'`. The
+/// check name, exit code, and captured output snippet are
+/// broadcast-only (not persisted server-side beyond the audit row), so
+/// the banner falls back to a generic "see audit log" hint when the
+/// user reloads after the pause.
+export interface PreMergeCheckFailureState {
+  /// The `name` from the offending `[[auto_mode.pre_merge_checks]]`
+  /// table entry (or the synthetic `_gate_setup_` / `_total_timeout_`
+  /// sentinels for whole-gate failures).
+  checkName: string;
+  /// `null` when the gate killed the check on per-check timeout or
+  /// the process died from a signal — banner copy renders "killed by
+  /// timeout" in that case.
+  exitCode: number | null;
+  /// 4 KB middle-truncated capture of combined stdout+stderr. The
+  /// banner clips to the first 2 KB for display; the audit row carries
+  /// the same snippet verbatim.
+  outputSnippet: string;
+  /// The agent whose branch tripped the gate. Surfaced in the banner
+  /// so the operator can locate the agent row + inspect its branch.
+  agentId: string | null;
+}
+
 export type ToastKind = "info" | "error" | "success";
 
 /// Optional inline action attached to a toast. When `snapshotId` is set
@@ -309,6 +335,13 @@ interface PlanStore {
   /// only persists `paused_reason`); the banner shows a generic
   /// "see audit log" hint in that case.
   autoPushRebaseConflicts: Record<string, AutoPushRebaseConflictState | null>;
+  /// Per-plan transient state for the `pre_merge_check_failed` banner
+  /// (T1.3 of the `pre-merge-gate` plan). Driven by the
+  /// `auto_mode_pre_merge_check_failed` WS event; reset on resume.
+  /// Reload loses the snippet (server only persists `paused_reason`
+  /// + the audit row); the banner falls back to a "see audit log"
+  /// hint in that case.
+  preMergeCheckFailures: Record<string, PreMergeCheckFailureState | null>;
   /// Transient toast queue. Driven by ws-store on destructive
   /// operations (e.g. `plan_deleted` pushes an "Undo" toast). The
   /// renderer reads this slice; auto-dismiss is wired into `pushToast`
@@ -354,6 +387,11 @@ interface PlanStore {
   /// pause so the banner can render them. Passing `null` clears the
   /// slice — driven by `auto_mode_resumed` (user clicked Resume).
   setAutoPushRebaseConflict: (planName: string, state: AutoPushRebaseConflictState | null) => void;
+  /// Record the structured detail captured on a `pre_merge_check_failed`
+  /// pause (T1.3) so the banner can render the check name + exit
+  /// code + output snippet. Passing `null` clears the slice — driven
+  /// by `auto_mode_resumed` (user clicked Resume) and by `reset()`.
+  setPreMergeCheckFailure: (planName: string, state: PreMergeCheckFailureState | null) => void;
   pushToast: (toast: PushToastInput) => string;
   dismissToast: (id: string) => void;
   /// DELETE /api/plans/:name (with `?hard=true` when `opts.hard`).
@@ -402,6 +440,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   autoModeRuntimes: {},
   autoPushRebases: {},
   autoPushRebaseConflicts: {},
+  preMergeCheckFailures: {},
   toasts: [],
 
   fetchPlans: () => {
@@ -719,6 +758,18 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     });
   },
 
+  setPreMergeCheckFailure: (planName, state) => {
+    set((s) => {
+      const next = { ...s.preMergeCheckFailures };
+      if (state === null) {
+        delete next[planName];
+      } else {
+        next[planName] = state;
+      }
+      return { preMergeCheckFailures: next };
+    });
+  },
+
   pushToast: ({ id, kind, message, action, ttlMs }) => {
     const toastId = id ?? `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     set((s) => ({
@@ -770,6 +821,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       autoModeRuntimes: {},
       autoPushRebases: {},
       autoPushRebaseConflicts: {},
+      preMergeCheckFailures: {},
       toasts: [],
     });
   },

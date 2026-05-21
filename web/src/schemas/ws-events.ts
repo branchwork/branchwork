@@ -200,6 +200,28 @@ const AutoModeResumed = v.object({
   }),
 });
 
+/// Pre-merge gate (T1.3 of the `pre-merge-gate` plan): a configured
+/// `[auto_mode.pre_merge_checks]` entry exited non-zero (or the
+/// whole-gate ceiling fired) before the merge could land. Plan is
+/// paused with the literal `pausedReason = "pre_merge_check_failed"`
+/// concurrently; the auto-mode pill listener reads that via the
+/// PlanConfig snapshot. This event carries the structured detail the
+/// dashboard banner renders: which check tripped, its exit code, and a
+/// 4 KB middle-truncated snippet of the captured combined stdout+stderr.
+const AutoModePreMergeCheckFailed = v.object({
+  type: v.literal("auto_mode_pre_merge_check_failed"),
+  data: v.object({
+    plan: v.string(),
+    task: NullishStr,
+    agent_id: NullishStr,
+    check_name: v.string(),
+    /// `null` when the gate killed the check on per-check timeout or
+    /// when the process died from a signal (no exit code surface).
+    exit_code: v.nullish(v.number()),
+    output_snippet: v.string(),
+  }),
+});
+
 const PlanRunnerAffinityChanged = v.object({
   type: v.literal("plan_runner_affinity_changed"),
   data: v.object({
@@ -452,6 +474,7 @@ export const WsMessageSchema = v.variant("type", [
   AutoModeFixSpawned,
   AutoModePaused,
   AutoModeResumed,
+  AutoModePreMergeCheckFailed,
   TaskAdvanced,
   TaskChecked,
   PlanChecked,

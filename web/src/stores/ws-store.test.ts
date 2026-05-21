@@ -17,6 +17,7 @@ afterEach(() => {
     autoModeRuntimes: {},
     autoPushRebases: {},
     autoPushRebaseConflicts: {},
+    preMergeCheckFailures: {},
     toasts: [],
     plans: [],
     selectedPlan: null,
@@ -180,6 +181,62 @@ describe("ws-store handleWsMessage", () => {
       data: { plan: "p", last_completed_task: null },
     });
     expect(usePlanStore.getState().autoPushRebaseConflicts["p"]).toBeUndefined();
+  });
+
+  it("auto_mode_pre_merge_check_failed stashes the structured detail", () => {
+    handleWsMessage({
+      type: "auto_mode_pre_merge_check_failed",
+      data: {
+        plan: "p",
+        task: "0.1",
+        agent_id: "agent-xyz",
+        check_name: "cargo-clippy",
+        exit_code: 101,
+        output_snippet: "error[E0412]: cannot find type `Foo`",
+      },
+    });
+    expect(usePlanStore.getState().preMergeCheckFailures["p"]).toEqual({
+      checkName: "cargo-clippy",
+      exitCode: 101,
+      outputSnippet: "error[E0412]: cannot find type `Foo`",
+      agentId: "agent-xyz",
+    });
+  });
+
+  it("auto_mode_pre_merge_check_failed treats missing exit_code as null (timeout kill)", () => {
+    handleWsMessage({
+      type: "auto_mode_pre_merge_check_failed",
+      data: {
+        plan: "p",
+        task: "0.1",
+        agent_id: "agent-xyz",
+        check_name: "long-runner",
+        // exit_code omitted: server emits `null` when the gate killed
+        // the check on its per-check timeout.
+        output_snippet: "[killed by gate: exceeded per-check timeout of 5s]",
+      },
+    });
+    const failure = usePlanStore.getState().preMergeCheckFailures["p"];
+    expect(failure?.exitCode).toBeNull();
+    expect(failure?.outputSnippet).toMatch(/killed by gate/);
+  });
+
+  it("auto_mode_resumed clears the pre-merge-check-failed stash", () => {
+    usePlanStore.setState({
+      preMergeCheckFailures: {
+        p: {
+          checkName: "cargo-clippy",
+          exitCode: 1,
+          outputSnippet: "fail",
+          agentId: "agent-xyz",
+        },
+      },
+    });
+    handleWsMessage({
+      type: "auto_mode_resumed",
+      data: { plan: "p", last_completed_task: null },
+    });
+    expect(usePlanStore.getState().preMergeCheckFailures["p"]).toBeUndefined();
   });
 
   it("sets auto_finishing pill state on auto_finish_triggered", () => {

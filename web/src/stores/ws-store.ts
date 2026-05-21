@@ -526,6 +526,26 @@ function dispatch(msg: WsMessage) {
       planStore.patchPlanConfig(d.plan, { pausedReason: null });
       planStore.setAutoModeRuntime(d.plan, null);
       planStore.setAutoPushRebaseConflict(d.plan, null);
+      planStore.setPreMergeCheckFailure(d.plan, null);
+      break;
+    }
+    case "auto_mode_pre_merge_check_failed": {
+      // T1.3 of the pre-merge-gate plan: a configured `pre_merge_checks`
+      // entry tripped the gate. The accompanying `auto_mode_paused`
+      // event (fired by the same server-side block) is what patches
+      // `pausedReason` on the PlanConfig snapshot — this event carries
+      // the structured detail (check name, exit code, output snippet)
+      // for the banner. We stash it in transient state so the dashboard
+      // can render the offending check without a separate fetch.
+      // Reload loses the snippet (server only persists the audit row);
+      // the banner falls back to a "see audit log" hint in that case.
+      const d = msg.data;
+      planStore.setPreMergeCheckFailure(d.plan, {
+        checkName: d.check_name,
+        exitCode: d.exit_code ?? null,
+        outputSnippet: d.output_snippet,
+        agentId: d.agent_id ?? null,
+      });
       break;
     }
     case "plan_runner_affinity_changed": {

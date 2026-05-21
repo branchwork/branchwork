@@ -71,12 +71,15 @@ pub mod actions {
     /// so the audit log carries the operator intent.
     pub const AUTO_MODE_FLUSHED_DEFERRED: &str = "auto_mode.flushed_deferred";
     /// A pre-merge gate check failed (or the whole-gate ceiling fired)
-    /// before the merge could land. The plan is paused with reason
-    /// `pre_merge_gate_failed: <check.name>`; diff carries
-    /// `{plan, task, agent_id, check, exit_code, output}` so the
-    /// dashboard can render the offending output. Phase 1 of the
-    /// `pre-merge-gate` plan.
-    pub const AUTO_MODE_PRE_MERGE_GATE_FAILED: &str = "auto_mode.pre_merge_gate_failed";
+    /// before the merge could land. The plan is paused with the literal
+    /// reason `pre_merge_check_failed`; diff carries
+    /// `{plan, task, agent_id, check_name, exit_code, output_snippet}`
+    /// where `output_snippet` is the captured combined stdout+stderr
+    /// truncated to [`PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES`] so the dashboard
+    /// can render the offending output. Phase 1 of the `pre-merge-gate`
+    /// plan; the constant name follows the task spec verbatim (CHECK,
+    /// not GATE — T1.3 renamed from the placeholder T1.2 wired in).
+    pub const AUTO_MODE_PRE_MERGE_CHECK_FAILED: &str = "auto_mode.pre_merge_check_failed";
 }
 
 // ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
@@ -433,8 +436,10 @@ fn resolve_effective_cadence(state: &AppState, plan_name: &str) -> MergeCadence 
 //
 // The gate runs each configured `[auto_mode.pre_merge_checks]` entry in a
 // fresh detached-HEAD worktree at the agent's branch tip before any merge
-// happens. A failing check pauses auto-mode with reason
-// `pre_merge_gate_failed: <check.name>`; a passing (or absent) gate is a
+// happens. A failing check pauses auto-mode with the literal reason
+// `pre_merge_check_failed` (T1.3); the check name + truncated output
+// snippet travel via the `auto_mode_pre_merge_check_failed` broadcast
+// payload and the matching audit row. A passing (or absent) gate is a
 // no-op so plans without the section keep their pre-1.2 behaviour.
 //
 // Wired into [`run_state_machine`] between [`should_merge_now`] returning
@@ -444,15 +449,27 @@ fn resolve_effective_cadence(state: &AppState, plan_name: &str) -> MergeCadence 
 // drained siblings are not re-gated (the brief explicitly keeps Phase 1
 // minimal; per-sibling gates can land in a later phase).
 //
-// 50 KB output cap matches the brief verbatim. The middle-truncation
-// marker (`[…truncated…]`) means a long log keeps both its beginning
+// 50 KB cap inside the check runner (`PRE_MERGE_CHECK_OUTPUT_CAP_BYTES`)
+// keeps the in-memory `GateOutcome::Fail.output` bounded; the audit row
+// and broadcast carry a tighter 4 KB snippet
+// (`PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES`) so neither persisted SQLite rows
+// nor the dashboard live feed balloon. The middle-truncation marker
+// (`[…truncated…]`) means a long log keeps both its beginning
 // (compile target / setup banner) and end (actual error) — the most
 // useful slices for triage.
 
 /// Maximum captured bytes per check output. Anything longer is collapsed
-/// to `<first half> [...truncated...] <last half>` so the audit row and
-/// dashboard payload stay bounded.
+/// to `<first half> [...truncated...] <last half>` so the in-memory
+/// `GateOutcome::Fail.output` stays bounded while the check is running.
 pub(crate) const PRE_MERGE_CHECK_OUTPUT_CAP_BYTES: usize = 50 * 1024;
+
+/// Cap on the `output_snippet` field carried by the audit row + the
+/// `auto_mode_pre_merge_check_failed` broadcast (T1.3 of the
+/// `pre-merge-gate` plan). Tighter than [`PRE_MERGE_CHECK_OUTPUT_CAP_BYTES`]
+/// because the audit row is persisted forever and the broadcast crosses
+/// the WS wire — 4 KB is enough context for triage; the operator
+/// reproduces locally for the full log.
+pub(crate) const PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES: usize = 4 * 1024;
 
 /// Marker inserted in the middle of a truncated capture.
 pub(crate) const PRE_MERGE_TRUNCATION_MARKER: &str = "\n[…truncated…]\n";
@@ -1375,6 +1392,19 @@ async fn run_state_machine(
     plan_name: &str,
     task_id: &str,
 ) {
+    // Defense-in-depth idempotency (T1.3): if the plan is already
+    // paused, bail out before doing any work. `on_task_agent_completed`
+    // already runs the same `db::auto_mode_enabled` check at the entry
+    // edge of the auto-mode flow, but a direct caller of
+    // `run_state_machine` (or a re-fired completion event for the same
+    // agent) must not re-run the pre-merge gate, re-pause the row,
+    // re-emit broadcasts, or write a duplicate audit row. The brief
+    // pins this explicitly: "subsequent calls to `run_state_machine`
+    // for the same task short-circuit — no infinite re-run."
+    if !db::auto_mode_enabled(&state.db, plan_name) {
+        return;
+    }
+
     let cadence = resolve_effective_cadence(state, plan_name);
 
     // Cadence gate: if we're not at the boundary, defer and bail.
@@ -1421,30 +1451,47 @@ async fn run_state_machine(
             exit_code,
             output,
         } => {
-            // Pause the plan with a structured reason so the dashboard
-            // banner can render the offending check name + output. The
-            // dirty-tree-watcher / runner-offline-style auto-resume
-            // paths intentionally do NOT cover this — fixing a failing
-            // build requires a human in the loop.
-            let reason = format!("pre_merge_gate_failed: {check}");
-            db::auto_mode_pause(&state.db, plan_name, &reason, None);
+            // T1.3 of the pre-merge-gate plan: pause the plan with the
+            // literal reason `pre_merge_check_failed` (no check name
+            // appended — the check name travels in the audit/broadcast
+            // payload, the reason is the kind of pause). The agent's
+            // work is still on its branch; the block is at the merge
+            // gate, not the work. We intentionally do NOT touch
+            // `agents.merge_status` here — a deferred-for-cadence row
+            // stays deferred so the sibling can drain after the
+            // operator clicks Resume. The dirty-tree-watcher /
+            // runner-offline-style auto-resume paths intentionally do
+            // NOT cover this — fixing a failing build requires a
+            // human in the loop.
+            let reason = "pre_merge_check_failed";
+            db::auto_mode_pause(&state.db, plan_name, reason, None);
+
+            // Truncate the captured output to a tight per-row cap for
+            // both the audit row (persisted forever) and the WS
+            // broadcast (crosses the wire). The full 50 KB capture
+            // lives in `GateOutcome::Fail.output` and is dropped on
+            // the floor when this function returns — operator
+            // reproduces locally for the unabridged log.
+            let output_snippet = truncate_output(&output, PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES);
 
             let payload = serde_json::json!({
                 "plan": plan_name,
                 "task": task_id,
                 "agent_id": agent_id,
-                "check": check,
+                "check_name": check,
                 "exit_code": exit_code,
-                "output": output,
+                "output_snippet": output_snippet,
             });
             broadcast_event(
                 &state.broadcast_tx,
-                "auto_mode_pre_merge_gate_failed",
+                "auto_mode_pre_merge_check_failed",
                 payload.clone(),
             );
             // Also surface a paused pill so the existing AutoModeStatusPill
-            // path catches it (the gate-failed event is new wire — the
-            // pill listener is already wired to auto_mode_paused).
+            // path catches it (the new event is structured detail — the
+            // pill listener is already wired to auto_mode_paused, and
+            // the dashboard banner reads `pausedReason` from the
+            // PlanConfig snapshot loaded via GET /api/plans/<name>/config).
             broadcast_event(
                 &state.broadcast_tx,
                 "auto_mode_paused",
@@ -1461,7 +1508,7 @@ async fn run_state_machine(
                     org_id,
                     None,
                     Some("branchwork-auto-mode"),
-                    actions::AUTO_MODE_PRE_MERGE_GATE_FAILED,
+                    actions::AUTO_MODE_PRE_MERGE_CHECK_FAILED,
                     audit::resources::PLAN,
                     Some(plan_name),
                     Some(&payload.to_string()),
@@ -8305,9 +8352,12 @@ mod tests {
         );
     }
 
-    /// A failing gate inside `run_state_machine` must pause the plan,
-    /// audit the failure, broadcast `auto_mode_pre_merge_gate_failed`,
-    /// and SKIP the merge step entirely.
+    /// A failing gate inside `run_state_machine` must pause the plan
+    /// with the literal reason `pre_merge_check_failed`, audit the
+    /// failure as `AUTO_MODE_PRE_MERGE_CHECK_FAILED`, broadcast
+    /// `auto_mode_pre_merge_check_failed` with the canonical payload,
+    /// and SKIP the merge step entirely. T1.3 of the pre-merge-gate
+    /// plan: name + payload shape is the user-visible contract.
     #[tokio::test]
     async fn run_state_machine_pauses_when_pre_merge_gate_fails() {
         let (db, dir) = fresh_db();
@@ -8339,15 +8389,12 @@ mod tests {
 
         run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
 
-        // Plan must be paused with the structured reason.
+        // Plan must be paused with the literal T1.3 reason — the check
+        // name lives in the payload, not the reason.
         let reason = paused_reason(&db, "p").expect("plan should be paused after gate failure");
-        assert!(
-            reason.starts_with("pre_merge_gate_failed:"),
-            "paused_reason should carry gate failure; got {reason:?}"
-        );
-        assert!(
-            reason.contains("always-fails"),
-            "paused_reason should include check name; got {reason:?}"
+        assert_eq!(
+            reason, "pre_merge_check_failed",
+            "paused_reason should be the literal T1.3 sentinel; got {reason:?}"
         );
 
         // Merge must NOT have run — master unchanged.
@@ -8357,30 +8404,59 @@ mod tests {
             "merge must be skipped when gate fails"
         );
 
-        // Audit row landed.
-        let actions = {
+        // Audit row landed with the new constant.
+        let (actions, diffs): (Vec<String>, Vec<Option<String>>) = {
             let conn = db.lock().unwrap();
             let mut stmt = conn
-                .prepare("SELECT action FROM audit_logs WHERE resource_id = ?1 ORDER BY id")
+                .prepare("SELECT action, diff FROM audit_logs WHERE resource_id = ?1 ORDER BY id")
                 .unwrap();
-            stmt.query_map(params!["p"], |row| row.get::<_, String>(0))
+            let rows: Vec<(String, Option<String>)> = stmt
+                .query_map(params!["p"], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
                 .unwrap()
                 .filter_map(Result::ok)
-                .collect::<Vec<_>>()
+                .collect();
+            rows.into_iter().unzip()
         };
+        let idx = actions
+            .iter()
+            .position(|a| a == actions::AUTO_MODE_PRE_MERGE_CHECK_FAILED)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected {} in {actions:?}",
+                    actions::AUTO_MODE_PRE_MERGE_CHECK_FAILED
+                )
+            });
+
+        // Audit diff carries the T1.3 payload shape verbatim.
+        let diff_str = diffs[idx].as_ref().expect("audit row must carry a diff");
+        let diff: serde_json::Value = serde_json::from_str(diff_str).expect("diff must be JSON");
+        assert_eq!(diff["plan"], "p");
+        assert_eq!(diff["task"], "0.1");
+        assert_eq!(diff["agent_id"], agent_id);
+        assert_eq!(diff["check_name"], "always-fails");
+        // exit_code can be a positive int or null (signal); just assert presence.
+        assert!(diff.get("exit_code").is_some());
+        let snippet = diff["output_snippet"]
+            .as_str()
+            .expect("output_snippet must be a string");
         assert!(
-            actions
-                .iter()
-                .any(|a| a == actions::AUTO_MODE_PRE_MERGE_GATE_FAILED),
-            "expected {} in {actions:?}",
-            actions::AUTO_MODE_PRE_MERGE_GATE_FAILED
+            snippet.contains("broken"),
+            "snippet should carry captured output; got {snippet:?}"
+        );
+        assert!(
+            snippet.len() <= PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES + PRE_MERGE_TRUNCATION_MARKER.len(),
+            "snippet must be capped at {}; got {}",
+            PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES,
+            snippet.len()
         );
 
-        // Broadcast event landed.
+        // Broadcast event landed with the new name.
         let events = drain_event_types(&mut rx);
         assert!(
-            events.contains(&"auto_mode_pre_merge_gate_failed".to_string()),
-            "expected auto_mode_pre_merge_gate_failed in {events:?}"
+            events.contains(&"auto_mode_pre_merge_check_failed".to_string()),
+            "expected auto_mode_pre_merge_check_failed in {events:?}"
         );
         // The merging pill is suppressed on a gate fail (we never enter
         // the merging state), so `auto_mode_merged` must NOT have fired.
@@ -8394,6 +8470,211 @@ mod tests {
             !expected_path.exists(),
             "worktree {} should be removed on gate failure",
             expected_path.display()
+        );
+    }
+
+    /// T1.3 acceptance criterion: a second call to `run_state_machine`
+    /// for the same task on an already-paused plan must short-circuit
+    /// — no second pre-merge gate run, no duplicate audit row, no
+    /// duplicate broadcast. The first call paused the plan; the second
+    /// must observe that state and bail at the top.
+    #[tokio::test]
+    async fn run_state_machine_short_circuits_after_gate_failure_pauses_plan() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               { name = \"always-fails\", cmd = \"echo broken && false\", timeout_secs = 5 },\n\
+             ]\n",
+        );
+
+        let agent_id = "agent-short-circuit";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        let expected_path = std::path::PathBuf::from(format!("/tmp/bw-gate-{agent_id}"));
+        let _ = std::fs::remove_dir_all(&expected_path);
+
+        // First call: gate fails, plan pauses, audit + broadcast land.
+        run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
+        let events_after_first = drain_event_types(&mut rx);
+        assert!(
+            events_after_first.contains(&"auto_mode_pre_merge_check_failed".to_string()),
+            "first call should fire auto_mode_pre_merge_check_failed; got {events_after_first:?}"
+        );
+        let first_audit_count = audit_actions_for(&db, "p")
+            .iter()
+            .filter(|a| *a == actions::AUTO_MODE_PRE_MERGE_CHECK_FAILED)
+            .count();
+        assert_eq!(
+            first_audit_count, 1,
+            "first call should land exactly one audit row"
+        );
+
+        // Second call: plan is paused, must short-circuit. No new gate
+        // run (worktree wouldn't be re-created), no new audit row, no
+        // new broadcast.
+        run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
+        let events_after_second = drain_event_types(&mut rx);
+        assert!(
+            !events_after_second.contains(&"auto_mode_pre_merge_check_failed".to_string()),
+            "second call must NOT re-fire the gate event; got {events_after_second:?}"
+        );
+        assert!(
+            !events_after_second.contains(&"auto_mode_paused".to_string()),
+            "second call must NOT re-broadcast paused; got {events_after_second:?}"
+        );
+        let second_audit_count = audit_actions_for(&db, "p")
+            .iter()
+            .filter(|a| *a == actions::AUTO_MODE_PRE_MERGE_CHECK_FAILED)
+            .count();
+        assert_eq!(
+            second_audit_count, 1,
+            "second call must not write a duplicate audit row; got {second_audit_count}"
+        );
+
+        // Worktree from the FIRST call is still cleaned up; second call
+        // shouldn't have created a new one either.
+        assert!(
+            !expected_path.exists(),
+            "no worktree should linger after second call"
+        );
+    }
+
+    /// T1.3 acceptance criterion: after a gate failure, the
+    /// `plan_auto_mode` row carries the literal `pre_merge_check_failed`
+    /// reason AND a non-NULL `paused_at` timestamp. This is the same
+    /// shape the unified `/api/plans/<name>/config` endpoint reads via
+    /// `read_plan_config` — verifying the DB write means the API
+    /// response is correct too (the config handler is a thin SELECT
+    /// wrapper, exercised by `tests/plan_config.rs` integration tests).
+    #[tokio::test]
+    async fn pre_merge_check_failed_pause_state_matches_config_contract() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               { name = \"always-fails\", cmd = \"false\", timeout_secs = 5 },\n\
+             ]\n",
+        );
+
+        let agent_id = "agent-config-state";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
+
+        // Verify the `plan_auto_mode` row carries the T1.3 shape end-to-end.
+        let (paused_reason, paused_at): (Option<String>, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT paused_reason, paused_at FROM plan_auto_mode WHERE plan_name = ?1",
+                params!["p"],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            paused_reason.as_deref(),
+            Some("pre_merge_check_failed"),
+            "paused_reason should be the literal T1.3 sentinel"
+        );
+        assert!(
+            paused_at.is_some(),
+            "paused_at must be set when the plan is paused"
+        );
+
+        // Also verify `db::auto_mode_config` (the helper read by
+        // `read_plan_config` -> GET /api/plans/<name>/config) returns
+        // the same shape, so the dashboard banner sees the pause.
+        let cfg = crate::db::auto_mode_config(&db, "p");
+        assert_eq!(cfg.paused_reason.as_deref(), Some("pre_merge_check_failed"));
+        // `enabled = 1` is preserved across the pause (auto-mode is the
+        // user opt-in; the pause is loop self-state).
+        assert!(
+            cfg.enabled,
+            "auto_mode.enabled must survive the pause; resume re-engages without re-toggling"
+        );
+    }
+
+    /// T1.3 acceptance criterion: the agent's `merge_status` survives
+    /// the gate failure unchanged. The agent's work is still on its
+    /// branch; the block is at the merge gate, not the work. A
+    /// `deferred_for_cadence` row stays deferred so the operator can
+    /// click Resume after fixing the offending check and the sibling
+    /// drains as planned. A NULL `merge_status` (the trigger agent on
+    /// a phase boundary) stays NULL.
+    #[tokio::test]
+    async fn pre_merge_check_failed_does_not_touch_merge_status() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               { name = \"always-fails\", cmd = \"false\", timeout_secs = 5 },\n\
+             ]\n",
+        );
+
+        let agent_id = "agent-merge-status";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        // Pretend a prior cadence tick stashed this agent as
+        // deferred_for_cadence; the gate failure must not flip it.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET merge_status = 'deferred_for_cadence' WHERE id = ?1",
+                params![agent_id],
+            )
+            .unwrap();
+        }
+        enable_auto_mode(&db, "p");
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
+
+        // `merge_status` must still be `deferred_for_cadence` — the
+        // gate failed at the merge boundary, the agent's commit on its
+        // branch is unaffected.
+        let merge_status: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT merge_status FROM agents WHERE id = ?1",
+                params![agent_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            merge_status.as_deref(),
+            Some("deferred_for_cadence"),
+            "gate failure must NOT clear merge_status; agent's work stays on its branch"
         );
     }
 }

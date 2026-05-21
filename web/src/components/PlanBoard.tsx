@@ -356,6 +356,7 @@ export function PlanBoard() {
       <UncommittedWorkBanner planName={plan.name} />
       <RunnerOfflineBanner planName={plan.name} />
       <AutoPushRebaseConflictBanner planName={plan.name} />
+      <PreMergeCheckFailedBanner planName={plan.name} />
       <BlockingWorkflowStalledBanner planName={plan.name} />
       <DeferredMergesBanner planName={plan.name} />
 
@@ -1513,6 +1514,93 @@ export function AutoPushRebaseConflictBanner({ planName }: { planName: string })
   );
 }
 
+/// Plan-pause banner for `pre_merge_check_failed` (T1.3 of the
+/// `pre-merge-gate` plan). Renders only when the persistent half
+/// (`planConfigs[plan].pausedReason === "pre_merge_check_failed"`)
+/// matches; the transient detail (check name, exit code, output
+/// snippet) comes from the `preMergeCheckFailures` slice, populated by
+/// the `auto_mode_pre_merge_check_failed` WS handler.
+///
+/// Detail is broadcast-only — the server persists the audit row + the
+/// `paused_reason` column, but NOT the snippet column. A reload after
+/// the pause renders the banner with a generic "see Activity log"
+/// hint. Resume is wired through the existing `AutoModeStatusPill`
+/// (PUT `pausedReason: null` on `/api/plans/:name/config`).
+///
+/// The captured output is middle-truncated to 4 KB upstream
+/// (`PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES`); the banner additionally
+/// clips to the first ~2 KB so a long snippet does not push the rest
+/// of the plan board off-screen. Operator reads the full audit row
+/// (or reruns the check locally) for the unabridged log.
+export function PreMergeCheckFailedBanner({ planName }: { planName: string }) {
+  const config = usePlanStore((s) => s.planConfigs[planName] ?? null);
+  const failure = usePlanStore((s) => s.preMergeCheckFailures[planName] ?? null);
+
+  if (config?.pausedReason !== "pre_merge_check_failed") return null;
+
+  const checkName = failure?.checkName ?? null;
+  const exitCode = failure?.exitCode ?? null;
+  const snippet = failure?.outputSnippet ?? null;
+  // Banner-side clip: the WS payload already caps at 4 KB but we
+  // render only the first 2 KB so a long capture doesn't dominate
+  // the plan board. Trim to a char boundary safe-enough for ASCII
+  // build output (the upstream truncate_output preserves char
+  // boundaries, and we further clip from the front so we never
+  // split a multi-byte sequence introduced by the marker).
+  const BANNER_SNIPPET_CAP = 2 * 1024;
+  const clippedSnippet =
+    snippet && snippet.length > BANNER_SNIPPET_CAP
+      ? `${snippet.slice(0, BANNER_SNIPPET_CAP)}\n[…truncated for banner — see Activity log…]`
+      : snippet;
+
+  return (
+    <div
+      role="alert"
+      data-testid="pre-merge-check-failed-banner"
+      className="mb-4 flex items-start gap-3 rounded border border-red-700/50 bg-red-900/20 px-4 py-3 text-sm"
+    >
+      <span
+        aria-hidden="true"
+        className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-red-700/60 text-xs font-bold text-red-100"
+      >
+        !
+      </span>
+      <div className="flex-1 text-red-100">
+        <div className="font-medium">
+          {checkName ? (
+            <>
+              Pre-merge check failed: <span className="font-mono">{checkName}</span>
+              {exitCode != null ? (
+                <>
+                  {" "}
+                  (exit <span className="font-mono">{exitCode}</span>)
+                </>
+              ) : exitCode === null && failure ? (
+                <> (killed by timeout)</>
+              ) : null}
+              .
+            </>
+          ) : (
+            <>Pre-merge check failed.</>
+          )}
+        </div>
+        {clippedSnippet ? (
+          <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded bg-red-950/50 px-3 py-2 font-mono text-xs text-red-200/90">
+            {clippedSnippet}
+          </pre>
+        ) : (
+          <div className="mt-1 text-red-200/90">
+            Output snippet not in memory (reload?) — see the Activity log for the captured stderr.
+          </div>
+        )}
+        <div className="mt-2 text-red-200/80">
+          Fix the branch and click <span className="font-medium">Resume</span> to re-run the gate.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /// Compact split-button chip that lives in the plan title bar alongside
 /// `AutoModeStatusPill` and `AutoPushRebasedPill`. Mirrors the gating
 /// logic of `DeferredMergesBanner` (Task 2.3) — both surfaces drain to
@@ -1982,6 +2070,7 @@ function humanPauseReason(reason: string): string {
   if (reason === "runner_offline") return "runner offline";
   if (reason === "agent_left_uncommitted_work") return "uncommitted work";
   if (reason === "auto_push_rebase_conflict") return "push rebase conflict";
+  if (reason === "pre_merge_check_failed") return "pre-merge check failed";
   if (reason.startsWith("merge_failed")) return "merge failed";
   if (reason.startsWith("fix_merge_failed")) return "fix merge failed";
   if (reason.startsWith("fix_spawn_failed")) return "fix spawn failed";
