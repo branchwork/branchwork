@@ -303,6 +303,11 @@ async fn handle_runner_ws(
                     *id_guard = Some(rid.clone());
 
                     // Update runner status in DB.
+                    //
+                    // T5.1: `WHERE removed_at IS NULL` on the conflict-resolution
+                    // UPDATE so a soft-deleted runner whose token somehow validated
+                    // (e.g. a token-DELETE race) cannot revive its row. Fresh
+                    // inserts skip the WHERE because the INSERT itself runs.
                     {
                         let conn = state.db.lock().unwrap();
                         conn.execute(
@@ -311,10 +316,32 @@ async fn handle_runner_ws(
                              ON CONFLICT(id) DO UPDATE SET
                                status = 'online',
                                last_seen_at = datetime('now'),
-                               name = excluded.name",
+                               name = excluded.name
+                             WHERE removed_at IS NULL",
                             params![rid, runner_name, org_id],
                         )
                         .ok();
+                    }
+
+                    // T5.1: defense-in-depth — if the runners row exists with
+                    // `removed_at` set (revoked while a stale token still
+                    // validated, or a token row was hand-edited), refuse the
+                    // connection cleanly instead of leaking an in-memory
+                    // handle. Token DELETE in `delete_runner` is the primary
+                    // gate; this is the belt-and-braces check.
+                    let row_revoked: bool = {
+                        let conn = state.db.lock().unwrap();
+                        conn.query_row(
+                            "SELECT 1 FROM runners \
+                             WHERE id = ?1 AND removed_at IS NOT NULL",
+                            params![rid],
+                            |_row| Ok(()),
+                        )
+                        .is_ok()
+                    };
+                    if row_revoked {
+                        eprintln!("[runner-ws] refusing connection from revoked runner_id={rid}");
+                        break;
                     }
 
                     // Register in-memory handle.
@@ -373,6 +400,22 @@ async fn handle_runner_ws(
                 }
             }
 
+            // T5.1: defense in depth — if `delete_runner` cleared the
+            // in-memory `ConnectedRunner` entry for this runner_id mid-flight,
+            // refuse to keep processing inbound messages. Otherwise the live
+            // WS would keep ACKing reliable messages and re-broadcasting
+            // runner_drivers / runner-health events for a soft-deleted runner
+            // (the SQL UPDATEs already no-op via the `removed_at IS NULL`
+            // gates above). Skipping the handler AND breaking the loop closes
+            // the WS from the server side on the next inbound message.
+            {
+                let still_registered = state.runners.lock().await.contains_key(&rid);
+                if !still_registered {
+                    eprintln!("[runner-ws] runner_id={rid} no longer in registry, dropping WS");
+                    break;
+                }
+            }
+
             // Handle the message.
             handle_runner_message(&state, &rid, &org_id, &envelope, &cmd_tx).await;
         }
@@ -390,11 +433,14 @@ async fn handle_runner_ws(
         }
 
         // Mark offline in DB.
+        //
+        // T5.1: `AND removed_at IS NULL` so a runner revoked mid-flight does
+        // not get tickled by the disconnect-cleanup UPDATE on its way out.
         {
             let conn = state.db.lock().unwrap();
             conn.execute(
                 "UPDATE runners SET status = 'offline', last_seen_at = datetime('now') \
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND removed_at IS NULL",
                 params![rid],
             )
             .ok();
@@ -558,13 +604,15 @@ async fn handle_runner_message(
             // poll). Older runners without the field default to `false`
             // — back-compat is symmetric since the dashboard already
             // computes server-side `version_severity` from `version`.
+            // T5.1: `AND removed_at IS NULL` so a stale RunnerHello on a
+            // live WS does not re-populate a revoked runner's metadata.
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
                     "UPDATE runners SET hostname = ?1, version = ?2, drivers_json = ?3, \
                                        server_bin_path = ?4, server_bin_error = ?5, \
                                        upgrade_available = ?6 \
-                     WHERE id = ?7",
+                     WHERE id = ?7 AND removed_at IS NULL",
                     params![
                         hostname,
                         version,
@@ -965,10 +1013,14 @@ async fn handle_runner_message(
             // can serve it without a wire round-trip and the dashboard can
             // surface the inventory even after the runner disconnects.
             let drivers_json = serde_json::to_string(drivers).ok();
+            // T5.1: `AND removed_at IS NULL` so a DriverAuthReport from a
+            // revoked-but-still-connected runner does not rewrite its
+            // drivers_json column.
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
-                    "UPDATE runners SET drivers_json = ?1 WHERE id = ?2",
+                    "UPDATE runners SET drivers_json = ?1 \
+                     WHERE id = ?2 AND removed_at IS NULL",
                     params![drivers_json, runner_id],
                 )
                 .ok();
@@ -1208,6 +1260,9 @@ async fn handle_runner_message(
             // tick. last_health_at is a freshness marker the dashboard uses
             // to distinguish "currently green" from "was green five minutes
             // ago" when the runner drops offline.
+            // T5.1: `AND removed_at IS NULL` so a periodic RunnerHealth on a
+            // revoked-but-still-connected runner does not bump
+            // last_health_at / outbox_depth on the soft-deleted row.
             {
                 let conn = state.db.lock().unwrap();
                 conn.execute(
@@ -1218,7 +1273,7 @@ async fn handle_runner_message(
                        ci_poll_ms_p99 = ?4, \
                        orphans_reaped_24h = ?5, \
                        last_health_at = datetime('now') \
-                     WHERE id = ?6",
+                     WHERE id = ?6 AND removed_at IS NULL",
                     params![
                         *outbox_depth as i64,
                         *ws_reconnects_24h as i64,

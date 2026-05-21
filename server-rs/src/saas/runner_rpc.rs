@@ -779,4 +779,369 @@ mod tests {
         drop(ws);
         server_handle.abort();
     }
+
+    /// T5.1 acceptance pin: after a runner is soft-deleted via the API,
+    /// the next WS upgrade attempt with the now-revoked token must return
+    /// 401 `invalid_token` (`validate_runner_token` sees no matching row).
+    /// No row updates land on the soft-deleted `runners` row because the
+    /// upgrade never proceeds past the handshake.
+    #[tokio::test]
+    async fn ws_connect_after_revoke_fails_with_invalid_token() {
+        use std::path::PathBuf;
+        use tokio_tungstenite::tungstenite::http::StatusCode;
+
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::init(&tempdir.path().join("test.db"));
+        let user_id = "tester-t51-revoke";
+        let token = "test-token-t51-revoke";
+        let org_id = "default-org";
+        let runner_id = "test-runner-t51-revoke";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                params![user_id, "t51@test", "x"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runner_tokens \
+                 (token_hash, runner_name, org_id, created_by, claimed_runner_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![token, "runner-t51", org_id, user_id, runner_id],
+            )
+            .unwrap();
+            // Simulate the runner having connected at least once: a runners
+            // row exists with hostname/version set so we can later prove
+            // nothing tickled it.
+            conn.execute(
+                "INSERT INTO runners (id, name, org_id, status, hostname, version, last_seen_at) \
+                 VALUES (?1, ?2, ?3, 'online', 'pre-revoke-host', 'pre-revoke-version', \
+                         datetime('now'))",
+                params![runner_id, "runner-t51", org_id],
+            )
+            .unwrap();
+        }
+
+        // Simulate `delete_runner`'s effect: delete the token row + set
+        // `removed_at` on the runners row. Mirrors `api/runners.rs::delete_runner`.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "DELETE FROM runner_tokens WHERE claimed_runner_id = ?1",
+                params![runner_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE runners SET removed_at = datetime('now') WHERE id = ?1",
+                params![runner_id],
+            )
+            .unwrap();
+        }
+
+        // Build a minimal AppState and mount the production WS handler.
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/branchwork-test-t51"),
+            0,
+            true,
+        );
+        let runners = new_runner_registry();
+        let state = crate::state::AppState {
+            db: db.clone(),
+            plans_dir: PathBuf::from("/tmp"),
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners: runners.clone(),
+            settings_path: PathBuf::from("/tmp/branchwork-test-t51-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            started_at: std::time::Instant::now(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/ws/runner",
+                axum::routing::get(crate::saas::runner_ws::runner_ws_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Connect with the now-revoked token. tokio-tungstenite surfaces the
+        // pre-upgrade HTTP error directly because the server returns
+        // `(401, "invalid_token")` without honoring the upgrade.
+        let url = format!("ws://127.0.0.1:{port}/ws/runner?token={token}");
+        let err = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect_err("connect_async must fail after the token is revoked");
+        let status = match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => resp.status(),
+            other => panic!("expected HTTP error from upgrade, got {other:?}"),
+        };
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "revoked-token WS connect must return 401"
+        );
+
+        // No row updates landed: hostname/version/status untouched by the
+        // failed upgrade, removed_at still set, and ConnectedRunner stays
+        // absent from the in-memory registry.
+        let (hostname, version, status_col, removed_at): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT hostname, version, status, removed_at FROM runners WHERE id = ?1",
+                params![runner_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(hostname.as_deref(), Some("pre-revoke-host"));
+        assert_eq!(version.as_deref(), Some("pre-revoke-version"));
+        assert_eq!(status_col.as_deref(), Some("online"));
+        assert!(removed_at.is_some(), "removed_at must remain set");
+        assert!(
+            !runners.lock().await.contains_key(runner_id),
+            "no in-memory ConnectedRunner must exist for a revoked runner"
+        );
+
+        server_handle.abort();
+    }
+
+    /// T5.1 acceptance pin: when a runner is revoked **while** its WS is
+    /// still alive, the next inbound message must NOT tickle the
+    /// soft-deleted `runners` row. The reader loop's in-memory revoke
+    /// check breaks the WS, the `removed_at IS NULL` SQL gates catch any
+    /// straggler UPDATEs, and the runner row stays exactly as it was at
+    /// the moment of revoke.
+    #[tokio::test]
+    async fn mid_ws_revoke_breaks_reader_loop_and_does_not_update_runners_row() {
+        use futures_util::SinkExt;
+        use std::path::PathBuf;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::init(&tempdir.path().join("test.db"));
+        let user_id = "tester-t51-mid";
+        let token = "test-token-t51-mid";
+        let org_id = "default-org";
+        let runner_id = "test-runner-t51-mid";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                params![user_id, "t51mid@test", "x"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runner_tokens (token_hash, runner_name, org_id, created_by) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![token, "runner-t51-mid", org_id, user_id],
+            )
+            .unwrap();
+        }
+
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/branchwork-test-t51-mid"),
+            0,
+            true,
+        );
+        let runners = new_runner_registry();
+        let state = crate::state::AppState {
+            db: db.clone(),
+            plans_dir: PathBuf::from("/tmp"),
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners: runners.clone(),
+            settings_path: PathBuf::from("/tmp/branchwork-test-t51-mid-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            started_at: std::time::Instant::now(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/ws/runner",
+                axum::routing::get(crate::saas::runner_ws::runner_ws_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Open a WS and send RunnerHello so the server registers the runner.
+        let url = format!("ws://127.0.0.1:{port}/ws/runner?token={token}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect");
+        let hello = Envelope::reliable(
+            runner_id.into(),
+            1,
+            WireMessage::RunnerHello {
+                hostname: "mid-host".into(),
+                version: "mid-version".into(),
+                drivers: vec![],
+                active_agents: vec![],
+                server_bin: None,
+                upgrade_available: false,
+            },
+        );
+        ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+            .await
+            .unwrap();
+
+        // Wait for the server to register the runner AND apply the Hello
+        // UPDATE so we have a known-good baseline to compare against.
+        let mut attempts = 0;
+        loop {
+            let registered = runners.lock().await.contains_key(runner_id);
+            let hostname_set: bool = {
+                let conn = db.lock().unwrap();
+                conn.query_row(
+                    "SELECT hostname FROM runners WHERE id = ?1",
+                    params![runner_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+                .is_some()
+            };
+            if registered && hostname_set {
+                break;
+            }
+            attempts += 1;
+            assert!(attempts <= 200, "runner did not register + apply Hello");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Snapshot the runners row mid-flight so we can prove it stays put
+        // across the revoke + next message.
+        let baseline: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT hostname, version, status, last_seen_at FROM runners WHERE id = ?1",
+                params![runner_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+
+        // Simulate `delete_runner`: delete tokens, soft-delete the runner
+        // row, drop the in-memory ConnectedRunner. Mirrors the production
+        // sequence in `api/runners.rs::delete_runner`.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "DELETE FROM runner_tokens WHERE claimed_runner_id = ?1",
+                params![runner_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE runners SET removed_at = datetime('now') WHERE id = ?1",
+                params![runner_id],
+            )
+            .unwrap();
+        }
+        runners.lock().await.remove(runner_id);
+
+        // Send another RunnerHello with DIFFERENT hostname/version. The
+        // reader loop's in-memory revoke check must break BEFORE
+        // handle_runner_message dispatches the UPDATE; even if the dispatch
+        // did fire, the `AND removed_at IS NULL` SQL gate on the RunnerHello
+        // arm would no-op the UPDATE.
+        let post_revoke_hello = Envelope::reliable(
+            runner_id.into(),
+            2,
+            WireMessage::RunnerHello {
+                hostname: "post-revoke-host".into(),
+                version: "post-revoke-version".into(),
+                drivers: vec![],
+                active_agents: vec![],
+                server_bin: None,
+                upgrade_available: false,
+            },
+        );
+        let _ = ws
+            .send(Message::Text(
+                serde_json::to_string(&post_revoke_hello).unwrap().into(),
+            ))
+            .await;
+
+        // Give the server time to read the message, hit the revoke check,
+        // and break the loop. 1s is well under the 30s test timeout.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let after: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT hostname, version, status, last_seen_at FROM runners WHERE id = ?1",
+                params![runner_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+        // hostname/version: the post-revoke Hello carried "post-revoke-*"
+        // strings; both must stay at the pre-revoke values.
+        assert_eq!(
+            after.0, baseline.0,
+            "hostname must not change after revoke (got {:?}, baseline {:?})",
+            after.0, baseline.0
+        );
+        assert_eq!(
+            after.1, baseline.1,
+            "version must not change after revoke (got {:?}, baseline {:?})",
+            after.1, baseline.1
+        );
+        // status: the disconnect-cleanup UPDATE also carries
+        // `AND removed_at IS NULL`, so even when the WS closes the status
+        // column stays at whatever it was at revoke time (not 'offline').
+        assert_eq!(
+            after.2, baseline.2,
+            "status must not change after revoke (got {:?}, baseline {:?})",
+            after.2, baseline.2
+        );
+
+        // The runner stays out of the in-memory registry (no other
+        // connection re-added it).
+        assert!(
+            !runners.lock().await.contains_key(runner_id),
+            "registry must stay empty after mid-WS revoke"
+        );
+
+        drop(ws);
+        server_handle.abort();
+    }
 }
