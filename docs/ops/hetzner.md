@@ -180,51 +180,34 @@ lines if the compose CLI is unavailable.
 
 ## Runner setup for end users
 
-A Branchwork user who wants to point an outside machine (their
-laptop, a CI runner, a colocated workstation) at the production
-dashboard does three things:
-
-**1. Issue a token.** From a logged-in session, hit:
-
-```
-curl -sS -b ~/.config/branchwork/cookies.txt \
-  -X POST https://branchwork.dev/api/runners/tokens \
-  -H 'Content-Type: application/json' \
-  -d '{"runner_name":"my-laptop"}'
-```
-
-The response is `{"token":"<hex>","runner_name":"my-laptop"}`. The
-token is shown once; store it (e.g. in `pass`, `1Password`, or a
-plain `chmod 600` file) and treat it like a password.
-
-**2. Install the runner binary.** Same release artifact as the
-server (the build is monolithic — see
-`../reference/cli.md#branchwork-runner`):
+The branchwork.dev deploy serves the install one-liner at
+`https://branchwork.dev/install-runner.sh`. End users go through the
+dashboard's **Add runner** modal (`/runners` page), which mints a
+single-use token and renders a copy-paste install command of the
+form:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/branchwork/branchwork/master/install.sh | sh
+curl -fsSL https://branchwork.dev/install-runner.sh \
+  | sh -s -- bwr_live_xxxxxxxxxxxxxxxxxxxx
 ```
 
-`branchwork-runner` lands at `/usr/local/bin/branchwork-runner`
-alongside `branchwork-server`.
-
-**3. Run it.** Either as a long-running shell process or under
-systemd:
-
-```
-branchwork-runner \
-  --saas-url   wss://branchwork.dev \
-  --token      <hex-from-step-1> \
-  --cwd        $HOME \
-  --db-path    $HOME/.branchwork-runner/runner.db
-```
+The script drops both `branchwork-runner` and `branchwork-server`
+at `~/.local/bin/`, renders a user-mode systemd unit, and runs
+`systemctl --user enable --now branchwork-runner` so the runner
+survives reboots. Full lifecycle (the unit, journal logs, in-place
+upgrades, `loginctl enable-linger`, and the explicit decision to
+keep project clones in `$HOME`) is documented at
+[`../architecture/runner-lifecycle.md`](../architecture/runner-lifecycle.md).
+Token issuance, the `POST /api/runners/install-command` endpoint,
+the system-mode unit variant, and platform-specific recipes for
+macOS / Windows live at
+[`../operations/saas-runner.md`](../operations/saas-runner.md).
 
 The runner is outbound-only — no port to open, no inbound TLS to
-manage. It reattaches automatically after network blips and after
-restart (the `seq_tracker` row in `runner.db` keeps the same
-runner-id between sessions, so the dashboard sees a reattach not a
-new runner). Full flag reference:
-[`../reference/cli.md#branchwork-runner`](../reference/cli.md).
+manage on the customer side. It reattaches automatically after
+network blips and after restart (the `seq_tracker` row in
+`runner.db` keeps the same runner-id between sessions, so the
+dashboard sees a reattach, not a new runner).
 
 ## Known gaps
 

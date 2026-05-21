@@ -40,6 +40,11 @@ The three-binary split, wire protocols, and storage model.
   authenticated WebSocket upstream, runner ID persistence, driver auth
   reporting, outbox/ACK with at-least-once delivery, local agent
   spawning via the shared session daemon.
+- [architecture/runner-lifecycle.md](architecture/runner-lifecycle.md)
+  — daemon lifecycle: user-mode systemd unit, journal log paths,
+  in-place upgrade via `install-runner.sh --just-binary`,
+  `loginctl enable-linger` and headless reboots, and the explicit
+  decision to keep project clones in `$HOME`.
 - [architecture/protocols.md](architecture/protocols.md) — session IPC
   frames (`postcard` over UDS / named pipe), SaaS runner `WireMessage`
   JSON envelopes with reliable/best-effort split and outbox/ACK/replay
