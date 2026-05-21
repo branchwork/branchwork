@@ -372,4 +372,134 @@ mod tests {
             "http://localhost:3100",
         );
     }
+
+    // ── T2.2 foreign-runner detection contract ──────────────────────────
+    //
+    // These tests pin the user-visible surface of the foreign-runner
+    // refusal so a future edit to install-runner.sh cannot silently break
+    // the acceptance criterion ("another runner is already running as pid
+    // 12345 from /opt/other-runner; pass --force-replace to take over").
+
+    #[test]
+    fn install_script_carries_force_replace_flag() {
+        // The flag must be parseable + documented in usage.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("--force-replace"),
+            "install-runner.sh must expose --force-replace"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("FORCE_REPLACE=0"),
+            "install-runner.sh must initialise FORCE_REPLACE"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("--force-replace [TOKEN]"),
+            "usage banner must list the --force-replace form"
+        );
+    }
+
+    #[test]
+    fn install_script_emits_canonical_foreign_runner_error() {
+        // Exact substring is what the dashboard runbook + future scrapers
+        // will grep for. Any rewording must update both sides in lockstep.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("another runner is already running as pid"),
+            "must emit the canonical 'another runner is already running as pid…' error"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("pass --force-replace to take over"),
+            "error must suggest --force-replace as the remediation"
+        );
+    }
+
+    #[test]
+    fn install_script_uses_kernel_truth_for_detection() {
+        // Defense against a future regression that re-introduces
+        // pgrep -f against the host process list (forbidden by ADR 0005:
+        // matches the production supervisor's command line).
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("/proc/[0-9]*"),
+            "Linux detection must walk /proc/[0-9]*/exe — kernel-truth, no pattern matching"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("readlink \"$proc_pid_dir/exe\""),
+            "must readlink /proc/<pid>/exe to confirm binary identity"
+        );
+        // macOS fallback path — pgrep -x is safe on Darwin (no comm
+        // truncation) and lsof gives us the binary path.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("pgrep -x branchwork-runner"),
+            "macOS fallback must pgrep -x (exact name, no -f substring match)"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("lsof -p"),
+            "macOS fallback must lsof the candidate PID for txt-type FD"
+        );
+        // Negative contract: no `pgrep -f branchwork-runner` in an
+        // executable line (comments referring to the forbidden pattern
+        // by name are fine — they document what we deliberately avoid).
+        let has_unscoped_pgrep_f = INSTALL_SCRIPT_TEMPLATE.lines().any(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.contains("pgrep -f branchwork-runner")
+        });
+        assert!(
+            !has_unscoped_pgrep_f,
+            "install-runner.sh must NOT pgrep -f as executable code (CLAUDE.md / ADR 0005)"
+        );
+        let has_killall = INSTALL_SCRIPT_TEMPLATE.lines().any(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.contains("killall branchwork-runner")
+        });
+        assert!(
+            !has_killall,
+            "install-runner.sh must NOT killall branchwork-runner as executable code (ADR 0005)"
+        );
+    }
+
+    #[test]
+    fn install_script_skips_own_managed_pid() {
+        // The check must subtract our own $PID_FILE's PID from the
+        // foreign-candidate set — otherwise a re-run while our own
+        // runner is up would always 1.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("our_managed_pid"),
+            "must read our managed PID from $PID_FILE before scoring"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"if [ -n "$our_pid" ] && [ "$pid" = "$our_pid" ]"#),
+            "must skip our own managed PID inside the candidate loop"
+        );
+    }
+
+    #[test]
+    fn install_script_invokes_foreign_check_before_binary_download() {
+        // Failing fast keeps a re-paste from wasting bandwidth on a host
+        // that already has a foreign runner. The `check_foreign_runners`
+        // call line must come before `download_binary`.
+        let template = INSTALL_SCRIPT_TEMPLATE;
+        let check_at = template
+            .find("\ncheck_foreign_runners\n")
+            .expect("check_foreign_runners must be invoked at top level");
+        let download_at = template
+            .find("download_binary ")
+            .expect("download_binary must appear in the script");
+        assert!(
+            check_at < download_at,
+            "check_foreign_runners must run before download_binary (fail fast on contention)"
+        );
+    }
+
+    #[test]
+    fn install_script_force_replace_uses_sigterm_then_sigkill() {
+        // Mirrors the SIGTERM-then-SIGKILL ladder we use for our own
+        // managed runner — the foreign install gets the same grace
+        // period before we force-quit it.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("kill -TERM \"$pid\""),
+            "force-replace must SIGTERM the foreign PID first"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("kill -KILL \"$pid\""),
+            "force-replace must SIGKILL after the grace window"
+        );
+    }
 }

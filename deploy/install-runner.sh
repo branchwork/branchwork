@@ -6,6 +6,7 @@
 #   curl -fsSL <SAAS_URL>/install-runner.sh | sh -s --                       (update)
 #   curl -fsSL <SAAS_URL>/install-runner.sh | sh -s -- --rotate-token <TOKEN>
 #   curl -fsSL <SAAS_URL>/install-runner.sh | sh -s -- --reset <TOKEN>
+#   curl -fsSL <SAAS_URL>/install-runner.sh | sh -s -- --force-replace [TOKEN]
 #
 # The dashboard substitutes its public URL into __SAAS_URL__ when serving
 # this script (see server-rs/src/saas/install_runner.rs); the only piece
@@ -34,6 +35,25 @@
 #   `--reset <TOKEN>` is the destructive flow for true re-enrollment: wipe
 #     runner.db (drop runner_id + outbox), rewrite config.toml with the new
 #     token, then proceed exactly like the first-run path.
+#
+# Foreign-runner safety (T2.2):
+#
+#   Before installing the binary the script scans for any running
+#   `branchwork-runner` process whose PID we don't manage (the PID in
+#   $PID_FILE belongs to *this* install; anything else is foreign).
+#   Detection is kernel-truth — we readlink /proc/<pid>/exe on Linux and
+#   ask `lsof -p <pid>` on macOS, never pattern-match command lines (per
+#   ADR 0005, pgrep -f on a host running the production Branchwork
+#   supervisor is unsafe). On hit, we exit 1 with
+#
+#     another runner is already running as pid 12345 from /opt/other-runner;
+#     pass --force-replace to take over
+#
+#   so the operator knows what's already running before a second runner
+#   competes for the same SaaS slot. Passing `--force-replace` SIGTERMs
+#   the foreign PID (5s grace, then SIGKILL) and proceeds. This prevents
+#   the accidental two-runners-one-config-dir state where one host runs
+#   both a system-package branchwork-runner and a curl-piped one.
 #
 # Environment overrides (rarely needed):
 #   BRANCHWORK_SAAS_URL    — override the URL baked in by the server.
@@ -75,6 +95,7 @@ note() { printf '  %s\n' "$*"; }
 TOKEN=""
 RESET=0
 ROTATE_TOKEN=0
+FORCE_REPLACE=0
 
 usage() {
     cat <<USAGE
@@ -83,6 +104,7 @@ usage:
   curl -fsSL $SAAS_URL/install-runner.sh | sh -s --                       (update existing)
   curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --rotate-token <TOKEN>
   curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --reset <TOKEN>
+  curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --force-replace [TOKEN]
 USAGE
 }
 
@@ -93,6 +115,9 @@ while [ $# -gt 0 ]; do
             ;;
         --rotate-token)
             ROTATE_TOKEN=1
+            ;;
+        --force-replace)
+            FORCE_REPLACE=1
             ;;
         -h|--help)
             usage
@@ -241,6 +266,131 @@ case "$arch_raw" in
         ;;
 esac
 ok "detected platform: ${os}-${arch} (mode: $MODE)"
+
+# ── Foreign-runner detection (T2.2) ─────────────────────────────────────────
+#
+# Detect any running branchwork-runner process whose PID isn't tracked by
+# this install's $PID_FILE. We use kernel-truth (readlink /proc/<pid>/exe
+# on Linux, lsof on macOS) rather than `pgrep -f branchwork-runner` for
+# two reasons:
+#
+#   1. ADR 0005 forbids unscoped pgrep -f patterns: matching command-line
+#      substrings can pick up unrelated processes (editors with the file
+#      open, scrolled tty output, systemd unit dumps).
+#   2. On Linux the kernel truncates /proc/<pid>/comm to 15 chars, so
+#      `pgrep -x branchwork-runner` silently misses every match
+#      (`branchwork-runner` is 17 chars).
+#
+# /proc/<pid>/exe is the authoritative answer ("what binary is this PID
+# actually running?"). On macOS we fall back to `lsof -p <pid>` because
+# /proc doesn't exist there.
+
+# Read our managed PID from $PID_FILE, or empty when no file / non-numeric.
+our_managed_pid() {
+    [ -f "$PID_FILE" ] || return 0
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    case "$pid" in
+        ''|*[!0-9]*) return 0 ;;
+        *) printf '%s' "$pid" ;;
+    esac
+}
+
+# List every PID + binary path whose /proc/<pid>/exe basename is
+# `branchwork-runner`. Output one line per process: "<pid> <exe>". Empty
+# output when nothing matches.
+list_branchwork_runners() {
+    if [ -d /proc ]; then
+        # Linux path: scan /proc/[0-9]*/exe directly. No pattern matching.
+        for proc_pid_dir in /proc/[0-9]*; do
+            # Guard against the no-match glob expansion (busybox-friendly).
+            [ -d "$proc_pid_dir" ] || continue
+            pid="${proc_pid_dir##*/}"
+            exe="$(readlink "$proc_pid_dir/exe" 2>/dev/null || true)"
+            [ -n "$exe" ] || continue
+            case "$(basename "$exe" 2>/dev/null)" in
+                branchwork-runner) printf '%s %s\n' "$pid" "$exe" ;;
+            esac
+        done
+        return 0
+    fi
+    # macOS path: pgrep -x on the full process name (Darwin doesn't
+    # truncate comm), then verify each via lsof.
+    if command -v pgrep >/dev/null 2>&1 && command -v lsof >/dev/null 2>&1; then
+        for pid in $(pgrep -x branchwork-runner 2>/dev/null || true); do
+            # lsof txt-type FD is the binary mapping. First one wins.
+            exe="$(lsof -p "$pid" 2>/dev/null | awk '$4 == "txt" { print $NF; exit }')"
+            [ -n "$exe" ] || continue
+            case "$(basename "$exe" 2>/dev/null)" in
+                branchwork-runner) printf '%s %s\n' "$pid" "$exe" ;;
+            esac
+        done
+    fi
+}
+
+# Stop a foreign runner using the same SIGTERM-then-SIGKILL ladder we use
+# for our own managed runner. No PID_FILE bookkeeping — that belongs to
+# whatever install owns that foreign process.
+stop_foreign_runner() {
+    pid="$1"
+    note "force-replace: stopping foreign runner (pid $pid)"
+    kill -TERM "$pid" 2>/dev/null || true
+    i=0
+    while [ $i -lt 5 ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        note "foreign runner did not exit within 5s, sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+}
+
+check_foreign_runners() {
+    our_pid="$(our_managed_pid)"
+    foreign_pid=""
+    foreign_exe=""
+    # `list_branchwork_runners | while read` would run the loop in a
+    # subshell on plain POSIX `sh`, so any variable set inside (i.e.
+    # foreign_pid) would be lost. Route through a temp file instead so
+    # the while loop's input redirection keeps it in the current shell.
+    tmp_runners="$(mktemp 2>/dev/null || mktemp -t bwrunners 2>/dev/null || true)"
+    if [ -z "$tmp_runners" ]; then
+        tmp_runners="/tmp/.bw-runners.$$"
+    fi
+    list_branchwork_runners > "$tmp_runners" 2>/dev/null || true
+    if [ -s "$tmp_runners" ]; then
+        while read -r pid exe; do
+            # Skip our own managed runner.
+            if [ -n "$our_pid" ] && [ "$pid" = "$our_pid" ]; then
+                continue
+            fi
+            # Defensive: the process may have just exited between
+            # listing and now.
+            if ! kill -0 "$pid" 2>/dev/null; then
+                continue
+            fi
+            foreign_pid="$pid"
+            foreign_exe="${exe:-unknown path}"
+            break
+        done < "$tmp_runners"
+    fi
+    rm -f "$tmp_runners"
+    if [ -z "$foreign_pid" ]; then
+        return 0
+    fi
+    if [ "$FORCE_REPLACE" = "1" ]; then
+        stop_foreign_runner "$foreign_pid"
+        return 0
+    fi
+    err "another runner is already running as pid $foreign_pid from $foreign_exe; pass --force-replace to take over"
+    exit 1
+}
+
+check_foreign_runners
 
 # ── Helpers to land a binary at $TMP_BIN ────────────────────────────────────
 mkdir -p "$INSTALL_DIR"
