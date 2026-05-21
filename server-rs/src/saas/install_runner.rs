@@ -477,10 +477,16 @@ mod tests {
         // call line must come before the first `download_binary_to` call.
         // (Renamed from `download_binary` in T3.1 to make the per-binary
         // target output path explicit.)
+        //
+        // T3.3 wrapped the call in `if [ "$MODE" != "just_binary" ]` so
+        // systemd-managed installs (where the runner PID lives outside
+        // $PID_FILE) are not flagged. The indentation moved from
+        // column-0 to four spaces; the contract is unchanged.
         let template = INSTALL_SCRIPT_TEMPLATE;
         let check_at = template
-            .find("\ncheck_foreign_runners\n")
-            .expect("check_foreign_runners must be invoked at top level");
+            .find("\n    check_foreign_runners\n")
+            .or_else(|| template.find("\ncheck_foreign_runners\n"))
+            .expect("check_foreign_runners must be invoked");
         let download_at = template
             .find("download_binary_to ")
             .expect("download_binary_to must appear in the script");
@@ -754,6 +760,321 @@ mod tests {
         assert!(
             started_at < start_session_at,
             "runner-started must precede Start-session-will-use in the banner"
+        );
+    }
+
+    // ── T3.3 --just-binary in-place upgrade contract ────────────────────
+    //
+    // install-runner.sh must expose a binary-swap-only mode for hosts
+    // where systemd owns the runner. The mode:
+    //   • parses `--just-binary` (and `--upgrade` alias) and an optional
+    //     `--system` modifier;
+    //   • refuses on missing config.toml (no enroll, only upgrade);
+    //   • is mutually exclusive with --reset, --rotate-token, --force-replace;
+    //   • compares old and new binary versions BEFORE the mv and exits 0
+    //     with the canonical "already at vX.Y.Z — nothing to do" line
+    //     when both binaries already match;
+    //   • restarts the systemd unit (`systemctl --user restart
+    //     branchwork-runner` by default, `sudo systemctl restart
+    //     branchwork-runner` with --system) instead of launching the
+    //     runner via nohup;
+    //   • never writes $CONFIG_FILE so the existing token + saas_url
+    //     stay byte-for-byte identical.
+
+    #[test]
+    fn install_script_carries_just_binary_flag() {
+        // Both the canonical and alias forms must be parseable.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("--just-binary|--upgrade)"),
+            "install-runner.sh must accept --just-binary and --upgrade as aliases"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("JUST_BINARY=0"),
+            "install-runner.sh must initialise JUST_BINARY"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("--just-binary [--system]"),
+            "usage banner must list the --just-binary form with the --system modifier"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_validates_args() {
+        // No token, no --reset, no --rotate-token, no --force-replace.
+        // Each refusal must be wired so a future edit can't silently
+        // re-introduce one of the mutually-exclusive combinations.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(
+                r#"err "--just-binary takes no token (it does not enroll, only swaps binaries)""#
+            ),
+            "must refuse a positional token under --just-binary"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"err "--just-binary and --reset are mutually exclusive""#),
+            "must refuse --just-binary + --reset"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"err "--just-binary and --rotate-token are mutually exclusive""#),
+            "must refuse --just-binary + --rotate-token"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"err "--just-binary and --force-replace are mutually exclusive""#),
+            "must refuse --just-binary + --force-replace"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_requires_existing_install() {
+        // Missing $CONFIG_FILE is a hard error — the brief is explicit
+        // that just-binary mode "does not enroll, it only swaps binaries
+        // on an existing install".
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"err "--just-binary requires an existing install at $CONFIG_FILE""#),
+            "must refuse --just-binary on a host with no existing install"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_requires_systemctl() {
+        // The mode is for systemd-managed installs (see
+        // [[runner-daemon-workspace]]); a host without systemctl
+        // cannot satisfy the restart step, so fail fast with a
+        // pointer to the right plan.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"err "--just-binary requires systemctl (host has no systemd)""#),
+            "must refuse --just-binary on a host with no systemctl"
+        );
+    }
+
+    #[test]
+    fn install_script_system_flag_requires_just_binary() {
+        // --system is a modifier; using it alone is operator error and
+        // must surface a clear refusal rather than silently no-op'ing.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"err "--system is only meaningful with --just-binary""#),
+            "must refuse --system without --just-binary"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_does_not_write_config_toml() {
+        // The config-write gate must NOT include MODE=just_binary, so a
+        // dashboard one-click Upgrade cannot accidentally clobber the
+        // stored token or saas_url. The acceptance criterion is verbatim:
+        // "leaves ~/.branchwork-runner/config.toml byte-for-byte
+        // identical to before".
+        let gate = INSTALL_SCRIPT_TEMPLATE
+            .find(r#"if [ "$MODE" = "enroll" ] || [ "$MODE" = "reset" ] || [ "$ROTATE_TOKEN" = "1" ]"#)
+            .expect("config-write gate must remain on enroll/reset/rotate only");
+        let cat_at = INSTALL_SCRIPT_TEMPLATE[gate..]
+            .find(r#"cat > "$CONFIG_FILE""#)
+            .expect("config-write must be the next statement after the gate");
+        // The phrase "just_binary" must not appear inside the gate or
+        // the cat heredoc block — guard against a future edit that
+        // accidentally re-includes the mode in the write path.
+        let cat_abs = gate + cat_at;
+        let block = &INSTALL_SCRIPT_TEMPLATE[gate..cat_abs];
+        assert!(
+            !block.contains("just_binary"),
+            "config-write gate must not mention just_binary (the mode never writes $CONFIG_FILE)"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_idempotency_message() {
+        // Acceptance criterion: "already at v0.5.X — nothing to do".
+        // The em-dash (U+2014) is the canonical separator — matched
+        // byte-for-byte by the runbook grep + this test.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(
+                "ok \"already at v$(short_version \"$current_runner_version\") \u{2014} nothing to do\""
+            ),
+            "idempotency banner must read 'already at vX.Y.Z — nothing to do' verbatim"
+        );
+        // The check must compare BOTH binary versions (not just the
+        // runner) — a server-only drift would otherwise silently skip
+        // the upgrade. The two-binary-AND gate is the pin.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"current_runner_version="$("$RUNNER_BIN" --version"#),
+            "must probe the on-disk runner version before deciding to swap"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"current_server_version="$("$SERVER_BIN" --version"#),
+            "must probe the on-disk server version before deciding to swap"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"new_runner_version="$("$TMP_RUNNER" --version"#),
+            "must probe the new runner version (in $TMP_RUNNER) before deciding to swap"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"new_server_version="$("$TMP_SERVER" --version"#),
+            "must probe the new server version (in $TMP_SERVER) before deciding to swap"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_idempotency_runs_before_mv() {
+        // The idempotency `exit 0` must fire BEFORE the binaries are
+        // moved into place — otherwise a no-op upgrade would still
+        // pointlessly overwrite the live binaries (harmless today but
+        // would trip systemctl's binary-changed detection on some
+        // distros, and adds disk churn).
+        let exit_at = INSTALL_SCRIPT_TEMPLATE
+            .find(r#"ok "already at v$(short_version "#)
+            .expect("idempotency exit branch must exist");
+        let mv_at = INSTALL_SCRIPT_TEMPLATE
+            .find(r#"mv "$TMP_RUNNER" "$RUNNER_BIN""#)
+            .expect("final-path mv must remain");
+        assert!(
+            exit_at < mv_at,
+            "idempotency check must run before the binary swap (exit_at={exit_at} mv_at={mv_at})"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_restarts_systemd_user_mode() {
+        // Default --just-binary lifecycle is user-mode systemd.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("systemctl --user restart branchwork-runner"),
+            "just_binary default must `systemctl --user restart branchwork-runner`"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"ok "restarted branchwork-runner via systemd""#),
+            "just_binary must announce the successful systemd restart"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_system_mode_uses_sudo() {
+        // --system flips to root systemd. The literal sudo prefix
+        // matters because the runbook + dashboard upgrade button rely
+        // on it: the operator opts into sudo by setting --system,
+        // never implicitly.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("sudo systemctl restart branchwork-runner"),
+            "just_binary + --system must `sudo systemctl restart branchwork-runner`"
+        );
+        // The branch gate must be on SYSTEM_INSTALL=1 so a future
+        // edit can't accidentally fall through to user-mode under
+        // --system.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"if [ "$SYSTEM_INSTALL" = "1" ]; then"#),
+            "must branch on SYSTEM_INSTALL=1 for the sudo path"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_skips_nohup_launch() {
+        // The nohup launch path is for enroll/update/reset. just_binary
+        // delegates to systemd and must NOT hit the nohup statement —
+        // otherwise the script would start a second runner process
+        // alongside the systemd unit and write a stale $PID_FILE.
+        //
+        // Pin this structurally: the `nohup "$RUNNER_BIN"` line must
+        // live inside an `else` branch of a `[ "$MODE" = "just_binary" ]`
+        // conditional. Grep for both halves.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"if [ "$MODE" = "just_binary" ]; then"#),
+            "lifecycle gate must branch on MODE=just_binary"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"PATH="$INSTALL_DIR:$PATH" nohup "$RUNNER_BIN""#),
+            "the else branch must keep the original nohup launch"
+        );
+        let just_binary_branch = INSTALL_SCRIPT_TEMPLATE
+            .find(r#"if [ "$MODE" = "just_binary" ]; then"#)
+            .expect("just_binary lifecycle branch missing");
+        let nohup_at = INSTALL_SCRIPT_TEMPLATE
+            .find(r#"PATH="$INSTALL_DIR:$PATH" nohup"#)
+            .expect("nohup launch line missing");
+        assert!(
+            just_binary_branch < nohup_at,
+            "just_binary branch must come BEFORE the nohup fallback so the else clause guards it"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_skips_stop_existing_runner() {
+        // stop_existing_runner targets $PID_FILE, which is only written
+        // by the nohup-launch path. systemd-managed installs never
+        // populate it, so calling stop_existing_runner is at best a
+        // no-op and at worst confusing (it might find a stale PID from
+        // a prior nohup install and try to TERM it).
+        // The gate must restrict the call to update + reset only.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains("case \"$MODE\" in\n    update|reset) stop_existing_runner ;;"),
+            "stop_existing_runner must only run for MODE in {{update, reset}} — just_binary is systemd's job"
+        );
+        // Negative contract: the prior `if [ "$MODE" != "enroll" ]`
+        // gate (which would have included just_binary) must be gone.
+        assert!(
+            !INSTALL_SCRIPT_TEMPLATE.contains(
+                r#"if [ "$MODE" != "enroll" ]; then
+    stop_existing_runner
+fi"#
+            ),
+            "the legacy `MODE != enroll` gate must be replaced with the explicit case"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_skips_foreign_runner_check() {
+        // Foreign-runner detection uses $PID_FILE to subtract our own
+        // managed PID from the candidate list. systemd-managed installs
+        // don't write that file, so the check would always flag the
+        // systemd runner as foreign — false positive. Skip it under
+        // --just-binary.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(
+                "if [ \"$MODE\" != \"just_binary\" ]; then\n    check_foreign_runners\nfi"
+            ),
+            "check_foreign_runners must be gated to skip MODE=just_binary"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_completion_line() {
+        // The completion case must carry a just_binary arm so the
+        // operator-visible verdict reads as a successful upgrade rather
+        // than a generic "OK". Wording mirrors update/reset for
+        // consistency with the dashboard runbook grep.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"just_binary) ok "upgraded binaries in place (config untouched)" ;;"#),
+            "case `$MODE` completion line must include the just_binary arm"
+        );
+    }
+
+    #[test]
+    fn install_script_just_binary_next_steps_uses_systemctl() {
+        // The trailing Next-steps block must point at systemctl/journalctl
+        // for the systemd path, not the PID_FILE/LOG_FILE references that
+        // only apply to the nohup-launch modes. Otherwise the operator
+        // sees "kill $(cat $PID_FILE)" which has no relation to the
+        // systemd unit they actually need to manage.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"unit_status_cmd="systemctl --user status branchwork-runner""#),
+            "user-mode next-steps must reference `systemctl --user status branchwork-runner`"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"unit_status_cmd="sudo systemctl status branchwork-runner""#),
+            "system-mode next-steps must reference `sudo systemctl status branchwork-runner`"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains("Binary upgrade only \u{2014} the existing systemd unit and"),
+            "just_binary next-steps banner must announce config-preservation"
         );
     }
 }

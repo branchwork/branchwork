@@ -7,6 +7,7 @@
 #   curl -fsSL <SAAS_URL>/install-runner.sh | sh -s -- --rotate-token <TOKEN>
 #   curl -fsSL <SAAS_URL>/install-runner.sh | sh -s -- --reset <TOKEN>
 #   curl -fsSL <SAAS_URL>/install-runner.sh | sh -s -- --force-replace [TOKEN]
+#   curl -fsSL <SAAS_URL>/install-runner.sh | sh -s -- --just-binary [--system]
 #
 # The dashboard substitutes its public URL into __SAAS_URL__ when serving
 # this script (see server-rs/src/saas/install_runner.rs); the only piece
@@ -43,6 +44,29 @@
 #   `--reset <TOKEN>` is the destructive flow for true re-enrollment: wipe
 #     runner.db (drop runner_id + outbox), rewrite config.toml with the new
 #     token, then proceed exactly like the first-run path.
+#
+#   `--just-binary` (alias: `--upgrade`) is the binary-swap engine for
+#     hosts where systemd already owns the runner (see
+#     [[runner-daemon-workspace]]). It:
+#       • Skips the token check at the top of the script — no enrollment.
+#       • Skips writing `$HOME/.branchwork-runner/config.toml` — the
+#         existing config (token + saas_url) stays byte-for-byte
+#         identical.
+#       • Skips any systemd-unit installation / `loginctl enable-linger`
+#         dance — the unit is assumed to be installed and enabled
+#         already (the runner-daemon-workspace plan owns that path).
+#       • Downloads BOTH `branchwork-runner` and `branchwork-server`
+#         (the T3.1 paired-install step) into `$HOME/.local/bin/`.
+#       • After the swap, runs `systemctl --user restart
+#         branchwork-runner` (default) or
+#         `sudo systemctl restart branchwork-runner` when `--system`
+#         is passed.
+#     Idempotency: if the on-disk binaries already match the version
+#     the install source would provide, the script exits 0 with
+#     `* already at v0.5.X — nothing to do` and does NOT restart the
+#     unit. This makes `--just-binary` safe for the dashboard's
+#     one-click Upgrade button (task 4.1) and the periodic
+#     version-check fallback (task 4.3) to invoke on every tick.
 #
 # Foreign-runner safety (T2.2):
 #
@@ -107,13 +131,16 @@ err()  { printf 'error: %s\n' "$*" >&2; }
 ok()   { printf '* %s\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
 
-# ── Parse args (T2.1) ───────────────────────────────────────────────────────
+# ── Parse args (T2.1 / T3.3) ────────────────────────────────────────────────
 # POSIX getopts can't handle long options, so do it by hand. One positional
-# argument (the token) plus two long flags. Order is not significant.
+# argument (the token) plus a handful of long flags. Order is not
+# significant.
 TOKEN=""
 RESET=0
 ROTATE_TOKEN=0
 FORCE_REPLACE=0
+JUST_BINARY=0
+SYSTEM_INSTALL=0
 
 usage() {
     cat <<USAGE
@@ -123,6 +150,7 @@ usage:
   curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --rotate-token <TOKEN>
   curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --reset <TOKEN>
   curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --force-replace [TOKEN]
+  curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --just-binary [--system]
 USAGE
 }
 
@@ -136,6 +164,12 @@ while [ $# -gt 0 ]; do
             ;;
         --force-replace)
             FORCE_REPLACE=1
+            ;;
+        --just-binary|--upgrade)
+            JUST_BINARY=1
+            ;;
+        --system)
+            SYSTEM_INSTALL=1
             ;;
         -h|--help)
             usage
@@ -173,12 +207,44 @@ fi
 # Strip a trailing slash so the runner binary stitches its URL correctly.
 SAAS_URL="${SAAS_URL%/}"
 
-# ── Decide enroll vs update vs reset (T2.1) ────────────────────────────────
-# The presence of $CONFIG_FILE is the load-bearing signal: we have a prior
-# install on this host. Without it, we treat --reset as a fresh enroll
-# (operator may have run --reset before the first enroll by mistake — note
-# but don't fail).
-if [ -f "$CONFIG_FILE" ]; then
+# ── Decide enroll vs update vs reset vs just_binary (T2.1 / T3.3) ──────────
+# --just-binary is a separate, top-priority mode: when it is set we skip
+# every enroll/update concern (no token, no config rewrite, no foreign-
+# runner scan — systemd owns the runner here). We still validate that the
+# host actually has an existing install to upgrade.
+if [ "$JUST_BINARY" = "1" ]; then
+    if [ -n "$TOKEN" ]; then
+        err "--just-binary takes no token (it does not enroll, only swaps binaries)"
+        usage >&2
+        exit 2
+    fi
+    if [ "$RESET" = "1" ]; then
+        err "--just-binary and --reset are mutually exclusive"
+        exit 2
+    fi
+    if [ "$ROTATE_TOKEN" = "1" ]; then
+        err "--just-binary and --rotate-token are mutually exclusive"
+        exit 2
+    fi
+    if [ "$FORCE_REPLACE" = "1" ]; then
+        err "--just-binary and --force-replace are mutually exclusive"
+        exit 2
+    fi
+    if [ ! -f "$CONFIG_FILE" ]; then
+        err "--just-binary requires an existing install at $CONFIG_FILE"
+        note "to enroll a new runner, run without --just-binary and pass the token"
+        exit 1
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        err "--just-binary requires systemctl (host has no systemd)"
+        note "this mode is for systemd-managed installs only — see runner-daemon-workspace"
+        exit 1
+    fi
+    MODE=just_binary
+elif [ "$SYSTEM_INSTALL" = "1" ]; then
+    err "--system is only meaningful with --just-binary"
+    exit 2
+elif [ -f "$CONFIG_FILE" ]; then
     if [ "$RESET" = "1" ]; then
         MODE=reset
     else
@@ -260,6 +326,10 @@ case "$MODE" in
                 fi
             fi
         fi
+        ;;
+    just_binary)
+        # No token check, no config read. Token + saas_url stay on disk and
+        # the existing systemd unit re-uses them on restart.
         ;;
 esac
 
@@ -408,7 +478,13 @@ check_foreign_runners() {
     exit 1
 }
 
-check_foreign_runners
+# --just-binary skips the foreign-runner scan: systemd owns the runner and
+# the unit's PID lives in /run/user/<uid>/, not in our $PID_FILE — every
+# systemd-managed runner would otherwise be flagged as "foreign". The
+# subsequent `systemctl restart` is the safe handoff.
+if [ "$MODE" != "just_binary" ]; then
+    check_foreign_runners
+fi
 
 # ── Helpers to land binaries at $TMP_RUNNER + $TMP_SERVER ──────────────────
 #
@@ -619,9 +695,11 @@ stop_existing_runner() {
     rm -f "$PID_FILE"
 }
 
-if [ "$MODE" != "enroll" ]; then
-    stop_existing_runner
-fi
+# enroll has no prior PID file; just_binary delegates lifecycle to systemd
+# (the unit stop happens implicitly as part of the post-swap restart).
+case "$MODE" in
+    update|reset) stop_existing_runner ;;
+esac
 
 # ── Reset wipes runner.db (and SQLite WAL/SHM sidecars) ────────────────────
 # Only fires on --reset. The acceptance criterion for update mode is that
@@ -634,10 +712,66 @@ if [ "$MODE" = "reset" ]; then
     fi
 fi
 
+# ── Idempotency check for --just-binary (T3.3) ─────────────────────────────
+# Compare on-disk vs about-to-install versions BEFORE the mv. If both
+# binaries already match what the source would provide, exit 0 without
+# touching the unit. The EXIT trap (set at TMP_* creation time) cleans up
+# the downloaded tmpfiles automatically.
+#
+# Version strings are the first line of `<binary> --version` (e.g.
+# `branchwork-runner 0.5.67`). An empty probe — old binary missing or
+# pre-T3.2 binary without `#[command(version)]` — collapses to "unknown"
+# which never matches the new probe, so we fall through to the swap.
+short_version() {
+    # "branchwork-runner 0.5.67" -> "0.5.67"; an empty input yields the
+    # empty string so the caller can branch on it.
+    case "$1" in
+        '') printf '' ;;
+        *)  printf '%s' "${1##* }" ;;
+    esac
+}
+
+# `curl -o` writes tmpfiles 0644 by umask; the idempotency probe needs to
+# execute them, so chmod up front. The mv'd-in-place chmod below is now
+# a no-op for the just_binary path but stays for the other modes (the
+# overall `chmod 0755 "$TMP_RUNNER" "$TMP_SERVER"` is cheap and idempotent).
+chmod 0755 "$TMP_RUNNER" "$TMP_SERVER"
+
+if [ "$MODE" = "just_binary" ]; then
+    current_runner_version=""
+    current_server_version=""
+    if [ -x "$RUNNER_BIN" ]; then
+        current_runner_version="$("$RUNNER_BIN" --version 2>/dev/null | head -n1 || true)"
+    fi
+    if [ -x "$SERVER_BIN" ]; then
+        current_server_version="$("$SERVER_BIN" --version 2>/dev/null | head -n1 || true)"
+    fi
+    new_runner_version="$("$TMP_RUNNER" --version 2>/dev/null | head -n1 || true)"
+    new_server_version="$("$TMP_SERVER" --version 2>/dev/null | head -n1 || true)"
+    if [ -n "$current_runner_version" ] \
+       && [ -n "$current_server_version" ] \
+       && [ -n "$new_runner_version" ] \
+       && [ -n "$new_server_version" ] \
+       && [ "$current_runner_version" = "$new_runner_version" ] \
+       && [ "$current_server_version" = "$new_server_version" ]; then
+        # The em-dash (U+2014) is the canonical separator — matched
+        # byte-for-byte by the install-runner Rust tests so the runbook's
+        # grep keeps working. Singular `v0.5.X` per the acceptance
+        # criterion: both binaries are at the same version on a
+        # well-formed paired install, and the runner is the primary
+        # subject of the banner.
+        ok "already at v$(short_version "$current_runner_version") — nothing to do"
+        # Tmpfiles are removed by the EXIT trap; the systemd unit is not
+        # restarted.
+        exit 0
+    fi
+fi
+
 # ── Install the new binaries ────────────────────────────────────────────────
 # Both must be in place before we clear the EXIT trap so an interrupt
 # mid-install removes both tmpfiles rather than leaving one orphaned
-# next to a half-installed pair.
+# next to a half-installed pair. The chmod above already ensured 0755;
+# repeat the call so the move-in-place path stays explicit for readers.
 chmod 0755 "$TMP_RUNNER" "$TMP_SERVER"
 mv "$TMP_RUNNER" "$RUNNER_BIN"
 mv "$TMP_SERVER" "$SERVER_BIN"
@@ -678,31 +812,57 @@ TOML
     ok "wrote $CONFIG_FILE"
 fi
 
-# ── Start runner in the background ──────────────────────────────────────────
-# nohup + & detaches so the curl|sh pipeline returns. The runner persists
-# its runner_id in $HOME/.branchwork-runner/runner.db (under seq_tracker) so
-# update mode preserves identity across binary replacements; reset mode
-# wiped runner.db above so a fresh runner_id will be generated here.
+# ── Start (or restart) the runner ───────────────────────────────────────────
+# Two lifecycle owners depending on mode:
 #
-# PATH prepend: the runner shells out to `branchwork-server session …`
-# for every per-agent supervisor and resolves the binary via which() at
-# startup. Prepending $INSTALL_DIR to PATH guarantees the paired binary
-# we just dropped wins over any older system-wide install (e.g.
-# /usr/local/bin/branchwork-server from a prior package). Without this
-# the runner would still find a system copy on hosts where
+#  • enroll / update / reset — nohup + & detaches so the curl|sh pipeline
+#    returns. The runner persists its runner_id in
+#    $HOME/.branchwork-runner/runner.db (under seq_tracker) so update mode
+#    preserves identity across binary replacements; reset mode wiped
+#    runner.db above so a fresh runner_id will be generated here.
+#
+#  • just_binary — the systemd unit (installed by the runner-daemon-
+#    workspace plan) owns the runner. We swapped the binaries above; a
+#    `systemctl restart` is the safe handoff that stops the old process
+#    image and starts a new one against the just-installed binaries. No
+#    PID_FILE, no LOG_FILE writes — systemd's journal owns that surface.
+#
+# PATH prepend (nohup path): the runner shells out to `branchwork-server
+# session …` for every per-agent supervisor and resolves the binary via
+# which() at startup. Prepending $INSTALL_DIR to PATH guarantees the
+# paired binary we just dropped wins over any older system-wide install
+# (e.g. /usr/local/bin/branchwork-server from a prior package). Without
+# this the runner would still find a system copy on hosts where
 # $HOME/.local/bin isn't on PATH but $INSTALL_DIR somehow is reachable
 # through some other means — keeping the lookup deterministic.
-note "starting runner in the background"
-PATH="$INSTALL_DIR:$PATH" nohup "$RUNNER_BIN" --saas-url "$SAAS_URL" --token "$TOKEN" \
-    >"$LOG_FILE" 2>&1 &
-echo $! > "$PID_FILE"
-sleep 1
-if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    err "runner exited immediately — last lines of $LOG_FILE:"
-    tail -n 20 "$LOG_FILE" >&2 || true
-    exit 1
+if [ "$MODE" = "just_binary" ]; then
+    if [ "$SYSTEM_INSTALL" = "1" ]; then
+        note "restarting systemd unit (sudo systemctl restart branchwork-runner)"
+        if ! sudo systemctl restart branchwork-runner; then
+            err "sudo systemctl restart branchwork-runner failed (see above)"
+            exit 1
+        fi
+    else
+        note "restarting systemd unit (systemctl --user restart branchwork-runner)"
+        if ! systemctl --user restart branchwork-runner; then
+            err "systemctl --user restart branchwork-runner failed (see above)"
+            exit 1
+        fi
+    fi
+    ok "restarted branchwork-runner via systemd"
+else
+    note "starting runner in the background"
+    PATH="$INSTALL_DIR:$PATH" nohup "$RUNNER_BIN" --saas-url "$SAAS_URL" --token "$TOKEN" \
+        >"$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    sleep 1
+    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        err "runner exited immediately — last lines of $LOG_FILE:"
+        tail -n 20 "$LOG_FILE" >&2 || true
+        exit 1
+    fi
+    ok "runner started (pid $(cat "$PID_FILE"))"
 fi
-ok "runner started (pid $(cat "$PID_FILE"))"
 
 # ── Confirm Start session readiness (T3.2) ──────────────────────────────────
 # The runner shells out to `branchwork-server session …` for every per-agent
@@ -725,12 +885,31 @@ fi
 # "updated runner in place (runner_id preserved)" verbatim — that string is
 # what the prod dashboard's deploy runbook greps for.
 case "$MODE" in
-    enroll) ok "enrolled runner with the dashboard" ;;
-    update) ok "updated runner in place (runner_id preserved)" ;;
-    reset)  ok "re-enrolled runner (runner_id reset)" ;;
+    enroll)      ok "enrolled runner with the dashboard" ;;
+    update)      ok "updated runner in place (runner_id preserved)" ;;
+    reset)       ok "re-enrolled runner (runner_id reset)" ;;
+    just_binary) ok "upgraded binaries in place (config untouched)" ;;
 esac
 
-cat <<NEXT
+if [ "$MODE" = "just_binary" ]; then
+    if [ "$SYSTEM_INSTALL" = "1" ]; then
+        unit_status_cmd="sudo systemctl status branchwork-runner"
+        unit_journal_cmd="sudo journalctl -u branchwork-runner -f"
+    else
+        unit_status_cmd="systemctl --user status branchwork-runner"
+        unit_journal_cmd="journalctl --user -u branchwork-runner -f"
+    fi
+    cat <<NEXT
+
+  Next steps:
+    • Check status:  $unit_status_cmd
+    • Tail log:      $unit_journal_cmd
+
+  Binary upgrade only — the existing systemd unit and
+  $CONFIG_FILE are untouched.
+NEXT
+else
+    cat <<NEXT
 
   Next steps:
     • Check status:  curl -fsSL $SAAS_URL/api/runners
@@ -740,3 +919,4 @@ cat <<NEXT
   For a long-running service (systemd user unit / launchd plist), see
   the Branchwork docs: $SAAS_URL/docs/runner-as-a-service
 NEXT
+fi
