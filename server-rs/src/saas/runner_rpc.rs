@@ -1302,4 +1302,218 @@ mod tests {
         drop(ws);
         server_handle.abort();
     }
+
+    /// T5.3 acceptance pin: a ghost reconnect (the runner row was
+    /// soft-deleted but its token is still valid) writes exactly one
+    /// `runner.ghost_reconnect` audit row keyed by the runner_id, with a
+    /// diff that includes the prior `removed_at` value and a token_hash
+    /// fingerprint. The structured warning log line is observable in
+    /// stderr during the run but we pin only the audit + DB-state half
+    /// of the contract here — those two are deterministic; stderr
+    /// capture varies across test harnesses.
+    ///
+    /// Setup mirrors `ws_connect_with_bound_token_unhides_soft_deleted_runner_row`
+    /// (T5.2) verbatim — same legacy / stale-state scenario, same
+    /// outcome on the `runners` row (un-hide + status='online'), but
+    /// this test additionally asserts the forensics row landed.
+    #[tokio::test]
+    async fn ghost_reconnect_writes_audit_row_and_unhides_row() {
+        use futures_util::SinkExt;
+        use std::path::PathBuf;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::init(&tempdir.path().join("test.db"));
+        let user_id = "tester-t53-ghost";
+        let token = "test-token-t53-ghost";
+        let org_id = "default-org";
+        let runner_id = "test-runner-t53-ghost";
+        let pre_removed_at = "2026-04-01 12:34:56";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                params![user_id, "t53@test", "x"],
+            )
+            .unwrap();
+            // Stale-state legacy row: token still bound, `removed_at` set.
+            // This is the ghost shape — the security gate (token DELETE in
+            // `delete_runner`) did not fire so the WS upgrade still
+            // authenticates, but the row was soft-deleted.
+            conn.execute(
+                "INSERT INTO runner_tokens \
+                 (token_hash, runner_name, org_id, created_by, claimed_runner_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![token, "runner-t53", org_id, user_id, runner_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runners (id, name, org_id, status, hostname, version, \
+                                     last_seen_at, removed_at) \
+                 VALUES (?1, ?2, ?3, 'offline', 'pre-revoke-host', 'pre-revoke-version', \
+                         datetime('now', '-1 hour'), ?4)",
+                params![runner_id, "runner-t53", org_id, pre_removed_at],
+            )
+            .unwrap();
+        }
+
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/branchwork-test-t53"),
+            0,
+            true,
+        );
+        let runners = new_runner_registry();
+        let state = crate::state::AppState {
+            db: db.clone(),
+            plans_dir: PathBuf::from("/tmp"),
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners: runners.clone(),
+            settings_path: PathBuf::from("/tmp/branchwork-test-t53-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            started_at: std::time::Instant::now(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/ws/runner",
+                axum::routing::get(crate::saas::runner_ws::runner_ws_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/ws/runner?token={token}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect");
+        let hello = Envelope::reliable(
+            runner_id.into(),
+            1,
+            WireMessage::RunnerHello {
+                hostname: "post-revoke-host".into(),
+                version: "post-revoke-version".into(),
+                drivers: vec![],
+                active_agents: vec![],
+                server_bin: None,
+                upgrade_available: false,
+            },
+        );
+        ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+            .await
+            .unwrap();
+
+        // Wait for the server to register the runner so we know the
+        // first-message branch (which writes the audit row) has run.
+        let mut attempts = 0;
+        loop {
+            let registered = runners.lock().await.contains_key(runner_id);
+            if registered {
+                break;
+            }
+            attempts += 1;
+            assert!(
+                attempts <= 200,
+                "runner did not register after ghost reconnect"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Pin (1): the runner row was un-hidden (T5.2 behavior survives).
+        let (status_col, removed_at): (Option<String>, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status, removed_at FROM runners WHERE id = ?1",
+                params![runner_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(status_col.as_deref(), Some("online"));
+        assert!(
+            removed_at.is_none(),
+            "ghost reconnect must still un-hide the row (got {removed_at:?})"
+        );
+
+        // Pin (2): exactly one audit row with the right shape.
+        let rows: Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT action, resource_type, resource_id, diff, user_email \
+                     FROM audit_logs WHERE org_id = ?1 \
+                       AND action = 'runner.ghost_reconnect' \
+                     ORDER BY id DESC",
+                )
+                .unwrap();
+            stmt.query_map(params![org_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one ghost-reconnect audit row, got {rows:?}"
+        );
+        let (action, resource_type, resource_id, diff, user_email) = &rows[0];
+        assert_eq!(action, "runner.ghost_reconnect");
+        assert_eq!(resource_type, "runner");
+        assert_eq!(resource_id.as_deref(), Some(runner_id));
+        assert_eq!(user_email.as_deref(), Some("branchwork-runner-ws"));
+
+        // Pin (3): diff captures the forensics we need to trace this
+        // back to a token without leaking the token itself.
+        let diff_value: serde_json::Value =
+            serde_json::from_str(diff.as_deref().expect("audit row must carry a diff"))
+                .expect("diff must be valid JSON");
+        assert_eq!(diff_value["runner_id"], runner_id);
+        assert_eq!(diff_value["runner_name"], "runner-t53");
+        assert_eq!(diff_value["removed_at"], pre_removed_at);
+        let prefix = diff_value["token_hash_prefix"]
+            .as_str()
+            .expect("token_hash_prefix must be a string");
+        assert_eq!(
+            prefix.len(),
+            8,
+            "token_hash_prefix must be exactly 8 chars (got {prefix:?})"
+        );
+        assert!(
+            token.starts_with(prefix),
+            "token_hash_prefix must be a prefix of the underlying token \
+             (token={token:?}, prefix={prefix:?})"
+        );
+        assert_ne!(
+            prefix, token,
+            "fingerprint must not equal the raw token value"
+        );
+
+        drop(ws);
+        server_handle.abort();
+    }
 }

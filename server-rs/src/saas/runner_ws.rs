@@ -302,6 +302,59 @@ async fn handle_runner_ws(
 
                     *id_guard = Some(rid.clone());
 
+                    // T5.3 defense-in-depth: before the un-hide UPSERT below,
+                    // peek at the row's current `removed_at` so we can detect
+                    // ghost reconnects — a WS connect from a runner whose row
+                    // was soft-deleted but whose token was not revoked.
+                    // After T5.1 + T5.2 this should be rare (the token DELETE
+                    // is now part of `delete_runner`), so any audit row here
+                    // is a smoke signal that either a legacy stale-state row
+                    // slipped through or a fresh shape of this bug class is
+                    // emerging. We log + audit and let the UPSERT proceed so
+                    // normal operation continues; the forensics matter more
+                    // than the recovery action.
+                    let existing_removed_at: Option<String> = {
+                        let conn = state.db.lock().unwrap();
+                        conn.query_row(
+                            "SELECT removed_at FROM runners WHERE id = ?1",
+                            params![rid],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .ok()
+                        .flatten()
+                    };
+                    if let Some(removed_at_value) = existing_removed_at.as_deref() {
+                        // Only log a fingerprint of the token_hash — today
+                        // `sha256_hex` returns the raw token (see its
+                        // doc-comment), and even a future real-SHA256
+                        // version is still a credential we should not
+                        // emit in full to stderr or to audit_logs.
+                        let token_hash_prefix: String = token_hash.chars().take(8).collect();
+                        eprintln!(
+                            "[runner-ws] WARNING: ghost-runner connect — \
+                             runner_id={rid} removed_at={removed_at_value} \
+                             token_hash={token_hash_prefix}"
+                        );
+                        let diff = serde_json::json!({
+                            "runner_id": &rid,
+                            "runner_name": &runner_name,
+                            "removed_at": removed_at_value,
+                            "token_hash_prefix": &token_hash_prefix,
+                        })
+                        .to_string();
+                        let conn = state.db.lock().unwrap();
+                        crate::audit::log(
+                            &conn,
+                            &org_id,
+                            None,
+                            Some("branchwork-runner-ws"),
+                            crate::audit::actions::RUNNER_GHOST_RECONNECT,
+                            crate::audit::resources::RUNNER,
+                            Some(&rid),
+                            Some(&diff),
+                        );
+                    }
+
                     // Update runner status in DB.
                     //
                     // T5.2: clear `removed_at` on the conflict-resolution UPDATE
@@ -314,7 +367,8 @@ async fn handle_runner_ws(
                     // only way we land here with `removed_at IS NOT NULL` is a
                     // legacy / stale-state row where the runner row was
                     // soft-deleted without revoking the token — un-hiding is
-                    // the desired recovery.
+                    // the desired recovery, and T5.3 logs the event above
+                    // so the smoke signal does not get lost.
                     //
                     // This intentionally relaxes the `WHERE removed_at IS NULL`
                     // gate T5.1 placed here; the other four mid-WS UPDATE sites
@@ -336,10 +390,11 @@ async fn handle_runner_ws(
                         .ok();
                     }
 
-                    // T5.1 → T5.2: the prior defense-in-depth SELECT for
-                    // `removed_at IS NOT NULL` is now redundant — the UPDATE
-                    // above unconditionally clears `removed_at`. Token
-                    // revocation in `delete_runner` is the primary gate.
+                    // T5.1 → T5.2 → T5.3: the prior defense-in-depth SELECT
+                    // for `removed_at IS NOT NULL` is now folded into the
+                    // ghost-reconnect telemetry above; the UPDATE
+                    // unconditionally clears `removed_at`. Token revocation
+                    // in `delete_runner` is the primary gate.
 
                     // Register in-memory handle.
                     runners.lock().await.insert(

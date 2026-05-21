@@ -100,6 +100,21 @@ pub mod actions {
     /// runner_version_before}`. Audit value: a future incident triggered
     /// by an upgrade can be traced back to this row.
     pub const RUNNER_UPGRADE_REQUESTED: &str = "runner.upgrade_requested";
+    /// Defense-in-depth (T5.3): the WS handler observed a connect from a
+    /// runner whose `runners` row has `removed_at IS NOT NULL`. After T5.1
+    /// (token DELETE in `delete_runner`) + T5.2 (UPSERT clearing
+    /// `removed_at` on the first message) this should be rare — the only
+    /// way we land here is a legacy / stale-state row where the token
+    /// DELETE was skipped, OR a fresh shape of this bug class we have not
+    /// yet closed. The row is emitted BEFORE the un-hide UPSERT so the
+    /// forensics survive even though normal operation continues. Diff
+    /// carries `{runner_id, runner_name, removed_at, token_hash_prefix}`
+    /// (the prefix is the first 8 chars of the stored token_hash — see
+    /// `runner_ws::sha256_hex` for why we only log a fingerprint).
+    /// Resource is `RUNNER` keyed by `runner_id`. A spike on this action
+    /// is the smoke signal that something is soft-deleting runners
+    /// without revoking their tokens.
+    pub const RUNNER_GHOST_RECONNECT: &str = "runner.ghost_reconnect";
     /// `git_helpers::push_branch_local` was rejected as non-fast-forward
     /// and successfully rebased + retried. One row per retry attempt
     /// (so a 3-attempt push that succeeds on attempt 2 produces one
