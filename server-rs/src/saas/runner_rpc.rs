@@ -1447,6 +1447,7 @@ mod tests {
         );
 
         // Pin (2): exactly one audit row with the right shape.
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(
             String,
             String,
@@ -1511,6 +1512,254 @@ mod tests {
         assert_ne!(
             prefix, token,
             "fingerprint must not equal the raw token value"
+        );
+
+        drop(ws);
+        server_handle.abort();
+    }
+
+    /// T5.4 acceptance pin: a duplicate-seq `RunnerHello` still refreshes
+    /// `runners.hostname/version/drivers_json/server_bin/upgrade_available`,
+    /// because the runner's outbox persists seqs in
+    /// `~/.branchwork-runner/runner.db` and replays previously-ACKed
+    /// envelopes after every binary upgrade + reconnect. Pre-T5.4 the
+    /// early `return` at the top of `handle_runner_message` short-
+    /// circuited the row UPDATE so the dashboard kept showing whatever
+    /// version made it through the first-ever hello (the 2026-05-18
+    /// incident: dashboard stuck at `v0.3.0` for a runner whose on-disk
+    /// binary was `v0.5.x`).
+    ///
+    /// Acceptance:
+    ///   - First hello (seq=1, version=A) lands version=A.
+    ///   - Second hello (SAME seq=1, version=B) lands version=B — the
+    ///     row UPDATE was hoisted out of the per-envelope match arm.
+    ///   - In-memory `ConnectedRunner` snapshot also flips to B.
+    ///   - Idempotent-unsafe side effects don't re-fire: `runner_drivers`
+    ///     broadcast happens exactly once (after hello#1, suppressed on
+    ///     the duplicate hello#2). `runner_connected` fires exactly once
+    ///     per WS connect (structural property of the first-message
+    ///     branch, included here as a tripwire so a future regression
+    ///     that drops the connection-state gate is caught).
+    ///
+    /// Test setup uses ONE WS connection sending two same-seq hellos
+    /// rather than two physical WS connections — same code path
+    /// (`is_duplicate_seq == true` via `outbox::advance_peer_seq`), much
+    /// simpler harness.
+    #[tokio::test]
+    async fn duplicate_seq_runner_hello_refreshes_version_but_skips_side_effects() {
+        use futures_util::SinkExt;
+        use std::path::PathBuf;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::init(&tempdir.path().join("test.db"));
+        let user_id = "tester-t54-version";
+        let token = "test-token-t54-version";
+        let org_id = "default-org";
+        let runner_id = "test-runner-t54-version";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                params![user_id, "t54@test", "x"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runner_tokens \
+                 (token_hash, runner_name, org_id, created_by, claimed_runner_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![token, "runner-t54", org_id, user_id, runner_id],
+            )
+            .unwrap();
+            // Runner row pre-exists with no hostname/version yet. Status
+            // 'offline' mirrors the post-disconnect-cleanup state we'd
+            // typically be in just before a reconnect.
+            conn.execute(
+                "INSERT INTO runners (id, name, org_id, status, last_seen_at) \
+                 VALUES (?1, ?2, ?3, 'offline', datetime('now', '-1 hour'))",
+                params![runner_id, "runner-t54", org_id],
+            )
+            .unwrap();
+        }
+
+        let (broadcast_tx, mut broadcast_rx) = tokio::sync::broadcast::channel::<String>(256);
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/branchwork-test-t54"),
+            0,
+            true,
+        );
+        let runners = new_runner_registry();
+        let state = crate::state::AppState {
+            db: db.clone(),
+            plans_dir: PathBuf::from("/tmp"),
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners: runners.clone(),
+            settings_path: PathBuf::from("/tmp/branchwork-test-t54-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            started_at: std::time::Instant::now(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/ws/runner",
+                axum::routing::get(crate::saas::runner_ws::runner_ws_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/ws/runner?token={token}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect");
+
+        // Hello #1: seq=1, version=A. Server advances seq_tracker to 1
+        // and writes version=A.
+        let hello_a = Envelope::reliable(
+            runner_id.into(),
+            1,
+            WireMessage::RunnerHello {
+                hostname: "host-a".into(),
+                version: "0.3.0".into(),
+                drivers: vec![],
+                active_agents: vec![],
+                server_bin: None,
+                upgrade_available: false,
+            },
+        );
+        ws.send(Message::Text(
+            serde_json::to_string(&hello_a).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+
+        // Wait for hello #1 to land. Polling the runners.version column
+        // is the canonical signal because the UPDATE is the load-bearing
+        // observable both pre- and post-fix.
+        let mut attempts = 0;
+        loop {
+            let v: Option<String> = {
+                let conn = db.lock().unwrap();
+                conn.query_row(
+                    "SELECT version FROM runners WHERE id = ?1",
+                    params![runner_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+            };
+            if v.as_deref() == Some("0.3.0") {
+                break;
+            }
+            attempts += 1;
+            assert!(attempts <= 200, "first hello did not land version=0.3.0");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Hello #2: SAME seq=1 (duplicate), hostname/version=B. Models a
+        // reconnect after a runner restart with an upgraded binary —
+        // the runner-side outbox persisted seq=1 across the restart and
+        // replays it as the first envelope after the new WS handshake.
+        let hello_b = Envelope::reliable(
+            runner_id.into(),
+            1,
+            WireMessage::RunnerHello {
+                hostname: "host-b".into(),
+                version: "0.5.99".into(),
+                drivers: vec![],
+                active_agents: vec![],
+                server_bin: None,
+                upgrade_available: false,
+            },
+        );
+        ws.send(Message::Text(
+            serde_json::to_string(&hello_b).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+
+        // Headline acceptance: with T5.4 the runners row flips to B
+        // within one hello round-trip. Without the fix the row stays
+        // at A forever because the duplicate-seq early-return ran
+        // before the per-arm UPDATE.
+        let mut attempts = 0;
+        loop {
+            let (hostname, version): (Option<String>, Option<String>) = {
+                let conn = db.lock().unwrap();
+                conn.query_row(
+                    "SELECT hostname, version FROM runners WHERE id = ?1",
+                    params![runner_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+            };
+            if hostname.as_deref() == Some("host-b") && version.as_deref() == Some("0.5.99") {
+                break;
+            }
+            attempts += 1;
+            assert!(
+                attempts <= 200,
+                "duplicate-seq hello did not refresh row \
+                 (hostname={hostname:?}, version={version:?}) — \
+                 the T5.4 fix lifts UPDATE runners out of the per-envelope match arm \
+                 so it survives the duplicate-seq early-return"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // In-memory `ConnectedRunner` handle is also refreshed, so
+        // `list_drivers_dispatch` and other registry-snapshot readers
+        // see fresh metadata without an extra DB round-trip.
+        {
+            let guard = runners.lock().await;
+            let runner = guard.get(runner_id).expect("runner still registered");
+            assert_eq!(runner.hostname.as_deref(), Some("host-b"));
+            assert_eq!(runner.version.as_deref(), Some("0.5.99"));
+        }
+
+        // Drain the broadcast channel and assert the duplicate-skip
+        // contract: `runner_connected` fires exactly once per WS
+        // (first-message branch gate), and `runner_drivers` fires
+        // exactly once (suppressed on the duplicate-seq hello#2 by the
+        // post-refresh early-return in `handle_runner_message`).
+        let mut runner_connected_count = 0;
+        let mut runner_drivers_count = 0;
+        loop {
+            match broadcast_rx.try_recv() {
+                Ok(payload) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+                        match v.get("type").and_then(|t| t.as_str()) {
+                            Some("runner_connected") => runner_connected_count += 1,
+                            Some("runner_drivers") => runner_drivers_count += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        assert_eq!(
+            runner_connected_count, 1,
+            "runner_connected must fire exactly once per WS connect, not twice — \
+             the first-message branch gate (id_guard.is_none()) keeps this true"
+        );
+        assert_eq!(
+            runner_drivers_count, 1,
+            "runner_drivers must be suppressed on duplicate-seq hello — \
+             the post-refresh early-return in handle_runner_message is the gate"
         );
 
         drop(ws);

@@ -592,6 +592,84 @@ async fn handle_runner_ws(
     write_handle.abort();
 }
 
+/// Refresh `runners.hostname/version/drivers_json/server_bin*/upgrade_available`
+/// from a `RunnerHello`, plus the in-memory `ConnectedRunner` snapshot.
+///
+/// T5.4: hoisted out of the per-envelope match arm in `handle_runner_message`
+/// so it runs on every RunnerHello regardless of duplicate-seq status. The
+/// runner persists its outbox seqs in `~/.branchwork-runner/runner.db`, so
+/// every reconnect after a binary upgrade replays a hello carrying a seq
+/// the server has already advanced past — without this hoisted refresh,
+/// `version` and `hostname` stay frozen at whatever value made it through
+/// the first-ever hello (the 2026-05-18 incident: dashboard showed
+/// `version=0.3.0` for a runner whose on-disk binary was `v0.5.x`).
+///
+/// `drivers_json` accidentally kept updating pre-T5.4 because
+/// `DriverAuthReport` also touches it via fresh seqs; version/hostname have
+/// no such secondary refresh path and froze hard.
+///
+/// The `removed_at IS NULL` gate (T5.1) is preserved: a stale hello on a
+/// live WS must not re-populate a revoked runner's metadata.
+async fn refresh_runner_row_from_hello(
+    state: &AppState,
+    runner_id: &str,
+    hostname: &str,
+    version: &str,
+    drivers: &[DriverAuthInfo],
+    server_bin: Option<&crate::saas::runner_protocol::ServerBinDiagnostic>,
+    upgrade_available: bool,
+) {
+    let drivers_json = serde_json::to_string(drivers).ok();
+
+    // T1.2: split the wire diagnostic into the two persisted columns.
+    // Found ⇒ (path=Some, error=NULL); NotFound ⇒ (path=NULL,
+    // error="<reason>: <searched>") so the dashboard can render a green
+    // check + path or a red cross + reason without re-parsing the enum.
+    // None (older runners) ⇒ both columns NULL, dashboard renders a
+    // neutral chip.
+    let (server_bin_path, server_bin_error): (Option<String>, Option<String>) = match server_bin {
+        Some(crate::saas::runner_protocol::ServerBinDiagnostic::Found { path }) => {
+            (Some(path.clone()), None)
+        }
+        Some(crate::saas::runner_protocol::ServerBinDiagnostic::NotFound { searched, reason }) => {
+            (None, Some(format!("{reason}: {searched}")))
+        }
+        None => (None, None),
+    };
+
+    // T4.3: `upgrade_available` is set by the runner's per-connect drift
+    // check or periodic `install-runner.sh` poll. Older runners without
+    // the field default to `false` — back-compat is symmetric since the
+    // dashboard already computes server-side `version_severity` from
+    // `version`.
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE runners SET hostname = ?1, version = ?2, drivers_json = ?3, \
+                               server_bin_path = ?4, server_bin_error = ?5, \
+                               upgrade_available = ?6 \
+             WHERE id = ?7 AND removed_at IS NULL",
+            params![
+                hostname,
+                version,
+                drivers_json,
+                server_bin_path,
+                server_bin_error,
+                upgrade_available as i64,
+                runner_id
+            ],
+        )
+        .ok();
+    }
+
+    // Update in-memory handle (idempotent snapshot refresh).
+    if let Some(runner) = state.runners.lock().await.get_mut(runner_id) {
+        runner.hostname = Some(hostname.to_string());
+        runner.version = Some(version.to_string());
+        runner.drivers = Some(drivers.to_vec());
+    }
+}
+
 /// Process a single message from a runner.
 async fn handle_runner_message(
     state: &AppState,
@@ -600,25 +678,65 @@ async fn handle_runner_message(
     envelope: &Envelope,
     cmd_tx: &mpsc::UnboundedSender<String>,
 ) {
-    // ACK reliable messages.
-    if let Some(seq) = envelope.seq {
-        // Idempotency check.
+    // ACK reliable messages (always — duplicate or not).
+    //
+    // T5.4: previously this early-returned on duplicate-seq envelopes
+    // *before* the per-envelope match arm ran. That short-circuited the
+    // `UPDATE runners SET hostname/version/...` write on every reconnect
+    // (the runner's outbox replays a seq the server has already advanced
+    // past), freezing `runners.version` at whatever value made it through
+    // the first-ever hello. We now compute `is_duplicate_seq` and let the
+    // RunnerHello row-refresh below run unconditionally; the rest of the
+    // per-arm side effects (broadcasts, agent reattachment, hello
+    // println) still get the dedupe via the conditional return after the
+    // refresh.
+    let is_duplicate_seq = if let Some(seq) = envelope.seq {
         let is_new = {
             let conn = state.db.lock().unwrap();
             outbox::init_seq_tracker(&conn);
             outbox::advance_peer_seq(&conn, runner_id, seq)
         };
+        // Always ACK — even on duplicate, so the runner can prune.
+        let ack = Envelope::best_effort("server".into(), WireMessage::Ack { ack_seq: seq });
+        let _ = cmd_tx.send(serde_json::to_string(&ack).unwrap_or_default());
+        !is_new
+    } else {
+        false
+    };
 
-        if is_new {
-            // Send ACK back to runner.
-            let ack = Envelope::best_effort("server".into(), WireMessage::Ack { ack_seq: seq });
-            let _ = cmd_tx.send(serde_json::to_string(&ack).unwrap_or_default());
-        } else {
-            // Duplicate — already processed. Still ACK so the runner prunes.
-            let ack = Envelope::best_effort("server".into(), WireMessage::Ack { ack_seq: seq });
-            let _ = cmd_tx.send(serde_json::to_string(&ack).unwrap_or_default());
-            return; // Don't re-process.
-        }
+    // T5.4 ghost-version fix: hoisted out of the match arm so it runs on
+    // every RunnerHello, including duplicate-seq replays. A duplicate
+    // hello carries an accurate snapshot of the runner's current
+    // self-report and should refresh the row — see
+    // `refresh_runner_row_from_hello` for the full rationale.
+    if let WireMessage::RunnerHello {
+        hostname,
+        version,
+        drivers,
+        active_agents: _,
+        server_bin,
+        upgrade_available,
+    } = &envelope.message
+    {
+        refresh_runner_row_from_hello(
+            state,
+            runner_id,
+            hostname,
+            version,
+            drivers,
+            server_bin.as_ref(),
+            *upgrade_available,
+        )
+        .await;
+    }
+
+    // Duplicate seq: the RunnerHello row-refresh above is the only side
+    // effect we want to run twice. Skip broadcasts, agent reattachment,
+    // and the per-arm side effects below — those are idempotent-unsafe
+    // (e.g. don't re-broadcast `runner_drivers`, don't re-run agent
+    // reattachment).
+    if is_duplicate_seq {
+        return;
     }
 
     match &envelope.message {
@@ -627,63 +745,13 @@ async fn handle_runner_message(
             version,
             drivers,
             active_agents,
-            server_bin,
-            upgrade_available,
+            server_bin: _,
+            upgrade_available: _,
         } => {
-            let drivers_json = serde_json::to_string(drivers).ok();
-
-            // T1.2: split the wire diagnostic into the two persisted
-            // columns. Found ⇒ (path=Some, error=NULL); NotFound ⇒
-            // (path=NULL, error="<reason>: <searched>") so the dashboard
-            // can render a green check + path or a red cross + reason
-            // without re-parsing the enum. None (older runners) ⇒ both
-            // columns NULL, dashboard renders a neutral chip.
-            let (server_bin_path, server_bin_error): (Option<String>, Option<String>) =
-                match server_bin {
-                    Some(crate::saas::runner_protocol::ServerBinDiagnostic::Found { path }) => {
-                        (Some(path.clone()), None)
-                    }
-                    Some(crate::saas::runner_protocol::ServerBinDiagnostic::NotFound {
-                        searched,
-                        reason,
-                    }) => (None, Some(format!("{reason}: {searched}"))),
-                    None => (None, None),
-                };
-
-            // Update runner metadata.
-            // T4.3: also persist `upgrade_available` (set by the runner's
-            // per-connect drift check or periodic `install-runner.sh`
-            // poll). Older runners without the field default to `false`
-            // — back-compat is symmetric since the dashboard already
-            // computes server-side `version_severity` from `version`.
-            // T5.1: `AND removed_at IS NULL` so a stale RunnerHello on a
-            // live WS does not re-populate a revoked runner's metadata.
-            {
-                let conn = state.db.lock().unwrap();
-                conn.execute(
-                    "UPDATE runners SET hostname = ?1, version = ?2, drivers_json = ?3, \
-                                       server_bin_path = ?4, server_bin_error = ?5, \
-                                       upgrade_available = ?6 \
-                     WHERE id = ?7 AND removed_at IS NULL",
-                    params![
-                        hostname,
-                        version,
-                        drivers_json,
-                        server_bin_path,
-                        server_bin_error,
-                        *upgrade_available as i64,
-                        runner_id
-                    ],
-                )
-                .ok();
-            }
-
-            // Update in-memory handle.
-            if let Some(runner) = state.runners.lock().await.get_mut(runner_id) {
-                runner.hostname = Some(hostname.clone());
-                runner.version = Some(version.clone());
-                runner.drivers = Some(drivers.clone());
-            }
+            // T5.4: the runner row UPDATE + in-memory handle refresh
+            // already ran in `refresh_runner_row_from_hello` above. This
+            // arm only owns the idempotent-unsafe side effects that must
+            // NOT re-fire on a duplicate-seq hello.
 
             // Broadcast driver auth to dashboard.
             broadcast_event(
