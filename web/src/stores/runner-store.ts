@@ -261,6 +261,15 @@ export interface RunnerRevokeResponse {
   tokensRevoked: number;
 }
 
+/// Server response for `POST /api/runners/{id}/upgrade`. The server has
+/// enqueued an `UpgradeRunner` wire frame; whether the runner picks it up
+/// and successfully swaps binaries is observed via subsequent `runner_log`
+/// lines and the eventual reconnect carrying the new `RunnerHello.version`.
+export interface RunnerUpgradeResponse {
+  queued: boolean;
+  seq: number;
+}
+
 interface RunnerStore {
   /// Resolved deployment mode. Starts as `unknown` so the indicator stays
   /// hidden until we know the answer (avoids flashing the amber "register
@@ -398,6 +407,23 @@ interface RunnerStore {
   /// handler) and soft-deletes the runner row. Updates the in-memory
   /// store so the row disappears immediately.
   revokeRunner: (runnerId: string) => Promise<RunnerRevokeResponse>;
+  /// POST `/api/runners/{id}/upgrade`. Reliable: the server enqueues a
+  /// `WireMessage::UpgradeRunner` that survives a runner-side disconnect.
+  /// The runner is expected to fetch the install script, swap binaries,
+  /// and restart via systemd. Successful upgrade is observed when the
+  /// runner reconnects with a new `RunnerHello.version` and the row's
+  /// `versionSeverity` flips to green; until then the row stays where
+  /// it was, so a no-op click against an already-up-to-date runner is
+  /// silent (the install script exits 0 without restarting the unit).
+  upgradeRunner: (
+    runnerId: string,
+    body?: { reason?: string },
+  ) => Promise<RunnerUpgradeResponse>;
+  /// Stamp the time of the most recent `upgradeRunner` call so the row
+  /// can render "Upgrade requested <Xm ago>" while the script is fetching
+  /// + installing. Cleared when the runner reconnects with a fresh
+  /// version (`applyConnected`).
+  upgradeRequestedAt: Record<string, number>;
   /// Track the moment a shutdown was requested for `runnerId`, so the UI
   /// can show "Requested at <ts>" and surface the 30-second "runner
   /// ignored shutdown" fallback affordance. Cleared by `applyDisconnected`
@@ -426,6 +452,7 @@ const INITIAL_STATE: Pick<
   | "configByRunnerId"
   | "logsByRunnerId"
   | "shutdownRequestedAt"
+  | "upgradeRequestedAt"
   | "agentCounts"
   | "serverVersion"
   | "healthHistoryByRunnerId"
@@ -439,6 +466,7 @@ const INITIAL_STATE: Pick<
   configByRunnerId: {},
   logsByRunnerId: {},
   shutdownRequestedAt: {},
+  upgradeRequestedAt: {},
   agentCounts: {},
   serverVersion: null,
   healthHistoryByRunnerId: {},
@@ -543,6 +571,12 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
       if (autoSelected !== s.selectedRunnerId) {
         writePersistedSelectedRunnerId(autoSelected);
       }
+      // T4.1: a reconnect is the success signal for an in-flight upgrade
+      // — the runner restarted via systemd and is back, so clear the
+      // "Upgrade requested" label. Idempotent: clearing a runner that
+      // never had an entry is a no-op.
+      const nextUpgradeRequestedAt = { ...s.upgradeRequestedAt };
+      delete nextUpgradeRequestedAt[payload.runner_id];
       if (idx >= 0) {
         const next = s.runners.slice();
         next[idx] = {
@@ -551,7 +585,11 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
           name: payload.runner_name ?? next[idx].name ?? null,
           lastSeenAt: nowIso,
         };
-        return { runners: next, selectedRunnerId: autoSelected };
+        return {
+          runners: next,
+          selectedRunnerId: autoSelected,
+          upgradeRequestedAt: nextUpgradeRequestedAt,
+        };
       }
       // New runner — server's broadcast arrived before any `/api/runners`
       // refetch carried the row. Synthesize a row so the indicator can flip
@@ -574,6 +612,7 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
         // (e.g. a runner connected mid-bootstrap before fetchRunners landed).
         mode: s.mode === "unknown" ? "saas" : s.mode,
         selectedRunnerId: autoSelected,
+        upgradeRequestedAt: nextUpgradeRequestedAt,
       };
     });
   },
@@ -784,6 +823,19 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
     return resp;
   },
 
+  upgradeRunner: async (runnerId, body) => {
+    const resp = await postJson<RunnerUpgradeResponse>(
+      `/api/runners/${encodeURIComponent(runnerId)}/upgrade`,
+      // Always send a JSON body so the server's optional-body extractor
+      // sees a parseable shape. `reason` is omitted when undefined.
+      body?.reason ? { reason: body.reason } : {},
+    );
+    set((s) => ({
+      upgradeRequestedAt: { ...s.upgradeRequestedAt, [runnerId]: Date.now() },
+    }));
+    return resp;
+  },
+
   revokeRunner: async (runnerId) => {
     const resp = await deleteJson<RunnerRevokeResponse>(
       `/api/runners/${encodeURIComponent(runnerId)}`,
@@ -798,6 +850,8 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
       delete remainingDrivers[runnerId];
       const remainingShutdowns = { ...s.shutdownRequestedAt };
       delete remainingShutdowns[runnerId];
+      const remainingUpgrades = { ...s.upgradeRequestedAt };
+      delete remainingUpgrades[runnerId];
       const remainingConfigs = { ...s.configByRunnerId };
       delete remainingConfigs[runnerId];
       const remainingLogs = { ...s.logsByRunnerId };
@@ -813,6 +867,7 @@ export const useRunnerStore = create<RunnerStore>((set, get) => ({
         runners: remainingRunners,
         driversByRunnerId: remainingDrivers,
         shutdownRequestedAt: remainingShutdowns,
+        upgradeRequestedAt: remainingUpgrades,
         configByRunnerId: remainingConfigs,
         logsByRunnerId: remainingLogs,
         selectedRunnerId: nextSelected,

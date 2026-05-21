@@ -470,6 +470,80 @@ describe("runner-store", () => {
     expect(useRunnerStore.getState().runners[0].status).toBe("offline");
   });
 
+  // ── T4.1 upgradeRunner ──────────────────────────────────────────────
+
+  it("upgradeRunner POSTs to /upgrade with reason and stamps upgradeRequestedAt", async () => {
+    let postBody: unknown = null;
+    let postPath: string | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo, init?: RequestInit) => {
+        postPath = typeof input === "string" ? input : (input as Request).url;
+        postBody = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(JSON.stringify({ queued: true, seq: 12 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    const before = Date.now();
+    const resp = await useRunnerStore
+      .getState()
+      .upgradeRunner("runner-up", { reason: "0.3.0 → 0.5.x" });
+    expect(resp).toEqual({ queued: true, seq: 12 });
+    expect(postPath).toMatch(/\/api\/runners\/runner-up\/upgrade$/);
+    expect(postBody).toEqual({ reason: "0.3.0 → 0.5.x" });
+    const stamp = useRunnerStore.getState().upgradeRequestedAt["runner-up"];
+    expect(stamp).toBeGreaterThanOrEqual(before);
+  });
+
+  it("upgradeRunner with no reason sends an empty body", async () => {
+    let postBody: unknown = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo, init?: RequestInit) => {
+        postBody = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(JSON.stringify({ queued: true, seq: 1 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    await useRunnerStore.getState().upgradeRunner("runner-up");
+    expect(postBody).toEqual({});
+  });
+
+  it("applyConnected clears upgradeRequestedAt when the runner reconnects", () => {
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r-up", status: "offline" })],
+      upgradeRequestedAt: { "r-up": Date.now() - 5_000 },
+    });
+    useRunnerStore.getState().applyConnected({ runner_id: "r-up" });
+    expect(useRunnerStore.getState().upgradeRequestedAt).not.toHaveProperty("r-up");
+    expect(useRunnerStore.getState().runners[0].status).toBe("online");
+  });
+
+  it("revokeRunner clears upgradeRequestedAt for the revoked runner", async () => {
+    useRunnerStore.setState({
+      runners: [seedRunner({ id: "r1" }), seedRunner({ id: "r2" })],
+      upgradeRequestedAt: { r1: 1000, r2: 2000 },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ revoked: true, tokensRevoked: 1 }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      ),
+    );
+    await useRunnerStore.getState().revokeRunner("r1");
+    const s = useRunnerStore.getState();
+    expect(s.upgradeRequestedAt).not.toHaveProperty("r1");
+    expect(s.upgradeRequestedAt).toHaveProperty("r2"); // other entries untouched
+  });
+
   // ── T11.3 health metrics ────────────────────────────────────────────────
 
   it("applyHealth patches the runner row + appends to the history ring", () => {

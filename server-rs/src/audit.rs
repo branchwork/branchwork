@@ -91,6 +91,15 @@ pub mod actions {
     /// (`agents`, `runner_config`, `plan_runner_affinity`, …) is untouched.
     /// Diff carries `{runner_id, runner_name, tokens_revoked: usize}`.
     pub const RUNNER_TOKEN_ROTATED: &str = "runner.token_rotated";
+    /// `POST /api/runners/{id}/upgrade` — operator clicked "Upgrade" on
+    /// the runner row to swap in the matching `branchwork-runner` +
+    /// `branchwork-server` binaries. The server enqueues a reliable
+    /// `WireMessage::UpgradeRunner` that the runner consumes by shelling
+    /// `curl -fsSL <saas_url>/install-runner.sh | sh -s -- --just-binary`.
+    /// Diff carries `{runner_id, reason: Option<String>, server_version,
+    /// runner_version_before}`. Audit value: a future incident triggered
+    /// by an upgrade can be traced back to this row.
+    pub const RUNNER_UPGRADE_REQUESTED: &str = "runner.upgrade_requested";
     /// `git_helpers::push_branch_local` was rejected as non-fast-forward
     /// and successfully rebased + retried. One row per retry attempt
     /// (so a 3-attempt push that succeeds on attempt 2 produces one

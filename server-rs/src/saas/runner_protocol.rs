@@ -288,6 +288,40 @@ pub enum WireMessage {
         reason: Option<String>,
     },
 
+    /// Operator clicked "Upgrade runner" on the dashboard. The runner is
+    /// expected to fetch the SaaS server's installer script and run it in
+    /// `--just-binary` mode, which:
+    ///   - downloads matching `branchwork-runner` and `branchwork-server`
+    ///     binaries into `$HOME/.local/bin/`,
+    ///   - skips token / config rewrites (the existing config stays as-is),
+    ///   - restarts the systemd-managed unit so the new binary picks up.
+    ///
+    /// The dashboard only surfaces this button when the version-drift
+    /// verdict is amber or red (see `VersionMismatch::Patch|Minor|Major`)
+    /// so a healthy runner stays untouched.
+    ///
+    /// **Reliable**: outbox-backed and replayed if the runner disconnects
+    /// before consuming it. A flap mid-click should not silently drop the
+    /// operator's intent.
+    ///
+    /// `install_url` defaults to `<saas_url>/install-runner.sh` (the
+    /// server-templated script). It is overridable so a future operator
+    /// can pin a specific commit / hand-rolled installer; the dashboard
+    /// today never sets the field.
+    UpgradeRunner {
+        /// Free-form operator-supplied reason; echoed in the runner's
+        /// structured log line so the host operator can correlate the
+        /// restart with the dashboard click.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Override the install-script URL the runner fetches. `None` ⇒
+        /// the runner derives it as `<saas_url>/install-runner.sh` from
+        /// its own `--saas-url` flag — same value the dashboard rendered
+        /// the script from at enrollment time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        install_url: Option<String>,
+    },
+
     /// Resize the agent's PTY.
     ResizeTerminal {
         agent_id: String,
@@ -953,6 +987,7 @@ impl WireMessage {
             WireMessage::StartAgent { .. } => "start_agent",
             WireMessage::KillAgent { .. } => "kill_agent",
             WireMessage::ShutdownRequest { .. } => "shutdown_request",
+            WireMessage::UpgradeRunner { .. } => "upgrade_runner",
             WireMessage::ResizeTerminal { .. } => "resize_terminal",
             WireMessage::AgentInput { .. } => "agent_input",
             WireMessage::TerminalReplay { .. } => "terminal_replay",
@@ -1097,6 +1132,57 @@ mod tests {
         };
         assert!(!msg.is_best_effort(), "AgentStopped must be reliable");
         assert_eq!(msg.event_type(), "agent_stopped");
+    }
+
+    #[test]
+    fn upgrade_runner_round_trip_and_is_reliable() {
+        // Task 4.1 pin: `UpgradeRunner` is the dashboard's one-click runner
+        // upgrade. Must stay reliable so a transient flap mid-click doesn't
+        // silently drop the operator's intent — the install-runner.sh
+        // `--just-binary` mode is idempotent so a replayed message is safe.
+        let msg = WireMessage::UpgradeRunner {
+            reason: Some("operator clicked Upgrade".into()),
+            install_url: None,
+        };
+        assert!(!msg.is_best_effort(), "UpgradeRunner must be reliable");
+        assert_eq!(msg.event_type(), "upgrade_runner");
+
+        let env = Envelope::reliable("r1".into(), 8, msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"upgrade_runner\""));
+        // install_url: None must be omitted on the wire so the runner
+        // derives the default from its own --saas-url flag.
+        assert!(
+            !json.contains("\"install_url\""),
+            "install_url=None must be skipped"
+        );
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::UpgradeRunner {
+                reason,
+                install_url,
+            } => {
+                assert_eq!(reason.as_deref(), Some("operator clicked Upgrade"));
+                assert_eq!(install_url, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upgrade_runner_omits_both_optional_fields_when_none() {
+        // Pre-T4.1 wire shape is empty body. Any future operator-supplied
+        // reason/url makes the JSON longer — but the *no-extras* form
+        // must serialize without trailing nulls so back-compat with
+        // older runners (that may not know the fields) holds.
+        let msg = WireMessage::UpgradeRunner {
+            reason: None,
+            install_url: None,
+        };
+        let env = Envelope::reliable("r1".into(), 1, msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"reason\""));
+        assert!(!json.contains("\"install_url\""));
     }
 
     #[test]

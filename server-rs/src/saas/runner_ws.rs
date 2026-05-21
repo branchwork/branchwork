@@ -1279,6 +1279,7 @@ async fn handle_runner_message(
         | WireMessage::StartAgent { .. }
         | WireMessage::KillAgent { .. }
         | WireMessage::ShutdownRequest { .. }
+        | WireMessage::UpgradeRunner { .. }
         | WireMessage::ResizeTerminal { .. }
         | WireMessage::AgentInput { .. }
         | WireMessage::TerminalReplay { .. }

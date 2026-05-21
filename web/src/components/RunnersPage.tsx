@@ -910,13 +910,26 @@ export function ServerBinChip({ serverBin }: { serverBin?: ServerBinStatus }) {
 /// yet) rather than fake a verdict.
 export function VersionSeverityChip({ runner }: { runner: Runner }) {
   const setOverride = useRunnerStore((s) => s.setVersionMismatchOverride);
+  // T4.1: stamp set by `upgradeRunner`, cleared by `applyConnected` when
+  // the runner reconnects with new binaries. Surfaces an inline
+  // "Upgrade requested" label so a stuck button is obvious.
+  const upgradeRequestedAt = useRunnerStore(
+    (s) => s.upgradeRequestedAt[runner.id] ?? null,
+  );
   const [busy, setBusy] = useState(false);
+  const [upgradeOpen, setUpgradeOpen] = useState(false);
   const severity = runner.versionSeverity;
   if (!severity || severity === "green") return null;
 
   const runnerVersion = runner.version ?? "?";
   const isRed = severity === "red";
   const isOverridden = runner.versionMismatchOverride === true;
+  // T4.1: Upgrade button is available whenever the chip is rendered
+  // (i.e. severity is amber or red). The runner must be online — the
+  // wire frame is outbox-backed but an offline runner can't restart
+  // itself, and the dashboard surface lying about "queued" would
+  // confuse the operator more than a disabled button.
+  const isOnline = runner.status === "online";
 
   // Color the chip from the canonical severity (not the override
   // state). Even when overridden, the underlying mismatch is still red
@@ -954,6 +967,31 @@ export function VersionSeverityChip({ runner }: { runner: Runner }) {
           </span>
         )}
       </span>
+      <Button
+        variant="primary"
+        size="sm"
+        onClick={() => setUpgradeOpen(true)}
+        disabled={!isOnline || upgradeRequestedAt !== null}
+        className="ml-2"
+        data-testid={`runner-upgrade-${runner.id}`}
+        title={
+          !isOnline
+            ? "Runner is offline — reconnect to upgrade"
+            : upgradeRequestedAt !== null
+              ? "Upgrade already in flight — waiting for the runner to restart"
+              : "Swap this runner's binaries for the matching server version"
+        }
+      >
+        Upgrade runner
+      </Button>
+      {upgradeRequestedAt !== null && (
+        <span
+          className="ml-2 text-[11px] px-2 py-0.5 rounded border border-blue-700/50 bg-blue-900/30 text-blue-200"
+          data-testid={`runner-upgrade-requested-${runner.id}`}
+        >
+          Upgrade requested {formatRelative(new Date(upgradeRequestedAt).toISOString())}
+        </span>
+      )}
       {isRed && (
         <Button
           variant="warn"
@@ -975,6 +1013,122 @@ export function VersionSeverityChip({ runner }: { runner: Runner }) {
         Version severity {severity}; runner version {runnerVersion}
         {isOverridden ? "; operator override active" : ""}
       </span>
+      <UpgradeRunnerModal
+        open={upgradeOpen}
+        runner={runner}
+        onClose={() => setUpgradeOpen(false)}
+      />
     </div>
+  );
+}
+
+/// T4.1 confirmation modal for the runner-upgrade flow. Same shape as
+/// `ShutdownRunnerModal` / `RevokeRunnerModal`: free-form reason field,
+/// inline Banner explaining what's about to happen, primary+cancel
+/// buttons. The server enqueues a reliable `UpgradeRunner` wire frame;
+/// the runner shells out to `install-runner.sh --just-binary` which
+/// downloads, swaps in place, and `systemctl restart`s itself. The
+/// dashboard sees the restart as a brief offline blip followed by a
+/// reconnect with the new `RunnerHello.version`.
+export function UpgradeRunnerModal({
+  open,
+  runner,
+  onClose,
+}: {
+  open: boolean;
+  runner: Runner;
+  onClose: () => void;
+}) {
+  const upgradeRunner = useRunnerStore((s) => s.upgradeRunner);
+  const serverVersion = useRunnerStore((s) => s.serverVersion);
+  const [reason, setReason] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  // Reset the form whenever the modal reopens so a previous session's
+  // typed reason doesn't carry over to a re-click.
+  useEffect(() => {
+    if (open) {
+      setReason("");
+      setSubmitting(false);
+    }
+  }, [open]);
+
+  const runnerVersionDisplay = runner.version ?? "unknown";
+  const serverVersionDisplay = serverVersion ?? "current";
+
+  async function submit() {
+    setSubmitting(true);
+    try {
+      const trimmedReason = reason.trim();
+      await upgradeRunner(runner.id, {
+        reason: trimmedReason.length > 0 ? trimmedReason : undefined,
+      });
+      useToastStore.getState().push({
+        kind: "success",
+        title: "Upgrade requested",
+        body: `${runner.name?.trim() || runner.id} is fetching the install script. It will reconnect once binaries are swapped.`,
+      });
+      onClose();
+    } catch (e) {
+      toastError(e, "Upgrade request failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Upgrade runner"
+      description={`Ask runner "${runner.name?.trim() || runner.id}" to fetch the install script and swap to v${serverVersionDisplay}. The runner restarts via systemd; in-flight session daemons stay attached but the runner process itself reloads.`}
+    >
+      <div className="mt-3 space-y-3" data-testid="upgrade-modal-warning">
+        <Banner kind="warn">
+          <p className="font-medium">
+            {runnerVersionDisplay}
+            {" → "}
+            {serverVersionDisplay}
+          </p>
+          <p className="mt-1 text-[11px] text-amber-200">
+            The runner runs <code className="font-mono">install-runner.sh --just-binary</code>,
+            which downloads matching <code className="font-mono">branchwork-runner</code> +{" "}
+            <code className="font-mono">branchwork-server</code> binaries and restarts the
+            systemd-managed unit. Already-up-to-date runners exit 0 without restarting. The
+            dashboard sees a brief offline blip followed by reconnect with the new version.
+          </p>
+        </Banner>
+        <div>
+          <label className="block text-[11px] text-gray-400 mb-1" htmlFor="upgrade-reason">
+            Reason (optional)
+          </label>
+          <input
+            id="upgrade-reason"
+            type="text"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. follow-up to incident #42"
+            className="w-full text-xs px-2 py-1 rounded border border-gray-700 bg-gray-900 text-gray-200"
+            disabled={submitting}
+            data-testid="upgrade-modal-reason"
+          />
+        </div>
+      </div>
+      <div className="mt-5 flex items-center justify-end gap-2">
+        <Button variant="secondary" size="sm" onClick={onClose} disabled={submitting}>
+          Cancel
+        </Button>
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={() => void submit()}
+          disabled={submitting}
+          loading={submitting}
+          data-testid="upgrade-modal-submit"
+        >
+          Upgrade runner
+        </Button>
+      </div>
+    </Modal>
   );
 }

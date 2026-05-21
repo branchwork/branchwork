@@ -460,6 +460,13 @@ struct RunnerState {
     ws_tx: mpsc::UnboundedSender<String>,
     cwd: PathBuf,
     server_bin: PathBuf,
+    /// SaaS server URL (http[s] form), captured from `--saas-url`. Used by
+    /// the `UpgradeRunner` handler to derive the default install-script URL
+    /// — `<saas_url>/install-runner.sh` — when the wire message omits a
+    /// per-call override. Stored as the user-facing http[s] form (not the
+    /// ws[s] form `ws_url` carries) so the runner can `curl -fsSL` against
+    /// it without re-translating the scheme.
+    saas_url: String,
     /// `plan_name → cwd` populated from each `StartAgent`. The CI handlers
     /// (`GetCiRunStatus`, `CiFailureLog`) only carry `plan_name` on the wire,
     /// so the runner needs a sticky map to recover the directory it should
@@ -676,6 +683,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         match connect_and_run(
             &ws_url,
+            &cli.saas_url,
             &runner_id,
             &cwd,
             &server_bin,
@@ -730,8 +738,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Single connection lifecycle.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
     ws_url: &str,
+    saas_url: &str,
     runner_id: &str,
     cwd: &Path,
     server_bin: &Path,
@@ -769,6 +779,7 @@ async fn connect_and_run(
         ws_tx: ws_tx.clone(),
         cwd: cwd.to_path_buf(),
         server_bin: server_bin.to_path_buf(),
+        saas_url: saas_url.to_string(),
         plan_cwd: Arc::new(Mutex::new(HashMap::new())),
         ci_cache: Arc::new(Mutex::new(CiAggregateCache::default())),
         shutdown_requested: shutdown.clone(),
@@ -1249,6 +1260,113 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             // iteration and breaks, and the outer reconnect loop checks
             // it before sleeping.
             state.shutdown_requested.store(true, AtomicOrdering::Relaxed);
+        }
+
+        WireMessage::UpgradeRunner {
+            reason,
+            install_url,
+        } => {
+            // Operator clicked "Upgrade runner" on the dashboard. Fetch
+            // the install script from the SaaS server and run it in
+            // `--just-binary` mode — the script handles binary download,
+            // idempotency, and systemd restart. We delegate the actual
+            // mechanics to the script because:
+            //   (a) it already knows how to map uname → release archive,
+            //       fall back to docker extraction, etc.
+            //   (b) it owns the systemd vs nohup decision per host.
+            //   (c) version idempotency (no-op when already up-to-date)
+            //       keeps a stuck dashboard button safe to re-click.
+            //
+            // We do NOT process::exit() inline: systemctl restart will
+            // SIGTERM us, which lets the writer drain ACK frames cleanly.
+            // If systemctl is absent on the host, the install script
+            // bails out with a clear error before touching binaries —
+            // the operator can read it in the dashboard tail panel
+            // (T11.1 runner_log shipper).
+            let reason_str = reason.as_deref().unwrap_or("(no reason given)");
+            log_info!("[runner] upgrade requested by SaaS: {reason_str}");
+
+            // Resolve the install URL. Default: derive from the runner's
+            // own `--saas-url` so the upgrade pulls from the same server
+            // that authenticated us. Operator override lands on the wire
+            // when a future ops flow needs to pin a specific commit.
+            let derived = format!("{}/install-runner.sh", state.saas_url.trim_end_matches('/'));
+            let url = install_url
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or(derived);
+            log_info!("[runner] upgrade: fetching {url}");
+
+            // Shell out to `curl -fsSL <url> | sh -s -- --just-binary`.
+            // The install script's idempotency check makes this safe to
+            // re-run: if the on-disk binaries already match the newest
+            // available version, the script exits 0 with `* already at
+            // vX.Y.Z — nothing to do` and does NOT restart the unit.
+            //
+            // Spawn under `sh -c` so the pipe semantics work without us
+            // having to wire two child processes manually. Spawn in the
+            // background (detached tokio task) so the WS read loop keeps
+            // draining frames while the script downloads + restarts.
+            //
+            // Output capture: route the script's stdout+stderr through
+            // log_info!/log_warn! so the dashboard tail panel surfaces
+            // each line. We block on the child via tokio::spawn_blocking
+            // because std::process::Command's stdio is sync.
+            let cmd = format!(
+                "set -eu; curl -fsSL {url} | sh -s -- --just-binary",
+                url = shell_escape(&url)
+            );
+            tokio::task::spawn_blocking(move || {
+                use std::io::{BufRead, BufReader};
+                let mut child = match std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log_warn!("[runner] upgrade: failed to spawn sh: {e}");
+                        return;
+                    }
+                };
+                // Drain stdout on the current thread and stderr on a
+                // sibling thread so a chatty script doesn't deadlock on
+                // pipe back-pressure.
+                let stderr_handle = child.stderr.take().map(|stderr| {
+                    std::thread::spawn(move || {
+                        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                            log_warn!("[upgrade] {line}");
+                        }
+                    })
+                });
+                if let Some(stdout) = child.stdout.take() {
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        log_info!("[upgrade] {line}");
+                    }
+                }
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                match child.wait() {
+                    Ok(status) => {
+                        if status.success() {
+                            log_info!(
+                                "[runner] upgrade: install-runner.sh exited 0; systemd will restart us"
+                            );
+                        } else {
+                            log_warn!(
+                                "[runner] upgrade: install-runner.sh exited with {status} — runner stays on current version"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log_warn!("[runner] upgrade: wait on install script failed: {e}");
+                    }
+                }
+            });
         }
 
         WireMessage::StartCheckAgent {
@@ -3331,6 +3449,25 @@ fn resolve_server_bin(explicit: Option<&Path>) -> ServerBinResolution {
     }
 }
 
+/// POSIX-shell single-quote escape: wrap `s` in single quotes and replace
+/// every embedded `'` with `'\''`. Used by the [`WireMessage::UpgradeRunner`]
+/// handler to interpolate a server-supplied URL into a `sh -c` command
+/// safely — defense-in-depth, the URL comes from our own SaaS server so a
+/// crafted payload would have already had to compromise the WS auth chain.
+fn shell_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 fn build_ws_url(saas_url: &str, token: &str) -> String {
     let base = saas_url.trim_end_matches('/');
     // Convert http(s) to ws(s) if needed.
@@ -3878,6 +4015,7 @@ mod tests {
             ws_tx,
             cwd: canonical,
             server_bin: PathBuf::from("/usr/bin/true"),
+            saas_url: "http://localhost:3100".to_string(),
             plan_cwd: Arc::new(Mutex::new(HashMap::new())),
             ci_cache: Arc::new(Mutex::new(CiAggregateCache::default())),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
@@ -5400,6 +5538,42 @@ mod tests {
         let (errno, tag) = classify_spawn_io_error(&io);
         assert_eq!(errno, None);
         assert_eq!(tag, "IO_ERROR");
+    }
+
+    // ── shell_escape (Task 4.1: UpgradeRunner handler safety) ───────────
+
+    /// Single-quote wrapping with no embedded quotes is the common case —
+    /// most URLs the dashboard renders have no apostrophes, so the result
+    /// should be `'<input>'` exactly.
+    #[test]
+    fn shell_escape_no_quotes_wraps_in_singles() {
+        assert_eq!(
+            shell_escape("https://branchwork.dev/install-runner.sh"),
+            "'https://branchwork.dev/install-runner.sh'"
+        );
+    }
+
+    /// Embedded single quotes are escaped via the canonical POSIX
+    /// `'\''` close-quote, escaped-quote, re-open-quote sequence. Without
+    /// this every interpolation would be vulnerable to command injection
+    /// from a server-supplied URL — defense in depth even though the URL
+    /// is server-controlled.
+    #[test]
+    fn shell_escape_escapes_embedded_single_quotes() {
+        assert_eq!(shell_escape("abc'def"), "'abc'\\''def'");
+    }
+
+    /// Spaces, dollar signs, semicolons, and other shell metacharacters
+    /// inside single quotes need no further escaping — single quotes are
+    /// the strongest POSIX quoting form. Result is `'<input>'`.
+    #[test]
+    fn shell_escape_passes_metachars_through_inside_single_quotes() {
+        let dangerous = "$(rm -rf /); echo pwn";
+        let escaped = shell_escape(dangerous);
+        assert_eq!(escaped, format!("'{dangerous}'"));
+        // Sanity: the surrounding ' ... ' is unbroken, so `sh -c` parses
+        // the whole thing as one literal argument.
+        assert_eq!(escaped.matches('\'').count(), 2);
     }
 
     // ── resolve_server_bin (T1.2) ───────────────────────────────────────

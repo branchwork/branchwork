@@ -552,6 +552,113 @@ pub async fn rotate_runner_token(
     .into_response()
 }
 
+/// Body for `POST /api/runners/{id}/upgrade`. The dashboard sends a
+/// free-form operator-typed reason; the install-script URL is left
+/// unspecified so the runner derives it from its own `--saas-url`.
+#[derive(Deserialize, Default)]
+pub struct RunnerUpgradeBody {
+    /// Free-form reason the operator typed (e.g. "0.3.0 → 0.5.x"); echoed
+    /// in the runner's `[runner] upgrade requested by SaaS:` log line.
+    /// `None` is fine — the runner just logs `(no reason given)`.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `POST /api/runners/{id}/upgrade` — ask the runner to fetch the
+/// install script and swap in the matching `branchwork-runner` +
+/// `branchwork-server` binaries.
+///
+/// Reliable delivery: enqueued in `inbox_pending` so a runner that's
+/// transiently disconnected still picks up the upgrade on its next
+/// reconnect. `install-runner.sh --just-binary` is idempotent — re-running
+/// against an already-matching version is a no-op — so a replayed message
+/// is safe.
+///
+/// Response: `200 { queued: true, seq }` on success; `404` when the runner
+/// doesn't belong to the caller's org or has been soft-deleted already.
+pub async fn upgrade_runner(
+    State(state): State<AppState>,
+    Path(runner_id): Path<String>,
+    user: AuthUser,
+    body: Option<Json<RunnerUpgradeBody>>,
+) -> impl IntoResponse {
+    if !runner_belongs_to_org(&state, &runner_id, &user.org_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "runner_not_found" })),
+        )
+            .into_response();
+    }
+
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    // Capture the current runner_version so the audit row records the
+    // before-state. A successful upgrade ends with the runner reconnecting
+    // and reporting a new version on its next `RunnerHello`, and the audit
+    // trail then shows `runner_version_before → server_version`.
+    let runner_version_before: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT version FROM runners WHERE id = ?1",
+            params![runner_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+
+    let message = WireMessage::UpgradeRunner {
+        reason: body.reason.clone(),
+        // The runner derives the install URL from its own `--saas-url`
+        // flag. The operator override surfaces on the wire only when a
+        // future ops flow needs to pin a specific commit; the dashboard
+        // does not set it today.
+        install_url: None,
+    };
+    let payload = serde_json::to_string(&message).unwrap_or_default();
+    let seq = {
+        let conn = state.db.lock().unwrap();
+        outbox::enqueue_server_command(&conn, &runner_id, message.event_type(), &payload)
+    };
+    let envelope = Envelope::reliable("server".to_string(), seq, message);
+    let env_json = serde_json::to_string(&envelope).unwrap_or_default();
+
+    // Push immediately if the runner is currently online. The outbox
+    // covers reconnect — push-immediately covers "online right now" so
+    // the operator sees a fast response in the common case.
+    if let Some(runner) = state.runners.lock().await.get(&runner_id) {
+        let _ = runner.command_tx.send(env_json);
+    }
+
+    let server_version = env!("CARGO_PKG_VERSION");
+    let diff = serde_json::json!({
+        "runner_id": runner_id,
+        "reason": body.reason,
+        "server_version": server_version,
+        "runner_version_before": runner_version_before,
+    })
+    .to_string();
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            &user.org_id,
+            Some(&user.id),
+            Some(&user.email),
+            audit::actions::RUNNER_UPGRADE_REQUESTED,
+            audit::resources::RUNNER,
+            Some(&runner_id),
+            Some(&diff),
+        );
+    }
+
+    Json(serde_json::json!({
+        "queued": true,
+        "seq": seq,
+    }))
+    .into_response()
+}
+
 /// Body for `POST /api/runners/{id}/version-mismatch-override`.
 #[derive(Deserialize)]
 pub struct VersionMismatchOverrideBody {
@@ -897,6 +1004,140 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Upgrade endpoint (Task 4.1) ─────────────────────────────────────
+
+    /// `POST /api/runners/{id}/upgrade` enqueues a reliable
+    /// `WireMessage::UpgradeRunner` AND pushes it to the live runner's
+    /// command channel so an online runner picks it up immediately. Same
+    /// shape as shutdown (T11.2) — outbox covers reconnect, push-immediately
+    /// covers "online right now".
+    #[tokio::test]
+    async fn upgrade_endpoint_enqueues_reliable_command_and_pushes_to_runner() {
+        let (db, _td) = full_db();
+        let user_id = "tester-up-1";
+        seed_runner_with_token(&db, "runner-up-1", "default-org", user_id, "hash-up-1");
+
+        let runners = new_runner_registry();
+        let mut envelope_rx = install_capturing_runner(&runners, "runner-up-1").await;
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = upgrade_runner(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("runner-up-1".to_string()),
+            auth_user("default-org", user_id),
+            Some(axum::Json(RunnerUpgradeBody {
+                reason: Some("0.3.0 → 0.5.x".into()),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["queued"], serde_json::json!(true));
+        assert!(json["seq"].is_number(), "seq missing in {json}");
+
+        // Online runner must have received the envelope on its command_tx.
+        let raw = tokio::time::timeout(std::time::Duration::from_millis(500), envelope_rx.recv())
+            .await
+            .expect("envelope arrives within 500ms")
+            .expect("channel still open");
+        let env: Envelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(env.message.event_type(), "upgrade_runner");
+        match env.message {
+            WireMessage::UpgradeRunner {
+                reason,
+                install_url,
+            } => {
+                assert_eq!(reason.as_deref(), Some("0.3.0 → 0.5.x"));
+                assert_eq!(install_url, None, "install_url default must be None");
+            }
+            other => panic!("expected UpgradeRunner, got {other:?}"),
+        }
+
+        // Reliable: must have hit the outbox so a flap also picks it up.
+        let pending_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM inbox_pending \
+                 WHERE runner_id = 'runner-up-1' AND command_type = 'upgrade_runner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pending_count, 1);
+    }
+
+    /// 404 for an unknown runner id — same membership gate as the other
+    /// per-runner endpoints. Crucially, no audit row is written and no
+    /// outbox row is enqueued on the rejection path (defense against a
+    /// stale-cookie burst hammering the audit log).
+    #[tokio::test]
+    async fn upgrade_endpoint_404s_for_unknown_runner() {
+        let (db, _td) = full_db();
+        let runners = new_runner_registry();
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = upgrade_runner(
+            axum::extract::State(state),
+            axum::extract::Path("never-existed".to_string()),
+            auth_user("default-org", "default-user"),
+            Some(axum::Json(RunnerUpgradeBody { reason: None })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // No outbox row enqueued for the unknown runner.
+        let pending_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM inbox_pending WHERE command_type = 'upgrade_runner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pending_count, 0);
+    }
+
+    /// Empty-body POST (the dashboard's no-reason variant) goes through —
+    /// `body: Option<Json<...>>` plus `Default` makes the body optional
+    /// without forcing a JSON object. Audit row still written with
+    /// `reason: null`.
+    #[tokio::test]
+    async fn upgrade_endpoint_accepts_empty_body() {
+        let (db, _td) = full_db();
+        let user_id = "tester-up-2";
+        seed_runner_with_token(&db, "runner-up-2", "default-org", user_id, "hash-up-2");
+
+        let runners = new_runner_registry();
+        let mut envelope_rx = install_capturing_runner(&runners, "runner-up-2").await;
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = upgrade_runner(
+            axum::extract::State(state),
+            axum::extract::Path("runner-up-2".to_string()),
+            auth_user("default-org", user_id),
+            None,
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = tokio::time::timeout(std::time::Duration::from_millis(500), envelope_rx.recv())
+            .await
+            .expect("envelope arrives within 500ms")
+            .expect("channel still open");
+        let env: Envelope = serde_json::from_str(&raw).unwrap();
+        match env.message {
+            WireMessage::UpgradeRunner { reason, .. } => {
+                assert_eq!(reason, None);
+            }
+            other => panic!("expected UpgradeRunner, got {other:?}"),
+        }
     }
 
     #[tokio::test]

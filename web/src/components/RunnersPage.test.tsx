@@ -473,4 +473,174 @@ describe("RunnersPage", () => {
     render(<RunnersPage />);
     expect(screen.queryByTestId("version-severity-chip")).toBeNull();
   });
+
+  // ── T4.1 Upgrade button ─────────────────────────────────────────────
+
+  /// Acceptance criterion from the plan brief: "amber or red" severity
+  /// renders the Upgrade button. The chip itself is hidden on green, so
+  /// the button is implicitly gated on that too — verified by the
+  /// "hidden on green verdict" test above.
+  it("upgrade button is enabled on amber-severity online runner", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-amber",
+          name: "laptop",
+          status: "online",
+          version: "1.4.0",
+          versionSeverity: "amber",
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    const btn = screen.getByTestId("runner-upgrade-r-amber") as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(false);
+    expect(btn.textContent).toMatch(/Upgrade runner/);
+  });
+
+  it("upgrade button is enabled on red-severity online runner", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-red",
+          name: "laptop",
+          status: "online",
+          version: "0.3.0",
+          versionSeverity: "red",
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    const btn = screen.getByTestId("runner-upgrade-r-red") as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(false);
+  });
+
+  it("upgrade button is disabled when the runner is offline", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-offline",
+          name: "laptop",
+          status: "offline",
+          version: "0.3.0",
+          versionSeverity: "red",
+        }),
+      ],
+    });
+    render(<RunnersPage />);
+    const btn = screen.getByTestId("runner-upgrade-r-offline") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(btn.title).toMatch(/offline/i);
+  });
+
+  it("upgrade button is disabled while an upgrade is already in flight", () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-flight",
+          name: "laptop",
+          status: "online",
+          version: "0.3.0",
+          versionSeverity: "red",
+        }),
+      ],
+      upgradeRequestedAt: { "r-flight": Date.now() - 5_000 },
+    });
+    render(<RunnersPage />);
+    const btn = screen.getByTestId("runner-upgrade-r-flight") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    // The "Upgrade requested <Xs ago>" label confirms the in-flight state.
+    expect(screen.getByTestId("runner-upgrade-requested-r-flight")).toBeTruthy();
+  });
+
+  it("clicking Upgrade opens the confirmation modal", async () => {
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-modal",
+          name: "laptop",
+          status: "online",
+          version: "0.3.0",
+          versionSeverity: "red",
+        }),
+      ],
+      serverVersion: "0.5.68",
+    });
+    render(<RunnersPage />);
+    const btn = screen.getByTestId("runner-upgrade-r-modal");
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(screen.getByTestId("upgrade-modal-submit")).toBeTruthy();
+    });
+    // Modal carries the before→after version line so the operator sees
+    // what they're about to swap to.
+    expect(screen.getByTestId("upgrade-modal-warning").textContent).toContain("0.3.0");
+    expect(screen.getByTestId("upgrade-modal-warning").textContent).toContain("0.5.68");
+  });
+
+  it("submitting the upgrade modal calls upgradeRunner and pushes a success toast", async () => {
+    const upgradeRunner = vi.fn().mockResolvedValue({ queued: true, seq: 7 });
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-submit",
+          name: "laptop",
+          status: "online",
+          version: "0.3.0",
+          versionSeverity: "red",
+        }),
+      ],
+      upgradeRunner,
+      serverVersion: "0.5.68",
+    });
+    render(<RunnersPage />);
+    fireEvent.click(screen.getByTestId("runner-upgrade-r-submit"));
+    await waitFor(() => {
+      expect(screen.getByTestId("upgrade-modal-submit")).toBeTruthy();
+    });
+    fireEvent.change(screen.getByTestId("upgrade-modal-reason"), {
+      target: { value: "follow-up to incident" },
+    });
+    fireEvent.click(screen.getByTestId("upgrade-modal-submit"));
+    await waitFor(() => {
+      expect(upgradeRunner).toHaveBeenCalledWith("r-submit", {
+        reason: "follow-up to incident",
+      });
+    });
+    await waitFor(() => {
+      const toasts = useToastStore.getState().toasts;
+      expect(toasts.some((t) => t.kind === "success" && /Upgrade requested/.test(t.title))).toBe(
+        true,
+      );
+    });
+  });
+
+  it("submitting with no reason sends body without reason", async () => {
+    const upgradeRunner = vi.fn().mockResolvedValue({ queued: true, seq: 1 });
+    useRunnerStore.setState({
+      runners: [
+        seedRunner({
+          id: "r-no-reason",
+          name: "laptop",
+          status: "online",
+          version: "0.3.0",
+          versionSeverity: "red",
+        }),
+      ],
+      upgradeRunner,
+    });
+    render(<RunnersPage />);
+    fireEvent.click(screen.getByTestId("runner-upgrade-r-no-reason"));
+    await waitFor(() => {
+      expect(screen.getByTestId("upgrade-modal-submit")).toBeTruthy();
+    });
+    fireEvent.click(screen.getByTestId("upgrade-modal-submit"));
+    await waitFor(() => {
+      // `reason: undefined` flows through; whitespace-only would also
+      // be normalized to undefined by the submit handler's trim.
+      expect(upgradeRunner).toHaveBeenCalledWith("r-no-reason", { reason: undefined });
+    });
+  });
 });
