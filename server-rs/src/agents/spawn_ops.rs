@@ -589,6 +589,72 @@ fn check_version_block(db: &crate::db::Db, runner_id: &str) -> Option<VersionBlo
     }
 }
 
+/// Snapshot returned by [`dispatch_version_block`] when HTTP dispatch
+/// must refuse a Start click before any side effects fire. The shape is
+/// echoed verbatim into the 409 response body so the UI can render the
+/// blocked-runner banner without a follow-up query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchVersionBlock {
+    /// Runner id the dispatch would have targeted.
+    pub runner_id: String,
+    /// Last-reported runner version (matches `runners.version`). `None` for
+    /// a runner that has connected but not yet shipped a `RunnerHello`.
+    pub runner_version: Option<String>,
+    /// Server's compiled-in `CARGO_PKG_VERSION` — the reference point the
+    /// severity classifier used.
+    pub server_version: String,
+}
+
+/// Pre-check whether the dispatch path would block on runner version
+/// mismatch (T4.2). HTTP callers SHOULD call this before
+/// [`start_agent_dispatch`] and return 409 with
+/// `code=runner_version_blocked` when this returns `Some`. Doing so
+/// avoids inserting a failed agent row and pausing the plan for a
+/// button click that the dispatcher would reject anyway.
+///
+/// Returns `None` for:
+///   - standalone deployments (`!org_has_runner`)
+///   - orgs where [`resolve_runner_for_spawn`] doesn't pick a real
+///     dispatch target (no online runner, or pinned-and-offline ⇒
+///     `PinnedRunnerOffline`/`NoRunner` paths in the dispatcher handle
+///     these as their own kind of block)
+///   - target runner is Green/Amber severity, or has the
+///     `version_mismatch_override` column flipped (T1.3 escape hatch)
+///
+/// The dispatcher's internal [`check_version_block`] stays as
+/// defense-in-depth so auto-mode / fix-spawn paths (which don't call
+/// this helper) still trip the existing pause-the-plan + fail-the-row
+/// path. Two layers means: a slow HTTP path (lots of clicks) gets clean
+/// 409s; the autonomous loops get visible pause states.
+pub fn dispatch_version_block(
+    state: &AppState,
+    org_id: &str,
+    plan_name: Option<&str>,
+    explicit_runner_id: Option<&str>,
+) -> Option<DispatchVersionBlock> {
+    if !org_has_runner(&state.db, org_id) {
+        return None;
+    }
+    let target = resolve_runner_for_spawn(&state.db, org_id, plan_name, explicit_runner_id);
+    let runner_id = match target {
+        SpawnTarget::Runner(rid) => rid,
+        SpawnTarget::SiblingFailover {
+            sibling_runner_id, ..
+        } => sibling_runner_id,
+        // No target runner — the dispatcher's PinnedRunnerOffline /
+        // NoRunner paths handle these (pause-and-fail or silent bail).
+        // T4.2 version-block only fires when there IS a runner we'd
+        // actually send `StartAgent` to.
+        SpawnTarget::PinnedRunnerOffline { .. } | SpawnTarget::NoRunner => return None,
+    };
+    let block = check_version_block(&state.db, &runner_id)?;
+    Some(DispatchVersionBlock {
+        runner_id,
+        runner_version: block.runner_version,
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
 /// Reliable delivery: enqueue first so an offline runner picks this up
 /// on reconnect via outbox replay; push immediately if currently online.
 async fn send_reliable_to_runner(
@@ -1789,6 +1855,149 @@ mod tests {
             .expect("channel still open");
         let envelope: Envelope = serde_json::from_str(&payload).unwrap();
         assert!(matches!(envelope.message, WireMessage::StartAgent { .. }));
+    }
+
+    // ── T4.2: dispatch_version_block (pre-check helper) ──────────────────
+
+    /// Acceptance: the pre-check helper returns Some for a red-severity
+    /// target runner. HTTP handlers use this Some/None signal to return
+    /// a 409 BEFORE any agent-row insert or plan-pause side effects.
+    #[tokio::test]
+    async fn dispatch_version_block_returns_some_for_red_severity_target() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        seed_runner_with_version(&db, "runner-old", org_id, "online", "0.3.0");
+
+        let runners = new_runner_registry();
+        let _rx = install_capturing_runner(&runners, "runner-old").await;
+        let state = test_app_state(db, runners);
+
+        let block = dispatch_version_block(&state, org_id, Some("demo-plan"), None);
+        let block = block.expect("expected Some for red-severity target");
+        assert_eq!(block.runner_id, "runner-old");
+        assert_eq!(block.runner_version.as_deref(), Some("0.3.0"));
+        // server_version is whatever env!("CARGO_PKG_VERSION") resolves to.
+        // Just assert it's non-empty so the HTTP body always carries a value.
+        assert!(
+            !block.server_version.is_empty(),
+            "server_version must be populated"
+        );
+    }
+
+    /// Operator override lifts the gate at the pre-check layer too: the
+    /// helper returns None when `version_mismatch_override = 1`, so HTTP
+    /// handlers fall through to the spawn path.
+    #[tokio::test]
+    async fn dispatch_version_block_returns_none_when_override_set() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        seed_runner_with_version(&db, "runner-old", org_id, "online", "0.3.0");
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE runners SET version_mismatch_override = 1 WHERE id = ?1",
+                params!["runner-old"],
+            )
+            .unwrap();
+        }
+
+        let runners = new_runner_registry();
+        let _rx = install_capturing_runner(&runners, "runner-old").await;
+        let state = test_app_state(db, runners);
+
+        let block = dispatch_version_block(&state, org_id, Some("demo-plan"), None);
+        assert!(
+            block.is_none(),
+            "override must lift the pre-check block: got {block:?}"
+        );
+    }
+
+    /// Standalone mode (no runners): pre-check returns None so the local
+    /// path runs unaffected.
+    #[tokio::test]
+    async fn dispatch_version_block_returns_none_in_standalone_mode() {
+        let (db, _td) = full_db();
+        let org_id = "default-org"; // no runners row
+
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let block = dispatch_version_block(&state, org_id, Some("demo-plan"), None);
+        assert!(block.is_none(), "standalone must not gate dispatch");
+    }
+
+    /// Green-severity runner: pre-check returns None — the dispatcher
+    /// proceeds normally, no 409 emitted.
+    #[tokio::test]
+    async fn dispatch_version_block_returns_none_for_green_severity_target() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        let server_version = env!("CARGO_PKG_VERSION");
+        seed_runner_with_version(&db, "runner-modern", org_id, "online", server_version);
+
+        let runners = new_runner_registry();
+        let _rx = install_capturing_runner(&runners, "runner-modern").await;
+        let state = test_app_state(db, runners);
+
+        let block = dispatch_version_block(&state, org_id, Some("demo-plan"), None);
+        assert!(
+            block.is_none(),
+            "green-severity must not gate dispatch: got {block:?}"
+        );
+    }
+
+    /// Pinned-but-offline path: pre-check returns None (the dispatcher
+    /// has its own PinnedRunnerOffline path that pauses the plan with
+    /// `runner_offline` — not our concern here).
+    #[tokio::test]
+    async fn dispatch_version_block_returns_none_for_pinned_offline() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        seed_runner_with_version(&db, "runner-pinned-offline", org_id, "offline", "0.3.0");
+        crate::db::set_plan_runner_id(&db, "demo-plan", org_id, Some("runner-pinned-offline"));
+
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let block = dispatch_version_block(&state, org_id, Some("demo-plan"), None);
+        assert!(
+            block.is_none(),
+            "PinnedRunnerOffline path must not produce a version-block: got {block:?}"
+        );
+    }
+
+    /// Sibling-failover path: when the dispatcher would route to a
+    /// sibling, the pre-check evaluates the SIBLING's severity (not the
+    /// offline pin's). Red sibling ⇒ block; green sibling ⇒ allow.
+    #[tokio::test]
+    async fn dispatch_version_block_evaluates_sibling_failover_target() {
+        let (db, _td) = full_db();
+        let org_id = "default-org";
+        // Pin is offline + green. Sibling is online + red. The dispatcher
+        // would route to the sibling, so the gate must trip on the
+        // sibling's version.
+        seed_runner_with_version(
+            &db,
+            "runner-pinned-offline",
+            org_id,
+            "offline",
+            env!("CARGO_PKG_VERSION"),
+        );
+        seed_runner_with_version(&db, "runner-sibling-red", org_id, "online", "0.3.0");
+
+        crate::db::set_plan_runner_id(&db, "demo-plan", org_id, Some("runner-pinned-offline"));
+        crate::db::set_plan_runner_failover(&db, "demo-plan", "sibling").expect("policy is valid");
+
+        let runners = new_runner_registry();
+        let _rx = install_capturing_runner(&runners, "runner-sibling-red").await;
+        let state = test_app_state(db, runners);
+
+        let block = dispatch_version_block(&state, org_id, Some("demo-plan"), None);
+        let block = block.expect("expected Some for red sibling-failover target");
+        assert_eq!(
+            block.runner_id, "runner-sibling-red",
+            "block must name the sibling (the actual dispatch target), not the pin"
+        );
     }
 
     /// Acceptance: an explicit `runner_id` override (e.g. from

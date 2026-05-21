@@ -3343,6 +3343,43 @@ pub struct StartTaskBody {
     driver: Option<String>,
 }
 
+/// Build the 409 response body for a T4.2 runner-version-blocked dispatch.
+/// Returns `None` when the dispatcher would NOT block, so callers can
+/// inline this as `if let Some(resp) = runner_version_blocked_response(...)
+/// { return resp; }` and fall through to the existing spawn path.
+///
+/// The `upgradeUrl` points at the `/runners` page where the per-runner
+/// **Upgrade runner** button (T4.1) lives. Front-end consumers render
+/// this URL as a hyperlink in the toast / error pane.
+fn runner_version_blocked_response(
+    state: &AppState,
+    org_id: &str,
+    plan_name: Option<&str>,
+    explicit_runner_id: Option<&str>,
+) -> Option<Response> {
+    let block = crate::agents::spawn_ops::dispatch_version_block(
+        state,
+        org_id,
+        plan_name,
+        explicit_runner_id,
+    )?;
+    Some(
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "runner_version_blocked",
+                "code": "runner_version_blocked",
+                "message": "Runner too old — upgrade required",
+                "runnerId": block.runner_id,
+                "runnerVersion": block.runner_version,
+                "serverVersion": block.server_version,
+                "upgradeUrl": "/runners",
+            })),
+        )
+            .into_response(),
+    )
+}
+
 fn plan_remaining_budget(
     db: &rusqlite::Connection,
     plan_name: &str,
@@ -3545,6 +3582,15 @@ pub async fn start_task(
 
     // Create a dedicated branch for this task
     let branch_name = format!("branchwork/{}/{}", body.plan_name, body.task_number);
+
+    // T4.2: refuse to dispatch to a red-severity runner before agent-row
+    // insert + plan-pause side effects. The operator override (T1.3) still
+    // bypasses this via the runner's `version_mismatch_override` column.
+    if let Some(resp) =
+        runner_version_blocked_response(&state, &org_id_str, Some(&body.plan_name), None)
+    {
+        return resp;
+    }
 
     let agent_id = crate::agents::spawn_ops::start_agent_dispatch(
         &state,
@@ -3766,6 +3812,17 @@ pub async fn start_phase_tasks(
 
     let port = state.config_port();
     let mcp_available = state.registry.drivers.injects_mcp(body.driver.as_deref());
+
+    // T4.2: refuse to dispatch this whole batch to a red-severity runner
+    // before any agent-row inserts. The pre-check is hoisted out of the
+    // loop because all tasks in the batch resolve to the same runner
+    // (same `plan_name`, same `resolve_runner_for_spawn` result). The
+    // operator override (T1.3) still bypasses this.
+    if let Some(resp) = runner_version_blocked_response(&state, &org_id_str, Some(&plan_name), None)
+    {
+        return resp;
+    }
+
     let mut started = Vec::new();
 
     for task in ready {
@@ -3983,6 +4040,14 @@ pub async fn start_plan_session(
     // ships work to the runner, which owns its own filesystem.
     if !crate::saas::dispatch::org_has_runner(&state.db, &org_id_str) {
         ensure_git_initialized(&work_dir);
+    }
+
+    // T4.2: refuse to dispatch to a red-severity runner before any
+    // agent-row insert. Same gate as `start_task`. Operator override
+    // (T1.3) still bypasses this.
+    if let Some(resp) = runner_version_blocked_response(&state, &org_id_str, Some(&plan_name), None)
+    {
+        return resp;
     }
 
     // task_id = None and branch = None: this is the whole point of the
@@ -4595,6 +4660,19 @@ pub async fn create_plan(
 
     let effort = *state.effort.lock().unwrap();
     let org_id_str = auth.org_id().to_string();
+
+    // T4.2: refuse to dispatch the plan-creator agent to a red-severity
+    // runner. NewPlanForm may have supplied an explicit `runner_id`; the
+    // resolver pre-checks that target. Without a plan yet there's nothing
+    // to pause, but failing fast keeps NewPlanForm from showing a
+    // misleading "Plan created!" toast when the agent will immediately
+    // fail. Operator override (T1.3) still bypasses this.
+    if let Some(resp) =
+        runner_version_blocked_response(&state, &org_id_str, None, body.runner_id.as_deref())
+    {
+        return resp;
+    }
+
     let agent_id = crate::agents::spawn_ops::start_agent_dispatch(
         &state,
         &org_id_str,

@@ -326,6 +326,33 @@ pub async fn fix_ci(
     //    group 3).
     let effort = *state.effort.lock().unwrap();
     let org_id_str = auth.org_id().to_string();
+
+    // T4.2: refuse to dispatch the recovery agent to a red-severity
+    // runner. Fix-CI is operator-driven (clicking the Fix CI button
+    // on a failed task), so this is exactly the path that wants a
+    // clean 409 + an upgrade link rather than a silent dispatcher
+    // pause. Operator override (T1.3) still bypasses this.
+    if let Some(block) = crate::agents::spawn_ops::dispatch_version_block(
+        &state,
+        &org_id_str,
+        Some(&body.plan_name),
+        None,
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "runner_version_blocked",
+                "code": "runner_version_blocked",
+                "message": "Runner too old — upgrade required",
+                "runnerId": block.runner_id,
+                "runnerVersion": block.runner_version,
+                "serverVersion": block.server_version,
+                "upgradeUrl": "/runners",
+            })),
+        )
+            .into_response();
+    }
+
     let agent_id = crate::agents::spawn_ops::start_agent_dispatch(
         &state,
         &org_id_str,
