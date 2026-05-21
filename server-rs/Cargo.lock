@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "branchwork-server"
-version = "0.5.72"
+version = "0.5.73"
 dependencies = [
  "axum",
  "base64",
