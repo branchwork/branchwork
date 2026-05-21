@@ -474,17 +474,19 @@ mod tests {
     fn install_script_invokes_foreign_check_before_binary_download() {
         // Failing fast keeps a re-paste from wasting bandwidth on a host
         // that already has a foreign runner. The `check_foreign_runners`
-        // call line must come before `download_binary`.
+        // call line must come before the first `download_binary_to` call.
+        // (Renamed from `download_binary` in T3.1 to make the per-binary
+        // target output path explicit.)
         let template = INSTALL_SCRIPT_TEMPLATE;
         let check_at = template
             .find("\ncheck_foreign_runners\n")
             .expect("check_foreign_runners must be invoked at top level");
         let download_at = template
-            .find("download_binary ")
-            .expect("download_binary must appear in the script");
+            .find("download_binary_to ")
+            .expect("download_binary_to must appear in the script");
         assert!(
             check_at < download_at,
-            "check_foreign_runners must run before download_binary (fail fast on contention)"
+            "check_foreign_runners must run before download_binary_to (fail fast on contention)"
         );
     }
 
@@ -500,6 +502,151 @@ mod tests {
         assert!(
             INSTALL_SCRIPT_TEMPLATE.contains("kill -KILL \"$pid\""),
             "force-replace must SIGKILL after the grace window"
+        );
+    }
+
+    // ── T3.1 paired-binary install contract ─────────────────────────────
+    //
+    // install-runner.sh must drop BOTH `branchwork-runner` and
+    // `branchwork-server` at $HOME/.local/bin/ so Start session works
+    // without an operator-supplied --server-bin hint. These tests pin
+    // the surface so a future re-org of the source-resolution loop
+    // can't silently regress to runner-only install.
+
+    #[test]
+    fn install_script_installs_both_binaries() {
+        // The two target paths must be declared next to each other and
+        // both flow into the final `mv $TMP_* $INSTALL_DIR/*` step.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"RUNNER_BIN="$INSTALL_DIR/branchwork-runner""#),
+            "must declare RUNNER_BIN under $INSTALL_DIR"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"SERVER_BIN="$INSTALL_DIR/branchwork-server""#),
+            "must declare SERVER_BIN under $INSTALL_DIR (T3.1 paired install)"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"mv "$TMP_RUNNER" "$RUNNER_BIN""#),
+            "must move the runner tmpfile into $RUNNER_BIN"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"mv "$TMP_SERVER" "$SERVER_BIN""#),
+            "must move the server tmpfile into $SERVER_BIN"
+        );
+    }
+
+    #[test]
+    fn install_script_atomic_pair_no_half_install() {
+        // Both binaries must be downloaded to tmpfiles BEFORE either is
+        // moved into $INSTALL_DIR, so a partial network failure cannot
+        // leave the host with a runner pointing at a missing server.
+        // We assert this structurally: every reference to mv into the
+        // final path must come after every download_binary_to call.
+        let template = INSTALL_SCRIPT_TEMPLATE;
+        let last_download = template
+            .rfind("download_binary_to")
+            .expect("script must call download_binary_to at least once");
+        let first_mv = template
+            .find(r#"mv "$TMP_RUNNER" "$RUNNER_BIN""#)
+            .expect("script must mv the runner into $RUNNER_BIN");
+        assert!(
+            last_download < first_mv,
+            "every download must precede every final-path mv (atomic-pair contract)"
+        );
+        let extract_call_idx = template
+            .find("if extract_via_docker ")
+            .expect("docker fallback must run between downloads and mv");
+        assert!(
+            extract_call_idx < first_mv,
+            "docker fallback must precede the final-path mv"
+        );
+    }
+
+    #[test]
+    fn install_script_has_per_binary_overrides() {
+        // BRANCHWORK_BINARY_URL stays runner-only for backward compat;
+        // BRANCHWORK_SERVER_BINARY_URL is the new sibling override so
+        // dogfooders can pin a custom server build alongside a custom
+        // runner build.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("BRANCHWORK_BINARY_URL"),
+            "runner override env var must remain wired"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("BRANCHWORK_SERVER_BINARY_URL"),
+            "T3.1 must add BRANCHWORK_SERVER_BINARY_URL as the server-side override"
+        );
+        // The two overrides must be processed at the top of the source
+        // resolution loop (env > release > docker), in that order, so
+        // operators can pin a custom build without docker on the host.
+        let template = INSTALL_SCRIPT_TEMPLATE;
+        let runner_env_idx = template
+            .find(r#"if [ -n "${BRANCHWORK_BINARY_URL:-}" ]"#)
+            .expect("runner env override branch missing");
+        let server_env_idx = template
+            .find(r#"if [ -n "${BRANCHWORK_SERVER_BINARY_URL:-}" ]"#)
+            .expect("server env override branch missing");
+        let release_idx = template
+            .find("releases/latest/download/branchwork-runner-")
+            .expect("release asset path missing");
+        assert!(
+            runner_env_idx < release_idx && server_env_idx < release_idx,
+            "env overrides must run before release-asset fallback"
+        );
+    }
+
+    #[test]
+    fn install_script_release_assets_cover_both_binaries() {
+        // Mirror release naming: one URL per binary per platform.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains("releases/latest/download/branchwork-runner-${os}-${arch}"),
+            "must point at the runner release asset URL pattern"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains("releases/latest/download/branchwork-server-${os}-${arch}"),
+            "must point at the server release asset URL pattern (T3.1)"
+        );
+    }
+
+    #[test]
+    fn install_script_docker_extracts_both_binaries() {
+        // The :edge image carries both binaries under /usr/local/bin
+        // (deploy/Dockerfile stage 3). A single container creation
+        // yields both — reuse the same `docker create` instead of
+        // paying the cost twice.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("docker cp \"$cid:/usr/local/bin/branchwork-runner\""),
+            "docker extract must copy the runner from /usr/local/bin"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("docker cp \"$cid:/usr/local/bin/branchwork-server\""),
+            "docker extract must copy the server from /usr/local/bin (T3.1)"
+        );
+        // Exactly one executable `docker create` to avoid double image
+        // pull. Comments may mention the phrase too, so count only lines
+        // that are not pure comments.
+        let create_count = INSTALL_SCRIPT_TEMPLATE
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && l.contains("docker create"))
+            .count();
+        assert_eq!(
+            create_count, 1,
+            "expected exactly one executable `docker create` (got {create_count}); both binaries must come from the same container"
+        );
+    }
+
+    #[test]
+    fn install_script_launches_runner_with_install_dir_on_path() {
+        // The runner's `which("branchwork-server")` resolver only finds
+        // our paired binary if $INSTALL_DIR is on PATH at launch. nohup
+        // inherits the operator's shell PATH, which on minimal hosts
+        // may NOT include $HOME/.local/bin — prepend $INSTALL_DIR so
+        // the lookup is deterministic regardless of dotfile state.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"PATH="$INSTALL_DIR:$PATH" nohup "$RUNNER_BIN""#),
+            "must prepend $INSTALL_DIR to PATH on the nohup launch line"
         );
     }
 }

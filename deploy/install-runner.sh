@@ -17,10 +17,18 @@
 #
 #   First run (no $HOME/.branchwork-runner/config.toml on disk) — ENROLL.
 #     1. Detect uname -s / uname -m → linux-amd64, linux-arm64, darwin-arm64.
-#     2. Drop a `branchwork-runner` binary at $HOME/.local/bin.
+#     2. Drop BOTH `branchwork-runner` and `branchwork-server` binaries at
+#        $HOME/.local/bin. The runner shells out to `branchwork-server
+#        session …` for every per-agent supervisor; shipping the paired
+#        binary alongside the runner means Start session works without
+#        any operator-supplied --server-bin hint (T3.1).
 #     3. Write $HOME/.branchwork-runner/config.toml with the token + SaaS URL.
 #     4. Start the runner in the background (nohup + &) so the dashboard's
 #        WS receives `runner_connected` and the modal flips to "Connected!".
+#        The launch line prepends $INSTALL_DIR to PATH so the runner's
+#        which("branchwork-server") resolver finds the paired binary
+#        regardless of whether the operator's shell has $HOME/.local/bin
+#        on PATH by default.
 #
 #   Subsequent runs (config.toml already present) — UPDATE.
 #     1. Stop the existing runner via $PID_FILE (kill -TERM, then -KILL).
@@ -56,17 +64,27 @@
 #   both a system-package branchwork-runner and a curl-piped one.
 #
 # Environment overrides (rarely needed):
-#   BRANCHWORK_SAAS_URL    — override the URL baked in by the server.
-#   BRANCHWORK_BINARY_URL  — direct URL to a runner binary; skips detection.
-#   BRANCHWORK_INSTALL_DIR — destination dir, default $HOME/.local/bin.
+#   BRANCHWORK_SAAS_URL           — override the URL baked in by the server.
+#   BRANCHWORK_BINARY_URL         — direct URL to a runner binary; skips
+#                                   detection for the runner only.
+#   BRANCHWORK_SERVER_BINARY_URL  — direct URL to a server binary; skips
+#                                   detection for the server only. Set
+#                                   alongside BRANCHWORK_BINARY_URL when
+#                                   dogfooding a custom build pair.
+#   BRANCHWORK_INSTALL_DIR        — destination dir, default $HOME/.local/bin.
 #
-# Binary sources, tried in order:
-#   1. $BRANCHWORK_BINARY_URL (operator override).
+# Binary sources, tried in order (per binary — runner and server are
+# resolved independently, so partial success from an earlier source is
+# allowed; only an unresolved binary falls through to the next source):
+#   1. $BRANCHWORK_BINARY_URL / $BRANCHWORK_SERVER_BINARY_URL
+#      (operator overrides, per binary).
 #   2. GitHub Release asset (https://github.com/branchwork/branchwork/...).
 #      404s silently when releases aren't shipped yet.
 #   3. `docker create + cp` from ghcr.io/branchwork/branchwork:edge — the
-#      multi-arch :edge tag DOES carry both amd64 and arm64 runner binaries
-#      today, so this is the working MVP path on Linux.
+#      multi-arch :edge tag carries both binaries under /usr/local/bin/
+#      (see deploy/Dockerfile stage 3), so a single container creation
+#      yields both runner and server. Linux only — the image is musl,
+#      not Darwin Mach-O.
 #
 # Limitations:
 #   • macOS extract path: the :edge image only carries linux/musl binaries,
@@ -392,11 +410,21 @@ check_foreign_runners() {
 
 check_foreign_runners
 
-# ── Helpers to land a binary at $TMP_BIN ────────────────────────────────────
+# ── Helpers to land binaries at $TMP_RUNNER + $TMP_SERVER ──────────────────
+#
+# Two binaries to install (T3.1): the runner itself and the paired
+# `branchwork-server`. They are sourced INDEPENDENTLY — i.e. an env
+# override for one does not skip the GitHub-release / docker-extract
+# attempt for the other — so an operator dogfooding a custom runner
+# build still gets a matching server from the next source. Both must
+# land in $TMP_* tmpfiles before either is moved into $INSTALL_DIR, so
+# a partial download cannot leave the host with a mismatched pair.
 mkdir -p "$INSTALL_DIR"
-BIN="$INSTALL_DIR/branchwork-runner"
-TMP_BIN="$(mktemp 2>/dev/null || mktemp -t bwrunner)"
-trap 'rm -f "$TMP_BIN"' EXIT
+RUNNER_BIN="$INSTALL_DIR/branchwork-runner"
+SERVER_BIN="$INSTALL_DIR/branchwork-server"
+TMP_RUNNER="$(mktemp 2>/dev/null || mktemp -t bwrunner)"
+TMP_SERVER="$(mktemp 2>/dev/null || mktemp -t bwserver)"
+trap 'rm -f "$TMP_RUNNER" "$TMP_SERVER"' EXIT
 
 is_native_executable() {
     # ELF magic for Linux, Mach-O magic for macOS. The Mach-O check covers
@@ -411,17 +439,38 @@ is_native_executable() {
     return 1
 }
 
-download_binary() {
+# Download $1=url → $2=output path; verify executable magic before returning
+# success. Used per-binary so callers can target either $TMP_RUNNER or
+# $TMP_SERVER without dragging in `set` or `eval` indirection.
+download_binary_to() {
     url="$1"
-    if curl -fsSL "$url" -o "$TMP_BIN" 2>/dev/null; then
-        if [ -s "$TMP_BIN" ] && is_native_executable "$TMP_BIN"; then
+    out="$2"
+    if curl -fsSL "$url" -o "$out" 2>/dev/null; then
+        if [ -s "$out" ] && is_native_executable "$out"; then
             return 0
         fi
     fi
     return 1
 }
 
+# Pull both binaries from a single multi-arch :edge container.
+# The container is created once and removed in either branch, so we never
+# leak a stopped container even on partial cp failure. Both files must
+# land successfully — a one-binary extract is a hard fail because the
+# release asset fallback already ran (we'd be installing a mismatched
+# pair otherwise).
+#
+# $1=1 if we need the runner, $2=1 if we need the server. The branching
+# lets us skip a `docker cp` when an earlier source already provided one
+# of the two binaries (e.g. BRANCHWORK_BINARY_URL satisfied the runner,
+# BRANCHWORK_SERVER_BINARY_URL did not, fall through to docker for the
+# server only).
 extract_via_docker() {
+    need_runner_arg="$1"
+    need_server_arg="$2"
+    if [ "$need_runner_arg" -eq 0 ] && [ "$need_server_arg" -eq 0 ]; then
+        return 0
+    fi
     if ! command -v docker >/dev/null 2>&1; then
         return 1
     fi
@@ -434,38 +483,96 @@ extract_via_docker() {
     plat="linux/$arch"
     note "extracting $image ($plat) via docker"
     cid="$(docker create --platform="$plat" "$image" 2>/dev/null)" || return 1
-    if docker cp "$cid:/usr/local/bin/branchwork-runner" "$TMP_BIN" 2>/dev/null; then
-        docker rm "$cid" >/dev/null 2>&1 || true
-        return 0
+    docker_ok=1
+    if [ "$need_runner_arg" -eq 1 ]; then
+        if ! docker cp "$cid:/usr/local/bin/branchwork-runner" "$TMP_RUNNER" 2>/dev/null; then
+            docker_ok=0
+        elif ! is_native_executable "$TMP_RUNNER"; then
+            docker_ok=0
+        fi
+    fi
+    if [ "$need_server_arg" -eq 1 ] && [ "$docker_ok" -eq 1 ]; then
+        if ! docker cp "$cid:/usr/local/bin/branchwork-server" "$TMP_SERVER" 2>/dev/null; then
+            docker_ok=0
+        elif ! is_native_executable "$TMP_SERVER"; then
+            docker_ok=0
+        fi
     fi
     docker rm "$cid" >/dev/null 2>&1 || true
+    if [ "$docker_ok" -eq 1 ]; then
+        return 0
+    fi
     return 1
 }
 
 # ── Pick a source ──────────────────────────────────────────────────────────
-found=0
+#
+# Source resolution order (per binary): env override → GitHub release →
+# docker extract. The runner and server flags are tracked independently
+# so an earlier source partially satisfying the pair doesn't reset the
+# unsatisfied side.
+need_runner=1
+need_server=1
+
+# Source 1 — env overrides (per binary).
 if [ -n "${BRANCHWORK_BINARY_URL:-}" ]; then
     note "trying override: $BRANCHWORK_BINARY_URL"
-    download_binary "$BRANCHWORK_BINARY_URL" && found=1
+    if download_binary_to "$BRANCHWORK_BINARY_URL" "$TMP_RUNNER"; then
+        need_runner=0
+    fi
 fi
-if [ "$found" -eq 0 ]; then
-    rel_url="https://github.com/branchwork/branchwork/releases/latest/download/branchwork-runner-${os}-${arch}"
-    note "trying release asset: $rel_url"
-    download_binary "$rel_url" && found=1
-fi
-if [ "$found" -eq 0 ]; then
-    extract_via_docker && found=1
+if [ -n "${BRANCHWORK_SERVER_BINARY_URL:-}" ]; then
+    note "trying server override: $BRANCHWORK_SERVER_BINARY_URL"
+    if download_binary_to "$BRANCHWORK_SERVER_BINARY_URL" "$TMP_SERVER"; then
+        need_server=0
+    fi
 fi
 
-if [ "$found" -eq 0 ]; then
-    err "could not obtain a runner binary"
+# Source 2 — GitHub release assets, one URL per binary per platform.
+if [ "$need_runner" -eq 1 ]; then
+    rel_runner_url="https://github.com/branchwork/branchwork/releases/latest/download/branchwork-runner-${os}-${arch}"
+    note "trying release asset: $rel_runner_url"
+    if download_binary_to "$rel_runner_url" "$TMP_RUNNER"; then
+        need_runner=0
+    fi
+fi
+if [ "$need_server" -eq 1 ]; then
+    rel_server_url="https://github.com/branchwork/branchwork/releases/latest/download/branchwork-server-${os}-${arch}"
+    note "trying release asset: $rel_server_url"
+    if download_binary_to "$rel_server_url" "$TMP_SERVER"; then
+        need_server=0
+    fi
+fi
+
+# Source 3 — docker extract (one container, both binaries copied).
+if [ "$need_runner" -eq 1 ] || [ "$need_server" -eq 1 ]; then
+    if extract_via_docker "$need_runner" "$need_server"; then
+        need_runner=0
+        need_server=0
+    fi
+fi
+
+if [ "$need_runner" -eq 1 ] || [ "$need_server" -eq 1 ]; then
+    missing=""
+    if [ "$need_runner" -eq 1 ]; then
+        missing="branchwork-runner"
+    fi
+    if [ "$need_server" -eq 1 ]; then
+        if [ -n "$missing" ]; then
+            missing="$missing and branchwork-server"
+        else
+            missing="branchwork-server"
+        fi
+    fi
+    err "could not obtain $missing"
     note "options:"
-    note "  • set BRANCHWORK_BINARY_URL=<url> and re-run"
+    note "  • set BRANCHWORK_BINARY_URL=<url> (runner) and/or"
+    note "    BRANCHWORK_SERVER_BINARY_URL=<url> (server), then re-run"
     note "  • install Docker so the script can extract ghcr.io/branchwork/branchwork:edge"
     if [ "$os" = "darwin" ]; then
         note "  • build from source (no macOS release shipped yet):"
         note "      cargo install --git https://github.com/branchwork/branchwork \\"
-        note "                    --bin branchwork-runner"
+        note "                    --bin branchwork-runner --bin branchwork-server"
     fi
     exit 1
 fi
@@ -527,11 +634,16 @@ if [ "$MODE" = "reset" ]; then
     fi
 fi
 
-# ── Install the new binary ──────────────────────────────────────────────────
-chmod 0755 "$TMP_BIN"
-mv "$TMP_BIN" "$BIN"
+# ── Install the new binaries ────────────────────────────────────────────────
+# Both must be in place before we clear the EXIT trap so an interrupt
+# mid-install removes both tmpfiles rather than leaving one orphaned
+# next to a half-installed pair.
+chmod 0755 "$TMP_RUNNER" "$TMP_SERVER"
+mv "$TMP_RUNNER" "$RUNNER_BIN"
+mv "$TMP_SERVER" "$SERVER_BIN"
 trap - EXIT
-ok "installed $BIN"
+ok "installed $RUNNER_BIN"
+ok "installed $SERVER_BIN"
 
 # ── Write config (enroll / reset / explicit rotate) ────────────────────────
 # Update mode (no --rotate-token) deliberately skips this step: the on-disk
@@ -561,8 +673,17 @@ fi
 # its runner_id in $HOME/.branchwork-runner/runner.db (under seq_tracker) so
 # update mode preserves identity across binary replacements; reset mode
 # wiped runner.db above so a fresh runner_id will be generated here.
+#
+# PATH prepend: the runner shells out to `branchwork-server session …`
+# for every per-agent supervisor and resolves the binary via which() at
+# startup. Prepending $INSTALL_DIR to PATH guarantees the paired binary
+# we just dropped wins over any older system-wide install (e.g.
+# /usr/local/bin/branchwork-server from a prior package). Without this
+# the runner would still find a system copy on hosts where
+# $HOME/.local/bin isn't on PATH but $INSTALL_DIR somehow is reachable
+# through some other means — keeping the lookup deterministic.
 note "starting runner in the background"
-nohup "$BIN" --saas-url "$SAAS_URL" --token "$TOKEN" \
+PATH="$INSTALL_DIR:$PATH" nohup "$RUNNER_BIN" --saas-url "$SAAS_URL" --token "$TOKEN" \
     >"$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 sleep 1

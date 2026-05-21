@@ -26,11 +26,14 @@ the single-host shape — server + agents on the same machine — see
 
 ## Footprint
 
-A runner install is one binary plus one tiny state directory:
+A runner install is two binaries (paired so the runner can shell out to
+`branchwork-server session …` without an operator-supplied
+`--server-bin` hint — T3.1) plus one tiny state directory:
 
 | Path | Created by | Holds |
 |---|---|---|
 | `branchwork-runner` (~10 MB, no runtime deps beyond `git` + `gh` if you want CI integration) | release archive, `cargo build --release`, or `install-runner.sh` (drops it at `~/.local/bin/`) | The binary. Outbound WSS client; never opens a listening socket. |
+| `branchwork-server` (~15 MB, same source as the dashboard server binary) | release archive, `cargo build --release`, or `install-runner.sh` (drops it at `~/.local/bin/` alongside the runner). The runner's `which("branchwork-server")` resolver picks it up; `install-runner.sh` also prepends `$INSTALL_DIR` to `PATH` on launch so the lookup wins regardless of the operator's dotfile state. | Per-agent supervisor — `branchwork-runner` spawns `branchwork-server session …` for every agent it hosts. Never listens; only invoked as a detached child process. |
 | `~/.branchwork-runner/runner.db` (+ `-wal`, `-shm`) | `init_runner_outbox` + `init_seq_tracker` at first boot | SQLite — the [outbox](../architecture/runner.md#outbox-and-replay-on-reconnect) (`runner_outbox`), per-peer ACK cursors (`seq_tracker`), and the persisted `runner_id`. WAL mode. |
 | `~/.branchwork-runner/config.toml` | `install-runner.sh` (only) | Operator-only record of the SaaS URL + token. The runner binary itself does **not** read this file — it consumes `--saas-url` / `--token` (or the matching env vars). Keep it `0600`; a fresh token here is enough to relaunch by hand. |
 | `<cwd>/.branchwork-runner-sessions/<agent-id>.{sock,log,pid}` | the per-agent session daemon, lazily | One set per running agent. Sockets land under the runner's `--cwd`, not under `~/.branchwork-runner/`, because a single runner can host agents in multiple project trees and the sockets must be co-located with the worktree the agent edits. |
@@ -71,18 +74,24 @@ The script (sourced from
 1. Detects `uname -s / -m`. Supported triples: `linux-amd64`,
    `linux-arm64`, `darwin-arm64` (`darwin-amd64` falls through to a
    build-from-source hint).
-2. Downloads the runner binary — first from the GitHub Release
-   asset, falling back to extracting the multi-arch `:edge` GHCR
-   image with `docker create + cp` when releases haven't shipped
-   yet. `BRANCHWORK_BINARY_URL=…` overrides both.
-3. Drops it at `~/.local/bin/branchwork-runner` (override:
-   `BRANCHWORK_INSTALL_DIR=…`).
+2. Downloads BOTH `branchwork-runner` and `branchwork-server` — first
+   from the GitHub Release assets (one URL per binary per platform),
+   falling back to extracting the multi-arch `:edge` GHCR image with a
+   single `docker create + cp` cycle (both binaries live under
+   `/usr/local/bin/` in the image). `BRANCHWORK_BINARY_URL=…` overrides
+   the runner URL only; `BRANCHWORK_SERVER_BINARY_URL=…` overrides the
+   server URL — each falls through to the next source independently.
+3. Drops both at `~/.local/bin/` (override: `BRANCHWORK_INSTALL_DIR=…`).
+   Both must be obtained before either is moved into place — a partial
+   network failure cannot leave a runner pointing at a missing server.
 4. Writes `~/.branchwork-runner/config.toml` (mode `0600`) with the
    SaaS URL and token, for **your records** — the runner does not
    read this file.
-5. Backgrounds the runner with `nohup … &`, writes the PID to
-   `~/.branchwork-runner/runner.pid`, and tails the log to
-   `~/.branchwork-runner/runner.log`.
+5. Backgrounds the runner with `nohup … &`, prepending `$INSTALL_DIR`
+   to `PATH` so the runner's `which("branchwork-server")` resolver
+   finds the paired binary even on hosts where `~/.local/bin` is not
+   on `PATH` by default. The PID lands in `~/.branchwork-runner/runner.pid`
+   and the log in `~/.branchwork-runner/runner.log`.
 
 If the runner connects within ~1 s the modal flips to **Connected**;
 if it doesn't, the script tails the last 20 log lines to stderr and
