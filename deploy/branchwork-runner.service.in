@@ -1,0 +1,36 @@
+# Branchwork SaaS runner — systemd `--user` unit template.
+#
+# Rendered into place by `install-runner.sh` at
+# `~/.config/systemd/user/branchwork-runner.service`, then activated via
+#   loginctl enable-linger $USER
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now branchwork-runner
+#
+# `%h` is the standard systemd specifier for the user's home directory
+# (the same value as `$HOME`). It is expanded by systemd at unit-load
+# time, so this template needs no further substitution.
+#
+# The runner is fully `$HOME`-anchored:
+#   • Binary       %h/.local/bin/branchwork-runner
+#   • Config       %h/.branchwork-runner/config.toml
+#   • State (DB)   %h/.branchwork-runner/runner.db (and SQLite -wal/-shm
+#                   sidecars)
+#   • Per-session  %h/.claude/sessions/<agent-id>.{sock,pid,log,...}
+#
+# Lints with `systemd-analyze --user verify branchwork-runner.service`.
+
+[Unit]
+Description=Branchwork SaaS runner (user mode)
+Documentation=https://github.com/branchwork/branchwork
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/branchwork-runner
+Restart=on-failure
+RestartSec=5
+Environment=BRANCHWORK_RUNNER_CONFIG=%h/.branchwork-runner/config.toml
+
+[Install]
+WantedBy=default.target
