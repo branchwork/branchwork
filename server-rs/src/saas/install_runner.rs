@@ -47,9 +47,28 @@ pub const SAAS_URL_PLACEHOLDER: &str = "__SAAS_URL__";
 /// substitution fires.
 pub const SERVER_VERSION_PLACEHOLDER: &str = "__SERVER_VERSION__";
 
+/// T1.2 (runner-daemon-workspace): the install script renders the
+/// systemd user-mode unit into `~/.config/systemd/user/`. The unit body
+/// itself is the canonical template at `deploy/branchwork-runner.service.in`
+/// — kept as a separate file so it lints with
+/// `systemd-analyze --user verify` independently of the shell script.
+///
+/// The script carries this sentinel inside a quoted heredoc
+/// (`<<'UNIT'`) so `%h` and other systemd specifiers survive verbatim
+/// until the unit is loaded by systemd at start time.
+pub const UNIT_TEMPLATE_PLACEHOLDER: &str = "__UNIT_TEMPLATE__";
+
 /// Embedded copy of `deploy/install-runner.sh`. Compiled in so the binary
 /// is self-contained — no on-disk asset path to worry about at runtime.
 const INSTALL_SCRIPT_TEMPLATE: &str = include_str!("../../../deploy/install-runner.sh");
+
+/// Embedded copy of `deploy/branchwork-runner.service.in` (T1.1's
+/// user-mode unit template). Substituted into the install script at
+/// render time so the wire form ships a single self-contained
+/// `curl | sh` body. Source of truth lives in `deploy/` so
+/// `systemd-analyze --user verify` runs against the same bytes the
+/// runtime emits.
+const UNIT_TEMPLATE: &str = include_str!("../../../deploy/branchwork-runner.service.in");
 
 /// Resolve the URL the dashboard advertises for itself, in priority order:
 /// 1. `BRANCHWORK_PUBLIC_URL` (set by the prod overlay) — the only signal
@@ -108,18 +127,37 @@ pub fn resolve_public_url(
     format!("{proto}://{host}")
 }
 
-/// Render the install script with the placeholder replaced by `saas_url`.
-/// Pure function so unit tests can drive it without a live server.
+/// Render the install script with placeholders replaced. Pure function
+/// so unit tests can drive it without a live server.
 ///
-/// T4.3 also substitutes `__SERVER_VERSION__` with `env!("CARGO_PKG_VERSION")`
-/// so the runner's periodic poll can grep the script body for the
-/// server's currently-on-offer version sentinel
-/// (`# BRANCHWORK_SERVER_VERSION=<semver>`) without downloading any
-/// binaries first.
+/// Substitutions performed (in order):
+///   • `__SAAS_URL__`       → `saas_url`
+///   • `__SERVER_VERSION__` → compile-time `CARGO_PKG_VERSION` (T4.3)
+///   • `__UNIT_TEMPLATE__`  → contents of `branchwork-runner.service.in`
+///     (T1.2 — the unit body lives in a separate file so it lints
+///     with `systemd-analyze --user verify`).
+///
+/// The unit-template substitution lands inside a quoted heredoc
+/// (`<<'UNIT'` in install-runner.sh) so the file's `%h` specifiers
+/// survive verbatim. The substituted block also includes the file's
+/// trailing newline; cat treats that as one extra empty line in the
+/// output, which is harmless for systemd unit parsing.
 pub fn render_install_script(template: &str, saas_url: &str) -> String {
     template
         .replace(SAAS_URL_PLACEHOLDER, saas_url)
         .replace(SERVER_VERSION_PLACEHOLDER, env!("CARGO_PKG_VERSION"))
+        .replace(UNIT_TEMPLATE_PLACEHOLDER, unit_template_body())
+}
+
+/// Trim the trailing newline from the embedded unit-template file before
+/// substituting it into the install script's heredoc. The .in file ends
+/// with `WantedBy=default.target\n`; without trimming, the substituted
+/// heredoc body would gain an extra blank line before the closing
+/// `UNIT` terminator. Systemd is tolerant of trailing blank lines, but
+/// trimming keeps the rendered script tidy and the byte-for-byte sync
+/// tests easier to reason about.
+fn unit_template_body() -> &'static str {
+    UNIT_TEMPLATE.trim_end_matches('\n')
 }
 
 /// Build the curl-pipe-sh command surfaced in the modal. Token is
@@ -701,15 +739,35 @@ mod tests {
     }
 
     #[test]
-    fn install_script_launches_runner_with_install_dir_on_path() {
-        // The runner's `which("branchwork-server")` resolver only finds
-        // our paired binary if $INSTALL_DIR is on PATH at launch. nohup
-        // inherits the operator's shell PATH, which on minimal hosts
-        // may NOT include $HOME/.local/bin — prepend $INSTALL_DIR so
-        // the lookup is deterministic regardless of dotfile state.
+    fn install_script_user_unit_execstart_passes_server_bin_explicitly() {
+        // T1.2 replaced the nohup launch with a systemd unit; the runner
+        // now resolves `branchwork-server` via the explicit
+        // `--server-bin %h/.local/bin/branchwork-server` flag rather than
+        // the `which("branchwork-server")` fallback (systemd's user PATH
+        // is not guaranteed to carry $HOME/.local/bin). The unit
+        // template at deploy/branchwork-runner.service.in is the source
+        // of truth; substituted into the script via
+        // `__UNIT_TEMPLATE__`. Render the script and confirm the literal
+        // flag survives into the on-disk unit body.
+        let rendered = render_install_script(INSTALL_SCRIPT_TEMPLATE, "https://example.com");
         assert!(
-            INSTALL_SCRIPT_TEMPLATE.contains(r#"PATH="$INSTALL_DIR:$PATH" nohup "$RUNNER_BIN""#),
-            "must prepend $INSTALL_DIR to PATH on the nohup launch line"
+            rendered.contains(
+                "ExecStart=%h/.local/bin/branchwork-runner --server-bin %h/.local/bin/branchwork-server"
+            ),
+            "user-mode unit must pass --server-bin in ExecStart so the runner's branchwork-server lookup is deterministic under systemd"
+        );
+    }
+
+    #[test]
+    fn install_script_system_unit_execstart_passes_server_bin_explicitly() {
+        // Same as the user-mode test above, but the system-mode unit
+        // uses absolute paths (since %h would expand to /root without
+        // an explicit User=) — pin the same --server-bin contract.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(
+                r#"ExecStart=$runner_home/.local/bin/branchwork-runner --server-bin $runner_home/.local/bin/branchwork-server"#
+            ),
+            "system-mode unit must pass --server-bin in ExecStart with absolute paths"
         );
     }
 
@@ -802,21 +860,22 @@ mod tests {
     }
 
     #[test]
-    fn install_script_banner_emits_start_session_line_after_runner_started() {
-        // Ordering matters for the operator's reading flow: first they
-        // see "* runner started (pid X)", then "* Start session will use:
-        // …". Reversing the order would put the readiness verdict before
-        // the runner actually has a pid, which would mislead an operator
-        // skimming the tail of the install output.
-        let started_at = INSTALL_SCRIPT_TEMPLATE
-            .find(r#"ok "runner started (pid"#)
-            .expect("runner-started line must remain in the script");
+    fn install_script_banner_emits_start_session_line_after_unit_enabled() {
+        // T1.2 replaced "runner started (pid X)" with
+        // "branchwork-runner.service enabled and running" — the systemd
+        // unit owns the lifecycle now. Operator reading flow still
+        // requires the readiness banner to precede the Start-session
+        // verdict (otherwise the verdict would print before the runner
+        // is actually up).
+        let enabled_at = INSTALL_SCRIPT_TEMPLATE
+            .find(r#"ok "branchwork-runner.service enabled and running""#)
+            .expect("unit-enabled banner line must remain in the script");
         let start_session_at = INSTALL_SCRIPT_TEMPLATE
             .find(r#"ok "Start session will use:"#)
             .expect("Start-session-will-use line must be emitted");
         assert!(
-            started_at < start_session_at,
-            "runner-started must precede Start-session-will-use in the banner"
+            enabled_at < start_session_at,
+            "unit-enabled banner must precede Start-session-will-use line"
         );
     }
 
@@ -909,13 +968,33 @@ mod tests {
     }
 
     #[test]
-    fn install_script_system_flag_requires_just_binary() {
-        // --system is a modifier; using it alone is operator error and
-        // must surface a clear refusal rather than silently no-op'ing.
+    fn install_script_system_flag_requires_root_for_enroll() {
+        // T1.2 lifted the `--system is only meaningful with --just-binary`
+        // gate so --system now works alongside enroll/update/reset (it
+        // writes the unit to /etc/systemd/system/ instead of
+        // ~/.config/systemd/user/). That path needs root; the script
+        // must refuse unprivileged invocations with a clear message.
+        // --just-binary --system stays unprivileged because it delegates
+        // the restart to `sudo systemctl restart`.
         assert!(
             INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"err "--system requires root (use sudo or run as root)""#),
+            "must refuse non-root --system for enroll/update/reset modes"
+        );
+        // The gate must NOT fire for --just-binary --system (that's the
+        // operator's pre-T1.2 entry point and stays unprivileged).
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(
+                r#"if [ "$SYSTEM_INSTALL" = "1" ] && [ "$MODE" != "just_binary" ]; then"#
+            ),
+            "root-check must skip MODE=just_binary (delegates to sudo systemctl)"
+        );
+        // Negative contract: the prior `--system is only meaningful` gate
+        // must be gone.
+        assert!(
+            !INSTALL_SCRIPT_TEMPLATE
                 .contains(r#"err "--system is only meaningful with --just-binary""#),
-            "must refuse --system without --just-binary"
+            "the prior just-binary-only gate on --system must be lifted by T1.2"
         );
     }
 
@@ -1029,32 +1108,35 @@ mod tests {
     }
 
     #[test]
-    fn install_script_just_binary_skips_nohup_launch() {
-        // The nohup launch path is for enroll/update/reset. just_binary
-        // delegates to systemd and must NOT hit the nohup statement —
-        // otherwise the script would start a second runner process
-        // alongside the systemd unit and write a stale $PID_FILE.
-        //
-        // Pin this structurally: the `nohup "$RUNNER_BIN"` line must
-        // live inside an `else` branch of a `[ "$MODE" = "just_binary" ]`
-        // conditional. Grep for both halves.
+    fn install_script_has_no_nohup_launch_after_t1_2() {
+        // T1.2 replaced the nohup launch with a systemd unit for ALL
+        // non-just_binary modes. The `PATH="$INSTALL_DIR:$PATH" nohup
+        // "$RUNNER_BIN"` line must be gone — leaving it in place would
+        // race the systemd unit (two runner processes, one stale
+        // PID_FILE). The lifecycle gate on `MODE=just_binary` is still
+        // there but its `else` branch now runs systemctl, not nohup.
         assert!(
             INSTALL_SCRIPT_TEMPLATE.contains(r#"if [ "$MODE" = "just_binary" ]; then"#),
             "lifecycle gate must branch on MODE=just_binary"
         );
+        // Negative contract: no nohup launch anywhere in executable code.
+        let has_nohup = INSTALL_SCRIPT_TEMPLATE.lines().any(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.contains("nohup \"$RUNNER_BIN\"")
+        });
         assert!(
-            INSTALL_SCRIPT_TEMPLATE.contains(r#"PATH="$INSTALL_DIR:$PATH" nohup "$RUNNER_BIN""#),
-            "the else branch must keep the original nohup launch"
+            !has_nohup,
+            "post-T1.2 install-runner.sh must NOT contain `nohup \"$RUNNER_BIN\"` as executable code"
         );
-        let just_binary_branch = INSTALL_SCRIPT_TEMPLATE
-            .find(r#"if [ "$MODE" = "just_binary" ]; then"#)
-            .expect("just_binary lifecycle branch missing");
-        let nohup_at = INSTALL_SCRIPT_TEMPLATE
-            .find(r#"PATH="$INSTALL_DIR:$PATH" nohup"#)
-            .expect("nohup launch line missing");
+        // Companion negative: no `echo $! > "$PID_FILE"` either — that
+        // line stamped the nohup PID for the legacy lifecycle path.
+        let has_pidfile_stamp = INSTALL_SCRIPT_TEMPLATE.lines().any(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.contains(r#"echo $! > "$PID_FILE""#)
+        });
         assert!(
-            just_binary_branch < nohup_at,
-            "just_binary branch must come BEFORE the nohup fallback so the else clause guards it"
+            !has_pidfile_stamp,
+            "post-T1.2 install-runner.sh must NOT stamp a PID into $PID_FILE — systemd owns the lifecycle"
         );
     }
 
@@ -1132,6 +1214,379 @@ fi"#
             INSTALL_SCRIPT_TEMPLATE
                 .contains("Binary upgrade only \u{2014} the existing systemd unit and"),
             "just_binary next-steps banner must announce config-preservation"
+        );
+    }
+
+    // ── T1.2 systemd-lifecycle contract ─────────────────────────────────
+    //
+    // install-runner.sh enroll/update/reset modes own the systemd unit
+    // lifecycle (T1.2 replaced the nohup launch). The script must:
+    //   • render the unit from deploy/branchwork-runner.service.in via
+    //     the __UNIT_TEMPLATE__ placeholder, into
+    //     ~/.config/systemd/user/branchwork-runner.service (user mode)
+    //     or /etc/systemd/system/branchwork-runner.service (--system).
+    //   • write a sidecar env file at ~/.branchwork-runner/env carrying
+    //     BRANCHWORK_SAAS_URL + BRANCHWORK_RUNNER_TOKEN in KEY=VALUE
+    //     syntax (so the unit's EnvironmentFile= can source it).
+    //   • daemon-reload + enable --now the unit.
+    //   • user mode: also `loginctl enable-linger "$USER"` so the
+    //     runner survives logouts and reboots.
+    //   • migrate from pre-T1.2 nohup installs by SIGTERMing any
+    //     legacy $PID_FILE-tracked process before the unit comes up.
+
+    #[test]
+    fn embedded_template_carries_unit_template_sentinel() {
+        // Guard: install-runner.sh must embed __UNIT_TEMPLATE__ so the
+        // server has something to substitute. Without this, the
+        // user-mode heredoc would have an empty body and `systemctl
+        // --user daemon-reload` would later fail with "service file
+        // empty".
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(UNIT_TEMPLATE_PLACEHOLDER),
+            "install-runner.sh must embed {UNIT_TEMPLATE_PLACEHOLDER} for the server to substitute"
+        );
+    }
+
+    #[test]
+    fn embedded_unit_template_file_is_nonempty_and_has_install_section() {
+        // Sanity check on deploy/branchwork-runner.service.in itself:
+        // present, non-trivial, and carries the minimal directives the
+        // T1.1 acceptance pinned (Type=simple, Restart=on-failure,
+        // [Install] section). If a future edit accidentally truncates
+        // the file, this test fires before the substitution path goes
+        // out to operators.
+        assert!(
+            UNIT_TEMPLATE.len() > 200,
+            "unit template suspiciously short"
+        );
+        assert!(
+            UNIT_TEMPLATE.contains("[Unit]")
+                && UNIT_TEMPLATE.contains("[Service]")
+                && UNIT_TEMPLATE.contains("[Install]"),
+            "unit template must carry the three core sections"
+        );
+        assert!(
+            UNIT_TEMPLATE.contains("Type=simple"),
+            "unit template must declare Type=simple"
+        );
+        assert!(
+            UNIT_TEMPLATE.contains("Restart=on-failure"),
+            "unit template must declare Restart=on-failure"
+        );
+        assert!(
+            UNIT_TEMPLATE.contains("WantedBy=default.target"),
+            "unit template must declare WantedBy=default.target (user mode)"
+        );
+    }
+
+    #[test]
+    fn rendered_script_substitutes_unit_template() {
+        // After render, the placeholder must be gone everywhere — a
+        // stray `__UNIT_TEMPLATE__` would mean systemd sees the literal
+        // string as a unit body and refuses to load.
+        let rendered = render_install_script(INSTALL_SCRIPT_TEMPLATE, "https://example.com");
+        assert!(
+            !rendered.contains(UNIT_TEMPLATE_PLACEHOLDER),
+            "render_install_script must replace every {UNIT_TEMPLATE_PLACEHOLDER}"
+        );
+    }
+
+    #[test]
+    fn rendered_script_carries_unit_template_body() {
+        // The substituted body must include the canonical directives
+        // from the .in file. Asserting on a handful of lines (rather
+        // than the whole file) makes this test resilient to whitespace
+        // tweaks in the .in template while still catching catastrophic
+        // failures (empty substitution, wrong content).
+        let rendered = render_install_script(INSTALL_SCRIPT_TEMPLATE, "https://example.com");
+        assert!(
+            rendered.contains("[Unit]"),
+            "rendered script must contain the [Unit] section header"
+        );
+        assert!(
+            rendered.contains("Description=Branchwork SaaS runner (user mode)"),
+            "rendered script must carry the canonical Description= line"
+        );
+        assert!(
+            rendered.contains(
+                "ExecStart=%h/.local/bin/branchwork-runner --server-bin %h/.local/bin/branchwork-server"
+            ),
+            "rendered script must carry the unit's ExecStart line verbatim"
+        );
+        assert!(
+            rendered.contains("EnvironmentFile=%h/.branchwork-runner/env"),
+            "rendered script must carry the EnvironmentFile= directive"
+        );
+        assert!(
+            rendered.contains("WantedBy=default.target"),
+            "rendered script must carry the WantedBy= directive"
+        );
+    }
+
+    #[test]
+    fn install_script_writes_user_unit_via_quoted_heredoc() {
+        // The user-mode unit is written via `cat > ... <<'UNIT'` so the
+        // body's `%h` specifiers survive verbatim until systemd
+        // expands them at unit-load time. An unquoted heredoc would
+        // let the shell try to expand `%h` (which produces empty
+        // string in POSIX sh) and corrupt the unit content.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"cat > "$user_unit_file" <<'UNIT'"#),
+            "user unit must be written via a SINGLE-QUOTED heredoc (<<'UNIT')"
+        );
+        // And the target path must be inside the systemd user-config
+        // dir — not /etc/systemd/system/ which would be system mode.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"user_unit_dir="$HOME/.config/systemd/user""#),
+            "user-mode unit dir must be ~/.config/systemd/user"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"user_unit_file="$user_unit_dir/branchwork-runner.service""#),
+            "user-mode unit file must be branchwork-runner.service under the user dir"
+        );
+    }
+
+    #[test]
+    fn install_script_writes_system_unit_with_user_directive() {
+        // System mode writes the unit inline (not via the .in
+        // substitution) because the User= / Group= / WorkingDirectory=
+        // / absolute-path differences are mode-specific. Pin the
+        // canonical directives so a future edit can't silently drop
+        // any of them.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"system_unit_file="/etc/systemd/system/branchwork-runner.service""#),
+            "system-mode unit path must be /etc/systemd/system/branchwork-runner.service"
+        );
+        // User= and Group= must use the install user (SUDO_USER or USER).
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("User=$runner_user"),
+            "system unit must declare User=<install user>"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("Group=$runner_user"),
+            "system unit must declare Group=<install user>"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("WorkingDirectory=$runner_home"),
+            "system unit must set WorkingDirectory= to the user's home"
+        );
+        // System mode pulls in multi-user.target so it starts at boot.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("WantedBy=multi-user.target"),
+            "system unit must declare WantedBy=multi-user.target"
+        );
+        // EnvironmentFile must use an absolute path under $runner_home
+        // (system units cannot rely on %h expanding correctly without
+        // an explicit User=, even with User= it expands at load time).
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("EnvironmentFile=$runner_home/.branchwork-runner/env"),
+            "system unit must EnvironmentFile= from the user's home"
+        );
+    }
+
+    #[test]
+    fn install_script_writes_sidecar_env_file() {
+        // The runner reads BRANCHWORK_SAAS_URL + BRANCHWORK_RUNNER_TOKEN
+        // via clap's env=, so the systemd unit needs a KEY=VALUE file
+        // to source via EnvironmentFile=. The env file lives alongside
+        // config.toml (same dir, same 0700 chmod) and is rewritten on
+        // every install run except just_binary (which preserves the
+        // existing config + env).
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"cat > "$CONFIG_DIR/env" <<ENV"#),
+            "must write $CONFIG_DIR/env via a heredoc"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("BRANCHWORK_SAAS_URL=$SAAS_URL"),
+            "env file must export BRANCHWORK_SAAS_URL"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("BRANCHWORK_RUNNER_TOKEN=$TOKEN"),
+            "env file must export BRANCHWORK_RUNNER_TOKEN"
+        );
+        // The unquoted heredoc (<<ENV) is INTENTIONAL — we want
+        // $SAAS_URL and $TOKEN expanded inside.
+        assert!(
+            !INSTALL_SCRIPT_TEMPLATE.contains(r#"cat > "$CONFIG_DIR/env" <<'ENV'"#),
+            "env-file heredoc must be unquoted so $SAAS_URL / $TOKEN expand"
+        );
+        // just_binary mode does NOT write the env file — the existing
+        // env file alongside the existing config.toml is preserved.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"if [ "$MODE" != "just_binary" ]; then"#),
+            "env-file write must be gated to skip MODE=just_binary"
+        );
+    }
+
+    #[test]
+    fn install_script_runs_systemctl_daemon_reload_and_enable_now() {
+        // T1.2 acceptance: a fresh `curl … | sh -s -- <token>` install
+        // must leave a running unit. The two commands that do that are
+        // `systemctl --user daemon-reload` (pick up the new unit file)
+        // and `systemctl --user enable --now branchwork-runner` (start
+        // + enable for autostart). Both must be present for both user
+        // and system modes.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("systemctl --user daemon-reload"),
+            "user mode must run `systemctl --user daemon-reload`"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("systemctl --user enable --now branchwork-runner"),
+            "user mode must run `systemctl --user enable --now branchwork-runner`"
+        );
+        // System mode: same two but without --user (root is the
+        // systemd manager).
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("systemctl daemon-reload"),
+            "system mode must run `systemctl daemon-reload`"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("systemctl enable --now branchwork-runner"),
+            "system mode must run `systemctl enable --now branchwork-runner`"
+        );
+    }
+
+    #[test]
+    fn install_script_enables_user_linger() {
+        // Acceptance: the runner must survive logouts/reboots. For
+        // user-mode units that means `loginctl enable-linger "$USER"`
+        // — without it, the user systemd instance stops when the last
+        // login session ends, taking the runner with it.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"loginctl enable-linger "$USER""#),
+            "user mode must call `loginctl enable-linger \"$USER\"`"
+        );
+        // Linger must be best-effort: locked-down corporate hosts
+        // refuse linger and we still want the install to succeed
+        // (runner just stops on logout, which is fine for interactive
+        // sessions).
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("loginctl enable-linger failed"),
+            "linger failure must downgrade to a note (not exit 1)"
+        );
+        // System mode does NOT need linger — system units run
+        // regardless of login state. Pin this structurally: the linger
+        // CALL must live AFTER write_user_unit's invocation (the user
+        // arm of the lifecycle if/else), so the system arm cannot fall
+        // through into it. Use the executable-call pattern
+        // `if ! loginctl enable-linger "$USER"` so we skip the
+        // comment-block mentions earlier in the script.
+        let linger_call_idx = INSTALL_SCRIPT_TEMPLATE
+            .find(r#"if ! loginctl enable-linger "$USER""#)
+            .expect("linger call must exist as executable code");
+        let write_user_call_idx = INSTALL_SCRIPT_TEMPLATE
+            .find("\n        write_user_unit\n")
+            .expect("write_user_unit call must exist (8-space indent in else branch)");
+        assert!(
+            write_user_call_idx < linger_call_idx,
+            "linger call must come AFTER write_user_unit (it lives in the same user-mode branch)"
+        );
+        // Defensive: the linger CALL must NOT live anywhere near
+        // write_system_unit (the system-mode arm).
+        let write_system_call_idx = INSTALL_SCRIPT_TEMPLATE
+            .find("\n        write_system_unit\n")
+            .expect("write_system_unit call must exist (8-space indent in if branch)");
+        assert!(
+            write_system_call_idx < linger_call_idx,
+            "write_system_unit must come before the linger call (system arm runs first)"
+        );
+        // And there must be only ONE linger CALL (no duplicate in the
+        // system arm).
+        let linger_call_count = INSTALL_SCRIPT_TEMPLATE
+            .matches(r#"if ! loginctl enable-linger "$USER""#)
+            .count();
+        assert_eq!(
+            linger_call_count, 1,
+            "exactly one executable `loginctl enable-linger \"$USER\"` call; got {linger_call_count}"
+        );
+    }
+
+    #[test]
+    fn install_script_requires_systemctl_for_enroll() {
+        // T1.2 dropped the non-systemd fallback (the previous nohup
+        // launch). enroll/update/reset on a host without systemctl
+        // must fail fast with a clear pointer.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"err "branchwork-runner needs systemd (no systemctl on PATH)""#),
+            "ensure_systemctl must emit the canonical no-systemd error"
+        );
+        // The check must run BEFORE write_user_unit / write_system_unit
+        // — calling them on a non-systemd host would write dead files.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("ensure_systemctl"),
+            "ensure_systemctl must be invoked"
+        );
+    }
+
+    #[test]
+    fn install_script_migrates_legacy_nohup_via_pidfile() {
+        // Pre-T1.2 installs launched the runner via nohup and stamped
+        // its PID into $PID_FILE. The T1.2 install path must detect
+        // and stop that legacy process before bringing the unit up so
+        // we don't end up with two runners competing for the same
+        // SaaS slot. The function is called only for non-just_binary
+        // modes (just_binary already ran under systemd).
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("stop_legacy_nohup_runner"),
+            "must invoke stop_legacy_nohup_runner during the systemd-lifecycle path"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(
+                r#"note "migrating from legacy nohup runner (pid $pid \u{2192} systemd)""#
+            ) || INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"note "migrating from legacy nohup runner (pid $pid → systemd)""#),
+            "must announce the legacy-PID migration so operators see the handover"
+        );
+    }
+
+    #[test]
+    fn install_script_unit_enabled_banner_announces_success() {
+        // The success banner for enroll/update/reset must include the
+        // canonical "branchwork-runner.service enabled and running"
+        // line — that string is what the dashboard runbook (and the
+        // T6.4 deploy workflow) greps for.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"ok "branchwork-runner.service enabled and running""#),
+            "must emit the canonical 'enabled and running' success line"
+        );
+    }
+
+    #[test]
+    fn install_script_next_steps_uses_systemctl_for_enroll() {
+        // The trailing Next-steps block for enroll/update/reset modes
+        // must reference systemctl + journalctl (not tail -f $LOG_FILE
+        // and kill $(cat $PID_FILE) which were the pre-T1.2 nohup
+        // affordances). System and user modes get different commands.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"unit_stop_cmd="systemctl --user stop branchwork-runner""#),
+            "user-mode next-steps must reference `systemctl --user stop branchwork-runner`"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"unit_stop_cmd="systemctl stop branchwork-runner""#),
+            "system-mode next-steps must reference `systemctl stop branchwork-runner`"
+        );
+        // Negative contract: the legacy "tail -f $LOG_FILE" /
+        // "kill $(cat $PID_FILE)" lines must be gone outside comments.
+        let has_tail_log = INSTALL_SCRIPT_TEMPLATE.lines().any(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.contains("tail -f $LOG_FILE")
+        });
+        assert!(
+            !has_tail_log,
+            "post-T1.2 next-steps must not reference `tail -f $LOG_FILE`"
+        );
+        let has_kill_pidfile = INSTALL_SCRIPT_TEMPLATE.lines().any(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.contains("kill \\$(cat $PID_FILE)")
+        });
+        assert!(
+            !has_kill_pidfile,
+            "post-T1.2 next-steps must not reference `kill $(cat $PID_FILE)`"
         );
     }
 }

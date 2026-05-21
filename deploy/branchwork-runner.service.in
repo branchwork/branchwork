@@ -13,6 +13,10 @@
 # The runner is fully `$HOME`-anchored:
 #   • Binary       %h/.local/bin/branchwork-runner
 #   • Config       %h/.branchwork-runner/config.toml
+#   • Env file     %h/.branchwork-runner/env (KEY=VALUE; loaded by
+#                   `EnvironmentFile=` below so the runner picks up
+#                   `BRANCHWORK_SAAS_URL` + `BRANCHWORK_RUNNER_TOKEN`
+#                   via clap's `env=` fallback)
 #   • State (DB)   %h/.branchwork-runner/runner.db (and SQLite -wal/-shm
 #                   sidecars)
 #   • Per-session  %h/.claude/sessions/<agent-id>.{sock,pid,log,...}
@@ -27,10 +31,21 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/branchwork-runner
+# `--server-bin` is explicit because systemd's user-instance PATH is not
+# guaranteed to include `~/.local/bin` (it depends on
+# `systemctl --user import-environment` / `~/.config/environment.d/`
+# state). The runner's `which("branchwork-server")` fallback would
+# otherwise miss the paired binary T3.1 dropped next to the runner.
+ExecStart=%h/.local/bin/branchwork-runner --server-bin %h/.local/bin/branchwork-server
 Restart=on-failure
 RestartSec=5
+# Forward-looking contract — a future task will teach the runner binary to
+# read its config from `$BRANCHWORK_RUNNER_CONFIG`. Today the runner only
+# reads `BRANCHWORK_SAAS_URL` / `BRANCHWORK_RUNNER_TOKEN` via clap's
+# `env=` fallback (see `branchwork_runner::Cli`), so the actual auth
+# travels via `EnvironmentFile=` below.
 Environment=BRANCHWORK_RUNNER_CONFIG=%h/.branchwork-runner/config.toml
+EnvironmentFile=%h/.branchwork-runner/env
 
 [Install]
 WantedBy=default.target

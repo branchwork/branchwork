@@ -24,7 +24,7 @@
 # the operator pastes is the single-use token returned by
 # `GET /api/runners/install-command`.
 #
-# Two-mode behaviour (T2.1):
+# Two-mode behaviour (T2.1, T1.2 systemd lifecycle):
 #
 #   First run (no $HOME/.branchwork-runner/config.toml on disk) — ENROLL.
 #     1. Detect uname -s / uname -m → linux-amd64, linux-arm64, darwin-arm64.
@@ -33,23 +33,35 @@
 #        session …` for every per-agent supervisor; shipping the paired
 #        binary alongside the runner means Start session works without
 #        any operator-supplied --server-bin hint (T3.1).
-#     3. Write $HOME/.branchwork-runner/config.toml with the token + SaaS URL.
-#     4. Start the runner in the background (nohup + &) so the dashboard's
-#        WS receives `runner_connected` and the modal flips to "Connected!".
-#        The launch line prepends $INSTALL_DIR to PATH so the runner's
-#        which("branchwork-server") resolver finds the paired binary
-#        regardless of whether the operator's shell has $HOME/.local/bin
-#        on PATH by default.
+#     3. Write $HOME/.branchwork-runner/config.toml with the token + SaaS URL,
+#        plus a sidecar `env` file in `KEY=VALUE` syntax for systemd's
+#        `EnvironmentFile=` directive (T1.2).
+#     4. Render the user-mode systemd unit into
+#        `~/.config/systemd/user/branchwork-runner.service` (from the
+#        deploy/branchwork-runner.service.in template), then
+#        `systemctl --user daemon-reload && enable --now branchwork-runner`.
+#        Finally `loginctl enable-linger "$USER"` so the runner survives
+#        logouts and reboots without an active login session.
 #
 #   Subsequent runs (config.toml already present) — UPDATE.
-#     1. Stop the existing runner via $PID_FILE (kill -TERM, then -KILL).
+#     1. Detect any legacy nohup-launched runner via $PID_FILE and stop it
+#        (one-time migration from pre-T1.2 installs).
 #     2. Re-use $HOME/.branchwork-runner/runner.db so runner_id is preserved
 #        and any queued outbox state survives the upgrade.
 #     3. Replace the binary in place.
 #     4. DO NOT rewrite the token — the stored one stays unless the operator
-#        passed `--rotate-token <NEW>` explicitly.
-#     5. Restart the runner. Final line reports
+#        passed `--rotate-token <NEW>` explicitly. The sidecar env file is
+#        rewritten unconditionally so a pre-T1.2 host migrates naturally.
+#     5. Re-render the unit (idempotent), `daemon-reload`, and
+#        `enable --now` — `enable` is idempotent if already enabled, and
+#        `--now` restarts the binary. Final line reports
 #        "updated runner in place (runner_id preserved)".
+#
+#   --system flips the unit installation from user-mode systemd
+#   (`~/.config/systemd/user/`) to system-mode (`/etc/systemd/system/`),
+#   using `systemctl` (no `--user`) and skipping linger. Requires root
+#   for enroll/update/reset; `--just-binary --system` is unprivileged
+#   because it delegates the restart to `sudo systemctl restart`.
 #
 #   `--reset <TOKEN>` is the destructive flow for true re-enrollment: wipe
 #     runner.db (drop runner_id + outbox), rewrite config.toml with the new
@@ -161,6 +173,10 @@ usage:
   curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --reset <TOKEN>
   curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --force-replace [TOKEN]
   curl -fsSL $SAAS_URL/install-runner.sh | sh -s -- --just-binary [--system]
+
+  --system is also valid alongside any of the above (root only) to install
+  the systemd unit at /etc/systemd/system/ instead of the user instance at
+  ~/.config/systemd/user/. No linger needed for system units.
 USAGE
 }
 
@@ -251,9 +267,6 @@ if [ "$JUST_BINARY" = "1" ]; then
         exit 1
     fi
     MODE=just_binary
-elif [ "$SYSTEM_INSTALL" = "1" ]; then
-    err "--system is only meaningful with --just-binary"
-    exit 2
 elif [ -f "$CONFIG_FILE" ]; then
     if [ "$RESET" = "1" ]; then
         MODE=reset
@@ -265,6 +278,17 @@ else
         note "--reset has no effect: no existing config at $CONFIG_FILE"
     fi
     MODE=enroll
+fi
+
+# --system writes a unit at /etc/systemd/system/ and reloads system-mode
+# systemd — both require root. just_binary --system instead delegates to
+# `sudo systemctl restart`, so it can be invoked unprivileged.
+if [ "$SYSTEM_INSTALL" = "1" ] && [ "$MODE" != "just_binary" ]; then
+    if [ "$(id -u)" != "0" ]; then
+        err "--system requires root (use sudo or run as root)"
+        note "the system unit lives at /etc/systemd/system/branchwork-runner.service"
+        exit 1
+    fi
 fi
 
 # Read a TOML scalar from $CONFIG_FILE without pulling in a TOML parser.
@@ -822,29 +846,149 @@ TOML
     ok "wrote $CONFIG_FILE"
 fi
 
+# ── Sidecar env file for the systemd unit (T1.2) ───────────────────────────
+# The user-mode unit references `%h/.branchwork-runner/env` via
+# `EnvironmentFile=`; write a `KEY=VALUE` file with the same saas_url +
+# token the runner needs. Refreshed on every install run (enroll / update /
+# reset / rotate-token) so a pre-T1.2 host with config.toml but no env
+# file naturally migrates on its next install. just_binary skips this —
+# the unit's existing env file is byte-for-byte preserved alongside the
+# stored config.toml.
+if [ "$MODE" != "just_binary" ]; then
+    mkdir -p "$CONFIG_DIR"
+    chmod 0700 "$CONFIG_DIR"
+    old_umask="$(umask)"
+    umask 077
+    cat > "$CONFIG_DIR/env" <<ENV
+BRANCHWORK_SAAS_URL=$SAAS_URL
+BRANCHWORK_RUNNER_TOKEN=$TOKEN
+ENV
+    umask "$old_umask"
+    ok "wrote $CONFIG_DIR/env"
+fi
+
 # ── Start (or restart) the runner ───────────────────────────────────────────
-# Two lifecycle owners depending on mode:
+# Lifecycle is owned by systemd for ALL non-just_binary modes (T1.2):
 #
-#  • enroll / update / reset — nohup + & detaches so the curl|sh pipeline
-#    returns. The runner persists its runner_id in
-#    $HOME/.branchwork-runner/runner.db (under seq_tracker) so update mode
-#    preserves identity across binary replacements; reset mode wiped
-#    runner.db above so a fresh runner_id will be generated here.
+#  • enroll / update / reset — render the unit into
+#    `~/.config/systemd/user/branchwork-runner.service` (user mode) or
+#    `/etc/systemd/system/branchwork-runner.service` (--system), then
+#    `daemon-reload` and `enable --now`. User mode also runs
+#    `loginctl enable-linger "$USER"` so the runner survives logouts and
+#    reboots without an active login session.
 #
-#  • just_binary — the systemd unit (installed by the runner-daemon-
-#    workspace plan) owns the runner. We swapped the binaries above; a
-#    `systemctl restart` is the safe handoff that stops the old process
-#    image and starts a new one against the just-installed binaries. No
-#    PID_FILE, no LOG_FILE writes — systemd's journal owns that surface.
+#  • just_binary — the unit is already installed; a `systemctl restart`
+#    swaps in the new binary image. No PID_FILE, no LOG_FILE writes —
+#    systemd's journal owns that surface.
 #
-# PATH prepend (nohup path): the runner shells out to `branchwork-server
-# session …` for every per-agent supervisor and resolves the binary via
-# which() at startup. Prepending $INSTALL_DIR to PATH guarantees the
-# paired binary we just dropped wins over any older system-wide install
-# (e.g. /usr/local/bin/branchwork-server from a prior package). Without
-# this the runner would still find a system copy on hosts where
-# $HOME/.local/bin isn't on PATH but $INSTALL_DIR somehow is reachable
-# through some other means — keeping the lookup deterministic.
+# A legacy nohup-launched runner from a pre-T1.2 install is detected via
+# `$PID_FILE` and SIGTERMed before the systemd unit comes up; the file is
+# then removed so subsequent runs don't try to kill a stale PID.
+
+ensure_systemctl() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        err "branchwork-runner needs systemd (no systemctl on PATH)"
+        note "for non-systemd hosts, see $SAAS_URL/docs/runner-as-a-service"
+        exit 1
+    fi
+}
+
+# Migrate hosts that ran a pre-T1.2 nohup launch (PID_FILE present): stop
+# the legacy process so systemd's new unit doesn't compete with it. After
+# this runs, PID_FILE is gone and we own the runner via systemd.
+stop_legacy_nohup_runner() {
+    [ -f "$PID_FILE" ] || return 0
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -z "$pid" ]; then
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    case "$pid" in
+        ''|*[!0-9]*)
+            rm -f "$PID_FILE"
+            return 0
+            ;;
+    esac
+    if kill -0 "$pid" 2>/dev/null; then
+        note "migrating from legacy nohup runner (pid $pid → systemd)"
+        kill -TERM "$pid" 2>/dev/null || true
+        i=0
+        while [ $i -lt 5 ]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+            i=$((i + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    rm -f "$PID_FILE"
+}
+
+# Render the user-mode unit verbatim from deploy/branchwork-runner.service.in.
+# The body is substituted in by the server at GET-time (see
+# render_install_script in server-rs/src/saas/install_runner.rs — the
+# placeholder one line below is replaced with the .in file's content).
+# `%h` stays literal because the heredoc is quoted — systemd expands `%h`
+# at unit-load time, so this template never needs the install script to
+# know the home directory at render time.
+write_user_unit() {
+    user_unit_dir="$HOME/.config/systemd/user"
+    user_unit_file="$user_unit_dir/branchwork-runner.service"
+    mkdir -p "$user_unit_dir"
+    cat > "$user_unit_file" <<'UNIT'
+__UNIT_TEMPLATE__
+UNIT
+    ok "wrote $user_unit_file"
+}
+
+# Render the system-mode unit. Differs from user mode in three ways:
+#   (a) Path: /etc/systemd/system/ (needs root, checked above).
+#   (b) Explicit `User=` + `Group=` so %h expands to that user's home
+#       instead of /root.
+#   (c) `WantedBy=multi-user.target` so it auto-starts at boot.
+# `WorkingDirectory=` is set to the runner user's home so the runner's
+# default `--cwd .` resolves to a sensible place (system services
+# default to /, which would break agent spawning).
+write_system_unit() {
+    system_unit_file="/etc/systemd/system/branchwork-runner.service"
+    runner_user="${SUDO_USER:-${USER:-root}}"
+    runner_home="$(getent passwd "$runner_user" 2>/dev/null | cut -d: -f6)"
+    if [ -z "$runner_home" ]; then
+        runner_home="$HOME"
+    fi
+    cat > "$system_unit_file" <<UNIT
+# Branchwork SaaS runner — system-mode systemd unit (installed by install-runner.sh).
+# Runs as $runner_user; state under $runner_home/.branchwork-runner/.
+
+[Unit]
+Description=Branchwork SaaS runner (system mode)
+Documentation=https://github.com/branchwork/branchwork
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$runner_user
+Group=$runner_user
+WorkingDirectory=$runner_home
+# --server-bin is explicit so the runner does not depend on systemd
+# putting the paired-install dir on PATH.
+ExecStart=$runner_home/.local/bin/branchwork-runner --server-bin $runner_home/.local/bin/branchwork-server
+Restart=on-failure
+RestartSec=5
+Environment=BRANCHWORK_RUNNER_CONFIG=$runner_home/.branchwork-runner/config.toml
+EnvironmentFile=$runner_home/.branchwork-runner/env
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    ok "wrote $system_unit_file"
+}
+
 if [ "$MODE" = "just_binary" ]; then
     if [ "$SYSTEM_INSTALL" = "1" ]; then
         note "restarting systemd unit (sudo systemctl restart branchwork-runner)"
@@ -861,17 +1005,51 @@ if [ "$MODE" = "just_binary" ]; then
     fi
     ok "restarted branchwork-runner via systemd"
 else
-    note "starting runner in the background"
-    PATH="$INSTALL_DIR:$PATH" nohup "$RUNNER_BIN" --saas-url "$SAAS_URL" --token "$TOKEN" \
-        >"$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
-    sleep 1
-    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        err "runner exited immediately — last lines of $LOG_FILE:"
-        tail -n 20 "$LOG_FILE" >&2 || true
-        exit 1
+    ensure_systemctl
+    stop_legacy_nohup_runner
+    if [ "$SYSTEM_INSTALL" = "1" ]; then
+        write_system_unit
+        note "reloading systemd (system mode)"
+        if ! systemctl daemon-reload; then
+            err "systemctl daemon-reload failed (see above)"
+            exit 1
+        fi
+        note "enabling and starting branchwork-runner"
+        if ! systemctl enable --now branchwork-runner; then
+            err "systemctl enable --now branchwork-runner failed (see above)"
+            note "tail the journal for the failure reason: journalctl -u branchwork-runner -n 50"
+            exit 1
+        fi
+    else
+        write_user_unit
+        note "reloading systemd (--user)"
+        if ! systemctl --user daemon-reload; then
+            err "systemctl --user daemon-reload failed (see above)"
+            note "ensure a user-systemd session is active (e.g. linger may be off and you have no active session)"
+            exit 1
+        fi
+        note "enabling and starting branchwork-runner"
+        if ! systemctl --user enable --now branchwork-runner; then
+            err "systemctl --user enable --now branchwork-runner failed (see above)"
+            note "tail the journal for the failure reason: journalctl --user -u branchwork-runner -n 50"
+            exit 1
+        fi
+        # `loginctl enable-linger "$USER"` makes the user instance start at
+        # boot and survive logouts — without it the runner only runs while a
+        # login session is active. Best-effort: some environments disallow
+        # linger (locked-down corporate hosts, certain container runtimes);
+        # downgrade to a warning rather than failing the whole install.
+        if command -v loginctl >/dev/null 2>&1; then
+            note "enabling user-linger so the runner survives logouts/reboots"
+            if ! loginctl enable-linger "$USER" 2>/dev/null; then
+                note "loginctl enable-linger failed — the runner will stop on logout"
+                note "this is usually a privilege-restriction (try: sudo loginctl enable-linger $USER)"
+            fi
+        else
+            note "loginctl not found — the runner will stop on logout"
+        fi
     fi
-    ok "runner started (pid $(cat "$PID_FILE"))"
+    ok "branchwork-runner.service enabled and running"
 fi
 
 # ── Confirm Start session readiness (T3.2) ──────────────────────────────────
@@ -919,14 +1097,24 @@ if [ "$MODE" = "just_binary" ]; then
   $CONFIG_FILE are untouched.
 NEXT
 else
+    if [ "$SYSTEM_INSTALL" = "1" ]; then
+        unit_status_cmd="systemctl status branchwork-runner"
+        unit_journal_cmd="journalctl -u branchwork-runner -f"
+        unit_stop_cmd="systemctl stop branchwork-runner"
+    else
+        unit_status_cmd="systemctl --user status branchwork-runner"
+        unit_journal_cmd="journalctl --user -u branchwork-runner -f"
+        unit_stop_cmd="systemctl --user stop branchwork-runner"
+    fi
     cat <<NEXT
 
   Next steps:
-    • Check status:  curl -fsSL $SAAS_URL/api/runners
-    • Tail log:      tail -f $LOG_FILE
-    • Stop runner:   kill \$(cat $PID_FILE)
+    • Check status:  $unit_status_cmd
+    • Tail log:      $unit_journal_cmd
+    • Stop runner:   $unit_stop_cmd
+    • Dashboard:     $SAAS_URL/runners
 
-  For a long-running service (systemd user unit / launchd plist), see
-  the Branchwork docs: $SAAS_URL/docs/runner-as-a-service
+  systemd owns the runner's lifecycle now — it restarts on crash and
+  survives logouts/reboots (user mode uses \`loginctl enable-linger\`).
 NEXT
 fi
