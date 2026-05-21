@@ -437,6 +437,121 @@ pub async fn delete_runner(
     .into_response()
 }
 
+/// `POST /api/runners/{id}/rotate-token` — issue a fresh API token bound
+/// to the existing `runner_id` and revoke every previous token.
+///
+/// The flow this unlocks: an operator who needs a fresh credential for an
+/// already-enrolled runner (e.g. the `install-runner.sh --rotate-token`
+/// path the install script exposes after T2.1) can mint a new token from
+/// the dashboard without going through a full DELETE + re-enroll. The
+/// runner_id binding survives, so every `agents` / `runner_config` /
+/// `plan_runner_affinity` row that references the runner stays resolvable.
+///
+/// Previous token rows are deleted in the same transaction so a leaked
+/// credential can no longer authenticate. The new token row is inserted
+/// with `claimed_runner_id` pre-bound to this runner — `claim_or_verify_token`
+/// on the next reconnect sees the matching claim and Verify-OKs immediately
+/// without entering the unclaimed-then-bind branch (and without any chance
+/// of binding to a different runner_id).
+///
+/// Response: `200 { token, runnerId, runnerName, tokensRevoked: usize }`.
+/// Like `create_runner_token`, the raw token is returned exactly once — only
+/// the SHA hash is persisted server-side. `404` when the runner doesn't
+/// belong to the caller's org or has been revoked already.
+pub async fn rotate_runner_token(
+    State(state): State<AppState>,
+    Path(runner_id): Path<String>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    // Membership + soft-delete check rolled in: pull the runner_name in the
+    // same SELECT so we can echo it in the response + audit row without a
+    // second query.
+    let runner_name: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT name FROM runners WHERE id = ?1 AND org_id = ?2 AND removed_at IS NULL",
+            params![runner_id, user.org_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+
+    if !runner_belongs_to_org(&state, &runner_id, &user.org_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "runner_not_found" })),
+        )
+            .into_response();
+    }
+    // Defensive fallback: every active runner row has a non-NULL name in
+    // practice (CREATE TABLE sets `name TEXT NOT NULL`), but the SELECT
+    // returns `Option<String>` via `row.get`, so handle the None branch
+    // rather than `.unwrap()` and 500ing on a corrupt row.
+    let runner_name = runner_name.unwrap_or_else(|| runner_id.clone());
+
+    let token = crate::saas::runner_ws::generate_token();
+    let hash = crate::saas::runner_ws::sha256_hex(&token);
+
+    let tokens_revoked: usize = {
+        let conn = state.db.lock().unwrap();
+        // Revoke every existing token for this runner so a leaked previous
+        // credential can no longer authenticate. Mirrors the revoke step in
+        // `delete_runner` — the difference is that we leave the `runners`
+        // row alone (not soft-deleted) and immediately insert a fresh
+        // pre-bound token row below.
+        let revoked = conn
+            .execute(
+                "DELETE FROM runner_tokens WHERE claimed_runner_id = ?1 AND org_id = ?2",
+                params![runner_id, user.org_id],
+            )
+            .unwrap_or(0);
+        // Insert the new token pre-claimed for this runner_id. On the
+        // runner's next WS connect with this token, `claim_or_verify_token`
+        // sees `claimed_runner_id == runner_id` and returns `Ok(())` via
+        // the "already claimed by self" branch — same path a reconnect
+        // takes. A second host that pasted the same token but somehow
+        // picked a different runner_id would land in the Err(existing)
+        // branch and fail closed.
+        conn.execute(
+            "INSERT INTO runner_tokens \
+             (token_hash, runner_name, org_id, created_by, claimed_runner_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![hash, runner_name, user.org_id, user.id, runner_id],
+        )
+        .expect("failed to insert rotated runner token");
+        revoked
+    };
+
+    let diff = serde_json::json!({
+        "runner_id": runner_id,
+        "runner_name": runner_name,
+        "tokens_revoked": tokens_revoked,
+    })
+    .to_string();
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            &user.org_id,
+            Some(&user.id),
+            Some(&user.email),
+            audit::actions::RUNNER_TOKEN_ROTATED,
+            audit::resources::RUNNER,
+            Some(&runner_id),
+            Some(&diff),
+        );
+    }
+
+    Json(serde_json::json!({
+        "token": token,
+        "runnerId": runner_id,
+        "runnerName": runner_name,
+        "tokensRevoked": tokens_revoked,
+    }))
+    .into_response()
+}
+
 /// Body for `POST /api/runners/{id}/version-mismatch-override`.
 #[derive(Deserialize)]
 pub struct VersionMismatchOverrideBody {
@@ -1010,5 +1125,298 @@ mod tests {
         let runners = new_runner_registry();
         let state = test_app_state(db, runners);
         assert!(!runner_belongs_to_org(&state, "runner-soft", "default-org"));
+    }
+
+    // ── T2.3: rotate-token endpoint ─────────────────────────────────────────
+
+    /// Seed a `runner_config` row that holds the per-runner effort/skip
+    /// override (FK on `runner_id` with `ON DELETE CASCADE`). The rotate
+    /// path must NOT delete the `runners` row, so this row must survive.
+    /// `agents` doesn't carry a `runner_id` column today (per the SaaS-
+    /// compat audit), so the strongest "dependent row survives" signal
+    /// available without inventing schema is `runner_config`.
+    fn seed_dependent_rows(db: &crate::db::Db, runner_id: &str, org_id: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO runner_config (runner_id, effort, skip_permissions, org_id) \
+             VALUES (?1, 'max', 1, ?2)",
+            params![runner_id, org_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotate_token_returns_new_token_bound_to_runner_id() {
+        let (db, _td) = full_db();
+        let user_id = "tester-rt-1";
+        seed_runner_with_token(&db, "runner-rotate-1", "default-org", user_id, "hash-old");
+        seed_dependent_rows(&db, "runner-rotate-1", "default-org");
+
+        let runners = new_runner_registry();
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = rotate_runner_token(
+            axum::extract::State(state),
+            axum::extract::Path("runner-rotate-1".to_string()),
+            auth_user("default-org", user_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["runnerId"], serde_json::json!("runner-rotate-1"));
+        assert_eq!(json["tokensRevoked"], serde_json::json!(1));
+        let new_token = json["token"]
+            .as_str()
+            .expect("response must include a fresh token")
+            .to_string();
+        assert!(
+            !new_token.is_empty() && new_token != "hash-old",
+            "minted token must be fresh and non-empty (got {new_token})"
+        );
+
+        // The new token row exists, hashes to the returned token, and is
+        // pre-bound to the same runner_id so the next reconnect Verify-OKs
+        // without ever entering the unclaimed-then-bind branch.
+        let (stored_runner_id, stored_runner_name, stored_org_id): (
+            Option<String>,
+            String,
+            String,
+        ) = {
+            let conn = db.lock().unwrap();
+            let hash = crate::saas::runner_ws::sha256_hex(&new_token);
+            conn.query_row(
+                "SELECT claimed_runner_id, runner_name, org_id FROM runner_tokens \
+                 WHERE token_hash = ?1",
+                params![hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored_runner_id.as_deref(), Some("runner-rotate-1"));
+        assert_eq!(stored_runner_name, "test");
+        assert_eq!(stored_org_id, "default-org");
+
+        // Old token row is gone (single previous token deleted).
+        let old_present: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM runner_tokens WHERE token_hash = ?1",
+                params!["hash-old"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(old_present, 0, "old token must be revoked");
+
+        // Exactly one token row left for this runner.
+        let token_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM runner_tokens WHERE claimed_runner_id = ?1",
+                params!["runner-rotate-1"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(token_count, 1);
+
+        // `runners` row still alive (NOT soft-deleted) and the dependent
+        // `runner_config` row survives — runner_id binding persists.
+        let (removed_at, config_count): (Option<String>, i64) = {
+            let conn = db.lock().unwrap();
+            let removed_at: Option<String> = conn
+                .query_row(
+                    "SELECT removed_at FROM runners WHERE id = ?1",
+                    params!["runner-rotate-1"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let config_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM runner_config WHERE runner_id = ?1",
+                    params!["runner-rotate-1"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (removed_at, config_count)
+        };
+        assert!(
+            removed_at.is_none(),
+            "runners.removed_at must stay NULL — rotate must not soft-delete"
+        );
+        assert_eq!(config_count, 1, "runner_config row survives token rotation");
+
+        // Reconnect simulation: the runner sends its existing runner_id and
+        // the freshly-issued token. claim_or_verify_token must Ok via the
+        // "already claimed by self" branch. Pre-binding the new token to
+        // this runner_id is what makes this work; the old code path of
+        // INSERT-then-claim-on-first-connect would have been Ok too but
+        // would race with a hypothetical second host using the same token.
+        let new_hash = crate::saas::runner_ws::sha256_hex(&new_token);
+        crate::saas::runner_ws::claim_or_verify_token(&db, &new_hash, "runner-rotate-1")
+            .expect("freshly rotated token must Verify-OK for the existing runner_id");
+
+        // Audit row landed with the right shape.
+        let audit_diff: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT diff FROM audit_logs \
+                 WHERE action = ?1 AND resource_id = ?2 ORDER BY id DESC LIMIT 1",
+                params![audit::actions::RUNNER_TOKEN_ROTATED, "runner-rotate-1"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&audit_diff).unwrap();
+        assert_eq!(parsed["runner_id"], "runner-rotate-1");
+        assert_eq!(parsed["tokens_revoked"], 1);
+    }
+
+    #[tokio::test]
+    async fn rotate_token_404s_for_unknown_runner() {
+        let (db, _td) = full_db();
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let resp = rotate_runner_token(
+            axum::extract::State(state),
+            axum::extract::Path("nope-such-runner".to_string()),
+            auth_user("default-org", "default-user"),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rotate_token_404s_for_revoked_runner() {
+        // Same posture as the other endpoints — a soft-deleted runner
+        // cannot be re-tokenized. The operator must DELETE + re-enroll.
+        let (db, _td) = full_db();
+        let user_id = "tester-rt-2";
+        seed_runner_with_token(
+            &db,
+            "runner-rotate-soft",
+            "default-org",
+            user_id,
+            "hash-soft",
+        );
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE runners SET removed_at = datetime('now') WHERE id = ?1",
+                params!["runner-rotate-soft"],
+            )
+            .unwrap();
+        }
+        let runners = new_runner_registry();
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = rotate_runner_token(
+            axum::extract::State(state),
+            axum::extract::Path("runner-rotate-soft".to_string()),
+            auth_user("default-org", user_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Belt-and-braces: no new token was inserted.
+        let token_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM runner_tokens WHERE claimed_runner_id = ?1",
+                params!["runner-rotate-soft"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            token_count, 1,
+            "404 path must not mutate token rows (still has the seed token)"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_token_404s_across_orgs() {
+        // The dashboard scopes all runner ops to the caller's org. A
+        // member of org-B must not be able to rotate org-A's runner
+        // even if they happen to know the runner_id.
+        let (db, _td) = full_db();
+        let user_id = "tester-rt-3";
+        seed_runner_with_token(&db, "runner-rotate-org", "default-org", user_id, "hash-org");
+        let runners = new_runner_registry();
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = rotate_runner_token(
+            axum::extract::State(state),
+            axum::extract::Path("runner-rotate-org".to_string()),
+            auth_user("other-org", user_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Token row untouched — the seed token is still there.
+        let token_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM runner_tokens WHERE claimed_runner_id = ?1",
+                params!["runner-rotate-org"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(token_count, 1);
+    }
+
+    #[tokio::test]
+    async fn rotate_token_revokes_multiple_pre_existing_tokens() {
+        // If an operator ran the enrollment flow twice without revoking
+        // in between (which is technically possible because token
+        // creation is a separate endpoint), every previous token must
+        // be revoked by the next rotate — otherwise a leaked older
+        // token would keep authenticating.
+        let (db, _td) = full_db();
+        let user_id = "tester-rt-4";
+        seed_runner_with_token(&db, "runner-rotate-many", "default-org", user_id, "hash-1");
+        // Add a second pre-existing token bound to the same runner_id.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO runner_tokens \
+                 (token_hash, runner_name, org_id, created_by, claimed_runner_id) \
+                 VALUES ('hash-2', 'test', 'default-org', ?1, 'runner-rotate-many')",
+                params![user_id],
+            )
+            .unwrap();
+        }
+        let runners = new_runner_registry();
+        let state = test_app_state(db.clone(), runners);
+
+        let resp = rotate_runner_token(
+            axum::extract::State(state),
+            axum::extract::Path("runner-rotate-many".to_string()),
+            auth_user("default-org", user_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["tokensRevoked"], serde_json::json!(2));
+
+        // After rotate: only the new token is left, none of the old.
+        let leftover: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM runner_tokens \
+                 WHERE claimed_runner_id = ?1 AND token_hash IN ('hash-1', 'hash-2')",
+                params!["runner-rotate-many"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(leftover, 0, "every previous token must be deleted");
     }
 }

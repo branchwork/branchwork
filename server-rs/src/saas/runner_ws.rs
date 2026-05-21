@@ -1901,7 +1901,7 @@ pub struct CreateTokenRequest {
     pub runner_name: String,
 }
 
-fn generate_token() -> String {
+pub(crate) fn generate_token() -> String {
     use rand::RngCore;
     let mut buf = [0u8; 32];
     rand::rng().fill_bytes(&mut buf);

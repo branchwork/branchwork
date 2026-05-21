@@ -82,6 +82,15 @@ pub mod actions {
     /// mismatch — if a future incident is rooted in protocol drift, this row
     /// is what shows that the operator was warned and accepted the risk.
     pub const RUNNER_VERSION_MISMATCH_OVERRIDE: &str = "runner.version_mismatch_override";
+    /// `POST /api/runners/{id}/rotate-token` — operator minted a fresh API
+    /// token for an existing runner without going through DELETE +
+    /// re-enroll. Every previous `runner_tokens` row for the runner is
+    /// deleted (so the old token is dead) and a new row is inserted with
+    /// `claimed_runner_id` pre-bound to this runner so the next reconnect
+    /// Verify-OKs immediately. The `runners` row + every dependent row
+    /// (`agents`, `runner_config`, `plan_runner_affinity`, …) is untouched.
+    /// Diff carries `{runner_id, runner_name, tokens_revoked: usize}`.
+    pub const RUNNER_TOKEN_ROTATED: &str = "runner.token_rotated";
     /// `git_helpers::push_branch_local` was rejected as non-fast-forward
     /// and successfully rebased + retried. One row per retry attempt
     /// (so a 3-attempt push that succeeds on attempt 2 produces one
