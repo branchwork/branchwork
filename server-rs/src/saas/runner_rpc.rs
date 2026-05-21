@@ -1144,4 +1144,162 @@ mod tests {
         drop(ws);
         server_handle.abort();
     }
+
+    /// T5.2 acceptance pin: a soft-deleted runner row whose token is still
+    /// bound (i.e. legacy state — operator soft-deleted without revoking the
+    /// token, OR a re-enrolled host where a fresh token was bound to the
+    /// pre-existing runner_id) un-hides on the first message in. After the
+    /// WS handshake lands, `removed_at` must be cleared and `status` must be
+    /// `'online'`.
+    ///
+    /// Counterpart to `ws_connect_after_revoke_fails_with_invalid_token`,
+    /// which proves the security gate: a *properly* revoked runner (token
+    /// row DELETEd) cannot reach this code at all.
+    #[tokio::test]
+    async fn ws_connect_with_bound_token_unhides_soft_deleted_runner_row() {
+        use futures_util::SinkExt;
+        use std::path::PathBuf;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::init(&tempdir.path().join("test.db"));
+        let user_id = "tester-t52-unhide";
+        let token = "test-token-t52-unhide";
+        let org_id = "default-org";
+        let runner_id = "test-runner-t52-unhide";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                params![user_id, "t52@test", "x"],
+            )
+            .unwrap();
+            // Token row still present and bound to the runner. This models a
+            // re-enrolled host (operator issued a fresh token after soft-
+            // delete, runner_id persisted via local seq_tracker) or a legacy
+            // stale-state row where the token DELETE got skipped somehow.
+            conn.execute(
+                "INSERT INTO runner_tokens \
+                 (token_hash, runner_name, org_id, created_by, claimed_runner_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![token, "runner-t52", org_id, user_id, runner_id],
+            )
+            .unwrap();
+            // Runner row pre-exists with removed_at set. status='offline'
+            // mirrors the disconnect-cleanup state we'd typically be in after
+            // the operator clicked Revoke (and the prior WS dropped).
+            conn.execute(
+                "INSERT INTO runners (id, name, org_id, status, hostname, version, \
+                                     last_seen_at, removed_at) \
+                 VALUES (?1, ?2, ?3, 'offline', 'pre-revoke-host', 'pre-revoke-version', \
+                         datetime('now', '-1 hour'), datetime('now', '-1 hour'))",
+                params![runner_id, "runner-t52", org_id],
+            )
+            .unwrap();
+        }
+
+        // Build a minimal AppState and mount the production WS handler.
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/branchwork-test-t52"),
+            0,
+            true,
+        );
+        let runners = new_runner_registry();
+        let state = crate::state::AppState {
+            db: db.clone(),
+            plans_dir: PathBuf::from("/tmp"),
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners: runners.clone(),
+            settings_path: PathBuf::from("/tmp/branchwork-test-t52-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            started_at: std::time::Instant::now(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/ws/runner",
+                axum::routing::get(crate::saas::runner_ws::runner_ws_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Connect with the still-valid token and send the first envelope.
+        // The first-message branch in `handle_runner_ws` is the one that
+        // hits the INSERT/ON-CONFLICT block under test.
+        let url = format!("ws://127.0.0.1:{port}/ws/runner?token={token}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect");
+        let hello = Envelope::reliable(
+            runner_id.into(),
+            1,
+            WireMessage::RunnerHello {
+                hostname: "post-revoke-host".into(),
+                version: "post-revoke-version".into(),
+                drivers: vec![],
+                active_agents: vec![],
+                server_bin: None,
+                upgrade_available: false,
+            },
+        );
+        ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+            .await
+            .unwrap();
+
+        // Wait for the server to register the runner AND apply the INSERT/
+        // ON-CONFLICT clearing removed_at. Polling for in-memory registration
+        // is sufficient because that insert happens AFTER the SQL UPDATE in
+        // `handle_runner_ws`.
+        let mut attempts = 0;
+        loop {
+            let registered = runners.lock().await.contains_key(runner_id);
+            if registered {
+                break;
+            }
+            attempts += 1;
+            assert!(
+                attempts <= 200,
+                "runner did not register after legitimate reconnect"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The headline acceptance: removed_at is cleared AND status flipped
+        // back to 'online'. Without the T5.2 UPDATE SET removed_at = NULL,
+        // both stay at their soft-deleted baseline.
+        let (status_col, removed_at): (Option<String>, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status, removed_at FROM runners WHERE id = ?1",
+                params![runner_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            status_col.as_deref(),
+            Some("online"),
+            "legitimate reconnect must flip status to online"
+        );
+        assert!(
+            removed_at.is_none(),
+            "legitimate reconnect must clear removed_at (got {removed_at:?})"
+        );
+
+        drop(ws);
+        server_handle.abort();
+    }
 }

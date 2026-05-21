@@ -304,10 +304,23 @@ async fn handle_runner_ws(
 
                     // Update runner status in DB.
                     //
-                    // T5.1: `WHERE removed_at IS NULL` on the conflict-resolution
-                    // UPDATE so a soft-deleted runner whose token somehow validated
-                    // (e.g. a token-DELETE race) cannot revive its row. Fresh
-                    // inserts skip the WHERE because the INSERT itself runs.
+                    // T5.2: clear `removed_at` on the conflict-resolution UPDATE
+                    // so a legitimate reconnect (token still bound by
+                    // `claim_or_verify_token` above) un-hides a runner row that
+                    // was previously soft-deleted. The security model relies on
+                    // `delete_runner`'s token DELETE: a *properly* revoked
+                    // runner cannot reach this code because
+                    // `validate_runner_token` already 401'd the upgrade. The
+                    // only way we land here with `removed_at IS NOT NULL` is a
+                    // legacy / stale-state row where the runner row was
+                    // soft-deleted without revoking the token — un-hiding is
+                    // the desired recovery.
+                    //
+                    // This intentionally relaxes the `WHERE removed_at IS NULL`
+                    // gate T5.1 placed here; the other four mid-WS UPDATE sites
+                    // (disconnect, RunnerHello, DriverAuthReport, RunnerHealth)
+                    // keep that gate because they fire on a still-alive WS that
+                    // raced an in-flight `delete_runner`.
                     {
                         let conn = state.db.lock().unwrap();
                         conn.execute(
@@ -316,33 +329,17 @@ async fn handle_runner_ws(
                              ON CONFLICT(id) DO UPDATE SET
                                status = 'online',
                                last_seen_at = datetime('now'),
-                               name = excluded.name
-                             WHERE removed_at IS NULL",
+                               name = excluded.name,
+                               removed_at = NULL",
                             params![rid, runner_name, org_id],
                         )
                         .ok();
                     }
 
-                    // T5.1: defense-in-depth — if the runners row exists with
-                    // `removed_at` set (revoked while a stale token still
-                    // validated, or a token row was hand-edited), refuse the
-                    // connection cleanly instead of leaking an in-memory
-                    // handle. Token DELETE in `delete_runner` is the primary
-                    // gate; this is the belt-and-braces check.
-                    let row_revoked: bool = {
-                        let conn = state.db.lock().unwrap();
-                        conn.query_row(
-                            "SELECT 1 FROM runners \
-                             WHERE id = ?1 AND removed_at IS NOT NULL",
-                            params![rid],
-                            |_row| Ok(()),
-                        )
-                        .is_ok()
-                    };
-                    if row_revoked {
-                        eprintln!("[runner-ws] refusing connection from revoked runner_id={rid}");
-                        break;
-                    }
+                    // T5.1 → T5.2: the prior defense-in-depth SELECT for
+                    // `removed_at IS NOT NULL` is now redundant — the UPDATE
+                    // above unconditionally clears `removed_at`. Token
+                    // revocation in `delete_runner` is the primary gate.
 
                     // Register in-memory handle.
                     runners.lock().await.insert(
