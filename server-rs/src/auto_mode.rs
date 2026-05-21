@@ -88,6 +88,14 @@ pub mod actions {
     /// post-mortem can correlate the retry with the prior
     /// `AUTO_MODE_PRE_MERGE_CHECK_FAILED` row that triggered it.
     pub const AUTO_MODE_PRE_MERGE_GATE_RETRIED: &str = "auto_mode.pre_merge_gate_retried";
+    /// A pre-merge gate check failed AND the project has both
+    /// `auto_fix_on_gate_failure = true` and a `fix_recipe` entry for
+    /// the failing check name (T2.2). The loop spawned a brief
+    /// "fix agent" with the recipe command + failing-check output in
+    /// the prompt; the agent commits straight to the task branch and
+    /// Branchwork re-runs the gate on completion. Diff carries
+    /// `{plan, task, agent_id, check_name, recipe_cmd, fix_agent_id}`.
+    pub const AUTO_MODE_GATE_FIX_SPAWNED: &str = "auto_mode.gate_fix_spawned";
 }
 
 // ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
@@ -298,20 +306,105 @@ pub async fn on_task_agent_completed(
     let plan_name = plan_name.to_string();
     let task_id = task_id.to_string();
 
-    // Fix agents (`task_id` carries the `-fix-<n>` suffix that
-    // [`spawn_fix_agent`] stamps on) flow through `on_fix_agent_completed`:
-    // their fix branch is merged into the canonical default and CI is
-    // re-polled on the new SHA. On Green the original task is marked
-    // completed in `task_status` and `try_auto_advance` fires for the
-    // original task id; on Red the loop spawns the next fix attempt.
-    let is_fix_agent = task_id.contains("-fix-");
+    // Routing key on `task_id`:
+    //   - `<task>-gate-fix-<n>` -> gate-fix completion (T2.2 of the
+    //     pre-merge-gate plan). The agent committed (hopefully) the
+    //     recipe's fix on the original task branch; we re-enter
+    //     `run_state_machine` for the ORIGINAL task so the gate runs
+    //     again over the new tip.
+    //   - `<task>-fix-<n>` -> CI-fix completion. The fix branch is
+    //     merged into the canonical default and CI is re-polled on
+    //     the new SHA. On Green the original task is marked completed
+    //     in `task_status` and `try_auto_advance` fires for the
+    //     original task id; on Red the loop spawns the next fix attempt.
+    //   - bare `<task>` -> standard task completion. Run the full
+    //     state machine (cadence gate → pre-merge gate → merge → CI).
+    //
+    // ORDER MATTERS: the gate-fix marker `-gate-fix-` contains the
+    // substring `-fix-`, so the gate-fix detection MUST run before
+    // the CI-fix detection.
+    let is_gate_fix_agent = task_id.contains(GATE_FIX_MARKER);
+    let is_fix_agent = !is_gate_fix_agent && task_id.contains("-fix-");
     tokio::spawn(async move {
-        if is_fix_agent {
+        if is_gate_fix_agent {
+            on_gate_fix_agent_completed(&state, &org_id, &agent_id, &plan_name, &task_id).await;
+        } else if is_fix_agent {
             on_fix_agent_completed(&state, &org_id, &agent_id, &plan_name, &task_id).await;
         } else {
             run_state_machine(&state, &org_id, &agent_id, &plan_name, &task_id).await;
         }
     });
+}
+
+/// Strip the `<original>-gate-fix-<n>` suffix from a gate-fix `task_id`
+/// to recover the original task number. Returns `None` if `task_id`
+/// doesn't carry the marker — callers should have routed on
+/// [`GATE_FIX_MARKER`] before calling this.
+pub(crate) fn extract_original_task_id(fix_task_id: &str) -> Option<String> {
+    fix_task_id
+        .find(GATE_FIX_MARKER)
+        .map(|idx| fix_task_id[..idx].to_string())
+}
+
+/// Called when a gate-fix agent completes cleanly (`task_id` carries the
+/// `-gate-fix-<n>` marker that [`spawn_gate_fix_agent`] stamped on). The
+/// agent has hopefully committed the recipe's fix on the task branch;
+/// we re-enter `run_state_machine` for the **original** task so the
+/// pre-merge gate runs again over the new tip.
+///
+/// Trigger agent for the re-entry is the original task agent (not the
+/// gate-fix agent), found via `(plan_name, task_id == original)`. This
+/// keeps audit + WS payloads pointing at the agent whose work is being
+/// merged, and lets the merge step null the right `branch` column on
+/// success. If the original agent row is gone (defensive — should not
+/// happen on a live gate-fail path), the function logs and bails;
+/// auto-mode never half-merges on missing metadata.
+async fn on_gate_fix_agent_completed(
+    state: &AppState,
+    org_id: &str,
+    gate_fix_agent_id: &str,
+    plan_name: &str,
+    gate_fix_task_id: &str,
+) {
+    let Some(original_task) = extract_original_task_id(gate_fix_task_id) else {
+        eprintln!(
+            "[auto_mode] gate-fix agent {gate_fix_agent_id} ({plan_name}/{gate_fix_task_id}) \
+             task_id has no `{GATE_FIX_MARKER}` marker — skipping re-gate"
+        );
+        return;
+    };
+
+    // Find the original task agent. We filter out fix/gate-fix rows so
+    // a re-entry doesn't pick its own gate-fix row by mistake. The most
+    // recent row is the one whose branch we want to re-gate against.
+    let original_agent_id: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM agents \
+             WHERE plan_name = ?1 AND task_id = ?2 \
+               AND task_id NOT LIKE '%-fix-%' \
+               AND task_id NOT LIKE '%-gate-fix-%' \
+             ORDER BY started_at DESC LIMIT 1",
+            params![plan_name, &original_task],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+
+    let Some(original_agent_id) = original_agent_id else {
+        eprintln!(
+            "[auto_mode] gate-fix agent {gate_fix_agent_id} ({plan_name}/{gate_fix_task_id}) \
+             has no surviving original task agent ({plan_name}/{original_task}) — skipping re-gate"
+        );
+        return;
+    };
+
+    // Re-enter the state machine for the original task. The gate will
+    // run again over the (hopefully) fixed branch tip; if it still
+    // fails, [`run_state_machine`]'s gate-fail path will see the
+    // existing `-gate-fix-1` agent row, hit the cap (1 attempt per
+    // cycle), fall through to the operator-visible pause from T1.3.
+    run_state_machine(state, org_id, &original_agent_id, plan_name, &original_task).await;
 }
 
 /// Decide whether auto-mode should merge `completed_task`'s branch right
@@ -874,6 +967,185 @@ fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
         idx += 1;
     }
     idx
+}
+
+// ── Gate-fix escalation (T2.2 of the pre-merge-gate plan) ──────────────────
+//
+// When `auto_mode.auto_fix_on_gate_failure = true` AND the project has a
+// `fix_recipe` entry for the failing check name, the loop spawns a brief
+// "fix agent" instead of pausing on the first failure. The agent runs the
+// recipe command (e.g. `pnpm format` for a `web-format` failure), commits
+// the result on the **task branch** (not a separate fix branch — gate-fix
+// is meant to land directly so the gate re-runs over a real merge target),
+// and exits cleanly. The completion handler in `on_task_agent_completed`
+// detects the `-gate-fix-` suffix in `task_id`, re-enters `run_state_machine`,
+// and the gate runs again over the new tip.
+//
+// Cap: 1 attempt per task per gate cycle. If the gate-fix agent's gate retry
+// also fails, fall back to the operator-visible pause from T1.3. The cap is
+// enforced by counting `agents` rows whose `task_id` matches `<task>-gate-fix-%`
+// for the plan — one row already present means the cycle has already had its
+// fix attempt. Per-cycle reset is implicit: the operator's Resume button (T2.1)
+// just re-runs the gate; if it still fails AND a previous gate-fix attempt
+// row exists, the cap is hit and the pause cycle repeats.
+
+/// Marker suffix planted on the `task_id` of a gate-fix agent. The
+/// completion handler routes on `task_id.contains(GATE_FIX_MARKER)` so a
+/// rename here needs the matching update in
+/// [`on_task_agent_completed`].
+pub(crate) const GATE_FIX_MARKER: &str = "-gate-fix-";
+
+/// Cap on the number of gate-fix attempts per `(plan, task)` per cycle.
+/// Currently hard-coded to 1 per the task brief; a future iteration may
+/// promote this to a configurable knob (e.g. when chained fixes become
+/// useful), but the brief is explicit that fallback to operator pause
+/// is the safety net for now.
+pub(crate) const GATE_FIX_CAP_PER_CYCLE: usize = 1;
+
+/// Count existing `agents` rows whose `task_id` looks like a gate-fix
+/// attempt for the given `(plan_name, original_task_id)`. Used as the
+/// cap check before spawning a new gate-fix agent.
+///
+/// Counts rows regardless of `status` so a still-running attempt blocks
+/// a second concurrent spawn AND a completed-but-still-failing attempt
+/// is recognized as "the cap already kicked, time to pause." Returns
+/// `0` on any DB error — fail-safe toward "allow the attempt"; the more
+/// dangerous failure mode would be silently double-spawning, which the
+/// SQL pattern below cannot do (it always returns a count or errors).
+fn count_gate_fix_attempts(state: &AppState, plan_name: &str, task_id: &str) -> usize {
+    let conn = state.db.lock().unwrap();
+    let pattern = format!("{task_id}{GATE_FIX_MARKER}%");
+    conn.query_row(
+        "SELECT COUNT(*) FROM agents \
+         WHERE plan_name = ?1 AND task_id LIKE ?2",
+        params![plan_name, pattern],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+    .map(|n| n as usize)
+    .unwrap_or(0)
+}
+
+/// Compose the gate-fix-agent prompt. The agent runs on the task branch
+/// (already checked out by `start_agent_dispatch`), inherits the
+/// unattended-execution contract from T0.7, and is told to keep the
+/// commit narrow.
+///
+/// Per the task brief: "The pre-merge gate failed on check `<name>`
+/// with output: <…>. Fix this in the smallest possible commit. Do not
+/// modify unrelated files. When done, exit cleanly — the gate will
+/// re-run automatically."
+pub(crate) fn build_gate_fix_prompt(
+    plan_name: &str,
+    task_id: &str,
+    task_branch: &str,
+    check_name: &str,
+    recipe_cmd: &str,
+    exit_code: Option<i32>,
+    output_snippet: &str,
+) -> String {
+    let contract = crate::agents::prompt::unattended_contract_block(task_branch);
+    let exit_blurb = match exit_code {
+        Some(c) => format!("exit code {c}"),
+        None => "(killed by gate — timeout or signal)".to_string(),
+    };
+    format!(
+        "The pre-merge gate failed on check `{check_name}` ({exit_blurb}) for task \
+         {task_id} (plan {plan_name}). The output snippet is:\n\
+         \n\
+         {output_snippet}\n\
+         \n\
+         Suggested fix: run `{recipe_cmd}` from the project root to apply the \
+         canonical fix for this check.\n\
+         \n\
+         Fix this in the smallest possible commit. Do not modify unrelated \
+         files. When done, exit cleanly — the gate will re-run automatically.\n\
+         \n\
+         {contract}",
+    )
+}
+
+/// Spawn a brief "fix agent" to recover from a pre-merge gate failure.
+///
+/// Looks up the trigger agent's `cwd` + `branch` (the original task
+/// agent, not any prior fix attempt), stamps a gate-fix marker on the
+/// `task_id` so the completion handler can route it through the
+/// re-gate codepath, and dispatches via [`start_agent_dispatch`] so
+/// SaaS mode emits a `StartAgent` envelope and standalone delegates to
+/// `start_pty_agent`.
+///
+/// Returns `Some(agent_id)` on successful dispatch, `None` if the
+/// trigger agent's row is missing or has a NULL branch column (the
+/// caller falls back to the operator-visible pause from T1.3).
+#[allow(clippy::too_many_arguments)] // every arg is a context the prompt needs verbatim
+pub(crate) async fn spawn_gate_fix_agent(
+    state: &AppState,
+    org_id: &str,
+    plan_name: &str,
+    task_id: &str,
+    trigger_agent_id: &str,
+    check_name: &str,
+    recipe_cmd: &str,
+    exit_code: Option<i32>,
+    output_snippet: &str,
+) -> Option<String> {
+    // 1. Look up the trigger agent's cwd + branch. We re-resolve here
+    //    rather than threading them through the gate-fail path so the
+    //    fields stay in sync with whatever the DB has — the agent row
+    //    may have been touched since the gate failed (e.g. metadata
+    //    backfill) without invalidating the spawn-time decision.
+    let (cwd, branch): (PathBuf, String) = {
+        let conn = state.db.lock().unwrap();
+        match conn
+            .query_row(
+                "SELECT cwd, branch FROM agents WHERE id = ?1",
+                params![trigger_agent_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .ok()
+        {
+            Some((cwd_str, Some(branch_str))) => (PathBuf::from(cwd_str), branch_str),
+            _ => return None,
+        }
+    };
+
+    // 2. Stamp the gate-fix marker on the task_id. The completion
+    //    handler keys off this in [`on_task_agent_completed`].
+    let next_attempt = (count_gate_fix_attempts(state, plan_name, task_id) as u32) + 1;
+    let fix_task_id = format!("{task_id}{GATE_FIX_MARKER}{next_attempt}");
+
+    let prompt = build_gate_fix_prompt(
+        plan_name,
+        task_id,
+        &branch,
+        check_name,
+        recipe_cmd,
+        exit_code,
+        output_snippet,
+    );
+
+    // 3. Dispatch the spawn. The gate-fix agent shares the trigger
+    //    agent's `cwd` and **the same task `branch`** — that's the
+    //    whole point: commits land directly on the branch the gate ran
+    //    against. `is_continue: true` keeps `git_checkout_branch` from
+    //    trying to `git checkout -b` (which would fail because the
+    //    branch already exists).
+    let opts = StartPtyOpts {
+        prompt,
+        cwd: &cwd,
+        plan_name: Some(plan_name),
+        task_id: Some(&fix_task_id),
+        effort: *state.effort.lock().unwrap(),
+        branch: Some(&branch),
+        is_continue: true,
+        max_budget_usd: None,
+        driver: None,
+        user_id: None,
+        org_id: Some(org_id),
+        runner_id: None,
+    };
+    let agent_id = start_agent_dispatch(state, org_id, opts).await;
+    Some(agent_id)
 }
 
 /// Outcome of [`run_merge_step`] — what the orchestrator should do next.
@@ -1459,6 +1731,95 @@ pub(crate) async fn run_state_machine(
             exit_code,
             output,
         } => {
+            // Truncate the captured output to a tight per-row cap for
+            // both the audit row (persisted forever) and the WS
+            // broadcast (crosses the wire). The full 50 KB capture
+            // lives in `GateOutcome::Fail.output` and is dropped on
+            // the floor when this function returns — operator
+            // reproduces locally for the unabridged log.
+            let output_snippet = truncate_output(&output, PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES);
+
+            // T2.2 of the pre-merge-gate plan: optional escalation.
+            // Before pausing, check whether the project has opted into
+            // `auto_fix_on_gate_failure` AND has a `fix_recipe` entry
+            // for the failing check name AND the per-cycle cap (1)
+            // hasn't been hit. If all three line up, spawn a gate-fix
+            // agent and return — the agent commits on the task branch
+            // and Branchwork re-runs the gate when it completes
+            // (`on_task_agent_completed` -> `on_gate_fix_agent_completed`).
+            //
+            // The recipe resolution chain is identical to
+            // [`run_pre_merge_gate`]: project_dir -> repo_config. Re-
+            // resolving here keeps the gate-failure branch self-
+            // contained — we already know the gate ran, so the project
+            // dir + repo config are guaranteed available.
+            let recipe_match: Option<String> =
+                crate::ci::project_dir_for(&state.plans_dir, &state.db, plan_name)
+                    .and_then(|project_dir| crate::repo_config::load_for_project_dir(&project_dir))
+                    .filter(|repo_cfg| repo_cfg.auto_mode.auto_fix_on_gate_failure)
+                    .and_then(|repo_cfg| repo_cfg.auto_mode.fix_recipe.get(&check).cloned());
+
+            if let Some(recipe_cmd) = recipe_match {
+                let attempts = count_gate_fix_attempts(state, plan_name, task_id);
+                if attempts < GATE_FIX_CAP_PER_CYCLE {
+                    // Spawn the gate-fix agent. On a successful spawn
+                    // we return WITHOUT pausing — the completion handler
+                    // re-enters this state machine and the gate runs
+                    // again. On a None return (trigger agent row missing
+                    // or NULL branch — defensive, should not happen on a
+                    // gate-failed path) we fall through to the existing
+                    // pause behaviour.
+                    if let Some(fix_agent_id) = spawn_gate_fix_agent(
+                        state,
+                        org_id,
+                        plan_name,
+                        task_id,
+                        agent_id,
+                        &check,
+                        &recipe_cmd,
+                        exit_code,
+                        &output_snippet,
+                    )
+                    .await
+                    {
+                        let payload = serde_json::json!({
+                            "plan": plan_name,
+                            "task": task_id,
+                            "agent_id": agent_id,
+                            "check_name": check,
+                            "recipe_cmd": recipe_cmd,
+                            "fix_agent_id": fix_agent_id,
+                        });
+                        broadcast_event(
+                            &state.broadcast_tx,
+                            "auto_mode_gate_fix_spawned",
+                            payload.clone(),
+                        );
+                        {
+                            let conn = state.db.lock().unwrap();
+                            audit::log(
+                                &conn,
+                                org_id,
+                                None,
+                                Some("branchwork-auto-mode"),
+                                actions::AUTO_MODE_GATE_FIX_SPAWNED,
+                                audit::resources::PLAN,
+                                Some(plan_name),
+                                Some(&payload.to_string()),
+                            );
+                        }
+                        // Plan stays running (not paused). The gate-fix
+                        // agent's completion will re-enter run_state_machine
+                        // via on_gate_fix_agent_completed.
+                        return;
+                    }
+                    // Fall through to pause below if spawn returned None.
+                }
+                // attempts >= cap: fall through to pause below. The brief
+                // is explicit: "If the fix-spawn agent's gate retry also
+                // fails, fall back to the operator-visible pause from 1.3."
+            }
+
             // T1.3 of the pre-merge-gate plan: pause the plan with the
             // literal reason `pre_merge_check_failed` (no check name
             // appended — the check name travels in the audit/broadcast
@@ -1473,14 +1834,6 @@ pub(crate) async fn run_state_machine(
             // human in the loop.
             let reason = "pre_merge_check_failed";
             db::auto_mode_pause(&state.db, plan_name, reason, None);
-
-            // Truncate the captured output to a tight per-row cap for
-            // both the audit row (persisted forever) and the WS
-            // broadcast (crosses the wire). The full 50 KB capture
-            // lives in `GateOutcome::Fail.output` and is dropped on
-            // the floor when this function returns — operator
-            // reproduces locally for the unabridged log.
-            let output_snippet = truncate_output(&output, PRE_MERGE_AUDIT_SNIPPET_CAP_BYTES);
 
             let payload = serde_json::json!({
                 "plan": plan_name,
@@ -8623,6 +8976,391 @@ mod tests {
         assert!(
             cfg.enabled,
             "auto_mode.enabled must survive the pause; resume re-engages without re-toggling"
+        );
+    }
+
+    // ── T2.2 of the pre-merge-gate plan: fix-spawn integration ─────────
+
+    /// Pure unit test: `extract_original_task_id` strips the
+    /// `<original>-gate-fix-<n>` suffix and returns `None` for IDs
+    /// without the marker.
+    #[test]
+    fn extract_original_task_id_strips_marker_and_recovers_original() {
+        assert_eq!(
+            extract_original_task_id("0.1-gate-fix-1").as_deref(),
+            Some("0.1")
+        );
+        assert_eq!(
+            extract_original_task_id("1.10-gate-fix-2").as_deref(),
+            Some("1.10")
+        );
+        // No marker -> None (defensive; callers route on contains() before
+        // calling, so this branch shouldn't fire in production).
+        assert_eq!(extract_original_task_id("0.1"), None);
+        assert_eq!(extract_original_task_id("0.1-fix-1"), None);
+        // Just-in-case: a task literally named "-gate-fix-" prefix would
+        // resolve to an empty original; this is impossible in practice
+        // (task IDs are `phase.task` decimals) but document the behaviour.
+        assert_eq!(extract_original_task_id("-gate-fix-1").as_deref(), Some(""));
+    }
+
+    /// `count_gate_fix_attempts` must filter on `task_id` strictly to
+    /// avoid counting attempts for SIBLING tasks. With the LIKE clause
+    /// `<task>-gate-fix-%`, `1.10-gate-fix-1` must not pollute the count
+    /// for `1.1`.
+    #[test]
+    fn count_gate_fix_attempts_does_not_collide_across_similarly_numbered_tasks() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        // Two separate gate-fix rows for two tasks whose numbers share a
+        // prefix: 1.1 and 1.10. The SQL LIKE pattern uses `<task>-gate-fix-%`
+        // (not `<task>%`), so the trailing `-gate-fix-` literal anchors
+        // the prefix and prevents the collision.
+        seed_agent(
+            &db,
+            "agent-1.10-gf",
+            &project_dir,
+            "p",
+            "1.10-gate-fix-1",
+            "branchwork/p/1.10",
+        );
+        seed_agent(
+            &db,
+            "agent-1.1-other",
+            &project_dir,
+            "p",
+            "1.1",
+            "branchwork/p/1.1",
+        );
+
+        let plans_dir = dir.path().join("plans");
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        assert_eq!(
+            count_gate_fix_attempts(&state, "p", "1.1"),
+            0,
+            "task 1.1 has no gate-fix attempts; 1.10-gate-fix-1 must NOT count"
+        );
+        assert_eq!(
+            count_gate_fix_attempts(&state, "p", "1.10"),
+            1,
+            "task 1.10 has exactly one gate-fix attempt"
+        );
+    }
+
+    /// `build_gate_fix_prompt` carries the brief's exact copy verbatim:
+    /// "Fix this in the smallest possible commit. Do not modify unrelated
+    /// files. When done, exit cleanly — the gate will re-run automatically."
+    /// Plus the recipe command and the failing check's output snippet.
+    /// Plus the unattended-execution contract from T0.7.
+    #[test]
+    fn build_gate_fix_prompt_carries_brief_copy_and_recipe_and_output() {
+        let prompt = build_gate_fix_prompt(
+            "myplan",
+            "1.2",
+            "branchwork/myplan/1.2",
+            "web-format",
+            "pnpm --filter @branchwork/web format",
+            Some(1),
+            "src/App.tsx: missing semicolon",
+        );
+        assert!(
+            prompt.contains("web-format"),
+            "check_name must appear: {prompt}"
+        );
+        assert!(
+            prompt.contains("pnpm --filter @branchwork/web format"),
+            "recipe cmd must appear: {prompt}"
+        );
+        assert!(
+            prompt.contains("src/App.tsx: missing semicolon"),
+            "output snippet must appear: {prompt}"
+        );
+        assert!(
+            prompt.contains("Fix this in the smallest possible commit"),
+            "brief copy must be verbatim: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do not modify unrelated"),
+            "brief copy must be verbatim: {prompt}"
+        );
+        assert!(
+            prompt.contains("the gate will re-run automatically"),
+            "brief copy must be verbatim: {prompt}"
+        );
+        // Unattended-execution contract is embedded — agent inherits the
+        // commit-don't-push rules from T0.7.
+        assert!(
+            prompt.contains("branchwork/myplan/1.2"),
+            "task branch must appear in the contract block: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do not run `git push`"),
+            "contract block must forbid `git push`: {prompt}"
+        );
+    }
+
+    /// `build_gate_fix_prompt` annotates a timeout / signal kill (exit
+    /// code None) so the agent doesn't have to guess what happened.
+    #[test]
+    fn build_gate_fix_prompt_annotates_timeout_kill() {
+        let prompt = build_gate_fix_prompt(
+            "p",
+            "0.1",
+            "branchwork/p/0.1",
+            "slowpoke",
+            "make fix",
+            None,
+            "[killed by gate: exceeded per-check timeout of 1s]",
+        );
+        assert!(
+            prompt.contains("killed by gate"),
+            "timeout marker must be carried in the prompt: {prompt}"
+        );
+    }
+
+    /// Headline T2.2 happy-path acceptance: with `auto_fix_on_gate_failure
+    /// = true` AND a `fix_recipe` mapping for the failing check name, the
+    /// gate failure spawns a fix agent (instead of pausing). The plan is
+    /// NOT paused, a `<task>-gate-fix-1` agent row lands in the DB, the
+    /// `auto_mode_gate_fix_spawned` broadcast + audit row both fire.
+    #[tokio::test]
+    async fn auto_fix_on_with_matching_recipe_spawns_gate_fix_agent_and_does_not_pause() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        // Check is named `web-format`, matching a fix_recipe entry. The
+        // recipe doesn't actually have to run in the test (we never spawn
+        // a real claude); we just verify the spawn was dispatched and the
+        // gate-fix agent row was inserted with the right task_id prefix.
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             auto_fix_on_gate_failure = true\n\
+             pre_merge_checks = [\n  \
+               { name = \"web-format\", cmd = \"false\", timeout_secs = 5 },\n\
+             ]\n\
+             [auto_mode.fix_recipe]\n\
+             \"web-format\" = \"pnpm --filter @branchwork/web format\"\n",
+        );
+
+        let agent_id = "agent-gate-fix-happy";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
+
+        // Plan must NOT be paused — the gate-fix agent is in flight.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "auto_fix should NOT pause the plan when a recipe matches"
+        );
+
+        // A gate-fix agent row landed with task_id `0.1-gate-fix-1`.
+        let gate_fix_count = count_gate_fix_attempts(&state, "p", "0.1");
+        assert_eq!(
+            gate_fix_count, 1,
+            "exactly one gate-fix agent row should have been inserted"
+        );
+
+        // Wire payload + audit row land with the new constant.
+        let events = drain_event_types(&mut rx);
+        assert!(
+            events.contains(&"auto_mode_gate_fix_spawned".to_string()),
+            "expected auto_mode_gate_fix_spawned in {events:?}"
+        );
+        assert!(
+            !events.contains(&"auto_mode_pre_merge_check_failed".to_string()),
+            "must NOT pause/audit pre_merge_check_failed when fix-spawn succeeds; got {events:?}"
+        );
+        let audit_actions = audit_actions_for(&db, "p");
+        assert!(
+            audit_actions.contains(&actions::AUTO_MODE_GATE_FIX_SPAWNED.to_string()),
+            "expected AUTO_MODE_GATE_FIX_SPAWNED in {audit_actions:?}"
+        );
+        assert!(
+            !audit_actions.contains(&actions::AUTO_MODE_PRE_MERGE_CHECK_FAILED.to_string()),
+            "must NOT write AUTO_MODE_PRE_MERGE_CHECK_FAILED when fix-spawn succeeds; got {audit_actions:?}"
+        );
+    }
+
+    /// Regression test for the no-config path: with the default
+    /// `auto_fix_on_gate_failure = false`, gate failure pauses the plan
+    /// exactly as T1.3 wired — no fix-spawn at all.
+    #[tokio::test]
+    async fn auto_fix_off_pauses_plan_with_no_fix_spawn_no_regression_of_t1_3() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        // Flag is FALSE (the default). Even though a recipe is configured,
+        // the flag gate trips first and the loop pauses.
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             auto_fix_on_gate_failure = false\n\
+             pre_merge_checks = [\n  \
+               { name = \"web-format\", cmd = \"false\", timeout_secs = 5 },\n\
+             ]\n\
+             [auto_mode.fix_recipe]\n\
+             \"web-format\" = \"pnpm --filter @branchwork/web format\"\n",
+        );
+
+        let agent_id = "agent-no-auto-fix";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
+
+        // Plan must be paused with the T1.3 sentinel.
+        assert_eq!(
+            paused_reason(&db, "p").as_deref(),
+            Some("pre_merge_check_failed"),
+            "flag off must preserve T1.3 pause behaviour"
+        );
+        // No gate-fix agent row was inserted.
+        assert_eq!(
+            count_gate_fix_attempts(&state, "p", "0.1"),
+            0,
+            "flag off must NOT spawn a gate-fix agent"
+        );
+
+        let events = drain_event_types(&mut rx);
+        assert!(
+            !events.contains(&"auto_mode_gate_fix_spawned".to_string()),
+            "must NOT emit gate_fix_spawned when flag is off; got {events:?}"
+        );
+        assert!(
+            events.contains(&"auto_mode_pre_merge_check_failed".to_string()),
+            "must still emit T1.3 broadcast; got {events:?}"
+        );
+    }
+
+    /// Flag is on but no `fix_recipe` entry matches the failing check
+    /// name -> pause as in T1.3. The opt-in is necessarily per-check; a
+    /// check the operator hasn't recipe'd stays in the operator's hands.
+    #[tokio::test]
+    async fn auto_fix_on_with_no_matching_recipe_pauses_plan() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        // Flag is TRUE but the recipe map keys on a DIFFERENT check
+        // (`rust-clippy`) than the one that fails (`web-format`).
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             auto_fix_on_gate_failure = true\n\
+             pre_merge_checks = [\n  \
+               { name = \"web-format\", cmd = \"false\", timeout_secs = 5 },\n\
+             ]\n\
+             [auto_mode.fix_recipe]\n\
+             \"rust-clippy\" = \"cargo clippy --fix\"\n",
+        );
+
+        let agent_id = "agent-no-match";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        enable_auto_mode(&db, "p");
+
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
+
+        assert_eq!(
+            paused_reason(&db, "p").as_deref(),
+            Some("pre_merge_check_failed"),
+            "no matching recipe must preserve T1.3 pause behaviour"
+        );
+        assert_eq!(
+            count_gate_fix_attempts(&state, "p", "0.1"),
+            0,
+            "no matching recipe must NOT spawn a gate-fix agent"
+        );
+    }
+
+    /// Cap: a second gate failure for the same task on the same cycle
+    /// must NOT spawn another fix agent. After one attempt, the loop
+    /// falls back to the operator-visible pause from T1.3.
+    ///
+    /// Simulated by pre-seeding a gate-fix agent row, then running the
+    /// state machine — the cap check sees the existing row and skips
+    /// the spawn.
+    #[tokio::test]
+    async fn second_gate_failure_with_cap_hit_falls_back_to_pause() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init_master(&project_dir);
+        git_create_task_branch(&project_dir, "branchwork/p/0.1", true);
+
+        let plans_dir = dir.path().join("plans");
+        write_one_task_plan(&plans_dir, "p", &project_dir);
+        write_branchwork_toml(
+            &project_dir,
+            "[auto_mode]\n\
+             auto_fix_on_gate_failure = true\n\
+             pre_merge_checks = [\n  \
+               { name = \"web-format\", cmd = \"false\", timeout_secs = 5 },\n\
+             ]\n\
+             [auto_mode.fix_recipe]\n\
+             \"web-format\" = \"pnpm format\"\n",
+        );
+
+        let agent_id = "agent-cap-hit";
+        seed_agent(&db, agent_id, &project_dir, "p", "0.1", "branchwork/p/0.1");
+        // Pre-seed a gate-fix agent row so the cap check trips. This
+        // simulates the second gate-failure firing after the first
+        // gate-fix attempt completed.
+        seed_agent(
+            &db,
+            "agent-gate-fix-1",
+            &project_dir,
+            "p",
+            "0.1-gate-fix-1",
+            "branchwork/p/0.1",
+        );
+        enable_auto_mode(&db, "p");
+
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+        assert_eq!(
+            count_gate_fix_attempts(&state, "p", "0.1"),
+            1,
+            "fixture pre-condition: one gate-fix row already exists"
+        );
+
+        run_state_machine(&state, "default-org", agent_id, "p", "0.1").await;
+
+        // Cap reached → fall back to the T1.3 pause.
+        assert_eq!(
+            paused_reason(&db, "p").as_deref(),
+            Some("pre_merge_check_failed"),
+            "cap reached must fall back to T1.3 pause"
+        );
+        // No SECOND gate-fix agent was inserted.
+        assert_eq!(
+            count_gate_fix_attempts(&state, "p", "0.1"),
+            1,
+            "cap must prevent a second spawn; count stays at 1"
+        );
+
+        let events = drain_event_types(&mut rx);
+        assert!(
+            !events.contains(&"auto_mode_gate_fix_spawned".to_string()),
+            "must NOT emit gate_fix_spawned on cap-hit; got {events:?}"
+        );
+        assert!(
+            events.contains(&"auto_mode_pre_merge_check_failed".to_string()),
+            "must emit T1.3 broadcast on cap-hit; got {events:?}"
         );
     }
 

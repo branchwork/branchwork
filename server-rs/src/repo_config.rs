@@ -39,6 +39,17 @@
 //! # wedge the merge pipeline past this many seconds. Default 600.
 //! pre_merge_total_timeout_secs = 600
 //!
+//! # Optional escalation: when a `pre_merge_checks` entry fails AND its
+//! # name has a `fix_recipe` mapping, auto-mode can optionally spawn a
+//! # "fix agent" to apply the canonical fix. The agent commits straight
+//! # to the task branch and Branchwork re-runs the gate. Default off —
+//! # operator must opt in, because a fix-spawn agent silently writing to
+//! # the branch is something you want to consciously turn on.
+//! auto_fix_on_gate_failure = false
+//! [auto_mode.fix_recipe]
+//! "web-format" = "pnpm --filter @branchwork/web format"
+//! "rust-fmt"   = "cargo fmt"
+//!
 //! [auto_mode.dirty_tree]
 //! # Paths whose dirty state should NOT trigger the
 //! # "agent_left_uncommitted_work" pause. Globs supported.
@@ -189,6 +200,37 @@ pub struct AutoModeConfig {
         skip_serializing_if = "is_default_pre_merge_total_timeout_secs"
     )]
     pub pre_merge_total_timeout_secs: u32,
+    /// Optional escalation: when a pre-merge check fails and its name
+    /// matches a [`Self::fix_recipe`] entry, auto-mode can spawn a
+    /// brief "fix agent" that runs the recipe, commits the result on
+    /// the task branch, and lets the gate re-run.
+    ///
+    /// **Off by default** — a fix-spawn agent silently writing to the
+    /// task branch is the kind of thing an operator should consciously
+    /// turn on (the agent isn't sandboxed beyond the recipe prompt; if
+    /// the recipe is wrong it can produce a misleading clean gate).
+    /// When false (the default) or when no recipe matches, gate failure
+    /// pauses the plan exactly as Phase 1.3 wired it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_fix_on_gate_failure: bool,
+    /// Map of `pre_merge_checks.name` → shell command that fixes the
+    /// failure. The command is run in the same worktree the gate failed
+    /// in (via the gate-fix agent's prompt), and the agent then commits
+    /// the result on the task branch.
+    ///
+    /// Keyed by check `name` (the unique identifier from the
+    /// `pre_merge_checks` array) so a project can selectively opt in
+    /// per-check — e.g. recipe a fast formatter but leave clippy fixes
+    /// to the human. Recipes that don't correspond to a configured
+    /// check name are silently ignored at gate time.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub fix_recipe: HashMap<String, String>,
+}
+
+/// `skip_serializing_if` companion for [`AutoModeConfig::auto_fix_on_gate_failure`]
+/// — keeps `bool` round-trips quiet when the value matches the default.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Default for AutoModeConfig {
@@ -198,6 +240,8 @@ impl Default for AutoModeConfig {
             dirty_tree: DirtyTreeConfig::default(),
             pre_merge_checks: Vec::new(),
             pre_merge_total_timeout_secs: default_pre_merge_total_timeout_secs(),
+            auto_fix_on_gate_failure: false,
+            fix_recipe: HashMap::new(),
         }
     }
 }
@@ -300,6 +344,8 @@ impl RepoConfig {
             && self.auto_mode.merge_cadence == MergeCadence::default()
             && self.auto_mode.pre_merge_checks.is_empty()
             && self.auto_mode.pre_merge_total_timeout_secs == default_pre_merge_total_timeout_secs()
+            && !self.auto_mode.auto_fix_on_gate_failure
+            && self.auto_mode.fix_recipe.is_empty()
     }
 }
 
@@ -726,6 +772,28 @@ blocking_workflows = ["CI"]
             ..Default::default()
         };
         assert!(!with_custom_total_timeout.is_empty());
+
+        // Toggling `auto_fix_on_gate_failure` alone counts as non-empty.
+        let with_auto_fix_only = RepoConfig {
+            auto_mode: AutoModeConfig {
+                auto_fix_on_gate_failure: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!with_auto_fix_only.is_empty());
+
+        // A non-empty `fix_recipe` map alone counts as non-empty.
+        let mut recipe = HashMap::new();
+        recipe.insert("web-format".into(), "pnpm format".into());
+        let with_recipe_only = RepoConfig {
+            auto_mode: AutoModeConfig {
+                fix_recipe: recipe,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!with_recipe_only.is_empty());
     }
 
     // ---- merge_cadence ------------------------------------------
@@ -1088,6 +1156,110 @@ pre_merge_checks = [
         );
         assert_eq!(reparsed.auto_mode.pre_merge_total_timeout_secs, 600);
         assert_eq!(reparsed, default);
+    }
+
+    // ---- auto_fix_on_gate_failure + fix_recipe (T2.2) ---------------
+
+    #[test]
+    fn auto_fix_on_gate_failure_defaults_to_false() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "branchwork.toml", "");
+        let cfg = load_for_project_dir(dir.path()).expect("empty TOML is valid");
+        assert!(
+            !cfg.auto_mode.auto_fix_on_gate_failure,
+            "auto_fix_on_gate_failure must default to false — the brief is explicit \
+             that this is an opt-in escalation"
+        );
+        assert!(cfg.auto_mode.fix_recipe.is_empty());
+    }
+
+    #[test]
+    fn auto_fix_on_gate_failure_parses_when_set() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            r#"
+[auto_mode]
+auto_fix_on_gate_failure = true
+"#,
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert!(cfg.auto_mode.auto_fix_on_gate_failure);
+    }
+
+    #[test]
+    fn fix_recipe_parses_keyed_by_check_name() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            r#"
+[auto_mode]
+auto_fix_on_gate_failure = true
+
+[auto_mode.fix_recipe]
+"web-format" = "pnpm --filter @branchwork/web format"
+"rust-fmt"   = "cargo fmt"
+"#,
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert!(cfg.auto_mode.auto_fix_on_gate_failure);
+        assert_eq!(cfg.auto_mode.fix_recipe.len(), 2);
+        assert_eq!(
+            cfg.auto_mode
+                .fix_recipe
+                .get("web-format")
+                .map(String::as_str),
+            Some("pnpm --filter @branchwork/web format")
+        );
+        assert_eq!(
+            cfg.auto_mode.fix_recipe.get("rust-fmt").map(String::as_str),
+            Some("cargo fmt")
+        );
+    }
+
+    #[test]
+    fn fix_recipe_round_trips() {
+        // Populated config round-trips through toml: serialize then re-
+        // parse should match the original.
+        let mut recipe = HashMap::new();
+        recipe.insert("web-format".into(), "pnpm format".into());
+        recipe.insert("rust-fmt".into(), "cargo fmt".into());
+        let cfg = RepoConfig {
+            auto_mode: AutoModeConfig {
+                auto_fix_on_gate_failure: true,
+                fix_recipe: recipe,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        let reparsed: RepoConfig = toml::from_str(&text).unwrap();
+        assert_eq!(reparsed, cfg);
+    }
+
+    #[test]
+    fn auto_fix_default_is_omitted_from_serialized_toml() {
+        // `skip_serializing_if = is_false` keeps the wire short when the
+        // operator hasn't opted in. Equally, an empty `fix_recipe` map
+        // doesn't show up. Both matter because the file is round-tripped
+        // by a future `POST /api/projects` validator and we don't want it
+        // to grow noise.
+        let default = RepoConfig::default();
+        let text = toml::to_string(&default).unwrap();
+        assert!(
+            !text.contains("auto_fix_on_gate_failure"),
+            "default `auto_fix_on_gate_failure` must be omitted from \
+             serialized TOML, got:\n{text}"
+        );
+        assert!(
+            !text.contains("fix_recipe"),
+            "empty `fix_recipe` must be omitted from serialized TOML, got:\n{text}"
+        );
     }
 
     #[test]
