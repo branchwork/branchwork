@@ -642,8 +642,18 @@ chmod 0755 "$TMP_RUNNER" "$TMP_SERVER"
 mv "$TMP_RUNNER" "$RUNNER_BIN"
 mv "$TMP_SERVER" "$SERVER_BIN"
 trap - EXIT
-ok "installed $RUNNER_BIN"
-ok "installed $SERVER_BIN"
+
+# T3.2 probe both binaries with --version so the success banner can name
+# them and confirm Start session readiness before the operator opens the
+# UI. Cached here (rather than re-probed at banner time) so a corrupted
+# download surfaces alongside the "installed" lines instead of after the
+# runner-start log line. `|| true` suppresses POSIX `set -e` even though
+# command-substitution assignments don't trigger it — belt-and-braces for
+# the run-as-sh-stream invocation. Empty string == probe failed.
+runner_version="$("$RUNNER_BIN" --version 2>/dev/null | head -n1 || true)"
+server_version="$("$SERVER_BIN" --version 2>/dev/null | head -n1 || true)"
+ok "installed $RUNNER_BIN${runner_version:+ ($runner_version)}"
+ok "installed $SERVER_BIN${server_version:+ ($server_version)}"
 
 # ── Write config (enroll / reset / explicit rotate) ────────────────────────
 # Update mode (no --rotate-token) deliberately skips this step: the on-disk
@@ -693,6 +703,22 @@ if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     exit 1
 fi
 ok "runner started (pid $(cat "$PID_FILE"))"
+
+# ── Confirm Start session readiness (T3.2) ──────────────────────────────────
+# The runner shells out to `branchwork-server session …` for every per-agent
+# supervisor (see T0.4 spawn-path audit in docs/architecture/session-daemon.md).
+# Without a working paired server binary on PATH, Start session fails at
+# first spawn — the very thing this plan exists to prevent. Surface the
+# resolved path so the operator can confirm the dual-binary model is wired
+# before opening the dashboard UI; if `branchwork-server --version` failed
+# to produce a version line (binary missing, wrong arch, corrupted
+# download), surface the verbatim fallback so the failure mode is named
+# at install time rather than discovered at Start time.
+if [ -n "$server_version" ]; then
+    ok "Start session will use: $SERVER_BIN ($server_version)"
+else
+    ok "Start session will use: $SERVER_BIN (could not verify — Start session will fail)"
+fi
 
 # ── Mode-aware completion line ──────────────────────────────────────────────
 # The acceptance criterion for Task 2.1 is that a second install run reports

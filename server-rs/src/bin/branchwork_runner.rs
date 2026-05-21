@@ -418,7 +418,8 @@ macro_rules! log_warn {
 #[derive(Parser, Debug)]
 #[command(
     name = "branchwork-runner",
-    about = "Branchwork remote agent runner — connects to the SaaS dashboard and executes agents locally"
+    about = "Branchwork remote agent runner — connects to the SaaS dashboard and executes agents locally",
+    version
 )]
 struct Cli {
     /// SaaS dashboard URL (e.g. wss://app.branchwork.dev or ws://localhost:3100).

@@ -649,4 +649,111 @@ mod tests {
             "must prepend $INSTALL_DIR to PATH on the nohup launch line"
         );
     }
+
+    // ── T3.2 dual-binary banner contract ────────────────────────────────
+    //
+    // The success banner must name both binaries with their versions and
+    // surface "Start session will use: <path>" so the operator can
+    // confirm dual-binary readiness before opening the dashboard. When
+    // `branchwork-server --version` fails (older binary that predates
+    // `#[command(version)]`, foreign-arch download, corrupted bytes),
+    // the banner falls back to the verbatim T3.2 acceptance copy
+    // "(could not verify — Start session will fail)".
+
+    #[test]
+    fn install_script_probes_both_binary_versions() {
+        // Both probes must be wired (runner_version + server_version),
+        // each `2>/dev/null | head -n1` so a stub that prints multiple
+        // lines on stderr cannot derail the banner. `|| true` is the
+        // belt-and-braces guard against POSIX `set -e` even though
+        // command-substitution assignments do not trip the option.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(
+                r#"runner_version="$("$RUNNER_BIN" --version 2>/dev/null | head -n1 || true)""#
+            ),
+            "must probe `branchwork-runner --version` into $runner_version"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(
+                r#"server_version="$("$SERVER_BIN" --version 2>/dev/null | head -n1 || true)""#
+            ),
+            "must probe `branchwork-server --version` into $server_version"
+        );
+    }
+
+    #[test]
+    fn install_script_annotates_install_lines_with_versions() {
+        // The two `installed …` lines render the version inline when the
+        // probe succeeded — `${var:+ (...)}` is the POSIX-portable way to
+        // omit the suffix when the probe failed (empty $var), which keeps
+        // a successful runner install readable even if the server probe
+        // failed (or vice versa).
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"ok "installed $RUNNER_BIN${runner_version:+ ($runner_version)}""#),
+            "runner install line must conditionally render $runner_version"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"ok "installed $SERVER_BIN${server_version:+ ($server_version)}""#),
+            "server install line must conditionally render $server_version"
+        );
+    }
+
+    #[test]
+    fn install_script_banner_announces_start_session_target() {
+        // Brief: "Start session will use: /home/cpo/.local/bin/branchwork-server".
+        // The path is interpolated from $SERVER_BIN and the version
+        // appended in parentheses on the happy path. The literal phrase
+        // "Start session will use:" must appear in both branches so the
+        // dashboard runbook can grep for it.
+        let starts = INSTALL_SCRIPT_TEMPLATE
+            .matches(r#"ok "Start session will use: $SERVER_BIN"#)
+            .count();
+        assert_eq!(
+            starts, 2,
+            "must emit `Start session will use: $SERVER_BIN …` in BOTH the success and fallback branches (got {starts} matches)"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE
+                .contains(r#"ok "Start session will use: $SERVER_BIN ($server_version)""#),
+            "happy-path banner must append ($server_version) to the resolved server path"
+        );
+    }
+
+    #[test]
+    fn install_script_banner_carries_could_not_verify_fallback() {
+        // T3.2 acceptance criterion: when `branchwork-server --version`
+        // fails, the banner literally says
+        // "(could not verify — Start session will fail)". The em-dash
+        // (U+2014) is the canonical separator — must match byte-for-byte
+        // so the runbook's grep keeps working.
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains("(could not verify \u{2014} Start session will fail)"),
+            "fallback message must read '(could not verify — Start session will fail)' verbatim"
+        );
+        assert!(
+            INSTALL_SCRIPT_TEMPLATE.contains(r#"if [ -n "$server_version" ]; then"#),
+            "fallback must be gated on $server_version being non-empty"
+        );
+    }
+
+    #[test]
+    fn install_script_banner_emits_start_session_line_after_runner_started() {
+        // Ordering matters for the operator's reading flow: first they
+        // see "* runner started (pid X)", then "* Start session will use:
+        // …". Reversing the order would put the readiness verdict before
+        // the runner actually has a pid, which would mislead an operator
+        // skimming the tail of the install output.
+        let started_at = INSTALL_SCRIPT_TEMPLATE
+            .find(r#"ok "runner started (pid"#)
+            .expect("runner-started line must remain in the script");
+        let start_session_at = INSTALL_SCRIPT_TEMPLATE
+            .find(r#"ok "Start session will use:"#)
+            .expect("Start-session-will-use line must be emitted");
+        assert!(
+            started_at < start_session_at,
+            "runner-started must precede Start-session-will-use in the banner"
+        );
+    }
 }

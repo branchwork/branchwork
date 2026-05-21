@@ -38,7 +38,7 @@ impl std::fmt::Display for Effort {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "branchwork", about = "Branchwork dashboard server")]
+#[command(name = "branchwork", about = "Branchwork dashboard server", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
