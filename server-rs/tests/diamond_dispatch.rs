@@ -151,6 +151,15 @@ fn actions_yaml_kill_mid_cleanup() -> &'static str {
 "#
 }
 
+/// T1.1's scripted agent exits non-zero before committing anything.
+/// The auto-mode chain has to notice and either retry or mark the
+/// task failed — silent stuck-in-running is the failure mode.
+fn actions_yaml_crash_before_commit() -> &'static str {
+    r#""1.1":
+  exit_code: 1
+"#
+}
+
 /// Same plan topology as the disjoint variant, but T1.2 and T1.3 both
 /// *append* to `lib.txt`. T1.2's branch and T1.3's branch start from
 /// the same base (T1.1's commit); when one merges to master the other
@@ -458,6 +467,99 @@ fn agent_skipping_stop_hook_reaches_terminal_state() {
         terminal, "no_terminal_state",
         "agent never reached a terminal status; supervisor reaper / on_agent_exit \
          did not fire when Stop hook was skipped"
+    );
+}
+
+/// Locks in the dep-ordering invariant: T1.4 must not be dispatched
+/// before BOTH T1.2 and T1.3 have completed AND their branches have
+/// merged. Passing baseline today; protects against a regression
+/// where the dispatcher fan-in skipped one of the deps.
+#[test]
+fn t14_dispatches_strictly_after_both_dependencies_merge() {
+    let server = Fixture::with_actions(actions_yaml_disjoint_files());
+    setup_plan(&server, "task");
+    let (s, _) = server.post(
+        "/api/actions/start-task",
+        json!({
+            "planName": PLAN_NAME,
+            "phaseNumber": 1,
+            "taskNumber": "1.1",
+        }),
+    );
+    assert_eq!(s, 200);
+    for t in ["1.1", "1.2", "1.3", "1.4"] {
+        drive_task(&server, t, "task");
+    }
+
+    let db = server.db();
+    let (_t12_start, t12_end) = agent_time_window(&db, PLAN_NAME, "1.2")
+        .expect("T1.2 must have started/finished timestamps");
+    let (_t13_start, t13_end) = agent_time_window(&db, PLAN_NAME, "1.3")
+        .expect("T1.3 must have started/finished timestamps");
+    let (t14_start, _t14_end) = agent_time_window(&db, PLAN_NAME, "1.4")
+        .expect("T1.4 must have started/finished timestamps");
+
+    assert!(
+        t14_start.as_str() >= t12_end.as_str(),
+        "T1.4 started {t14_start} before T1.2 finished {t12_end} — dep violation"
+    );
+    assert!(
+        t14_start.as_str() >= t13_end.as_str(),
+        "T1.4 started {t14_start} before T1.3 finished {t13_end} — dep violation"
+    );
+}
+
+/// T1.1's scripted agent exits non-zero before committing anything.
+/// Auto-mode must either mark the task failed or retry it — silent
+/// "still running" is the bug shape this probes.
+#[test]
+#[ignore = "exploratory: documents agent-crash recovery"]
+fn agent_crash_before_commit_reaches_failure_state() {
+    let server = Fixture::with_actions(actions_yaml_crash_before_commit());
+    setup_plan(&server, "task");
+    let (s, _) = server.post(
+        "/api/actions/start-task",
+        json!({
+            "planName": PLAN_NAME,
+            "phaseNumber": 1,
+            "taskNumber": "1.1",
+        }),
+    );
+    assert_eq!(s, 200);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = loop {
+        let db = server.db();
+        let status: Option<String> = db
+            .query_row(
+                "SELECT status FROM agents WHERE plan_name = ?1 AND task_id = '1.1' \
+                 ORDER BY started_at DESC LIMIT 1",
+                rusqlite::params![PLAN_NAME],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        match status.as_deref() {
+            Some("killed") | Some("failed") | Some("orphaned") | Some("completed") => {
+                break status.unwrap();
+            }
+            _ => {}
+        }
+        drop(db);
+        if Instant::now() >= deadline {
+            break "no_terminal_state".to_string();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    eprintln!("[crash-before-commit] terminal status: {outcome}");
+    assert_ne!(
+        outcome, "no_terminal_state",
+        "agent never reached a terminal status after crashing (exit_code=1) — \
+         auto-mode silently stuck in 'running'"
+    );
+    assert_ne!(
+        outcome, "completed",
+        "crashed agent (exit_code=1) was marked 'completed' — should be \
+         killed/failed/orphaned to surface the failure to the operator"
     );
 }
 
