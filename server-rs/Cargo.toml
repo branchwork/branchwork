@@ -60,6 +60,15 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 name = "branchwork-runner"
 path = "src/bin/branchwork_runner.rs"
 
+# Test-only `claude` replacement for the diamond-dispatch harness. Put on
+# PATH ahead of the real binary in integration tests so the supervisor's
+# PTY spawns deterministic per-task actions from a YAML file. Gated by
+# the `e2e` feature so production / CI image builds skip it.
+[[bin]]
+name = "scripted_agent"
+path = "tests/support/scripted_agent/main.rs"
+required-features = ["e2e"]
+
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"
