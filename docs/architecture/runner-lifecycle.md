@@ -309,9 +309,159 @@ What this means concretely for the lifecycle:
   that resolves to `$HOME/.branchwork-runner-sessions/` — a sibling
   of the existing `~/.branchwork-runner/` config dir, not a child.
 
-Out of scope for this plan: per-credential hand-off (the keep-(3)
-work), and multi-tenant isolation between orgs on a single runner.
-Both are tracked separately.
+The per-credential hand-off that keep-(3) called out is itself
+implemented in this plan (Phase 3) and documented in the next
+section. Multi-tenant isolation between orgs on a single runner
+remains out of scope and is tracked separately.
+
+## Credentials: managed-by-name vs. ambient
+
+Phase 3 of this plan landed the per-credential hand-off the
+2026-05-18 audit asked for. The shape of it — and the explicit
+**ambient-fallback policy** it leaves in place — is load-bearing
+for anyone modelling their threat surface against this runner.
+
+### Branchwork-managed credentials are used by name
+
+Branchwork stores SSH keys and personal access tokens in an
+encrypted SQLite column (`credentials.encrypted_secret`, AES-256-GCM
+with a per-host master key at `~/.claude/.master.key` mode `0600` —
+implementation in
+[`server-rs/src/crypto.rs`](../../server-rs/src/crypto.rs)). The dashboard's
+**Credentials** page (`/credentials`) is the operator's surface for
+adding, generating, and revoking them. Each credential carries a
+human name, a `kind` (`ssh_key` / `gh_pat` / `gitlab_pat`), and a
+host hint (e.g. `github.com`).
+
+An agent **never** reaches into `~/.ssh/` or `~/.config/gh/` to
+satisfy a credentialed git op. It asks the server for the op **by
+name**:
+
+```text
+clone_project(repo=git@github.com:org/repo.git, credential=my-gh-deploy-key)
+push_branch(branch=…, credential=my-gh-deploy-key)
+```
+
+(The on-the-wire shape today is the
+[`CloneProject { …, credential_id }`](protocols.md#project-clone-round-trip)
+envelope; fetch / push RPCs follow the same pattern as later phases
+add them.)
+
+What happens at the runner under the hood, per
+[`credential_material.rs`](../../server-rs/src/credential_material.rs):
+
+1. Server resolves `credential_id` against the encrypted
+   `credentials` table (`db::get_credential` + `crypto::decrypt`).
+2. The decrypted secret travels on the wire **inside the RPC
+   envelope** — only for this op, never persisted on the runner
+   host.
+3. The runner writes the secret to a fresh tmpfs file (under
+   `$XDG_RUNTIME_DIR` if available, `/tmp` otherwise) at mode `0600`
+   and points the git child at it via `Command::env`:
+   - **`ssh_key`** →
+     `GIT_SSH_COMMAND='ssh -i <path> -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'`.
+     `IdentitiesOnly=yes` is the load-bearing bit: it stops `ssh`
+     from offering keys from `ssh-agent` ahead of ours, so the
+     **named credential is the only thing that authenticates the
+     op** — not whatever happens to be loaded into the operator's
+     agent.
+   - **`gh_pat` / `gitlab_pat`** → `GIT_ASKPASS=<wrapper>` +
+     `GIT_TERMINAL_PROMPT=0`. The wrapper is a 4-line shell script
+     that `cat`s the token from a sibling 0600 file (the token
+     never appears in argv, even briefly during fork+exec).
+4. RAII `Drop` unlinks the file(s) on every exit path — clone
+   succeeds, git exits non-zero, the runner crashes mid-op, the
+   destructor runs and the secret is gone from disk.
+
+Two properties this gives you:
+
+- **The parent process env is untouched.** Mutations land on
+  `Command::env`, scoped to the spawned child. The operator's
+  `ssh-add -l` listing before and after a credentialed op is
+  byte-identical. The runner does not call `std::env::set_var`
+  anywhere on this path.
+- **The credential is not pinned to a project.** The same
+  `my-gh-deploy-key` can serve multiple clones, pushes, fetches.
+  Branchwork only knows it by name; the encrypted blob never leaves
+  SQLite except inside an in-flight RPC envelope.
+
+### Ambient creds (`~/.ssh/`, `~/.config/gh/`) stay reachable
+
+`branchwork-runner` runs as the operator's own user. It inherits
+the operator's `$HOME`, `$PATH`, `$SSH_AUTH_SOCK`, and every config
+file under them. Nothing in this plan changes that:
+
+| What                              | Where                                  | Who reads it                       |
+| --------------------------------- | -------------------------------------- | ---------------------------------- |
+| Operator's interactive SSH keys   | `~/.ssh/id_*`, `~/.ssh/config`         | Any direct shell `git` / `ssh`     |
+| `ssh-agent` loaded identities     | `$SSH_AUTH_SOCK`                       | Same as above                      |
+| Operator's `gh` auth              | `~/.config/gh/hosts.yml`               | Any direct `gh` shell-out          |
+| Operator's git identity / signing | `~/.gitconfig`, `~/.config/git/`       | Every `git` invocation             |
+| Known-hosts entries               | `~/.ssh/known_hosts`                   | Every `ssh` invocation             |
+
+This is **intentional**. It is what makes the operator's
+day-to-day workflow keep working while Branchwork is running on
+the host:
+
+- `cd ~/<project> && git push` from a terminal still works without
+  threading a Branchwork credential through.
+- `gh pr create` from a terminal still works.
+- `ssh github.com` from a terminal still works.
+- IDE-integrated git (VS Code's source-control panel, JetBrains'
+  Git tool window) still works — it never knew about Branchwork in
+  the first place.
+
+The split-brain to internalise: **credentialed RPCs** (the
+named-by-the-server hand-off) are the *isolated* surface;
+**ambient creds** are everything else. Both coexist on the same
+runner host by design — neither displaces the other.
+
+### The trade-off — and what the operator can do about it
+
+There is a sharp edge on this split. An **interactive agent**
+(currently `claude` driving a PTY session) that shells out
+`git push` directly — instead of asking the server for a
+`push_branch(credential=…)` RPC — will use the ambient
+`~/.ssh/` / `~/.config/gh/` creds, because that is what the
+operator's own shell would use, and the agent is running in the
+operator's own shell environment.
+
+In practice that means today's auto-merge path (`merge_agent_branch_inner`
+→ `git push origin <branch>`) and the Fix-CI shell-outs both ride
+ambient creds, not the Branchwork-managed credential pinned to the
+project. The named-credential RPC is what `clone_project` and the
+future authenticated push/fetch RPCs use — interactive agents that
+escape into `git push` from the PTY do not.
+
+If that matters for your threat model — e.g. you want to be sure
+the agent **cannot** push as you from a different machine, or
+cannot read a colleague's deploy key that happens to be loaded
+in your agent — **the operator must lock down their own
+`~/.ssh/`** (and `~/.config/gh/`). Concrete options, none of which
+Branchwork implements for you:
+
+- Use a dedicated OS user for the runner with its own minimal
+  `~/.ssh/` (and re-issue org-scoped keys to it). This is the
+  cleanest separation but it does undo the
+  [`code ~/<project>` muscle-memory benefit](#why-projects-stay-in-home)
+  for that user.
+- Keep your personal keys passphrase-protected and only `ssh-add`
+  them when you need them; the agent then has nothing useful in
+  `$SSH_AUTH_SOCK`.
+- Run the runner under `systemd-run --user --scope` with a
+  pruned `Environment=` so it does not inherit `$SSH_AUTH_SOCK`
+  at all. (You will lose `ssh-agent`-backed pushes from inside the
+  runner cwd, but credentialed RPCs still work because they bring
+  their own key.)
+
+What is **in scope here** is the credentialed-RPC surface. That
+path is end-to-end isolated: named credential → encrypted column →
+in-flight envelope → tmpfs 0600 → `Command::env` → unlink on drop.
+
+What is **out of scope here** is preventing an interactive shell
+op from reaching ambient creds. The runner runs as the operator;
+the operator's shell env is the operator's shell env. Locking that
+down is the operator's call, not Branchwork's.
 
 ## Failure modes (lifecycle-only)
 
@@ -347,6 +497,14 @@ modes specific to the daemon lifecycle:
 - [`../ops/hetzner.md`](../ops/hetzner.md) — production runbook for
   the SaaS deploy that *serves* `install-runner.sh` (the
   branchwork.dev side, not the customer side).
+- [`server-rs/src/credential_material.rs`](../../server-rs/src/credential_material.rs)
+  — the tmpfs-backed, RAII-cleaned credential hand-off that powers
+  the credentialed-RPC surface described in
+  [Credentials: managed-by-name vs. ambient](#credentials-managed-by-name-vs-ambient).
+- [`server-rs/src/api/credentials.rs`](../../server-rs/src/api/credentials.rs)
+  — the dashboard-facing REST endpoints (`GET / POST / DELETE
+  /api/credentials`) that own the named credentials in the
+  encrypted `credentials` table.
 - [`deploy/branchwork-runner.service.in`](../../deploy/branchwork-runner.service.in)
   — the user-mode unit template, kept under deploy/ next to the
   install script that renders it.
