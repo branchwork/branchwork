@@ -19,6 +19,13 @@
 //! later same-file variant lives next to it.
 
 #![cfg(unix)]
+// The `scripted_agent` test binary that this file drives is gated
+// behind the `e2e` feature (required-features in Cargo.toml). The
+// `Tests / Rust` CI job runs `cargo test --release` without features,
+// so `CARGO_BIN_EXE_scripted_agent` still resolves but points to a
+// non-existent path → runtime panic on first `fs::metadata`. Gate the
+// whole file on the same feature so the non-e2e job skips it cleanly.
+#![cfg(feature = "e2e")]
 
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -90,6 +97,57 @@ fn actions_yaml_disjoint_files() -> &'static str {
       file: main.txt
       write: "consumer of A + B\n"
   commit_message: "T1.4 consumer"
+"#
+}
+
+/// T1.2 and T1.3 both REPLACE the same line in lib.txt with different
+/// content. Standard `git merge` produces an unresolvable conflict —
+/// auto-mode must detect this and pause the plan with a clear reason.
+fn actions_yaml_unresolvable_conflict() -> &'static str {
+    r#""1.1":
+  edits:
+    - kind: write
+      file: lib.txt
+      write: "pub trait Diamond { fn run(&self); }\n"
+  commit_message: "T1.1 seed Diamond trait"
+
+"1.2":
+  edits:
+    - kind: replace
+      file: lib.txt
+      find: "pub trait Diamond { fn run(&self); }\n"
+      replace: "pub trait Diamond { fn run(&self) -> i32; }\n"
+  commit_message: "T1.2 change run signature to i32"
+
+"1.3":
+  edits:
+    - kind: replace
+      file: lib.txt
+      find: "pub trait Diamond { fn run(&self); }\n"
+      replace: "pub trait Diamond { fn run(&self) -> String; }\n"
+  commit_message: "T1.3 change run signature to String"
+
+"1.4":
+  edits:
+    - kind: write
+      file: main.txt
+      write: "consumer\n"
+  commit_message: "T1.4 consumer"
+"#
+}
+
+/// Single-task plan: T1.1 commits but skips the Stop hook (skip_stop_hook).
+/// Repros the country-awareness/2.2 pattern from 2026-05-22 — agent
+/// finishes its work, the supervisor process exits, but the server's
+/// auto-finish path never fires because Stop wasn't POSTed.
+fn actions_yaml_kill_mid_cleanup() -> &'static str {
+    r#""1.1":
+  edits:
+    - kind: write
+      file: lib.txt
+      write: "T1.1 committed but no Stop hook fired\n"
+  commit_message: "T1.1 work-but-no-stop"
+  skip_stop_hook: true
 "#
 }
 
@@ -276,6 +334,234 @@ fn diamond_phase_cadence_runs_fan_out_concurrently() {
         Fixture::with_actions(actions_yaml_disjoint_files()),
         "phase",
     );
+}
+
+/// T1.2 and T1.3 modify the same line of `lib.txt` in incompatible
+/// ways. Standard merge of the second branch must fail with a textual
+/// conflict. Pinned to `merge_cadence='task'` so the first merge lands
+/// cleanly and the second one is the one that conflicts — that's the
+/// shape auto-mode's per-task merge pipeline has to handle.
+///
+/// Expected: auto_mode sets `plan_auto_mode.paused_reason` to a
+/// conflict-shaped value (e.g. `merge_conflict`) and stops dispatching.
+/// Today's behaviour is what this test discovers.
+#[test]
+#[ignore = "exploratory: documents how auto-mode handles real merge conflicts"]
+fn diamond_real_conflict_pauses_plan() {
+    let server = Fixture::with_actions(actions_yaml_unresolvable_conflict());
+
+    setup_plan(&server, "task");
+    let (s, body) = server.post(
+        "/api/actions/start-task",
+        json!({
+            "planName": PLAN_NAME,
+            "phaseNumber": 1,
+            "taskNumber": "1.1",
+        }),
+    );
+    assert_eq!(s, 200, "start-task failed: {body}");
+    drive_task(&server, "1.1", "task");
+
+    // T1.2 and T1.3 should both be eligible after T1.1 merges. One
+    // will merge cleanly; the other should hit a conflict and pause
+    // the plan. Wait up to 30s for either:
+    //  (a) plan_auto_mode.paused_reason becomes non-NULL, OR
+    //  (b) one of T1.2/T1.3 reaches status='failed', OR
+    //  (c) we time out (current behaviour is the answer)
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = loop {
+        let db = server.db();
+        let paused: Option<String> = db
+            .query_row(
+                "SELECT paused_reason FROM plan_auto_mode WHERE plan_name = ?1",
+                rusqlite::params![PLAN_NAME],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(reason) = paused {
+            break format!("paused: {reason}");
+        }
+        let failed: Option<String> = db
+            .query_row(
+                "SELECT task_number FROM task_status \
+                 WHERE plan_name = ?1 AND status = 'failed' LIMIT 1",
+                rusqlite::params![PLAN_NAME],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        if let Some(t) = failed {
+            break format!("task {t} failed");
+        }
+        drop(db);
+        if Instant::now() >= deadline {
+            break "timeout (no detection)".to_string();
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    eprintln!("[conflict test] outcome: {outcome}");
+    assert!(
+        outcome != "timeout (no detection)",
+        "auto-mode never detected the merge conflict within 30s — \
+         no paused_reason set, no failed task_status. Outcome: {outcome}"
+    );
+}
+
+/// Single task whose scripted agent commits its work but skips the
+/// Stop hook POST — the country-awareness/2.2 pattern from 2026-05-22.
+/// In production that agent ended up `status='killed'` even though the
+/// work landed. This test probes what happens in the harness.
+#[test]
+#[ignore = "exploratory: documents kill-mid-cleanup behaviour"]
+fn agent_skipping_stop_hook_reaches_terminal_state() {
+    let server = Fixture::with_actions(actions_yaml_kill_mid_cleanup());
+
+    setup_plan(&server, "task");
+    let (s, body) = server.post(
+        "/api/actions/start-task",
+        json!({
+            "planName": PLAN_NAME,
+            "phaseNumber": 1,
+            "taskNumber": "1.1",
+        }),
+    );
+    assert_eq!(s, 200, "start-task failed: {body}");
+
+    // Poll the agent row until it hits some terminal status. We don't
+    // know which one a priori — that's the finding. Cap at 30s so a
+    // total no-op doesn't hang the suite.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let terminal = loop {
+        let db = server.db();
+        let row = db
+            .query_row(
+                "SELECT status FROM agents WHERE plan_name = ?1 AND task_id = '1.1' \
+                 ORDER BY started_at DESC LIMIT 1",
+                rusqlite::params![PLAN_NAME],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        match row.as_deref() {
+            Some("completed") | Some("killed") | Some("orphaned") | Some("failed") => {
+                break row.unwrap();
+            }
+            _ => {}
+        }
+        drop(db);
+        if Instant::now() >= deadline {
+            break "no_terminal_state".to_string();
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    eprintln!("[kill-mid-cleanup test] terminal status: {terminal}");
+    assert_ne!(
+        terminal, "no_terminal_state",
+        "agent never reached a terminal status; supervisor reaper / on_agent_exit \
+         did not fire when Stop hook was skipped"
+    );
+}
+
+/// Two concurrent `start-task` POSTs for the same (plan, task). The
+/// server should treat the second as a no-op or 4xx — at most one
+/// agent row per task. Catches a class of "user double-clicks the
+/// Start button" + "auto-mode races a manual dispatch" bugs.
+#[test]
+#[ignore = "exploratory: documents concurrent-dispatch idempotency"]
+fn concurrent_start_task_for_same_task_is_idempotent() {
+    let server = Fixture::with_actions(actions_yaml_disjoint_files());
+    setup_plan(&server, "task");
+
+    let body = json!({
+        "planName": PLAN_NAME,
+        "phaseNumber": 1,
+        "taskNumber": "1.1",
+    });
+    let (r1, r2) = std::thread::scope(|s| {
+        let h1 = s.spawn(|| server.post("/api/actions/start-task", body.clone()));
+        let h2 = s.spawn(|| server.post("/api/actions/start-task", body.clone()));
+        (h1.join().unwrap(), h2.join().unwrap())
+    });
+    eprintln!("[concurrent dispatch] r1={:?} r2={:?}", r1.0, r2.0);
+
+    // Give the server a beat to settle, then count agent rows.
+    std::thread::sleep(Duration::from_secs(3));
+    let count: i64 = server
+        .db()
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE plan_name = ?1 AND task_id = '1.1'",
+            rusqlite::params![PLAN_NAME],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "expected idempotent dispatch (1 agent row), got {count}. \
+         Both POSTs returned: r1={} r2={}",
+        r1.0, r2.0
+    );
+}
+
+fn setup_plan(server: &Fixture, cadence: &str) {
+    let plan_path = server.plans_dir.join(format!("{PLAN_NAME}.yaml"));
+    std::fs::write(&plan_path, plan_yaml()).unwrap();
+    let (s, _) = server.put(
+        &format!("/api/plans/{PLAN_NAME}/project"),
+        json!({ "project": PROJECT_NAME }),
+    );
+    assert_eq!(s, 200);
+    let (s, _) = server.put(
+        &format!("/api/plans/{PLAN_NAME}/config"),
+        json!({ "autoMode": true, "autoAdvance": true }),
+    );
+    assert_eq!(s, 200);
+    server
+        .db()
+        .execute(
+            "UPDATE plan_auto_mode SET merge_cadence = ?2 WHERE plan_name = ?1",
+            rusqlite::params![PLAN_NAME, cadence],
+        )
+        .expect("pin cadence");
+    let (s, _) = server.put(
+        &format!("/api/plans/{PLAN_NAME}/tasks/1.1/status"),
+        json!({ "status": "in_progress" }),
+    );
+    assert_eq!(s, 200);
+}
+
+fn drive_task(server: &Fixture, task: &str, cadence: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("drive_task({task}) timed out waiting for completion chain");
+        }
+        let db = server.db();
+        let Some(agent_id) = agent_id_for_task(&db, PLAN_NAME, task) else {
+            drop(db);
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+        let auto_finish = audit_rows_for_action(&db, "agent.auto_finish")
+            .iter()
+            .any(|(rid, _)| rid.as_deref() == Some(&agent_id));
+        let completed = matches!(agent_status(&db, &agent_id).as_deref(), Some("completed"));
+        let merged_ok = if cadence == "task" {
+            audit_rows_for_action(&db, "auto_mode.merged")
+                .iter()
+                .any(|(rid, _)| rid.as_deref() == Some(&agent_id))
+        } else {
+            true
+        };
+        drop(db);
+        if auto_finish && completed && merged_ok {
+            let (s, _) = server.put(
+                &format!("/api/plans/{PLAN_NAME}/tasks/{task}/status"),
+                json!({ "status": "completed" }),
+            );
+            assert_eq!(s, 200);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn run_diamond(server: Fixture, cadence: &str) {
