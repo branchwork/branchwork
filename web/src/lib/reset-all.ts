@@ -5,6 +5,7 @@ import { useRunnerStore } from "../stores/runner-store.js";
 import { useOrgStore } from "../stores/org-store.js";
 import { useToastStore } from "../stores/toast-store.js";
 import { useWsStore } from "../stores/ws-store.js";
+import { useCredentialsStore } from "../stores/credentials-store.js";
 
 /// Drop every dashboard store (except `auth-store`) back to its initial
 /// shape. Single source of truth for the "I just signed out, drop the
@@ -42,5 +43,9 @@ export function resetAllStores(): void {
   // matters less than presence — but keeping the pin clear before the
   // next /api/auth/me fires is the load-bearing part).
   useOrgStore.getState().reset();
+  // User-scoped: credentials are owner_user_id-keyed, so a logout MUST
+  // wipe them to avoid showing user A's credentials to user B during a
+  // signup-after-logout flow on the same machine.
+  useCredentialsStore.getState().reset();
   useToastStore.getState().clear();
 }

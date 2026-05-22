@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { Suspense, lazy, useEffect } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { usePlanStore } from "./stores/plan-store.js";
 import { useAgentStore } from "./stores/agent-store.js";
@@ -19,6 +19,15 @@ import { ArchivePanel } from "./components/ArchivePanel.js";
 import { LoginPage } from "./components/LoginPage.js";
 import { AdminPage } from "./components/AdminPage.js";
 import { RunnersPage } from "./components/RunnersPage.js";
+
+// Lazy-load the credentials surface so the modal forms (PEM textareas,
+// kind picker, generated-key view) don't ship in the main entry chunk.
+// Credentials is a low-frequency operator surface — the per-route lazy
+// boundary keeps the dashboard's first-paint bundle inside the gzipped
+// budget enforced by `scripts/check-bundle-size.ts`.
+const CredentialsPage = lazy(() =>
+  import("./components/CredentialsPage.js").then((m) => ({ default: m.CredentialsPage })),
+);
 import { Toaster } from "./components/Toaster.js";
 import { ConnectionBanner } from "./components/ConnectionBanner.js";
 import { RunnerStatus } from "./components/RunnerStatus.js";
@@ -141,6 +150,20 @@ export function App() {
             <Route path="/admin" element={<AdminPage />} />
             <Route path="/admin/:section" element={<AdminPage />} />
             <Route path="/runners" element={<RunnersPage />} />
+            <Route
+              path="/credentials"
+              element={
+                <Suspense
+                  fallback={
+                    <div className="p-6 max-w-4xl mx-auto text-sm text-gray-500">
+                      Loading credentials…
+                    </div>
+                  }
+                >
+                  <CredentialsPage />
+                </Suspense>
+              }
+            />
             <Route path="/new-plan" element={<NewPlanRoute />} />
             <Route path="/login" element={<Navigate to="/" replace />} />
             <Route path="*" element={<NotFoundPage />} />

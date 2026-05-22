@@ -474,6 +474,82 @@ fn delete_succeeds_once_project_default_is_cleared() {
 }
 
 #[test]
+fn list_credentials_includes_used_by_count_from_projects() {
+    // Task 3.4 (credentials UI): the list endpoint must surface the
+    // count of `projects.default_credential_id` references so the
+    // dashboard can render `used by N projects` without a per-row
+    // probe.
+    let d = TestDashboard::new();
+    let jar = d.dir.path().join("cookies.txt");
+    signup(&d, &jar, "iris@branchwork.local", "supersecret-pw");
+
+    // Create two credentials.
+    let (_, key_one) = post_authed(
+        &d,
+        &jar,
+        "/api/credentials",
+        json!({ "name": "key-one", "kind": "gh_pat", "secret": "ghp_one" }),
+    );
+    let id_one = key_one["id"].as_str().unwrap().to_string();
+    let (_, key_two) = post_authed(
+        &d,
+        &jar,
+        "/api/credentials",
+        json!({ "name": "key-two", "kind": "gh_pat", "secret": "ghp_two" }),
+    );
+    let id_two = key_two["id"].as_str().unwrap().to_string();
+
+    // Fresh `POST` response: used_by_count is 0 (a freshly-created row
+    // can't have references yet — pins the contract that the create
+    // endpoint never silently inherits an inflated count).
+    assert_eq!(
+        key_one["usedByCount"],
+        json!(0),
+        "fresh POST response must carry usedByCount=0"
+    );
+
+    // Two projects reference key-one; zero reference key-two.
+    let (_, _) = post_authed(
+        &d,
+        &jar,
+        "/api/projects",
+        json!({
+            "name": "p-alpha",
+            "repo_url": "git@github.com:owner/p-alpha.git",
+            "default_credential_id": id_one,
+        }),
+    );
+    let (_, _) = post_authed(
+        &d,
+        &jar,
+        "/api/projects",
+        json!({
+            "name": "p-beta",
+            "repo_url": "git@github.com:owner/p-beta.git",
+            "default_credential_id": id_one,
+        }),
+    );
+
+    // List returns both rows with the right counts. We don't pin the
+    // ORDER because consecutive INSERTs can share a second-resolution
+    // `created_at` and SQLite's ORDER BY tie-break is undefined — look
+    // up by id instead.
+    let (status, list_resp) = get_authed(&d, &jar, "/api/credentials");
+    assert_eq!(status, 200);
+    let creds = list_resp["credentials"].as_array().unwrap();
+    assert_eq!(creds.len(), 2);
+    let mut by_id: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for c in creds {
+        by_id.insert(
+            c["id"].as_str().unwrap().to_string(),
+            c["usedByCount"].as_i64().unwrap(),
+        );
+    }
+    assert_eq!(by_id.get(&id_one), Some(&2));
+    assert_eq!(by_id.get(&id_two), Some(&0));
+}
+
+#[test]
 fn create_then_list_does_not_carry_owner_user_id_of_other_users() {
     let d = TestDashboard::new();
     let jar_a = d.dir.path().join("cookies-a.txt");

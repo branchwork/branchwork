@@ -225,6 +225,19 @@ export function Sidebar() {
             <span aria-hidden="true">⛯ </span>Runners
           </NavLink>
           <NavLink
+            to="/credentials"
+            title="SSH keys + access tokens for git hosts"
+            className={({ isActive }) =>
+              `flex-1 text-left px-2 py-1 text-[10px] rounded transition ${
+                isActive
+                  ? "bg-gray-800 text-indigo-400"
+                  : "text-gray-600 hover:text-gray-300 hover:bg-gray-800/50"
+              }`
+            }
+          >
+            <span aria-hidden="true">⚿ </span>Credentials
+          </NavLink>
+          <NavLink
             to="/admin"
             className={({ isActive }) =>
               `flex-1 text-left px-2 py-1 text-[10px] rounded transition ${

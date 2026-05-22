@@ -60,6 +60,14 @@ use crate::state::AppState;
 /// operator-safe metadata (name, kind, public_part, host_hint, scopes,
 /// created_at). The Rust struct is also reused for the `POST` response, so
 /// the freshly-created row reads back identical to a `GET` list row.
+///
+/// `used_by_count` is the number of `projects.default_credential_id`
+/// references this row has, populated by the `GET` list endpoint via a
+/// subquery so the UI can render `used by N projects` without a
+/// per-row probe. Always `0` on the `POST` response (a freshly-created
+/// row by definition has zero references yet). Marked `default` on
+/// serde so older test fixtures that build the struct without setting
+/// the field keep compiling.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialRow {
@@ -71,6 +79,8 @@ pub struct CredentialRow {
     pub scopes: Option<String>,
     pub owner_user_id: String,
     pub created_at: String,
+    #[serde(default)]
+    pub used_by_count: i64,
 }
 
 /// Request body for `POST /api/credentials`.
@@ -123,10 +133,13 @@ pub async fn list_credentials(State(state): State<AppState>, user: AuthUser) -> 
     let rows: Vec<CredentialRow> = {
         let conn = state.db.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, name, kind, public_part, host_hint, scopes, owner_user_id, created_at \
-               FROM credentials \
-              WHERE owner_user_id = ?1 AND archived_at IS NULL \
-              ORDER BY created_at DESC",
+            "SELECT c.id, c.name, c.kind, c.public_part, c.host_hint, c.scopes, \
+                    c.owner_user_id, c.created_at, \
+                    (SELECT COUNT(*) FROM projects p \
+                       WHERE p.default_credential_id = c.id) AS used_by_count \
+               FROM credentials c \
+              WHERE c.owner_user_id = ?1 AND c.archived_at IS NULL \
+              ORDER BY c.created_at DESC",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -148,6 +161,7 @@ pub async fn list_credentials(State(state): State<AppState>, user: AuthUser) -> 
                 scopes: r.get(5)?,
                 owner_user_id: r.get(6)?,
                 created_at: r.get(7)?,
+                used_by_count: r.get(8)?,
             })
         }) {
             Ok(rows) => rows.flatten().collect(),
@@ -341,6 +355,12 @@ pub async fn create_credential(
         scopes: body.scopes.clone(),
         owner_user_id: user.id.clone(),
         created_at,
+        // Fresh row: no project can reference it yet (the create
+        // endpoint never accepts a project_id binding inline). Set
+        // explicitly rather than relying on `Default::default()` so a
+        // future refactor that flips Serialize-only -> Deserialize+
+        // round-trip doesn't silently regress to a stale count.
+        used_by_count: 0,
     };
 
     // ── audit ───────────────────────────────────────────────────────────
