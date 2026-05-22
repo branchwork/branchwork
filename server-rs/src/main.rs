@@ -437,6 +437,16 @@ async fn run_server(cli: Cli) {
             "/api/projects/{id}/clone",
             post(api::projects::clone_project),
         )
+        // Credentials (Phase 3.2 of runner-daemon-workspace). Branchwork-
+        // managed SSH keys + PATs. Secrets never leak in any response.
+        .route(
+            "/api/credentials",
+            get(api::credentials::list_credentials).post(api::credentials::create_credential),
+        )
+        .route(
+            "/api/credentials/{id}",
+            delete(api::credentials::delete_credential),
+        )
         // Settings
         .route(
             "/api/settings",

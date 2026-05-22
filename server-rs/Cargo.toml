@@ -50,6 +50,7 @@ quick-xml = "0.37"
 flate2 = "1"
 sha2 = "0.10"
 aes-gcm = "0.10"
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "alloc", "rand_core"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -191,6 +191,18 @@ pub mod actions {
     /// workspace_path, resolved_path, outcome}` so the activity feed can
     /// surface a per-clone audit row distinct from the create row.
     pub const PROJECT_CLONE: &str = "project.clone";
+    /// `POST /api/credentials` — operator stored (or generated) a new
+    /// Branchwork-managed credential (Phase 3.2 of
+    /// runner-daemon-workspace). Diff carries `{credential_id, name, kind,
+    /// host_hint, generated}` — the `generated` flag distinguishes a
+    /// user-supplied private key from a server-generated ed25519 pair.
+    /// Secrets are NEVER part of the audit payload.
+    pub const CREDENTIAL_CREATE: &str = "credential.create";
+    /// `DELETE /api/credentials/{id}` — operator removed (archived) a
+    /// credential. Diff carries `{credential_id, name, kind}`. Refused
+    /// with 409 + `credential_in_use` (and no audit row) when at least
+    /// one `projects.default_credential_id` still points at this row.
+    pub const CREDENTIAL_DELETE: &str = "credential.delete";
 }
 
 /// Resource types for audit entries.
@@ -205,6 +217,7 @@ pub mod resources {
     pub const SSO_PROVIDER: &str = "sso_provider";
     pub const RUNNER: &str = "runner";
     pub const PROJECT: &str = "project";
+    pub const CREDENTIAL: &str = "credential";
 }
 
 /// A single audit log entry as returned by the API.
