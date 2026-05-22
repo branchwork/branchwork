@@ -478,6 +478,144 @@ fn resolve_workspace_path(override_path: Option<&str>, name: &str) -> String {
     home.join(name).to_string_lossy().to_string()
 }
 
+/// `POST /api/projects/{id}/clone` — clone the project's `repo_url` into
+/// `workspace_path` via the runner (SaaS mode) or locally (standalone).
+///
+/// On success the runner-resolved absolute path is written back to
+/// `projects.workspace_path` so callers reading the row see the canonical
+/// location (which may differ from the originally-requested path because
+/// the runner resolves `~`-prefixes and bare names against `$HOME`).
+///
+/// Status codes:
+/// - 200: clone succeeded; body includes the resolved path.
+/// - 404: project not found in the caller's org.
+/// - 409: a clone already happened (workspace_path already exists in the
+///   filesystem) — the operator must `DELETE …?wipe_on_disk=true` first
+///   if they want to re-clone.
+/// - 500: dispatcher returned `RpcFailed` (no runner connected, runner
+///   timed out, etc.) OR `CloneFailed` (git exited non-zero).
+pub async fn clone_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    auth: OptionalAuthUser,
+) -> impl IntoResponse {
+    let org_id = auth.org_id().to_string();
+
+    // Fetch the project row scoped to the caller's org. Cross-org lookups
+    // return 404 (same shape as delete_project) so a leak doesn't expose
+    // project existence to other tenants.
+    let existing: Option<(String, String, String, Option<String>)> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT name, repo_url, workspace_path, default_credential_id \
+               FROM projects WHERE id = ?1 AND org_id = ?2",
+            params![id, org_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .ok()
+    };
+
+    let Some((name, repo_url, workspace_path, credential_id)) = existing else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "project_not_found" })),
+        )
+            .into_response();
+    };
+
+    let outcome = crate::saas::dispatch::clone_project_dispatch(
+        &state,
+        &org_id,
+        &repo_url,
+        &workspace_path,
+        credential_id.as_deref(),
+    )
+    .await;
+
+    let (status, resolved_path, error) = match &outcome {
+        crate::saas::dispatch::CloneDispatchOutcome::Ok { resolved_path } => {
+            // Persist the runner-resolved path so future reads of the
+            // project row see the canonical location (which may differ
+            // from the originally-requested `workspace_path` after `~`
+            // expansion / bare-name resolution).
+            let conn = state.db.lock().unwrap();
+            let _ = conn.execute(
+                "UPDATE projects SET workspace_path = ?1 \
+                  WHERE id = ?2 AND org_id = ?3",
+                params![resolved_path, id, org_id],
+            );
+            ("ok".to_string(), Some(resolved_path.clone()), None)
+        }
+        crate::saas::dispatch::CloneDispatchOutcome::CloneFailed { error } => {
+            ("clone_failed".to_string(), None, Some(error.clone()))
+        }
+        crate::saas::dispatch::CloneDispatchOutcome::RpcFailed { error } => {
+            ("rpc_failed".to_string(), None, Some(error.clone()))
+        }
+    };
+
+    // ── audit ───────────────────────────────────────────────────────────
+    let user = auth.0.as_ref();
+    let diff = serde_json::json!({
+        "project_id": id,
+        "name": name,
+        "repo_url": repo_url,
+        "workspace_path": workspace_path,
+        "resolved_path": resolved_path,
+        "outcome": status,
+        "error": error,
+    })
+    .to_string();
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            &org_id,
+            user.map(|u| u.id.as_str()),
+            user.map(|u| u.email.as_str()),
+            audit::actions::PROJECT_CLONE,
+            audit::resources::PROJECT,
+            Some(&id),
+            Some(&diff),
+        );
+    }
+
+    match outcome {
+        crate::saas::dispatch::CloneDispatchOutcome::Ok { resolved_path } => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "id": id,
+                "resolvedPath": resolved_path,
+            })),
+        )
+            .into_response(),
+        crate::saas::dispatch::CloneDispatchOutcome::CloneFailed { error } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "clone_failed",
+                "message": error,
+            })),
+        )
+            .into_response(),
+        crate::saas::dispatch::CloneDispatchOutcome::RpcFailed { error } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "runner_rpc_failed",
+                "message": error,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Slug check for project names.
 ///
 /// Accepts `[A-Za-z0-9._-]`, 1..=64 chars, with no leading dot and no

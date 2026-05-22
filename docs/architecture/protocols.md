@@ -150,6 +150,9 @@ makes progress on the next attempt.
 | `DriverAuthReport { drivers }` | yes | Driver auth state changed (e.g. user finished an OAuth flow). Re-broadcast as `runner_drivers`. Also implicitly delivered by the `RunnerHello` `drivers` field. |
 | `FoldersListed { req_id, entries }` | **no** — req/resp | Reply to `ListFolders`. Carries one `FolderEntry { name, path }` per directory under the runner's home (one level deep, mirroring the local-mode listing in `api::settings::list_folders`). Server matches `req_id` to a pending oneshot to resolve the originating HTTP caller; late replies (post-timeout or post-reconnect) are silently discarded. See [Request/response frames](#requestresponse-frames). |
 | `FolderCreated { req_id, ok, resolved_path?, error? }` | **no** — req/resp | Reply to `CreateFolder`. `ok=true` ⇒ `resolved_path` is the canonical absolute path the runner created; `ok=false` ⇒ `error` carries a human-readable reason (permission denied, path traversal, etc.). Same `req_id` correlation as `FoldersListed`. |
+| `CloneStarted { req_id }` | **no** (best-effort) | Progress breadcrumb emitted by the runner immediately after `CloneProject` lands and before the shell-out begins. The server re-broadcasts it as `clone_started` so the dashboard can render a "Cloning…" indicator while the network round-trip is in flight. Does NOT resolve the pending `runner_request` receiver — that waits for `CloneDone` or `CloneFailed`. |
+| `CloneDone { req_id, resolved_path }` | **no** — req/resp | Terminal success reply to `CloneProject`. `resolved_path` is the absolute directory the runner cloned into (after `~`-expansion / bare-name → `$HOME/<name>` resolution); the dispatcher writes it back to `projects.workspace_path`. |
+| `CloneFailed { req_id, error }` | **no** — req/resp | Terminal failure reply to `CloneProject`. `error` is an operator-readable reason (captured `git` stderr tail, pre-check failure like "destination already exists", or "clone timed out after 120s"). |
 | `DefaultBranchResolved { req_id, branch? }` | **no** — req/resp | Reply to `GetDefaultBranch`. `branch=None` ⇒ no candidate resolved (no `origin/HEAD` symref and neither `master` nor `main` exists locally — see [Branch and merge round-trips](#branch-and-merge-round-trips)). |
 | `BranchesListed { req_id, branches }` | **no** — req/resp | Reply to `ListBranches`. Alphabetically sorted `git branch --format='%(refname:short)'` output for the requested cwd; the server filters out the default branch and the live task branch before returning the dropdown payload. |
 | `MergeResult { req_id, outcome }` | **no** — req/resp | Reply to `MergeBranch`. `outcome` is a tagged enum on `kind` with five arms — `ok { merged_sha }`, `empty_branch`, `checkout_failed { stderr }`, `conflict { stderr }`, `other { stderr }` — so the dispatcher can map each one to the HTTP response code that the local `merge_agent_branch` would have returned (409 for empty/conflict, 500 for other). |
@@ -172,6 +175,7 @@ makes progress on the next attempt.
 | `TerminalReplay { agent_id, from_offset }` | yes | A reconnecting browser asked the server for backfill from a byte offset; the runner serves the missing range from its local `<socket>.log`. |
 | `ListFolders { req_id }` | **no** — req/resp | Dashboard hit a synchronous folder-listing HTTP endpoint and the org has a runner attached. Server mints `req_id`, registers a oneshot, sends best-effort, awaits with a timeout. See [Request/response frames](#requestresponse-frames). |
 | `CreateFolder { req_id, path, create_if_missing? }` | **no** — req/resp | Dashboard hit a synchronous folder-creation HTTP endpoint with a target path. Same correlation pattern as `ListFolders`; the runner replies with `FolderCreated`. `create_if_missing=false` (the default for older runners that omit the field) means existence-check only; `true` does `mkdir -p`. |
+| `CloneProject { req_id, repo_url, workspace_path, credential_id? }` | **no** — req/resp | `POST /api/projects/{id}/clone` reached an org with a runner attached. The runner emits `CloneStarted` immediately as a progress breadcrumb, then shells out `git clone <repo_url> <resolved_path>` and replies with `CloneDone` (success) or `CloneFailed` (failure). The wrapping `runner_request` timeout is 150 s (matches the runner's own 120 s `CLONE_TIMEOUT` plus headroom). `credential_id` is forwarded verbatim and is currently a no-op stub — Phase 3.x ships envelope encryption that delivers a resolved credential blob, this RPC is wire-stable across that work. |
 | `GetDefaultBranch { req_id, cwd }` | **no** — req/resp | Resolve the canonical default branch for `cwd` on the runner host. The runner runs the same three-step algo as the local `git_default_branch` helper: `git symbolic-ref --short refs/remotes/origin/HEAD` → strip `origin/`; fall back to `git rev-parse --verify --quiet master` then `main`; otherwise `None`. Used to seed the merge-target dropdown and to gate `should_record_ci_run` after a merge. See [Branch and merge round-trips](#branch-and-merge-round-trips). |
 | `ListBranches { req_id, cwd }` | **no** — req/resp | Enumerate local branches in `cwd` so the dashboard can populate the merge-target chevron dropdown. The runner runs `git branch --format='%(refname:short)'`, sorts alphabetically, and replies with the full list — the server filters out the default branch (implicit) and the agent's task branch (self-merge nonsense) before returning the JSON to the browser. |
 | `MergeBranch { req_id, cwd, target, task_branch }` | **no** — req/resp | Server-internal follow-up after the user clicks Merge. The runner runs the same five-step git sequence the local `merge_agent_branch` performs (`rev-list --count` → `checkout target` → `merge task_branch --no-edit` → best-effort `branch -d` → `rev-parse HEAD`) and replies with `MergeResult`. The server pre-resolves `target` via `resolve_merge_target` (a pure function) before sending. |
@@ -230,6 +234,40 @@ the user's actual expectation of a "Refresh" button.
 Today only the SaaS side initiates these pairs. The pattern is
 direction-agnostic — a runner-initiated request would mirror the same
 pending-requests map on the runner side.
+
+### Project clone round-trip
+
+`CloneProject` is a [request/response frame](#requestresponse-frames)
+with an extra **progress breadcrumb** the other req/resp pairs don't
+need. The runner emits *three* messages back for one `CloneProject`:
+
+1. **`CloneStarted { req_id }`** — fires immediately on receipt, *before*
+   the shell-out begins. Server re-broadcasts it as `clone_started` on
+   the Dashboard WS so the operator sees a "Cloning…" indicator while
+   the network round-trip is in flight. **Does not** resolve the pending
+   oneshot — that's what makes it a breadcrumb rather than a reply.
+2. **`CloneDone { req_id, resolved_path }`** *or*
+   **`CloneFailed { req_id, error }`** — the terminal reply. Resolves
+   the oneshot via the standard req-id correlator; the dispatcher maps
+   it to `CloneDispatchOutcome::Ok` / `CloneDispatchOutcome::CloneFailed`.
+
+The split exists because a `git clone` over the network can take tens
+of seconds and the dashboard wants a visible signal that work is
+actually happening. Without the breadcrumb, a slow clone is
+indistinguishable from a hung runner. Without the terminal reply, the
+HTTP caller couldn't unblock on success.
+
+The wrapping `runner_request` timeout is 150 s (the runner-side
+`CLONE_TIMEOUT` is 120 s plus headroom). On timeout the pending entry
+is dropped and the HTTP caller surfaces `runner_unavailable`; a late
+`CloneDone` arriving after timeout finds nothing waiting and is
+silently discarded.
+
+`credential_id` is forwarded verbatim on the wire. Today the runner
+ignores it (clones run without auth, suitable for public repos);
+Phase 3.x ships envelope encryption that delivers a resolved
+credential blob to the runner. This RPC is wire-stable across that
+work.
 
 ### Branch and merge round-trips
 

@@ -174,6 +174,10 @@ fn req_id_for(msg: &WireMessage) -> Option<&str> {
         | WireMessage::CreateFolder { req_id, .. }
         | WireMessage::FoldersListed { req_id, .. }
         | WireMessage::FolderCreated { req_id, .. }
+        | WireMessage::CloneProject { req_id, .. }
+        | WireMessage::CloneStarted { req_id, .. }
+        | WireMessage::CloneDone { req_id, .. }
+        | WireMessage::CloneFailed { req_id, .. }
         | WireMessage::GetDefaultBranch { req_id, .. }
         | WireMessage::DefaultBranchResolved { req_id, .. }
         | WireMessage::ListBranches { req_id, .. }

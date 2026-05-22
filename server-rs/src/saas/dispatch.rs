@@ -66,6 +66,14 @@ const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// --log-failed` downloads up to ~MBs from GitHub before tail-trimming.
 const FAILURE_LOG_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Project clone dispatch can take much longer than read-style ops because
+/// it does a full `git clone` over the network. Matches the runner-side
+/// `CLONE_TIMEOUT` (120 s); the runner aborts cleanly at its own cap and
+/// surfaces `CloneFailed` so the dispatcher does not actually need to race
+/// — but keeping the round-trip cap larger than the runner's cap ensures a
+/// runner-side timeout reaches us before we time out the dispatcher.
+const CLONE_TIMEOUT: Duration = Duration::from_secs(150);
+
 /// Errors from [`get_ci_run_status_dispatch`]. The auto-mode loop reacts
 /// differently to RPC failure (retry next tick) vs a malformed reply
 /// (programmer error — log and skip).
@@ -402,6 +410,178 @@ pub async fn fetch_failure_log_dispatch(
         .ok()
         .flatten();
         (log, Some(rid))
+    }
+}
+
+// ── Project clone dispatch (Phase 2.2) ──────────────────────────────────────
+
+/// Outcome of [`clone_project_dispatch`]. Mirrors the runner-side
+/// `CloneOutcome` so callers don't have to disambiguate between RPC
+/// failure and a clone failure — both surface as `Err` here.
+#[derive(Debug)]
+pub enum CloneDispatchOutcome {
+    /// Clone succeeded — `resolved_path` is the absolute directory the
+    /// repo landed in (after `~`-expansion / bare-name → `$HOME/<name>`
+    /// resolution on the runner side). The caller writes this back to
+    /// `projects.workspace_path`.
+    Ok { resolved_path: String },
+    /// Clone failed (precondition rejected, git exited non-zero, network
+    /// failure, etc.). `error` carries an operator-readable reason.
+    CloneFailed { error: String },
+    /// SaaS-mode round-trip failed (no runner, timeout, disconnect, etc.).
+    /// The HTTP caller surfaces this as a 5xx separately from clone
+    /// failures so the dashboard can render an actionable error.
+    RpcFailed { error: String },
+}
+
+/// Mode-aware "clone `repo_url` into `workspace_path` on the runner side"
+/// dispatcher.
+///
+/// In SaaS mode this round-trips through `WireMessage::CloneProject` →
+/// `CloneDone`/`CloneFailed`. In standalone mode it shells out locally —
+/// the dashboard host owns the filesystem, no runner round-trip needed.
+///
+/// `credential_id` is forwarded verbatim to the runner; today it's a
+/// stub (the runner ignores it and clones without auth, suitable for
+/// public repos). The envelope encryption that delivers a resolved
+/// credential blob lands in Phase 3.x; this dispatcher is wire-stable
+/// across that work.
+pub async fn clone_project_dispatch(
+    state: &AppState,
+    org_id: &str,
+    repo_url: &str,
+    workspace_path: &str,
+    credential_id: Option<&str>,
+) -> CloneDispatchOutcome {
+    if org_has_runner(&state.db, org_id) {
+        let req_id = Uuid::new_v4().to_string();
+        let msg = WireMessage::CloneProject {
+            req_id,
+            repo_url: repo_url.to_string(),
+            workspace_path: workspace_path.to_string(),
+            credential_id: credential_id.map(|s| s.to_string()),
+        };
+        match runner_request(state, org_id, msg, CLONE_TIMEOUT).await {
+            Ok(RunnerResponse::CloneResult {
+                ok: true,
+                resolved_path: Some(path),
+                ..
+            }) => CloneDispatchOutcome::Ok {
+                resolved_path: path,
+            },
+            Ok(RunnerResponse::CloneResult {
+                ok: false, error, ..
+            }) => CloneDispatchOutcome::CloneFailed {
+                error: error.unwrap_or_else(|| "clone failed without an error string".into()),
+            },
+            Ok(RunnerResponse::CloneResult {
+                ok: true,
+                resolved_path: None,
+                ..
+            }) => CloneDispatchOutcome::CloneFailed {
+                error: "runner reported success but no resolved_path".into(),
+            },
+            Ok(_) => CloneDispatchOutcome::RpcFailed {
+                error: "runner returned an unexpected reply variant".into(),
+            },
+            Err(e) => CloneDispatchOutcome::RpcFailed {
+                error: format!("{e}"),
+            },
+        }
+    } else {
+        // Standalone: shell out locally. Mirrors the runner-side
+        // `clone_project_on_runner` so both modes have identical
+        // semantics (and identical operator-facing error strings).
+        let repo_url_owned = repo_url.to_string();
+        let workspace_owned = workspace_path.to_string();
+        let credential_owned = credential_id.map(|s| s.to_string());
+        let outcome = tokio::task::spawn_blocking(move || {
+            clone_project_local(
+                &repo_url_owned,
+                &workspace_owned,
+                credential_owned.as_deref(),
+            )
+        })
+        .await;
+        match outcome {
+            Ok(LocalCloneOutcome::Ok { resolved_path }) => {
+                CloneDispatchOutcome::Ok { resolved_path }
+            }
+            Ok(LocalCloneOutcome::Err { error }) => CloneDispatchOutcome::CloneFailed { error },
+            Err(e) => CloneDispatchOutcome::RpcFailed {
+                error: format!("local clone task panicked: {e}"),
+            },
+        }
+    }
+}
+
+/// Local-mode counterpart of the runner's `clone_project_on_runner`.
+/// Kept in this module (rather than in the runner binary's source) so
+/// the standalone branch of [`clone_project_dispatch`] can call it
+/// without having to duplicate file paths.
+enum LocalCloneOutcome {
+    Ok { resolved_path: String },
+    Err { error: String },
+}
+
+fn clone_project_local(
+    repo_url: &str,
+    workspace_path: &str,
+    _credential_id: Option<&str>,
+) -> LocalCloneOutcome {
+    let resolved = resolve_local_workspace_path(workspace_path);
+    let resolved_str = resolved.display().to_string();
+    if resolved.exists() {
+        return LocalCloneOutcome::Err {
+            error: format!("destination already exists: {resolved_str}"),
+        };
+    }
+    if let Some(parent) = resolved.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return LocalCloneOutcome::Err {
+            error: format!("failed to create parent dir: {e}"),
+        };
+    }
+    let output = std::process::Command::new("git")
+        .args(["clone", "--no-progress", repo_url, &resolved_str])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => LocalCloneOutcome::Ok {
+            resolved_path: resolved_str,
+        },
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if resolved.exists() {
+                let _ = std::fs::remove_dir_all(&resolved);
+            }
+            LocalCloneOutcome::Err {
+                error: if stderr.is_empty() {
+                    format!("git clone exited with status {}", o.status)
+                } else {
+                    stderr
+                },
+            }
+        }
+        Err(e) => LocalCloneOutcome::Err {
+            error: format!("failed to spawn git: {e}"),
+        },
+    }
+}
+
+/// Local-mode path resolver for `workspace_path`. Mirrors the runner's
+/// `resolve_runner_path`: tilde-prefix expands to `$HOME`, absolute paths
+/// pass through, bare names land under `$HOME/<name>`.
+fn resolve_local_workspace_path(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix('~') {
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(rest.trim_start_matches('/'))
+    } else if Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        dirs::home_dir().unwrap_or_default().join(path)
     }
 }
 
@@ -814,7 +994,8 @@ mod tests {
         match msg {
             WireMessage::HasGithubActions { req_id, .. }
             | WireMessage::GetCiRunStatus { req_id, .. }
-            | WireMessage::CiFailureLog { req_id, .. } => Some(req_id),
+            | WireMessage::CiFailureLog { req_id, .. }
+            | WireMessage::CloneProject { req_id, .. } => Some(req_id),
             _ => None,
         }
     }
@@ -1467,5 +1648,152 @@ phases:
 
         let body = list_drivers_dispatch(&state, "org-saas", None).await;
         assert_eq!(body["runner_id"], "r-online");
+    }
+
+    // ── Phase 2.2 clone_project dispatch tests ──────────────────────────
+
+    /// SaaS branch routes through the runner and translates `CloneResult`
+    /// (ok=true) into [`CloneDispatchOutcome::Ok`] with the runner-resolved
+    /// path. The standalone branch (and the runner-side `git clone`
+    /// shell-out) is covered by `tests/project_clone.rs` and the runner
+    /// binary's own tests — this exercise pins the dispatcher mapping.
+    #[tokio::test]
+    async fn saas_clone_project_dispatch_returns_ok_with_resolved_path() {
+        let db = db_with_online_runner("runner-1", "org-saas");
+        let runners = new_runner_registry();
+        install_echo_runner(&runners, "runner-1", move |msg| match msg {
+            WireMessage::CloneProject { .. } => Some(RunnerResponse::CloneResult {
+                ok: true,
+                resolved_path: Some("/home/runner/example".into()),
+                error: None,
+            }),
+            _ => None,
+        })
+        .await;
+        let state = test_app_state(db, runners);
+
+        let outcome = clone_project_dispatch(
+            &state,
+            "org-saas",
+            "https://github.com/example/repo.git",
+            "/home/runner/example",
+            None,
+        )
+        .await;
+        match outcome {
+            CloneDispatchOutcome::Ok { resolved_path } => {
+                assert_eq!(resolved_path, "/home/runner/example");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// SaaS branch translates `CloneResult` (ok=false) into
+    /// [`CloneDispatchOutcome::CloneFailed`] with the runner-provided
+    /// error string forwarded verbatim.
+    #[tokio::test]
+    async fn saas_clone_project_dispatch_returns_clone_failed_on_runner_error() {
+        let db = db_with_online_runner("runner-1", "org-saas");
+        let runners = new_runner_registry();
+        install_echo_runner(&runners, "runner-1", move |msg| match msg {
+            WireMessage::CloneProject { .. } => Some(RunnerResponse::CloneResult {
+                ok: false,
+                resolved_path: None,
+                error: Some("Repository not found".into()),
+            }),
+            _ => None,
+        })
+        .await;
+        let state = test_app_state(db, runners);
+
+        let outcome = clone_project_dispatch(
+            &state,
+            "org-saas",
+            "https://github.com/nope/nope.git",
+            "/home/runner/nope",
+            None,
+        )
+        .await;
+        match outcome {
+            CloneDispatchOutcome::CloneFailed { error } => {
+                assert_eq!(error, "Repository not found");
+            }
+            other => panic!("expected CloneFailed, got {other:?}"),
+        }
+    }
+
+    /// When no runner is connected, the dispatcher must NOT silently fall
+    /// through to the local-fs branch (the SaaS server doesn't own the
+    /// customer's filesystem). It must surface
+    /// [`CloneDispatchOutcome::RpcFailed`] so the HTTP caller renders an
+    /// actionable 5xx.
+    #[tokio::test]
+    async fn saas_clone_project_dispatch_returns_rpc_failed_when_runner_offline() {
+        // Org has a runner row (so org_has_runner -> true) but no
+        // registered ConnectedRunner in the in-memory registry, mimicking
+        // a runner that's gone offline mid-flight.
+        let db = db_with_online_runner("runner-1", "org-saas");
+        let runners = new_runner_registry();
+        let state = test_app_state(db, runners);
+
+        let outcome = clone_project_dispatch(
+            &state,
+            "org-saas",
+            "https://github.com/example/repo.git",
+            "/home/runner/example",
+            None,
+        )
+        .await;
+        match outcome {
+            CloneDispatchOutcome::RpcFailed { error } => {
+                assert!(!error.is_empty(), "RpcFailed must carry an error message");
+            }
+            other => panic!("expected RpcFailed, got {other:?}"),
+        }
+    }
+
+    /// `credential_id` is forwarded verbatim on the wire so the runner
+    /// receives whatever the dispatcher's caller supplied (today: a
+    /// stubbed no-op; later: an envelope-encrypted credential blob ref).
+    /// Pins the contract that the dispatcher does NOT mangle the field.
+    #[tokio::test]
+    async fn saas_clone_project_dispatch_forwards_credential_id_verbatim() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+
+        let db = db_with_online_runner("runner-1", "org-saas");
+        let runners = new_runner_registry();
+        let captured: Arc<TokioMutex<Option<String>>> = Arc::new(TokioMutex::new(None));
+        let captured_for_responder = captured.clone();
+        install_echo_runner(&runners, "runner-1", move |msg| match msg {
+            WireMessage::CloneProject { credential_id, .. } => {
+                let captured = captured_for_responder.clone();
+                // Synchronous closure can't await — block_in_place would be
+                // wrong here. Use try_lock; the responder runs once per
+                // request so contention is impossible.
+                if let Ok(mut g) = captured.try_lock() {
+                    *g = credential_id;
+                }
+                Some(RunnerResponse::CloneResult {
+                    ok: true,
+                    resolved_path: Some("/home/runner/x".into()),
+                    error: None,
+                })
+            }
+            _ => None,
+        })
+        .await;
+        let state = test_app_state(db, runners);
+
+        let _ = clone_project_dispatch(
+            &state,
+            "org-saas",
+            "https://github.com/x/x.git",
+            "/home/runner/x",
+            Some("stub-cred-42"),
+        )
+        .await;
+        let got = captured.lock().await.clone();
+        assert_eq!(got.as_deref(), Some("stub-cred-42"));
     }
 }

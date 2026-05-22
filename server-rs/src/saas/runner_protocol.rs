@@ -388,6 +388,54 @@ pub enum WireMessage {
         error: Option<String>,
     },
 
+    /// Dashboard requested the runner clone `repo_url` into `workspace_path`
+    /// using the named credential. The runner replies with `CloneStarted`
+    /// immediately (progress notification, fire-and-forget) and then either
+    /// `CloneDone { resolved_path }` on success or `CloneFailed { error }`
+    /// on failure. The HTTP caller awaits the terminal reply
+    /// (`CloneDone`/`CloneFailed`) via `runner_request`; `CloneStarted` is a
+    /// breadcrumb the dashboard surfaces so the operator sees progress
+    /// without blocking the request/response correlation.
+    ///
+    /// `credential_id` is forwarded verbatim to the runner; the runner today
+    /// treats it as a no-op (clone runs without auth, suitable for public
+    /// repos). Phase 3.x ships the envelope encryption that delivers the
+    /// resolved credential blob to the runner; this RPC is wire-stable
+    /// across that work.
+    ///
+    /// Best-effort: tied to a live HTTP caller, so outbox replay is useless.
+    /// The wrapping `runner_request` timeout is large enough to cover a real
+    /// git clone (default 120 s in the dispatcher).
+    CloneProject {
+        req_id: String,
+        repo_url: String,
+        workspace_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential_id: Option<String>,
+    },
+
+    /// Runner progress notification: the clone has started. Fire-and-forget
+    /// (no request/response correlation); the dashboard listens via
+    /// `broadcast_event` and surfaces a "Cloning…" status. The terminal
+    /// reply lands as either `CloneDone` or `CloneFailed`.
+    CloneStarted { req_id: String },
+
+    /// Runner reply: clone succeeded. `resolved_path` is the absolute
+    /// directory the runner cloned into (after `~` expansion + bare-name
+    /// resolution against `$HOME` — same rules as `resolve_runner_path`).
+    /// The server uses this to update the `projects.workspace_path` column
+    /// so future runs can find the working tree without re-resolving.
+    CloneDone {
+        req_id: String,
+        resolved_path: String,
+    },
+
+    /// Runner reply: clone failed. `error` carries a short operator-readable
+    /// reason (captured stderr tail when available, e.g. "Repository not
+    /// found" or "could not resolve host"). The server surfaces it via the
+    /// HTTP 5xx body so the dashboard renders an actionable error.
+    CloneFailed { req_id: String, error: String },
+
     /// Dashboard requested the canonical default branch for a runner-side cwd.
     /// Best-effort: tied to a live HTTP caller, so outbox replay is useless.
     GetDefaultBranch { req_id: String, cwd: String },
@@ -972,6 +1020,10 @@ impl WireMessage {
                 | WireMessage::FoldersListed { .. }
                 | WireMessage::CreateFolder { .. }
                 | WireMessage::FolderCreated { .. }
+                | WireMessage::CloneProject { .. }
+                | WireMessage::CloneStarted { .. }
+                | WireMessage::CloneDone { .. }
+                | WireMessage::CloneFailed { .. }
                 | WireMessage::GetDefaultBranch { .. }
                 | WireMessage::DefaultBranchResolved { .. }
                 | WireMessage::ListBranches { .. }
@@ -1024,6 +1076,10 @@ impl WireMessage {
             WireMessage::FoldersListed { .. } => "folders_listed",
             WireMessage::CreateFolder { .. } => "create_folder",
             WireMessage::FolderCreated { .. } => "folder_created",
+            WireMessage::CloneProject { .. } => "clone_project",
+            WireMessage::CloneStarted { .. } => "clone_started",
+            WireMessage::CloneDone { .. } => "clone_done",
+            WireMessage::CloneFailed { .. } => "clone_failed",
             WireMessage::GetDefaultBranch { .. } => "get_default_branch",
             WireMessage::DefaultBranchResolved { .. } => "default_branch_resolved",
             WireMessage::ListBranches { .. } => "list_branches",
@@ -1688,6 +1744,146 @@ mod tests {
                 assert!(!ok);
                 assert!(resolved_path.is_none());
                 assert_eq!(error.as_deref(), Some("permission denied"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_project_round_trip() {
+        let msg = WireMessage::CloneProject {
+            req_id: "req-clone-1".into(),
+            repo_url: "https://github.com/example/repo.git".into(),
+            workspace_path: "/home/runner/repo".into(),
+            credential_id: Some("cred-123".into()),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "clone_project");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        // Pin the discriminator name so a future rename can't silently break the wire.
+        assert!(json.contains("\"type\":\"clone_project\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CloneProject {
+                req_id,
+                repo_url,
+                workspace_path,
+                credential_id,
+            } => {
+                assert_eq!(req_id, "req-clone-1");
+                assert_eq!(repo_url, "https://github.com/example/repo.git");
+                assert_eq!(workspace_path, "/home/runner/repo");
+                assert_eq!(credential_id.as_deref(), Some("cred-123"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_project_omits_credential_id_when_none() {
+        // The no-credential case (public repo) should serialize without the
+        // `credential_id` key so the wire payload stays tight.
+        let msg = WireMessage::CloneProject {
+            req_id: "req-clone-2".into(),
+            repo_url: "https://github.com/example/public.git".into(),
+            workspace_path: "/home/runner/public".into(),
+            credential_id: None,
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(
+            !json.contains("\"credential_id\""),
+            "credential_id key should be omitted when None, got: {json}"
+        );
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CloneProject { credential_id, .. } => {
+                assert!(credential_id.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_project_back_compat_omitted_credential_id_defaults_to_none() {
+        // Older clients may serialize without the optional field; the
+        // `#[serde(default)]` attribute keeps deserialization working.
+        let json = r#"{"type":"clone_project","req_id":"req-x","repo_url":"https://example.com/x.git","workspace_path":"/home/runner/x"}"#;
+        let msg: WireMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WireMessage::CloneProject {
+                req_id,
+                repo_url,
+                workspace_path,
+                credential_id,
+            } => {
+                assert_eq!(req_id, "req-x");
+                assert_eq!(repo_url, "https://example.com/x.git");
+                assert_eq!(workspace_path, "/home/runner/x");
+                assert!(credential_id.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_started_round_trip() {
+        let msg = WireMessage::CloneStarted {
+            req_id: "req-clone-1".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "clone_started");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"clone_started\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CloneStarted { req_id } => assert_eq!(req_id, "req-clone-1"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_done_round_trip() {
+        let msg = WireMessage::CloneDone {
+            req_id: "req-clone-1".into(),
+            resolved_path: "/home/runner/repo".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "clone_done");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"clone_done\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CloneDone {
+                req_id,
+                resolved_path,
+            } => {
+                assert_eq!(req_id, "req-clone-1");
+                assert_eq!(resolved_path, "/home/runner/repo");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clone_failed_round_trip() {
+        let msg = WireMessage::CloneFailed {
+            req_id: "req-clone-1".into(),
+            error: "Repository not found".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "clone_failed");
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"clone_failed\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CloneFailed { req_id, error } => {
+                assert_eq!(req_id, "req-clone-1");
+                assert_eq!(error, "Repository not found");
             }
             other => panic!("unexpected variant: {other:?}"),
         }

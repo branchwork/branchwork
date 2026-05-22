@@ -2073,6 +2073,81 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                 .send(serde_json::to_string(&env).unwrap_or_default());
         }
 
+        WireMessage::CloneProject {
+            req_id,
+            repo_url,
+            workspace_path,
+            credential_id,
+        } => {
+            // 1. Send `CloneStarted` immediately so the dashboard can
+            //    render progress while the network round-trip is in flight.
+            //    Fire-and-forget: this is NOT the request/response
+            //    correlator; the terminal reply (`CloneDone`/`CloneFailed`)
+            //    is what unblocks the HTTP caller.
+            send_best_effort(
+                state,
+                WireMessage::CloneStarted {
+                    req_id: req_id.clone(),
+                },
+            );
+
+            // 2. Shell out on a blocking thread, capped by `CLONE_TIMEOUT`.
+            //    Capturing the inputs by value keeps the closure `'static`.
+            let req_id_owned = req_id.clone();
+            let repo_url_owned = repo_url.clone();
+            let workspace_owned = workspace_path.clone();
+            let credential_owned = credential_id.clone();
+            let outcome = run_blocking_with_timeout(CLONE_TIMEOUT, move || {
+                clone_project_on_runner(
+                    &repo_url_owned,
+                    &workspace_owned,
+                    credential_owned.as_deref(),
+                )
+            })
+            .await;
+
+            // 3. Map to the terminal reply. `None` from
+            //    `run_blocking_with_timeout` means the wall-clock cap
+            //    fired — surface that as `CloneFailed` with a recognizable
+            //    reason so the dashboard can render an actionable error
+            //    (vs. waiting for a network-level disconnect via the
+            //    dispatcher timeout).
+            let reply = match outcome {
+                Some(CloneOutcome::Ok { resolved_path }) => {
+                    log_info!(
+                        "[runner] clone_project ok: {repo_url} -> {resolved_path}"
+                    );
+                    WireMessage::CloneDone {
+                        req_id: req_id_owned,
+                        resolved_path,
+                    }
+                }
+                Some(CloneOutcome::Err { error }) => {
+                    log_warn!(
+                        "[runner] clone_project failed for {repo_url}: {error}"
+                    );
+                    WireMessage::CloneFailed {
+                        req_id: req_id_owned,
+                        error,
+                    }
+                }
+                None => {
+                    log_warn!(
+                        "[runner] clone_project timed out after {}s for {repo_url}",
+                        CLONE_TIMEOUT.as_secs()
+                    );
+                    WireMessage::CloneFailed {
+                        req_id: req_id_owned,
+                        error: format!(
+                            "clone timed out after {}s",
+                            CLONE_TIMEOUT.as_secs()
+                        ),
+                    }
+                }
+            };
+            send_best_effort(state, reply);
+        }
+
         WireMessage::GetDefaultBranch { req_id, cwd } => {
             let req_id = req_id.clone();
             let reply = match validated_cwd(state, cwd) {
@@ -2482,6 +2557,9 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
         | WireMessage::DriverAuthReport { .. }
         | WireMessage::FoldersListed { .. }
         | WireMessage::FolderCreated { .. }
+        | WireMessage::CloneStarted { .. }
+        | WireMessage::CloneDone { .. }
+        | WireMessage::CloneFailed { .. }
         | WireMessage::DefaultBranchResolved { .. }
         | WireMessage::BranchesListed { .. }
         | WireMessage::MergeResult { .. }
@@ -2520,6 +2598,13 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wall-clock cap on a single `git clone`. Large enough to cover a real
+/// network clone (cold object pack on a slow upstream) but short enough
+/// that a wedged remote does not permanently park the request slot.
+/// The wrapping dispatcher on the SaaS side sets a matching round-trip
+/// timeout (default 120 s) so the HTTP caller receives a clean 504
+/// instead of hanging on `runner_request`.
+const CLONE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Validate a request-supplied `cwd` against the runner's canonical
 /// `--cwd`. Refuses anything outside the canonical root so a buggy or
@@ -2633,6 +2718,94 @@ fn check_or_create_folder(
         (true, resolved_str, None)
     } else {
         (false, resolved_str, Some("folder_not_found".to_string()))
+    }
+}
+
+/// Outcome of [`clone_project_on_runner`]. Wire conversion happens in the
+/// `CloneProject` arm of [`handle_server_message`].
+enum CloneOutcome {
+    /// Clone succeeded — `resolved_path` is the absolute directory the
+    /// repo landed in.
+    Ok { resolved_path: String },
+    /// Clone failed — `error` is a short operator-readable reason (captured
+    /// `git` stderr tail when available, or an internal precondition such
+    /// as "destination already exists").
+    Err { error: String },
+}
+
+/// Run `git clone <repo_url> <resolved_path>` on the runner.
+///
+/// Resolution rules for the destination path mirror
+/// [`resolve_runner_path`]: `~`-prefix expands to `$HOME`, absolute paths
+/// pass through as-is, bare names resolve to `$HOME/<name>`.
+///
+/// Pre-conditions checked before the shell-out:
+///  - The destination must not already exist (we refuse to overwrite an
+///    existing tree; the operator can `DELETE /api/projects/{id}` with
+///    `wipe_on_disk=true` to clear it first).
+///  - The parent directory is created via `std::fs::create_dir_all` so
+///    `git clone` does not error on a missing parent.
+///
+/// `credential_id` is currently a no-op stub — Phase 3.x ships the
+/// envelope encryption that delivers a resolved credential blob; the
+/// signature is wire-stable across that work.
+fn clone_project_on_runner(
+    repo_url: &str,
+    workspace_path: &str,
+    _credential_id: Option<&str>,
+) -> CloneOutcome {
+    let resolved = resolve_runner_path(workspace_path);
+    let resolved_str = resolved.display().to_string();
+
+    // Refuse to overwrite an existing tree. `git clone` would error on
+    // this anyway, but surfacing a specific reason makes the failure
+    // actionable on the dashboard (vs. raw "destination path already
+    // exists and is not an empty directory").
+    if resolved.exists() {
+        return CloneOutcome::Err {
+            error: format!("destination already exists: {resolved_str}"),
+        };
+    }
+
+    // Ensure the PARENT directory exists. `git clone` creates the leaf
+    // dir itself but errors if a parent component is missing.
+    if let Some(parent) = resolved.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return CloneOutcome::Err {
+            error: format!("failed to create parent dir: {e}"),
+        };
+    }
+
+    // Shell out. `--no-progress` keeps stderr noise to a minimum so the
+    // captured tail is the actual failure reason on the error path.
+    let output = std::process::Command::new("git")
+        .args(["clone", "--no-progress", repo_url, &resolved_str])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => CloneOutcome::Ok {
+            resolved_path: resolved_str,
+        },
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            // Best-effort: clean up a partial clone so a retry does not
+            // hit the "destination already exists" guard above.
+            if resolved.exists() {
+                let _ = std::fs::remove_dir_all(&resolved);
+            }
+            CloneOutcome::Err {
+                error: if stderr.is_empty() {
+                    format!("git clone exited with status {}", o.status)
+                } else {
+                    stderr
+                },
+            }
+        }
+        Err(e) => CloneOutcome::Err {
+            error: format!("failed to spawn git: {e}"),
+        },
     }
 }
 
@@ -6266,5 +6439,221 @@ mod tests {
         handle_server_message(&state, &envelope).await;
         let now = state.last_server_contact_at.load(AtomicOrdering::Relaxed);
         assert!(now > 0, "last_server_contact_at must be set, got {now}");
+    }
+
+    // ── Phase 2.2 clone_project tests ───────────────────────────────────
+    //
+    // `clone_project_on_runner` is the synchronous helper; the handler arm
+    // wraps it in `run_blocking_with_timeout` and emits the wire reply.
+    //
+    // The success-path tests use a local bare repo as the "remote" so they
+    // run offline and deterministically — the `git clone <src> <dst>`
+    // contract is identical for file:// vs https:// URLs.
+
+    /// Build a local bare repo at `bare` populated with one commit and
+    /// return its `file://` URL — suitable as a `git clone` source.
+    fn seed_bare_origin(workdir: &Path, bare: &Path) -> String {
+        // Seed: regular repo with one commit, then push to bare.
+        let seed = workdir.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git_init_with_commit(&seed, "master");
+        std::fs::write(seed.join("README.md"), "hello\n").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-m", "add readme"]);
+        // Initialise the bare repo and push.
+        std::fs::create_dir_all(bare).unwrap();
+        git(bare, &["init", "--bare", "-b", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", &bare.display().to_string()],
+        );
+        git(&seed, &["push", "origin", "master"]);
+        format!("file://{}", bare.display())
+    }
+
+    #[tokio::test]
+    async fn clone_project_on_runner_clones_local_bare_origin() {
+        let workdir = TempDir::new().unwrap();
+        let bare = workdir.path().join("origin.git");
+        let url = seed_bare_origin(workdir.path(), &bare);
+        let dest = workdir.path().join("clone-target");
+        let outcome = clone_project_on_runner(&url, &dest.display().to_string(), None);
+        match outcome {
+            CloneOutcome::Ok { resolved_path } => {
+                assert_eq!(resolved_path, dest.display().to_string());
+                assert!(
+                    dest.join(".git").is_dir(),
+                    ".git dir must exist after clone"
+                );
+                assert!(
+                    dest.join("README.md").is_file(),
+                    "README.md from origin must be present"
+                );
+            }
+            CloneOutcome::Err { error } => panic!("expected Ok, got Err({error})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_project_on_runner_refuses_existing_destination() {
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("already-here");
+        std::fs::create_dir_all(&dest).unwrap();
+        let outcome =
+            clone_project_on_runner("file:///does/not/matter", &dest.display().to_string(), None);
+        match outcome {
+            CloneOutcome::Err { error } => {
+                assert!(
+                    error.contains("destination already exists"),
+                    "expected pre-check error, got: {error}"
+                );
+            }
+            CloneOutcome::Ok { .. } => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_project_on_runner_surfaces_git_failure_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("never-clones");
+        // A guaranteed-missing local path makes git fail fast with a
+        // recognizable stderr we can match against without going over the
+        // network (no DNS, no timeouts).
+        let outcome = clone_project_on_runner(
+            "/tmp/branchwork-no-such-repo-ever",
+            &dest.display().to_string(),
+            None,
+        );
+        match outcome {
+            CloneOutcome::Err { error } => {
+                // Git's wording varies across versions; require *some*
+                // failure context (non-empty) and confirm we cleaned up.
+                assert!(!error.is_empty(), "stderr must be captured, got empty");
+                assert!(
+                    !dest.exists(),
+                    "partial clone must be cleaned up on failure, dest still present"
+                );
+            }
+            CloneOutcome::Ok { .. } => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_project_on_runner_creates_missing_parent_directory() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("origin.git");
+        let url = seed_bare_origin(tmp.path(), &bare);
+        // Nested destination — the parent does NOT exist yet.
+        let dest = tmp.path().join("a/b/c/clone-target");
+        assert!(!dest.parent().unwrap().exists());
+        let outcome = clone_project_on_runner(&url, &dest.display().to_string(), None);
+        match outcome {
+            CloneOutcome::Ok { .. } => {
+                assert!(dest.join(".git").is_dir());
+            }
+            CloneOutcome::Err { error } => panic!("expected Ok, got Err({error})"),
+        }
+    }
+
+    /// Handler-level smoke: drive `WireMessage::CloneProject` through
+    /// `handle_server_message` and assert both replies land in order:
+    /// 1) `CloneStarted` (progress breadcrumb)
+    /// 2) `CloneDone` (terminal reply that unblocks the HTTP caller)
+    #[tokio::test]
+    async fn clone_project_handler_emits_started_then_done() {
+        let workdir = TempDir::new().unwrap();
+        let bare = workdir.path().join("origin.git");
+        let url = seed_bare_origin(workdir.path(), &bare);
+        let dest = workdir.path().join("handler-clone");
+
+        let (state, mut rx) = make_test_state(workdir.path().to_path_buf());
+
+        let envelope = Envelope::best_effort(
+            state.runner_id.clone(),
+            WireMessage::CloneProject {
+                req_id: "req-clone-handler".into(),
+                repo_url: url,
+                workspace_path: dest.display().to_string(),
+                credential_id: None,
+            },
+        );
+        handle_server_message(&state, &envelope).await;
+
+        // First reply: CloneStarted
+        let raw = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("started reply within 10s")
+            .expect("ws_tx still alive");
+        let env: Envelope = serde_json::from_str(&raw).expect("env parses");
+        match env.message {
+            WireMessage::CloneStarted { req_id } => {
+                assert_eq!(req_id, "req-clone-handler");
+            }
+            other => panic!("expected CloneStarted first, got {other:?}"),
+        }
+
+        // Second reply: CloneDone (or CloneFailed if something went wrong)
+        let raw = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("terminal reply within 30s")
+            .expect("ws_tx still alive");
+        let env: Envelope = serde_json::from_str(&raw).expect("env parses");
+        match env.message {
+            WireMessage::CloneDone {
+                req_id,
+                resolved_path,
+            } => {
+                assert_eq!(req_id, "req-clone-handler");
+                assert_eq!(resolved_path, dest.display().to_string());
+                assert!(dest.join(".git").is_dir());
+            }
+            WireMessage::CloneFailed { error, .. } => {
+                panic!("clone unexpectedly failed: {error}")
+            }
+            other => panic!("expected CloneDone, got {other:?}"),
+        }
+    }
+
+    /// Handler-level smoke: a clone that fails surfaces as `CloneFailed`
+    /// with a non-empty error and still emits `CloneStarted` first so the
+    /// dashboard can render the progress chip before the failure lands.
+    #[tokio::test]
+    async fn clone_project_handler_emits_started_then_failed_on_error() {
+        let workdir = TempDir::new().unwrap();
+        let dest = workdir.path().join("handler-fail");
+        let (state, mut rx) = make_test_state(workdir.path().to_path_buf());
+
+        let envelope = Envelope::best_effort(
+            state.runner_id.clone(),
+            WireMessage::CloneProject {
+                req_id: "req-clone-bad".into(),
+                repo_url: "/tmp/branchwork-no-such-repo-ever".into(),
+                workspace_path: dest.display().to_string(),
+                credential_id: None,
+            },
+        );
+        handle_server_message(&state, &envelope).await;
+
+        // First: CloneStarted
+        let raw = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("started reply within 10s")
+            .expect("ws_tx still alive");
+        let env: Envelope = serde_json::from_str(&raw).expect("env parses");
+        assert!(matches!(env.message, WireMessage::CloneStarted { .. }));
+
+        // Second: CloneFailed
+        let raw = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("terminal reply within 15s")
+            .expect("ws_tx still alive");
+        let env: Envelope = serde_json::from_str(&raw).expect("env parses");
+        match env.message {
+            WireMessage::CloneFailed { req_id, error } => {
+                assert_eq!(req_id, "req-clone-bad");
+                assert!(!error.is_empty(), "error string must be non-empty");
+            }
+            other => panic!("expected CloneFailed, got {other:?}"),
+        }
     }
 }

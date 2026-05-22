@@ -40,6 +40,17 @@ pub enum RunnerResponse {
         resolved_path: Option<String>,
         error: Option<String>,
     },
+    /// Terminal reply to `CloneProject`. The runner separately emits a
+    /// `CloneStarted` breadcrumb (forwarded to the dashboard, not surfaced
+    /// here) before this lands. `ok=true` ⇒ `resolved_path` carries the
+    /// absolute directory the runner cloned into; `ok=false` ⇒ `error`
+    /// carries the captured stderr tail. The dispatcher uses the resolved
+    /// path to update the `projects.workspace_path` column.
+    CloneResult {
+        ok: bool,
+        resolved_path: Option<String>,
+        error: Option<String>,
+    },
     /// Reply to `GetDefaultBranch`. `None` ≡ no candidate resolved.
     DefaultBranchResolved(Option<String>),
     /// Reply to `ListBranches`. Always sorted; may be empty.
@@ -1221,6 +1232,74 @@ async fn handle_runner_message(
             .await;
         }
 
+        WireMessage::CloneStarted { req_id } => {
+            // Progress breadcrumb — broadcast for dashboard observability,
+            // but DO NOT resolve the pending receiver. The terminal reply
+            // (`CloneDone` or `CloneFailed`) is what unblocks the HTTP
+            // caller.
+            broadcast_event(
+                &state.broadcast_tx,
+                "clone_started",
+                serde_json::json!({
+                    "runner_id": runner_id,
+                    "req_id": req_id,
+                }),
+            );
+        }
+
+        WireMessage::CloneDone {
+            req_id,
+            resolved_path,
+        } => {
+            // Broadcast the completion so the dashboard can clear any
+            // "Cloning…" indicator before the HTTP response lands.
+            broadcast_event(
+                &state.broadcast_tx,
+                "clone_done",
+                serde_json::json!({
+                    "runner_id": runner_id,
+                    "req_id": req_id,
+                    "resolved_path": resolved_path,
+                }),
+            );
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "clone_done",
+                RunnerResponse::CloneResult {
+                    ok: true,
+                    resolved_path: Some(resolved_path.clone()),
+                    error: None,
+                },
+            )
+            .await;
+        }
+
+        WireMessage::CloneFailed { req_id, error } => {
+            broadcast_event(
+                &state.broadcast_tx,
+                "clone_failed",
+                serde_json::json!({
+                    "runner_id": runner_id,
+                    "req_id": req_id,
+                    "error": error,
+                }),
+            );
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "clone_failed",
+                RunnerResponse::CloneResult {
+                    ok: false,
+                    resolved_path: None,
+                    error: Some(error.clone()),
+                },
+            )
+            .await;
+        }
+
         WireMessage::DefaultBranchResolved { req_id, branch } => {
             resolve_pending(
                 state,
@@ -1478,6 +1557,7 @@ async fn handle_runner_message(
         | WireMessage::TerminalReplay { .. }
         | WireMessage::ListFolders { .. }
         | WireMessage::CreateFolder { .. }
+        | WireMessage::CloneProject { .. }
         | WireMessage::GetDefaultBranch { .. }
         | WireMessage::ListBranches { .. }
         | WireMessage::MergeBranch { .. }

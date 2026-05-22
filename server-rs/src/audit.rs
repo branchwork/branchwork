@@ -185,6 +185,12 @@ pub mod actions {
     /// row was the only thing removed or whether the workspace was also
     /// wiped (and if so, whether the wipe succeeded).
     pub const PROJECT_DELETE: &str = "project.delete";
+    /// `POST /api/projects/{id}/clone` — operator (or a follow-up flow on
+    /// project-create) asked the runner to clone `repo_url` into the
+    /// project's `workspace_path`. Diff carries `{project_id, repo_url,
+    /// workspace_path, resolved_path, outcome}` so the activity feed can
+    /// surface a per-clone audit row distinct from the create row.
+    pub const PROJECT_CLONE: &str = "project.clone";
 }
 
 /// Resource types for audit entries.

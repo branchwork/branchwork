@@ -432,6 +432,10 @@ async fn run_server(cli: Cli) {
             get(api::projects::list_projects).post(api::projects::create_project),
         )
         .route("/api/projects/{id}", delete(api::projects::delete_project))
+        .route(
+            "/api/projects/{id}/clone",
+            post(api::projects::clone_project),
+        )
         // Settings
         .route(
             "/api/settings",

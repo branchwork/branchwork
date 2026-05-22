@@ -319,15 +319,20 @@ handlers](#branch-merge-and-ci-handlers) below.
 |---|---|---|
 | `ListFolders { req_id }` | One-level scan of the runner home directory: `read_dir($HOME)`, filter to directories, drop dotfiles, return `name` + absolute `path` per entry. Mirrors `api::settings::list_folders`'s local fallback so the JSON shape is identical in both modes. | `FoldersListed { req_id, entries }` |
 | `CreateFolder { req_id, path, create_if_missing }` | Resolve `path` against three states: `~` or `~/<rest>` expands to `$HOME/<rest>`; an absolute path is passed through; a bare name resolves to `$HOME/<name>` (matching the user's "folder name under my home directory" mental model — pre-2026-05-07 a bare name fell through to `mkdir -p myproj` which `mkdir` interpreted relative to the runner's cwd). If the resolved directory exists, return `ok: true` with the canonical `resolved_path`. If missing and `create_if_missing` is `false`, return `ok: false, error: "folder_not_found"`. If missing and `create_if_missing` is `true`, `mkdir -p` and return the canonical path. Any other I/O error surfaces as `ok: false` with the OS error string in `error`. | `FolderCreated { req_id, ok, resolved_path?, error? }` |
+| `CloneProject { req_id, repo_url, workspace_path, credential_id? }` | Resolve `workspace_path` via the same three-state rule as `CreateFolder`. Pre-check: refuse if the destination already exists; create the parent directory via `mkdir -p` if needed. Emit `CloneStarted` immediately as a progress breadcrumb (best-effort fire-and-forget), then shell out `git clone --no-progress <repo_url> <resolved_path>` on a blocking thread capped at 120 s. On non-zero exit, clean up any partial clone and return the captured stderr in `error`. `credential_id` is currently a no-op stub. | `CloneStarted { req_id }` (progress) then `CloneDone { req_id, resolved_path }` *or* `CloneFailed { req_id, error }` |
 
-The runner-side implementation lives in `check_or_create_folder`
-inside [`branchwork_runner.rs`](../../server-rs/src/bin/branchwork_runner.rs);
+The runner-side implementation lives in `check_or_create_folder` and
+`clone_project_on_runner` inside
+[`branchwork_runner.rs`](../../server-rs/src/bin/branchwork_runner.rs);
 the SaaS-side dispatch is the
 [`runner_request`](../../server-rs/src/saas/runner_rpc.rs) helper.
 Both frames are best-effort — see
 [protocols.md — Request/response frames](protocols.md#requestresponse-frames)
 for the rationale (live HTTP caller is the retry loop, outbox replay
-would deliver an answer to a caller that has already given up).
+would deliver an answer to a caller that has already given up). The
+`CloneProject` flow additionally emits a progress breadcrumb between
+request and terminal reply — see
+[Project clone round-trip](protocols.md#project-clone-round-trip).
 
 ## Branch, merge, and CI handlers
 
