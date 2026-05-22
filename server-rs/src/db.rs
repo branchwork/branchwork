@@ -638,6 +638,256 @@ pub fn peek_push_lock(db: &Db, branch: &str) -> Option<PushLockHolder> {
     .ok()
 }
 
+// ── Credentials (Phase 3.1 of runner-daemon-workspace) ──────────────────
+
+/// Kinds of credentials Branchwork can store. The runner-side dispatch
+/// path (later phases) reads the `kind` column to pick the right
+/// rendering — SSH agent socket for `SshKey`, https oauth header for the
+/// PAT variants. Manual parse / wire helpers below; the schema column
+/// stores the snake_case wire form.
+#[allow(dead_code)] // consumed by API + dispatch in later phases
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialKind {
+    SshKey,
+    GhPat,
+    GitlabPat,
+}
+
+impl CredentialKind {
+    /// Wire-form (also the on-disk column value).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialKind::SshKey => "ssh_key",
+            CredentialKind::GhPat => "gh_pat",
+            CredentialKind::GitlabPat => "gitlab_pat",
+        }
+    }
+
+    /// Parse the wire form. Unknown values return None so a corrupted row
+    /// or future schema reshuffle does not panic. Mirrors the lenient parse
+    /// used by [`parse_merge_cadence`].
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ssh_key" => Some(CredentialKind::SshKey),
+            "gh_pat" => Some(CredentialKind::GhPat),
+            "gitlab_pat" => Some(CredentialKind::GitlabPat),
+            _ => None,
+        }
+    }
+}
+
+/// Operator-facing credential record. `secret_plaintext` is the raw secret
+/// — supplied at insert time, decrypted at the moment of dispatch, never
+/// stored in plaintext. Set both `set_credential` callers and downstream
+/// consumers must zeroize after use; the type does not enforce that today
+/// because no API surface returns this struct to the wire (a later phase
+/// will add a redacted DTO).
+#[allow(dead_code)] // consumed by API + dispatch in later phases
+#[derive(Debug, Clone)]
+pub struct CredentialInput<'a> {
+    pub id: &'a str,
+    pub owner_user_id: &'a str,
+    pub name: &'a str,
+    pub kind: CredentialKind,
+    pub public_part: Option<&'a str>,
+    pub secret_plaintext: &'a [u8],
+    pub host_hint: Option<&'a str>,
+    pub scopes: Option<&'a str>,
+}
+
+/// What `get_credential` returns. `secret_plaintext` is the decrypted
+/// blob — callers MUST treat this as ephemeral. Encryption metadata
+/// (nonce, tag) is stripped at the crypto boundary.
+#[allow(dead_code)] // consumed by API + dispatch in later phases
+#[derive(Debug, Clone)]
+pub struct DecryptedCredential {
+    pub id: String,
+    pub owner_user_id: String,
+    pub name: String,
+    pub kind: CredentialKind,
+    pub public_part: Option<String>,
+    pub secret_plaintext: Vec<u8>,
+    pub host_hint: Option<String>,
+    pub scopes: Option<String>,
+    pub created_at: String,
+    pub archived_at: Option<String>,
+}
+
+/// Errors from the credential round-trip path. Crypto failures wrap
+/// [`crate::crypto::CryptoError`] verbatim so the caller can match on
+/// `DecryptionFailed` to render "this credential was sealed by an older
+/// master key — re-enter it" in the UI.
+#[allow(dead_code)] // consumed by API + dispatch in later phases
+#[derive(Debug)]
+pub enum CredentialError {
+    NotFound,
+    Crypto(crate::crypto::CryptoError),
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for CredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialError::NotFound => f.write_str("credential not found"),
+            CredentialError::Crypto(e) => write!(f, "credential crypto error: {e}"),
+            CredentialError::Db(e) => write!(f, "credential db error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CredentialError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CredentialError::Crypto(e) => Some(e),
+            CredentialError::Db(e) => Some(e),
+            CredentialError::NotFound => None,
+        }
+    }
+}
+
+impl From<crate::crypto::CryptoError> for CredentialError {
+    fn from(e: crate::crypto::CryptoError) -> Self {
+        CredentialError::Crypto(e)
+    }
+}
+
+impl From<rusqlite::Error> for CredentialError {
+    fn from(e: rusqlite::Error) -> Self {
+        CredentialError::Db(e)
+    }
+}
+
+/// Encrypt `input.secret_plaintext` under `key` and INSERT the row.
+/// Plaintext never reaches the DB. Caller picks the `id` (typically a
+/// UUID); duplicate ids surface as `CredentialError::Db(...)`.
+///
+/// Idempotency: this is a plain INSERT, NOT an UPSERT — rotating the
+/// secret should be a separate path (different audit row, different UI
+/// affordance). Phase 3.x consumers will add an explicit
+/// `rotate_credential` helper.
+#[allow(dead_code)] // consumed by the credentials API in later phases
+pub fn set_credential(
+    db: &Db,
+    key: &crate::crypto::MasterKey,
+    input: &CredentialInput<'_>,
+) -> Result<(), CredentialError> {
+    let encrypted = crate::crypto::encrypt(key, input.secret_plaintext)?;
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO credentials \
+            (id, owner_user_id, name, kind, public_part, encrypted_secret, host_hint, scopes) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            input.id,
+            input.owner_user_id,
+            input.name,
+            input.kind.as_str(),
+            input.public_part,
+            encrypted,
+            input.host_hint,
+            input.scopes,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Look up a credential by `id` and decrypt the secret. Returns
+/// [`CredentialError::NotFound`] when no row matches, including archived
+/// rows (the read filter excludes `archived_at IS NOT NULL` so an
+/// archived credential cannot accidentally be dispatched against). To
+/// inspect archived rows for the audit log, use a dedicated reader (not
+/// yet shipped — Phase 3.x).
+///
+/// Decryption failure (wrong master key, tampered ciphertext) bubbles up
+/// as [`CredentialError::Crypto`]. This is the canonical signal that the
+/// operator rotated `.master.key` and existing rows are now sealed; the
+/// UI can render an actionable "re-enter this credential" prompt.
+#[allow(dead_code)] // consumed by dispatch in later phases
+pub fn get_credential(
+    db: &Db,
+    key: &crate::crypto::MasterKey,
+    id: &str,
+) -> Result<DecryptedCredential, CredentialError> {
+    let conn = db.lock().unwrap();
+    let row = conn
+        .query_row(
+            "SELECT id, owner_user_id, name, kind, public_part, encrypted_secret, \
+                    host_hint, scopes, created_at, archived_at \
+             FROM credentials \
+             WHERE id = ?1 AND archived_at IS NULL",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => CredentialError::NotFound,
+            other => CredentialError::Db(other),
+        })?;
+    drop(conn);
+
+    let (
+        id,
+        owner_user_id,
+        name,
+        kind_str,
+        public_part,
+        encrypted,
+        host_hint,
+        scopes,
+        created_at,
+        archived_at,
+    ) = row;
+    let secret_plaintext = crate::crypto::decrypt(key, &encrypted)?;
+    let kind = CredentialKind::parse(&kind_str).ok_or_else(|| {
+        // A corrupted kind column is a programmer error, but we map it to
+        // Crypto so it surfaces with the same "re-enter this credential"
+        // UX the rotation case uses. The alternative — panicking — would
+        // 500 the whole credentials list endpoint when one row is bad.
+        CredentialError::Crypto(crate::crypto::CryptoError::EncryptionFailed(format!(
+            "unknown credential kind on row {id}: {kind_str}"
+        )))
+    })?;
+
+    Ok(DecryptedCredential {
+        id,
+        owner_user_id,
+        name,
+        kind,
+        public_part,
+        secret_plaintext,
+        host_hint,
+        scopes,
+        created_at,
+        archived_at,
+    })
+}
+
+/// Flip a credential from active to archived (soft-delete). Idempotent —
+/// archiving an already-archived row leaves `archived_at` untouched.
+/// `get_credential` filters out archived rows automatically.
+#[allow(dead_code)] // consumed by the credentials API in later phases
+pub fn archive_credential(db: &Db, id: &str) -> Result<bool, CredentialError> {
+    let conn = db.lock().unwrap();
+    let n = conn.execute(
+        "UPDATE credentials SET archived_at = datetime('now') \
+         WHERE id = ?1 AND archived_at IS NULL",
+        params![id],
+    )?;
+    Ok(n > 0)
+}
+
 /// Open (or create) the database at `db_path` and run migrations.
 pub fn init(db_path: &Path) -> Db {
     if let Some(parent) = db_path.parent() {
@@ -1064,6 +1314,53 @@ fn migrate(conn: &Connection) {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_org_name
             ON projects(org_id, name);
         CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(org_id);
+
+        -- Credentials (Phase 3.1 of runner-daemon-workspace).
+        -- Branchwork-managed credentials for git hosts. Plaintext NEVER
+        -- hits the DB; encrypted_secret carries AES-GCM ciphertext (12-byte
+        -- nonce prepended) keyed by the master key at
+        -- BRANCHWORK_DATA_DIR/.master.key. Decryption happens only at the
+        -- moment of dispatch. See server-rs/src/crypto.rs for the cipher
+        -- impl + rotation contract.
+        --
+        -- Fields:
+        -- - id is a UUID generated server-side.
+        -- - owner_user_id is the user who created the credential; FK to
+        --   users(id) so deleting a user takes their credentials with them.
+        -- - name is operator-friendly. Not globally unique; scoped by
+        --   owner.
+        -- - kind enumerates the credential shape (ssh_key, gh_pat,
+        --   gitlab_pat). Future runner-side dispatch reads kind to pick
+        --   the right rendering (SSH agent vs. https oauth header).
+        -- - public_part is the operator-visible non-secret half: the SSH
+        --   public key, or a label / fingerprint for PATs. NULL when the
+        --   credential has no public component worth surfacing.
+        -- - encrypted_secret is the AES-GCM blob (nonce + ciphertext +
+        --   tag). The plaintext is the raw private key body or the PAT
+        --   string. Never logged.
+        -- - host_hint is the canonical host the credential is for (e.g.
+        --   github.com, gitlab.example.com). Lets the dispatch path pick a
+        --   credential without an explicit choice when one matches.
+        -- - scopes is the host-reported scope list (e.g. repo,workflow for
+        --   a GitHub PAT). Captured at registration time; not refreshed.
+        -- - archived_at flips the row from active to tombstoned so the
+        --   audit trail survives a delete. NULL means active.
+        CREATE TABLE IF NOT EXISTS credentials (
+            id                TEXT PRIMARY KEY,
+            owner_user_id     TEXT NOT NULL,
+            name              TEXT NOT NULL,
+            kind              TEXT NOT NULL,
+            public_part       TEXT,
+            encrypted_secret  BLOB NOT NULL,
+            host_hint         TEXT,
+            scopes            TEXT,
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            archived_at       TEXT,
+            FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_credentials_owner ON credentials(owner_user_id);
+        CREATE INDEX IF NOT EXISTS idx_credentials_active
+            ON credentials(owner_user_id) WHERE archived_at IS NULL;
         ",
     )
     .expect("failed to run schema migration");
@@ -1501,6 +1798,7 @@ mod tests {
         assert!(tables.contains(&"plan_runner_affinity".to_string()));
         assert!(tables.contains(&"master_push_lock".to_string()));
         assert!(tables.contains(&"projects".to_string()));
+        assert!(tables.contains(&"credentials".to_string()));
     }
 
     #[test]
@@ -3088,5 +3386,236 @@ mod tests {
             first, second,
             "token must be fresh per acquire (callers rely on this for auth)"
         );
+    }
+
+    // ── Credentials (Phase 3.1 of runner-daemon-workspace) ──────────────
+
+    /// Seed a user that the credential FK can reference. Returns the
+    /// user id.
+    fn seed_user(db: &Db, id: &str, email: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO users (id, email, password_hash) VALUES (?1, ?2, ?3)",
+            params![id, email, "x"],
+        )
+        .unwrap();
+    }
+
+    fn sample_input<'a>(
+        id: &'a str,
+        owner_user_id: &'a str,
+        secret: &'a [u8],
+    ) -> CredentialInput<'a> {
+        CredentialInput {
+            id,
+            owner_user_id,
+            name: "test cred",
+            kind: CredentialKind::GhPat,
+            public_part: Some("fingerprint:ab12"),
+            secret_plaintext: secret,
+            host_hint: Some("github.com"),
+            scopes: Some("repo,workflow"),
+        }
+    }
+
+    #[test]
+    fn credential_kind_round_trips_wire_form() {
+        assert_eq!(CredentialKind::SshKey.as_str(), "ssh_key");
+        assert_eq!(CredentialKind::GhPat.as_str(), "gh_pat");
+        assert_eq!(CredentialKind::GitlabPat.as_str(), "gitlab_pat");
+        assert_eq!(
+            CredentialKind::parse("ssh_key"),
+            Some(CredentialKind::SshKey)
+        );
+        assert_eq!(CredentialKind::parse("gh_pat"), Some(CredentialKind::GhPat));
+        assert_eq!(
+            CredentialKind::parse("gitlab_pat"),
+            Some(CredentialKind::GitlabPat)
+        );
+        assert_eq!(CredentialKind::parse("unknown"), None);
+        assert_eq!(CredentialKind::parse(""), None);
+    }
+
+    /// Headline acceptance test: round-trip set/get returns the original
+    /// secret bytes. Also pins that plaintext NEVER lands in the
+    /// `encrypted_secret` column.
+    #[test]
+    fn set_get_credential_round_trip_returns_original_bytes() {
+        let (db, _dir) = test_db();
+        seed_user(&db, "u1", "a@b.com");
+
+        let key = crate::crypto::MasterKey::generate();
+        let secret = b"ghp_supersecrettoken_AAA1234567";
+        let input = sample_input("cred-1", "u1", secret);
+        set_credential(&db, &key, &input).expect("set_credential");
+
+        let got = get_credential(&db, &key, "cred-1").expect("get_credential");
+        assert_eq!(got.id, "cred-1");
+        assert_eq!(got.owner_user_id, "u1");
+        assert_eq!(got.name, "test cred");
+        assert_eq!(got.kind, CredentialKind::GhPat);
+        assert_eq!(got.public_part.as_deref(), Some("fingerprint:ab12"));
+        assert_eq!(got.host_hint.as_deref(), Some("github.com"));
+        assert_eq!(got.scopes.as_deref(), Some("repo,workflow"));
+        assert_eq!(got.secret_plaintext.as_slice(), secret);
+        assert!(got.archived_at.is_none());
+
+        // Critical: the BLOB on disk must NOT contain the plaintext.
+        let conn = db.lock().unwrap();
+        let on_disk: Vec<u8> = conn
+            .query_row(
+                "SELECT encrypted_secret FROM credentials WHERE id = ?1",
+                params!["cred-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(on_disk.as_slice(), secret, "plaintext leaked to DB");
+        // The first 12 bytes are the nonce; the rest is ciphertext + tag.
+        // Tag is 16 bytes for AES-GCM.
+        assert!(on_disk.len() >= crate::crypto::NONCE_LEN + secret.len() + 16);
+    }
+
+    /// Acceptance test for the rotation knob: encrypting under key A then
+    /// re-keying to B must invalidate every existing row. The DB layer
+    /// surfaces this as `CredentialError::Crypto(DecryptionFailed)`.
+    #[test]
+    fn rotating_master_key_invalidates_existing_credential_rows() {
+        let (db, _dir) = test_db();
+        seed_user(&db, "u1", "a@b.com");
+
+        let key_a = crate::crypto::MasterKey::generate();
+        let secret = b"glpat-AAAAAAAAAAAAAAAAAA";
+        set_credential(&db, &key_a, &sample_input("cred-1", "u1", secret)).unwrap();
+
+        // Same key — fine.
+        let ok = get_credential(&db, &key_a, "cred-1").unwrap();
+        assert_eq!(ok.secret_plaintext.as_slice(), secret);
+
+        // Rotated key — fails with DecryptionFailed. AES-GCM does not
+        // distinguish wrong-key from tampered-ciphertext, which is the
+        // canonical knob the task acceptance pins.
+        let key_b = crate::crypto::MasterKey::generate();
+        assert_ne!(key_a.as_bytes(), key_b.as_bytes());
+        let err = get_credential(&db, &key_b, "cred-1").unwrap_err();
+        match err {
+            CredentialError::Crypto(crate::crypto::CryptoError::DecryptionFailed) => {}
+            other => panic!("expected DecryptionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_credential_returns_not_found_for_missing_id() {
+        let (db, _dir) = test_db();
+        let key = crate::crypto::MasterKey::generate();
+        let err = get_credential(&db, &key, "does-not-exist").unwrap_err();
+        assert!(matches!(err, CredentialError::NotFound));
+    }
+
+    #[test]
+    fn nonces_differ_across_two_writes_of_the_same_secret() {
+        // The encryption layer asserts this, but pin it again at the DB
+        // boundary because the wire shape (nonce || ciphertext || tag) is
+        // the contract callers will eventually read directly via raw SQL
+        // for backup/restore tooling. Two writes of the same plaintext
+        // must produce different BLOBs.
+        let (db, _dir) = test_db();
+        seed_user(&db, "u1", "a@b.com");
+        let key = crate::crypto::MasterKey::generate();
+        let secret = b"same-secret-bytes";
+        set_credential(&db, &key, &sample_input("cred-1", "u1", secret)).unwrap();
+        set_credential(&db, &key, &sample_input("cred-2", "u1", secret)).unwrap();
+
+        let conn = db.lock().unwrap();
+        let one: Vec<u8> = conn
+            .query_row(
+                "SELECT encrypted_secret FROM credentials WHERE id = 'cred-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let two: Vec<u8> = conn
+            .query_row(
+                "SELECT encrypted_secret FROM credentials WHERE id = 'cred-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(one, two, "fresh nonce must differ per row");
+    }
+
+    #[test]
+    fn archive_hides_credential_from_get() {
+        let (db, _dir) = test_db();
+        seed_user(&db, "u1", "a@b.com");
+        let key = crate::crypto::MasterKey::generate();
+        set_credential(&db, &key, &sample_input("cred-1", "u1", b"x")).unwrap();
+        // Visible before archive.
+        get_credential(&db, &key, "cred-1").expect("visible pre-archive");
+
+        let flipped = archive_credential(&db, "cred-1").unwrap();
+        assert!(flipped, "first archive must report a state change");
+
+        // Idempotent second archive — no state change.
+        let flipped_again = archive_credential(&db, "cred-1").unwrap();
+        assert!(!flipped_again);
+
+        let err = get_credential(&db, &key, "cred-1").unwrap_err();
+        assert!(matches!(err, CredentialError::NotFound));
+    }
+
+    #[test]
+    fn set_credential_rejects_duplicate_id() {
+        let (db, _dir) = test_db();
+        seed_user(&db, "u1", "a@b.com");
+        let key = crate::crypto::MasterKey::generate();
+        set_credential(&db, &key, &sample_input("cred-1", "u1", b"a")).unwrap();
+        let err = set_credential(&db, &key, &sample_input("cred-1", "u1", b"b")).unwrap_err();
+        // Duplicate PK is a `Db(...)` error — callers translate to 409.
+        assert!(matches!(err, CredentialError::Db(_)));
+    }
+
+    #[test]
+    fn fk_cascade_deletes_credential_when_user_is_deleted() {
+        // Deleting a user must take their credentials with them. This is
+        // the security floor: a removed user's PATs cannot continue to
+        // sit decryptable in the DB.
+        let (db, _dir) = test_db();
+        seed_user(&db, "u1", "a@b.com");
+        let key = crate::crypto::MasterKey::generate();
+        set_credential(&db, &key, &sample_input("cred-1", "u1", b"secret")).unwrap();
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("DELETE FROM users WHERE id = ?1", params!["u1"])
+                .unwrap();
+        }
+
+        let err = get_credential(&db, &key, "cred-1").unwrap_err();
+        assert!(matches!(err, CredentialError::NotFound));
+    }
+
+    #[test]
+    fn corrupted_kind_column_surfaces_as_crypto_error() {
+        // If a future schema reshuffle (or a manual SQL edit) stores an
+        // unknown `kind` value, get_credential must NOT panic — it maps
+        // the parse failure to a crypto error so the credentials list
+        // endpoint stays available for the other rows.
+        let (db, _dir) = test_db();
+        seed_user(&db, "u1", "a@b.com");
+        let key = crate::crypto::MasterKey::generate();
+        set_credential(&db, &key, &sample_input("cred-1", "u1", b"x")).unwrap();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE credentials SET kind = 'futuristic_oauth' WHERE id = 'cred-1'",
+                [],
+            )
+            .unwrap();
+        }
+        let err = get_credential(&db, &key, "cred-1").unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialError::Crypto(crate::crypto::CryptoError::EncryptionFailed(_))
+        ));
     }
 }

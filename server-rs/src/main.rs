@@ -5,6 +5,7 @@ mod auth;
 mod auto_mode;
 mod ci;
 mod config;
+mod crypto;
 mod db;
 mod file_watcher;
 mod git_helpers;
