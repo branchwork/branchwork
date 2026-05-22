@@ -193,6 +193,7 @@ export function Sidebar() {
             </button>
           )}
           <NewPlanLink hasMdPlans={hasMdPlans} />
+          <NewProjectLink />
         </div>
 
         {/* Driver auth status */}
@@ -493,6 +494,28 @@ function NewPlanLink({ hasMdPlans }: { hasMdPlans: boolean }) {
       }
     >
       + New Plan
+    </NavLink>
+  );
+}
+
+/// Second action button sitting right under "+ New Plan". Drives the
+/// `runner-daemon-workspace/2.4` clone-or-create modal at `/new-project`.
+/// Kept as a plain link (not the heavier NewPlanLink shape) because the
+/// destination is a route that owns its own modal — no skeleton tabs
+/// to defer.
+function NewProjectLink() {
+  return (
+    <NavLink
+      to="/new-project"
+      className={({ isActive }) =>
+        `block w-full text-center px-3 py-1.5 mt-1 text-xs border rounded transition ${
+          isActive
+            ? "bg-indigo-600 border-indigo-600 text-white"
+            : "bg-gray-800 border-gray-700 hover:border-indigo-600 hover:text-indigo-400 text-gray-400"
+        }`
+      }
+    >
+      + New Project
     </NavLink>
   );
 }

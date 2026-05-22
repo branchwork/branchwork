@@ -6,6 +6,7 @@ import { useOrgStore } from "../stores/org-store.js";
 import { useToastStore } from "../stores/toast-store.js";
 import { useWsStore } from "../stores/ws-store.js";
 import { useCredentialsStore } from "../stores/credentials-store.js";
+import { useProjectsStore } from "../stores/projects-store.js";
 
 /// Drop every dashboard store (except `auth-store`) back to its initial
 /// shape. Single source of truth for the "I just signed out, drop the
@@ -47,5 +48,10 @@ export function resetAllStores(): void {
   // wipe them to avoid showing user A's credentials to user B during a
   // signup-after-logout flow on the same machine.
   useCredentialsStore.getState().reset();
+  // Org-scoped: projects are listed via `GET /api/projects` filtered by
+  // the caller's org so a logout MUST wipe them to avoid showing
+  // user A's projects to user B during a signup-after-logout flow on
+  // the same machine.
+  useProjectsStore.getState().reset();
   useToastStore.getState().clear();
 }

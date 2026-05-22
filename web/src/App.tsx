@@ -14,6 +14,14 @@ import { ProjectDashboard } from "./components/ProjectDashboard.js";
 import { AgentTree } from "./components/AgentTree.js";
 import { AgentRail } from "./components/AgentRail.js";
 import { NewPlanForm } from "./components/NewPlanForm.js";
+// Lazy-load NewProjectModal so the modal forms (URL parser, credential
+// picker, repo-creation host wiring) don't ship in the main entry chunk.
+// Mirrors CredentialsPage's lazy-boundary pattern — the modal is a
+// low-frequency operator surface and the per-route lazy split keeps
+// the dashboard's first-paint bundle inside the gzipped budget.
+const NewProjectModal = lazy(() =>
+  import("./components/NewProjectModal.js").then((m) => ({ default: m.NewProjectModal })),
+);
 import { AuditLog } from "./components/AuditLog.js";
 import { ArchivePanel } from "./components/ArchivePanel.js";
 import { LoginPage } from "./components/LoginPage.js";
@@ -165,6 +173,20 @@ export function App() {
               }
             />
             <Route path="/new-plan" element={<NewPlanRoute />} />
+            <Route
+              path="/new-project"
+              element={
+                <Suspense
+                  fallback={
+                    <div className="p-6 max-w-2xl mx-auto text-sm text-gray-500">
+                      Loading new project dialog…
+                    </div>
+                  }
+                >
+                  <NewProjectRoute />
+                </Suspense>
+              }
+            />
             <Route path="/login" element={<Navigate to="/" replace />} />
             <Route path="*" element={<NotFoundPage />} />
           </Routes>
@@ -240,4 +262,12 @@ function RouteSync() {
 function NewPlanRoute() {
   const navigate = useNavigate();
   return <NewPlanForm onClose={() => navigate("/plans")} />;
+}
+
+/// /new-project renders the Phase 2.4 modal and routes back to /plans on
+/// close. Mirrors NewPlanRoute's wrapper pattern so tests can drive the
+/// modal with a plain onClose callback.
+function NewProjectRoute() {
+  const navigate = useNavigate();
+  return <NewProjectModal onClose={() => navigate("/plans")} />;
 }

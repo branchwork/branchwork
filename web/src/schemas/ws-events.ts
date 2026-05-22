@@ -455,6 +455,43 @@ const Connected = v.object({
   timestamp: v.string(),
 });
 
+/// Runner has accepted a `CloneProject` request and started the clone.
+/// Fire-and-forget progress breadcrumb — the terminal `clone_done` or
+/// `clone_failed` event is what unblocks the HTTP caller (and updates the
+/// projects.workspace_path column). Surfaced to the NewProjectModal so it
+/// can show a `Cloning …` indicator between submit and done.
+const CloneStarted = v.object({
+  type: v.literal("clone_started"),
+  data: v.object({
+    runner_id: v.string(),
+    req_id: v.string(),
+  }),
+});
+
+/// Runner finished cloning into `resolved_path`. The HTTP response
+/// arrives shortly after this fires; the modal can use either as the
+/// success signal but listening to the WS event lets it react before
+/// the HTTP response lands.
+const CloneDone = v.object({
+  type: v.literal("clone_done"),
+  data: v.object({
+    runner_id: v.string(),
+    req_id: v.string(),
+    resolved_path: v.string(),
+  }),
+});
+
+/// Runner could not clone — captured stderr lives in `error`. Fires
+/// before the HTTP response (which surfaces a 500 with the same body).
+const CloneFailed = v.object({
+  type: v.literal("clone_failed"),
+  data: v.object({
+    runner_id: v.string(),
+    req_id: v.string(),
+    error: v.string(),
+  }),
+});
+
 export const WsMessageSchema = v.variant("type", [
   Connected,
   PlanUpdated,
@@ -494,6 +531,9 @@ export const WsMessageSchema = v.variant("type", [
   RunnerHealth,
   PlanRunnerAffinityChanged,
   AutoPushRebased,
+  CloneStarted,
+  CloneDone,
+  CloneFailed,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;
