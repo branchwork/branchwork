@@ -441,11 +441,17 @@ pub enum CloneDispatchOutcome {
 /// `CloneDone`/`CloneFailed`. In standalone mode it shells out locally —
 /// the dashboard host owns the filesystem, no runner round-trip needed.
 ///
-/// `credential_id` is forwarded verbatim to the runner; today it's a
-/// stub (the runner ignores it and clones without auth, suitable for
-/// public repos). The envelope encryption that delivers a resolved
-/// credential blob lands in Phase 3.x; this dispatcher is wire-stable
-/// across that work.
+/// `credential_id` is forwarded verbatim to the runner for logging /
+/// correlation. T3.3 added the actual on-demand credential envelope: when
+/// `credential_id` is set, the dispatcher resolves it against the
+/// encrypted `credentials` table via [`crate::db::get_credential`], builds
+/// a [`crate::saas::runner_protocol::Credential`] envelope, and ships it
+/// alongside the request. The runner materialises the secret as a tmpfs-
+/// backed file for the git child process only and unlinks it on every
+/// exit path. If credential resolution fails (NotFound, decryption
+/// error), the dispatcher returns `CloneFailed` with an operator-readable
+/// reason — same surface as a real clone failure, no need for the caller
+/// to disambiguate.
 pub async fn clone_project_dispatch(
     state: &AppState,
     org_id: &str,
@@ -453,6 +459,19 @@ pub async fn clone_project_dispatch(
     workspace_path: &str,
     credential_id: Option<&str>,
 ) -> CloneDispatchOutcome {
+    // Resolve the credential up front (shared between SaaS + standalone).
+    // None means "public repo, no auth needed" — we skip the lookup and
+    // the runner falls through to a plain `git clone`.
+    let credential = match credential_id {
+        None => None,
+        Some(id) => match resolve_credential_for_dispatch(state, id) {
+            Ok(cred) => Some(cred),
+            Err(error) => {
+                return CloneDispatchOutcome::CloneFailed { error };
+            }
+        },
+    };
+
     if org_has_runner(&state.db, org_id) {
         let req_id = Uuid::new_v4().to_string();
         let msg = WireMessage::CloneProject {
@@ -460,6 +479,7 @@ pub async fn clone_project_dispatch(
             repo_url: repo_url.to_string(),
             workspace_path: workspace_path.to_string(),
             credential_id: credential_id.map(|s| s.to_string()),
+            credential,
         };
         match runner_request(state, org_id, msg, CLONE_TIMEOUT).await {
             Ok(RunnerResponse::CloneResult {
@@ -495,11 +515,15 @@ pub async fn clone_project_dispatch(
         let repo_url_owned = repo_url.to_string();
         let workspace_owned = workspace_path.to_string();
         let credential_owned = credential_id.map(|s| s.to_string());
+        // Take ownership of the resolved credential (if any). The closure
+        // is `'static` and must own its inputs.
+        let credential_owned_for_local = credential;
         let outcome = tokio::task::spawn_blocking(move || {
             clone_project_local(
                 &repo_url_owned,
                 &workspace_owned,
                 credential_owned.as_deref(),
+                credential_owned_for_local.as_ref(),
             )
         })
         .await;
@@ -515,6 +539,47 @@ pub async fn clone_project_dispatch(
     }
 }
 
+/// T3.3: Resolve a `credential_id` against the encrypted `credentials`
+/// table and turn it into a wire [`crate::saas::runner_protocol::Credential`].
+/// Mirrors the master-key resolution rules in `api::credentials::load_master_key`:
+/// `$BRANCHWORK_DATA_DIR` when set, otherwise `claude_dir`.
+///
+/// Returns operator-readable error strings on every failure path so the
+/// dispatcher can fold them straight into `CloneFailed::error`:
+///   - missing master key  → "master key unavailable: ..."
+///   - credential not found → "credential not found: <id>"
+///   - decryption failed   → "credential could not be decrypted (master key rotated?)"
+fn resolve_credential_for_dispatch(
+    state: &AppState,
+    credential_id: &str,
+) -> Result<crate::saas::runner_protocol::Credential, String> {
+    let claude_dir = state
+        .settings_path
+        .parent()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let master_key_path = crate::crypto::resolve_master_key_path(&claude_dir);
+    let master_key = crate::crypto::load_or_generate_master_key(&master_key_path)
+        .map_err(|e| format!("master key unavailable: {e}"))?;
+    let cred =
+        crate::db::get_credential(&state.db, &master_key, credential_id).map_err(|e| match e {
+            crate::db::CredentialError::NotFound => {
+                format!("credential not found: {credential_id}")
+            }
+            crate::db::CredentialError::Crypto(_) => {
+                "credential could not be decrypted (master key rotated?)".to_string()
+            }
+            crate::db::CredentialError::Db(e) => format!("credential db error: {e}"),
+        })?;
+    Ok(crate::saas::runner_protocol::Credential {
+        id: cred.id,
+        kind: cred.kind.as_str().to_string(),
+        secret: cred.secret_plaintext,
+        public_part: cred.public_part,
+        host_hint: cred.host_hint,
+    })
+}
+
 /// Local-mode counterpart of the runner's `clone_project_on_runner`.
 /// Kept in this module (rather than in the runner binary's source) so
 /// the standalone branch of [`clone_project_dispatch`] can call it
@@ -528,6 +593,7 @@ fn clone_project_local(
     repo_url: &str,
     workspace_path: &str,
     _credential_id: Option<&str>,
+    credential: Option<&crate::saas::runner_protocol::Credential>,
 ) -> LocalCloneOutcome {
     let resolved = resolve_local_workspace_path(workspace_path);
     let resolved_str = resolved.display().to_string();
@@ -544,9 +610,37 @@ fn clone_project_local(
             error: format!("failed to create parent dir: {e}"),
         };
     }
-    let output = std::process::Command::new("git")
-        .args(["clone", "--no-progress", repo_url, &resolved_str])
-        .output();
+
+    // T3.3: When a credential is on the wire (or, in standalone, resolved
+    // from disk by the dispatcher), materialise it as a tmpfs file for
+    // the git child only. `CredentialMaterial` is an RAII guard that
+    // unlinks the file when dropped, so we don't need to remember to
+    // clean up on every error path below.
+    let credential_material = match credential {
+        Some(cred) => match crate::credential_material::CredentialMaterial::materialize(cred) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                return LocalCloneOutcome::Err {
+                    error: format!("failed to materialise credential: {e}"),
+                };
+            }
+        },
+        None => None,
+    };
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["clone", "--no-progress", repo_url, &resolved_str]);
+    if let Some(m) = credential_material.as_ref() {
+        for (k, v) in m.git_env_vars() {
+            cmd.env(k, v);
+        }
+    }
+    let output = cmd.output();
+    // Explicit drop AFTER `git clone` returns so the secret file lives
+    // exactly as long as the git child (RAII closes the gap on every
+    // exit path — match arms below cannot leak it).
+    drop(credential_material);
+
     match output {
         Ok(o) if o.status.success() => LocalCloneOutcome::Ok {
             resolved_path: resolved_str,
@@ -1752,27 +1846,55 @@ phases:
         }
     }
 
-    /// `credential_id` is forwarded verbatim on the wire so the runner
-    /// receives whatever the dispatcher's caller supplied (today: a
-    /// stubbed no-op; later: an envelope-encrypted credential blob ref).
-    /// Pins the contract that the dispatcher does NOT mangle the field.
+    /// T3.3: `credential_id` is forwarded verbatim on the wire AND the
+    /// resolved [`crate::saas::runner_protocol::Credential`] envelope rides
+    /// alongside it with the decrypted secret. Pins the contract that:
+    ///   1. The dispatcher does NOT mangle `credential_id`.
+    ///   2. The dispatcher resolves the credential row + decrypts the
+    ///      secret + ships the result on the wire.
+    ///   3. The runner sees the secret bytes byte-for-byte (no
+    ///      double-encoding via base64 or hex).
     #[tokio::test]
-    async fn saas_clone_project_dispatch_forwards_credential_id_verbatim() {
+    async fn saas_clone_project_dispatch_forwards_credential_envelope() {
         use std::sync::Arc;
         use tokio::sync::Mutex as TokioMutex;
 
-        let db = db_with_online_runner("runner-1", "org-saas");
+        let workdir = tempfile::tempdir().expect("workdir");
+        // Build a DB that has BOTH the runners row AND the credentials
+        // table (with a real encrypted row keyed by the test master key).
+        let (db, master_key) = clone_project_test_db_with_credential(
+            "runner-1",
+            "org-saas",
+            "test-user",
+            "stub-cred-42",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\nfake-test-key\n-----END OPENSSH PRIVATE KEY-----\n",
+        );
+        // Persist the master key inside the workdir so the dispatcher's
+        // `resolve_credential_for_dispatch` finds the SAME key (settings_path
+        // → parent → resolve_master_key_path).
+        let key_path = workdir.path().join(".master.key");
+        std::fs::write(&key_path, master_key.as_bytes()).expect("persist key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod key");
+        }
+
         let runners = new_runner_registry();
-        let captured: Arc<TokioMutex<Option<String>>> = Arc::new(TokioMutex::new(None));
+        // (credential_id, decrypted secret) snapshot captured by the
+        // responder closure.
+        type CapturedCloneEnvelope = Option<(Option<String>, Option<Vec<u8>>)>;
+        let captured: Arc<TokioMutex<CapturedCloneEnvelope>> = Arc::new(TokioMutex::new(None));
         let captured_for_responder = captured.clone();
         install_echo_runner(&runners, "runner-1", move |msg| match msg {
-            WireMessage::CloneProject { credential_id, .. } => {
-                let captured = captured_for_responder.clone();
-                // Synchronous closure can't await — block_in_place would be
-                // wrong here. Use try_lock; the responder runs once per
-                // request so contention is impossible.
-                if let Ok(mut g) = captured.try_lock() {
-                    *g = credential_id;
+            WireMessage::CloneProject {
+                credential_id,
+                credential,
+                ..
+            } => {
+                if let Ok(mut g) = captured_for_responder.try_lock() {
+                    *g = Some((credential_id, credential.map(|c| c.secret)));
                 }
                 Some(RunnerResponse::CloneResult {
                     ok: true,
@@ -1783,9 +1905,9 @@ phases:
             _ => None,
         })
         .await;
-        let state = test_app_state(db, runners);
+        let state = test_app_state_with_claude_dir(db, runners, workdir.path());
 
-        let _ = clone_project_dispatch(
+        let outcome = clone_project_dispatch(
             &state,
             "org-saas",
             "https://github.com/x/x.git",
@@ -1793,7 +1915,185 @@ phases:
             Some("stub-cred-42"),
         )
         .await;
-        let got = captured.lock().await.clone();
-        assert_eq!(got.as_deref(), Some("stub-cred-42"));
+        assert!(
+            matches!(outcome, CloneDispatchOutcome::Ok { .. }),
+            "expected Ok, got {outcome:?}"
+        );
+
+        let got = captured.lock().await.clone().expect("responder fired");
+        let (cred_id, secret) = got;
+        assert_eq!(
+            cred_id.as_deref(),
+            Some("stub-cred-42"),
+            "credential_id must round-trip verbatim"
+        );
+        let secret = secret.expect("credential envelope must be on the wire");
+        let secret_str = String::from_utf8(secret.clone()).expect("utf8");
+        assert!(
+            secret_str.contains("fake-test-key"),
+            "decrypted secret must reach the runner verbatim, got: {secret_str:?}"
+        );
+    }
+
+    /// T3.3: when `credential_id` refers to an unknown / archived row,
+    /// the dispatcher returns `CloneFailed` BEFORE the wire roundtrip.
+    /// The runner never sees a half-resolved envelope and the caller
+    /// gets an actionable error.
+    #[tokio::test]
+    async fn saas_clone_project_dispatch_unknown_credential_fails_locally() {
+        let workdir = tempfile::tempdir().expect("workdir");
+        // Build a DB with the credentials table but NO matching row.
+        let (db, _) = clone_project_test_db_with_credential(
+            "runner-1",
+            "org-saas",
+            "test-user",
+            "different-cred",
+            b"placeholder",
+        );
+        let runners = new_runner_registry();
+        // Responder asserts that no CloneProject ever lands on the wire.
+        let was_called: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let was_called_for_responder = was_called.clone();
+        install_echo_runner(&runners, "runner-1", move |msg| match msg {
+            WireMessage::CloneProject { .. } => {
+                was_called_for_responder.store(true, std::sync::atomic::Ordering::SeqCst);
+                Some(RunnerResponse::CloneResult {
+                    ok: true,
+                    resolved_path: Some("should-not-reach".into()),
+                    error: None,
+                })
+            }
+            _ => None,
+        })
+        .await;
+        let state = test_app_state_with_claude_dir(db, runners, workdir.path());
+
+        let outcome = clone_project_dispatch(
+            &state,
+            "org-saas",
+            "https://github.com/x/x.git",
+            "/home/runner/x",
+            Some("does-not-exist"),
+        )
+        .await;
+        match outcome {
+            CloneDispatchOutcome::CloneFailed { error } => {
+                assert!(
+                    error.contains("credential not found"),
+                    "error must name the cause, got: {error}"
+                );
+            }
+            other => panic!("expected CloneFailed for unknown credential, got {other:?}"),
+        }
+        assert!(
+            !was_called.load(std::sync::atomic::Ordering::SeqCst),
+            "runner must not receive CloneProject when credential resolution fails"
+        );
+    }
+
+    // ── T3.3 test helpers ─────────────────────────────────────────────
+
+    /// Build a fully-shaped in-memory DB for credential-resolution tests:
+    /// `runners` + `users` + `credentials` tables, with one online runner
+    /// and one encrypted credential row keyed by a fresh master key.
+    /// Returns the DB and the master key the row was sealed with — caller
+    /// persists the key to disk so the dispatcher can find it.
+    fn clone_project_test_db_with_credential(
+        runner_id: &str,
+        org_id: &str,
+        owner_user_id: &str,
+        credential_id: &str,
+        secret: &[u8],
+    ) -> (Db, crate::crypto::MasterKey) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runners ( \
+               id TEXT PRIMARY KEY, name TEXT, org_id TEXT, status TEXT, \
+               hostname TEXT, version TEXT, last_seen_at TEXT, created_at TEXT \
+             ); \
+             CREATE TABLE users ( \
+               id TEXT PRIMARY KEY, email TEXT NOT NULL, password_hash TEXT, \
+               created_at TEXT NOT NULL DEFAULT (datetime('now')) \
+             ); \
+             CREATE TABLE credentials ( \
+               id TEXT PRIMARY KEY, \
+               owner_user_id TEXT NOT NULL, \
+               name TEXT NOT NULL, \
+               kind TEXT NOT NULL, \
+               public_part TEXT, \
+               encrypted_secret BLOB NOT NULL, \
+               host_hint TEXT, \
+               scopes TEXT, \
+               created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+               archived_at TEXT \
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runners (id, name, org_id, status, last_seen_at) \
+             VALUES (?1, 'test', ?2, 'online', datetime('now'))",
+            params![runner_id, org_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (id, email) VALUES (?1, ?2)",
+            params![owner_user_id, "test@example.com"],
+        )
+        .unwrap();
+        let db: Db = Arc::new(StdMutex::new(conn));
+
+        let master_key = crate::crypto::MasterKey::generate();
+        crate::db::set_credential(
+            &db,
+            &master_key,
+            &crate::db::CredentialInput {
+                id: credential_id,
+                owner_user_id,
+                name: "test-credential",
+                kind: crate::db::CredentialKind::SshKey,
+                public_part: Some("ssh-ed25519 AAAA test"),
+                secret_plaintext: secret,
+                host_hint: Some("github.com"),
+                scopes: None,
+            },
+        )
+        .expect("seed credential");
+        (db, master_key)
+    }
+
+    /// Build a minimal `AppState` with the settings_path pointing inside
+    /// `claude_dir` so [`resolve_credential_for_dispatch`] finds the
+    /// master-key file we persisted there.
+    fn test_app_state_with_claude_dir(
+        db: Db,
+        runners: RunnerRegistry,
+        claude_dir: &std::path::Path,
+    ) -> AppState {
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let plans_dir = claude_dir.join("plans");
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            plans_dir.clone(),
+            claude_dir.to_path_buf(),
+            0,
+            true,
+        );
+        AppState {
+            db,
+            plans_dir,
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners,
+            settings_path: claude_dir.join("settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            started_at: std::time::Instant::now(),
+        }
     }
 }

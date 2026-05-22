@@ -63,6 +63,14 @@ fn seed_bare_origin(workdir: &Path, bare_path: &Path) -> String {
 /// Headline acceptance test for Phase 2.2: clone a "public" repo (local
 /// `file://` bare) into `$HOME/<name>` and verify the project row's
 /// `workspace_path` was updated to the runner-resolved absolute path.
+///
+/// Pre-T3.3 this test passed `credentialId: "stub-no-op-cred"` because
+/// the runner ignored the field. T3.3 introduces real credential
+/// resolution (decrypt secret + ship on wire + materialise as tmpfs
+/// file) so passing a bogus id now (correctly) surfaces as
+/// `credential not found` at clone time. Public repos don't need
+/// credentials anyway — drop the field, the file:// clone works
+/// without one.
 #[test]
 fn clone_project_into_home_updates_workspace_path() {
     let d = TestDashboard::new();
@@ -77,7 +85,6 @@ fn clone_project_into_home_updates_workspace_path() {
         json!({
             "name": "clone-acceptance",
             "repo_url": url,
-            "credentialId": "stub-no-op-cred",
         }),
     );
     assert_eq!(status, 201, "create: {body}");
@@ -217,4 +224,34 @@ fn clone_project_honors_explicit_workspace_path_override() {
         Some(explicit.display().to_string()).as_deref()
     );
     assert!(explicit.join(".git").is_dir());
+}
+
+/// T3.3 E2E: a project pinned to a missing credential id fails the clone
+/// with `clone_failed` and an operator-readable message (`credential not
+/// found: <id>`). Pins the contract that the dispatcher surfaces
+/// credential-resolution errors via the same 500 channel as a real git
+/// failure, so the dashboard's error UI can render both consistently.
+#[test]
+fn clone_project_with_unknown_credential_id_fails_at_clone_time() {
+    let d = TestDashboard::new();
+
+    let (status, body) = d.post(
+        "/api/projects",
+        json!({
+            "name": "bad-cred",
+            "repo_url": "file:///does/not/matter.git",
+            "credentialId": "no-such-credential",
+        }),
+    );
+    assert_eq!(status, 201, "create: {body}");
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = d.post(&format!("/api/projects/{id}/clone"), json!({}));
+    assert_eq!(status, 500, "body: {body}");
+    assert_eq!(body["error"].as_str(), Some("clone_failed"));
+    let message = body["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("credential not found"),
+        "expected 'credential not found' in error, got: {message:?}"
+    );
 }

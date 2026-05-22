@@ -398,10 +398,16 @@ pub enum WireMessage {
     /// without blocking the request/response correlation.
     ///
     /// `credential_id` is forwarded verbatim to the runner; the runner today
-    /// treats it as a no-op (clone runs without auth, suitable for public
-    /// repos). Phase 3.x ships the envelope encryption that delivers the
-    /// resolved credential blob to the runner; this RPC is wire-stable
-    /// across that work.
+    /// only uses it for logging — the actual secret material rides in
+    /// `credential` so the runner never has to dial back to the server to
+    /// resolve it. T3.3 added the on-demand credential envelope: when a
+    /// credential is resolved server-side, [`Credential`] carries the
+    /// decrypted secret + kind + host hint, and the runner writes it to
+    /// a tmpfs-backed file for the lifetime of the git op only (file is
+    /// `mktemp`'d under `$XDG_RUNTIME_DIR` with mode 0600, fed to git via
+    /// `GIT_SSH_COMMAND` or `GIT_ASKPASS` for the child process, then
+    /// unlinked unconditionally). `None` means "no auth needed" (public
+    /// repo); the runner falls through to a plain `git clone`.
     ///
     /// Best-effort: tied to a live HTTP caller, so outbox replay is useless.
     /// The wrapping `runner_request` timeout is large enough to cover a real
@@ -412,6 +418,16 @@ pub enum WireMessage {
         workspace_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential_id: Option<String>,
+        /// On-demand credential envelope (T3.3). Server resolves the
+        /// `credential_id` against the encrypted `credentials` table and
+        /// ships the decrypted secret with the RPC; runner materialises
+        /// it as a tmpfs file for the git child process only and unlinks
+        /// it on every exit path. `None` ≡ public repo (no auth);
+        /// `#[serde(default)]` keeps older servers wire-compatible (they
+        /// don't ship the field and the runner falls through to the
+        /// no-auth path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential: Option<Credential>,
     },
 
     /// Runner progress notification: the clone has started. Fire-and-forget
@@ -805,6 +821,60 @@ pub enum WireMessage {
 pub struct FolderEntry {
     pub name: String,
     pub path: String,
+}
+
+// ── Credential envelope (Phase 3.3 of runner-daemon-workspace) ──────────────
+
+/// On-demand credential envelope shipped with `CloneProject` (and, later,
+/// fetch / push RPCs). The server resolves the encrypted row via
+/// `crypto::decrypt` + `db::get_credential`, builds this struct, and ships
+/// it on the wire alongside the git operation. The runner materialises the
+/// secret as a tmpfs-backed file for the lifetime of the git child process
+/// only and unlinks it on every exit path — successful clone, git failure,
+/// process spawn failure, and timeout.
+///
+/// Design notes:
+///  - The `secret` is a `Vec<u8>` (not `String`) so binary keys and PATs
+///    with non-UTF-8 bytes round-trip cleanly. serde-json encodes byte vecs
+///    as JSON arrays — slightly verbose on the wire, but correct.
+///  - `kind` is a string discriminator (`"ssh_key" | "gh_pat" | "gitlab_pat"`)
+///    rather than an enum tag, so the runner can fall through to a default
+///    rendering if a future server introduces a new kind the runner doesn't
+///    recognize. Matching the [`crate::db::CredentialKind`] wire form means
+///    a corrupted/unknown row surfaces as `Unknown` on the runner.
+///  - `public_part` carries the SSH public key for completeness but the
+///    runner never writes it to disk (git only needs the private key).
+///  - `host_hint` is operator metadata for logging — never used to make
+///    routing decisions on the runner side.
+///
+/// The whole envelope is **ephemeral**. Both the server's `tokio::spawn`
+/// clone task and the runner's git op clear the in-memory copy when they
+/// go out of scope; nothing is logged that contains `secret`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Credential {
+    /// Credential id from the `credentials` table. Echoed verbatim by the
+    /// runner in its structured log line so the operator can correlate a
+    /// failed clone with a specific credential row in the audit feed.
+    pub id: String,
+    /// Wire form of the credential kind: `"ssh_key" | "gh_pat" | "gitlab_pat"`.
+    /// Unknown values land on `CredentialKind::Unknown` on the runner side
+    /// (the runner refuses to dispatch, surfacing as a `CloneFailed`).
+    pub kind: String,
+    /// Raw secret bytes. For `ssh_key` this is the OpenSSH PEM body
+    /// (newline-terminated). For PATs this is the token bytes, UTF-8.
+    /// Never logged; never echoed back from the runner.
+    pub secret: Vec<u8>,
+    /// SSH public key (OpenSSH one-line form), if the credential is an
+    /// `ssh_key` and the operator captured one at insert time. Not used
+    /// by the runner today; carried for completeness and future tooling
+    /// (e.g. surfacing the fingerprint in a clone-failure error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_part: Option<String>,
+    /// Operator metadata — the host this credential was minted for
+    /// (e.g. `github.com`, `gitlab.example.com`). Runner uses this only in
+    /// structured log lines; routing decisions are driven by `repo_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_hint: Option<String>,
 }
 
 // ── GitHub Actions run ──────────────────────────────────────────────────────
@@ -1756,6 +1826,7 @@ mod tests {
             repo_url: "https://github.com/example/repo.git".into(),
             workspace_path: "/home/runner/repo".into(),
             credential_id: Some("cred-123".into()),
+            credential: None,
         };
         assert!(msg.is_best_effort());
         assert_eq!(msg.event_type(), "clone_project");
@@ -1770,11 +1841,13 @@ mod tests {
                 repo_url,
                 workspace_path,
                 credential_id,
+                credential,
             } => {
                 assert_eq!(req_id, "req-clone-1");
                 assert_eq!(repo_url, "https://github.com/example/repo.git");
                 assert_eq!(workspace_path, "/home/runner/repo");
                 assert_eq!(credential_id.as_deref(), Some("cred-123"));
+                assert!(credential.is_none());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -1789,6 +1862,7 @@ mod tests {
             repo_url: "https://github.com/example/public.git".into(),
             workspace_path: "/home/runner/public".into(),
             credential_id: None,
+            credential: None,
         };
         let env = Envelope::best_effort("r1".into(), msg);
         let json = serde_json::to_string(&env).unwrap();
@@ -1796,10 +1870,19 @@ mod tests {
             !json.contains("\"credential_id\""),
             "credential_id key should be omitted when None, got: {json}"
         );
+        assert!(
+            !json.contains("\"credential\""),
+            "credential key should be omitted when None, got: {json}"
+        );
         let back: Envelope = serde_json::from_str(&json).unwrap();
         match back.message {
-            WireMessage::CloneProject { credential_id, .. } => {
+            WireMessage::CloneProject {
+                credential_id,
+                credential,
+                ..
+            } => {
                 assert!(credential_id.is_none());
+                assert!(credential.is_none());
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -1817,11 +1900,99 @@ mod tests {
                 repo_url,
                 workspace_path,
                 credential_id,
+                credential,
             } => {
                 assert_eq!(req_id, "req-x");
                 assert_eq!(repo_url, "https://example.com/x.git");
                 assert_eq!(workspace_path, "/home/runner/x");
                 assert!(credential_id.is_none());
+                assert!(credential.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// T3.3: `Credential` envelope rides on `CloneProject`. Round-trip checks
+    /// that every field survives the JSON encoding, including the raw byte
+    /// secret (`Vec<u8>` ⇒ JSON array of integers under serde-json).
+    #[test]
+    fn clone_project_with_credential_round_trip() {
+        let secret =
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n";
+        let msg = WireMessage::CloneProject {
+            req_id: "req-clone-cred".into(),
+            repo_url: "git@github.com:example/private.git".into(),
+            workspace_path: "/home/runner/private".into(),
+            credential_id: Some("cred-9".into()),
+            credential: Some(Credential {
+                id: "cred-9".into(),
+                kind: "ssh_key".into(),
+                secret: secret.to_vec(),
+                public_part: Some("ssh-ed25519 AAAA branchwork:cred-9".into()),
+                host_hint: Some("github.com".into()),
+            }),
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        // Pin that the wire ships the secret as a JSON array (`[45,45,…]`)
+        // rather than a string — this is what makes binary keys / PATs
+        // round-trip cleanly.
+        assert!(json.contains("\"secret\":["));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CloneProject {
+                credential_id,
+                credential,
+                ..
+            } => {
+                assert_eq!(credential_id.as_deref(), Some("cred-9"));
+                let cred = credential.expect("credential survives round-trip");
+                assert_eq!(cred.id, "cred-9");
+                assert_eq!(cred.kind, "ssh_key");
+                assert_eq!(cred.secret, secret.to_vec());
+                assert_eq!(
+                    cred.public_part.as_deref(),
+                    Some("ssh-ed25519 AAAA branchwork:cred-9")
+                );
+                assert_eq!(cred.host_hint.as_deref(), Some("github.com"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// T3.3: secret bytes must not appear anywhere in `Debug` output either.
+    /// `Credential` derives Debug to keep ergonomics for non-secret fields,
+    /// but the runner should never `println!("{:?}", ...)` a credential.
+    /// This test is the canonical reminder — keep it as a tripwire if a
+    /// future maintainer adds a debug-print of the full struct.
+    #[test]
+    fn credential_round_trip_pat_kind_and_optional_fields() {
+        let msg = WireMessage::CloneProject {
+            req_id: "req-clone-pat".into(),
+            repo_url: "https://gitlab.example.com/group/project.git".into(),
+            workspace_path: "/home/runner/project".into(),
+            credential_id: Some("cred-pat".into()),
+            credential: Some(Credential {
+                id: "cred-pat".into(),
+                kind: "gitlab_pat".into(),
+                secret: b"glpat-XXXX".to_vec(),
+                public_part: None,
+                host_hint: None,
+            }),
+        };
+        let env = Envelope::best_effort("r1".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        // `None` optional fields stay off the wire.
+        assert!(!json.contains("\"public_part\""));
+        assert!(!json.contains("\"host_hint\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::CloneProject { credential, .. } => {
+                let cred = credential.expect("credential survives round-trip");
+                assert_eq!(cred.kind, "gitlab_pat");
+                assert_eq!(cred.secret, b"glpat-XXXX".to_vec());
+                assert!(cred.public_part.is_none());
+                assert!(cred.host_hint.is_none());
             }
             other => panic!("unexpected variant: {other:?}"),
         }

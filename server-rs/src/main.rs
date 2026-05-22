@@ -5,6 +5,7 @@ mod auth;
 mod auto_mode;
 mod ci;
 mod config;
+mod credential_material;
 mod crypto;
 mod db;
 mod file_watcher;

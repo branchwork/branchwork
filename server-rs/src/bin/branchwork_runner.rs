@@ -19,6 +19,8 @@
 
 // Pull in self-contained modules via #[path] so this binary compiles
 // independently of the main branchwork-server crate.
+#[path = "../credential_material.rs"]
+mod credential_material;
 #[path = "../git_helpers.rs"]
 mod git_helpers;
 #[path = "../saas/outbox.rs"]
@@ -2078,6 +2080,7 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             repo_url,
             workspace_path,
             credential_id,
+            credential,
         } => {
             // 1. Send `CloneStarted` immediately so the dashboard can
             //    render progress while the network round-trip is in flight.
@@ -2091,22 +2094,45 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
                 },
             );
 
-            // 2. Shell out on a blocking thread, capped by `CLONE_TIMEOUT`.
+            // 2. T3.3 credential envelope. Log the id (not the secret!)
+            //    so the operator can correlate a failure with a specific
+            //    credentials row in the audit feed. The actual secret
+            //    material is materialised inside `clone_project_on_runner`
+            //    via the RAII `CredentialMaterial` guard.
+            if let Some(cred) = credential.as_ref() {
+                log_info!(
+                    "[runner] clone_project with credential {id} (kind={kind}, host_hint={host:?})",
+                    id = cred.id,
+                    kind = cred.kind,
+                    host = cred.host_hint,
+                );
+            } else if let Some(id) = credential_id.as_deref() {
+                // Server shipped a credential id but no envelope. This
+                // shouldn't happen in normal flow (the dispatcher always
+                // resolves) but degrade gracefully — clone without auth.
+                log_warn!(
+                    "[runner] clone_project: credential_id {id} present but no envelope on wire"
+                );
+            }
+
+            // 3. Shell out on a blocking thread, capped by `CLONE_TIMEOUT`.
             //    Capturing the inputs by value keeps the closure `'static`.
             let req_id_owned = req_id.clone();
             let repo_url_owned = repo_url.clone();
             let workspace_owned = workspace_path.clone();
             let credential_owned = credential_id.clone();
+            let credential_envelope = credential.clone();
             let outcome = run_blocking_with_timeout(CLONE_TIMEOUT, move || {
                 clone_project_on_runner(
                     &repo_url_owned,
                     &workspace_owned,
                     credential_owned.as_deref(),
+                    credential_envelope.as_ref(),
                 )
             })
             .await;
 
-            // 3. Map to the terminal reply. `None` from
+            // 4. Map to the terminal reply. `None` from
             //    `run_blocking_with_timeout` means the wall-clock cap
             //    fired — surface that as `CloneFailed` with a recognizable
             //    reason so the dashboard can render an actionable error
@@ -2746,13 +2772,21 @@ enum CloneOutcome {
 ///  - The parent directory is created via `std::fs::create_dir_all` so
 ///    `git clone` does not error on a missing parent.
 ///
-/// `credential_id` is currently a no-op stub — Phase 3.x ships the
-/// envelope encryption that delivers a resolved credential blob; the
-/// signature is wire-stable across that work.
+/// `credential_id` is echoed in structured logs only.
+///
+/// T3.3 `credential`: when an envelope is on the wire, the runner
+/// materialises the secret as a tmpfs file (0600) via
+/// [`crate::credential_material::CredentialMaterial`], scopes the
+/// resulting env vars (`GIT_SSH_COMMAND` for ssh keys, `GIT_ASKPASS`
+/// for PATs) to the `git clone` child process only via `Command::env`,
+/// and unlinks the file unconditionally on every exit path. The runner's
+/// own environment (`HOME`, `SSH_AUTH_SOCK`, etc.) is untouched so the
+/// operator's interactive workflows are unaffected.
 fn clone_project_on_runner(
     repo_url: &str,
     workspace_path: &str,
     _credential_id: Option<&str>,
+    credential: Option<&runner_protocol::Credential>,
 ) -> CloneOutcome {
     let resolved = resolve_runner_path(workspace_path);
     let resolved_str = resolved.display().to_string();
@@ -2778,11 +2812,35 @@ fn clone_project_on_runner(
         };
     }
 
+    // T3.3: Materialise the credential to a tmpfs file (RAII guard) for
+    // the lifetime of the `git clone` child. Unlinked unconditionally on
+    // every exit path below (Ok success, Ok non-zero exit, Err spawn).
+    let credential_material = match credential {
+        Some(cred) => match credential_material::CredentialMaterial::materialize(cred) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                return CloneOutcome::Err {
+                    error: format!("failed to materialise credential: {e}"),
+                };
+            }
+        },
+        None => None,
+    };
+
     // Shell out. `--no-progress` keeps stderr noise to a minimum so the
     // captured tail is the actual failure reason on the error path.
-    let output = std::process::Command::new("git")
-        .args(["clone", "--no-progress", repo_url, &resolved_str])
-        .output();
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["clone", "--no-progress", repo_url, &resolved_str]);
+    if let Some(m) = credential_material.as_ref() {
+        for (k, v) in m.git_env_vars() {
+            cmd.env(k, v);
+        }
+    }
+    let output = cmd.output();
+    // Drop the RAII guard AFTER `git clone` returns — unlinks the
+    // tmpfs secret file. Explicit so a future maintainer doesn't move
+    // the drop point inadvertently.
+    drop(credential_material);
 
     match output {
         Ok(o) if o.status.success() => CloneOutcome::Ok {
@@ -6477,7 +6535,7 @@ mod tests {
         let bare = workdir.path().join("origin.git");
         let url = seed_bare_origin(workdir.path(), &bare);
         let dest = workdir.path().join("clone-target");
-        let outcome = clone_project_on_runner(&url, &dest.display().to_string(), None);
+        let outcome = clone_project_on_runner(&url, &dest.display().to_string(), None, None);
         match outcome {
             CloneOutcome::Ok { resolved_path } => {
                 assert_eq!(resolved_path, dest.display().to_string());
@@ -6499,8 +6557,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dest = tmp.path().join("already-here");
         std::fs::create_dir_all(&dest).unwrap();
-        let outcome =
-            clone_project_on_runner("file:///does/not/matter", &dest.display().to_string(), None);
+        let outcome = clone_project_on_runner(
+            "file:///does/not/matter",
+            &dest.display().to_string(),
+            None,
+            None,
+        );
         match outcome {
             CloneOutcome::Err { error } => {
                 assert!(
@@ -6522,6 +6584,7 @@ mod tests {
         let outcome = clone_project_on_runner(
             "/tmp/branchwork-no-such-repo-ever",
             &dest.display().to_string(),
+            None,
             None,
         );
         match outcome {
@@ -6546,12 +6609,123 @@ mod tests {
         // Nested destination — the parent does NOT exist yet.
         let dest = tmp.path().join("a/b/c/clone-target");
         assert!(!dest.parent().unwrap().exists());
-        let outcome = clone_project_on_runner(&url, &dest.display().to_string(), None);
+        let outcome = clone_project_on_runner(&url, &dest.display().to_string(), None, None);
         match outcome {
             CloneOutcome::Ok { .. } => {
                 assert!(dest.join(".git").is_dir());
             }
             CloneOutcome::Err { error } => panic!("expected Ok, got Err({error})"),
+        }
+    }
+
+    /// T3.3 pin: a clone with an `ssh_key` credential envelope still
+    /// succeeds against a local bare origin. The materialise + unlink
+    /// lifecycle (file mode 0600, RAII drop) is unit-tested directly in
+    /// `credential_material::tests` — here we exercise the integration
+    /// (envelope flows from wire → materialise → `GIT_SSH_COMMAND` →
+    /// git child) and that the clone produces the expected working tree.
+    #[tokio::test]
+    async fn clone_project_on_runner_materialises_and_unlinks_ssh_credential() {
+        let workdir = TempDir::new().unwrap();
+        let bare = workdir.path().join("origin.git");
+        let url = seed_bare_origin(workdir.path(), &bare);
+        let dest = workdir.path().join("ssh-clone-target");
+
+        let cred = runner_protocol::Credential {
+            id: "cred-test".into(),
+            kind: "ssh_key".into(),
+            // file:// URLs don't actually exercise ssh transport but the
+            // materialise + env-set path is exercised regardless. The
+            // secret bytes are written, GIT_SSH_COMMAND is set on the
+            // child, and the file is unlinked when the RAII guard drops.
+            secret:
+                b"-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n"
+                    .to_vec(),
+            public_part: None,
+            host_hint: Some("github.com".into()),
+        };
+        let outcome = clone_project_on_runner(
+            &url,
+            &dest.display().to_string(),
+            Some("cred-test"),
+            Some(&cred),
+        );
+        match outcome {
+            CloneOutcome::Ok { resolved_path } => {
+                assert_eq!(resolved_path, dest.display().to_string());
+                assert!(dest.join(".git").is_dir(), "clone must succeed");
+                assert!(dest.join("README.md").is_file());
+            }
+            CloneOutcome::Err { error } => panic!("expected Ok, got Err({error})"),
+        }
+    }
+
+    /// T3.3 pin: a clone with a `gh_pat` credential succeeds against a
+    /// local bare origin (PAT path doesn't fire on file:// URLs but the
+    /// materialise+unlink ride alongside). Mirrors the SSH happy path.
+    #[tokio::test]
+    async fn clone_project_on_runner_materialises_and_unlinks_pat_credential() {
+        let workdir = TempDir::new().unwrap();
+        let bare = workdir.path().join("origin.git");
+        let url = seed_bare_origin(workdir.path(), &bare);
+        let dest = workdir.path().join("pat-clone-target");
+
+        let cred = runner_protocol::Credential {
+            id: "cred-pat".into(),
+            kind: "gh_pat".into(),
+            secret: b"ghp_notarealtoken1234".to_vec(),
+            public_part: None,
+            host_hint: Some("github.com".into()),
+        };
+        let outcome = clone_project_on_runner(
+            &url,
+            &dest.display().to_string(),
+            Some("cred-pat"),
+            Some(&cred),
+        );
+        match outcome {
+            CloneOutcome::Ok { resolved_path } => {
+                assert_eq!(resolved_path, dest.display().to_string());
+                assert!(dest.join(".git").is_dir(), "clone must succeed");
+            }
+            CloneOutcome::Err { error } => panic!("expected Ok, got Err({error})"),
+        }
+    }
+
+    /// T3.3 pin: a clone with an empty / malformed credential surfaces as
+    /// `CloneOutcome::Err` BEFORE the `git clone` shell-out. Ensures bad
+    /// envelopes don't leak partial files and don't waste a network round
+    /// trip — the dispatcher already surfaces this as the operator-facing
+    /// error message.
+    #[tokio::test]
+    async fn clone_project_on_runner_rejects_empty_credential_secret() {
+        let workdir = TempDir::new().unwrap();
+        let dest = workdir.path().join("never-clones");
+        let cred = runner_protocol::Credential {
+            id: "cred-empty".into(),
+            kind: "ssh_key".into(),
+            secret: Vec::new(),
+            public_part: None,
+            host_hint: None,
+        };
+        let outcome = clone_project_on_runner(
+            "file:///does/not/matter",
+            &dest.display().to_string(),
+            Some("cred-empty"),
+            Some(&cred),
+        );
+        match outcome {
+            CloneOutcome::Err { error } => {
+                assert!(
+                    error.contains("materialise") || error.contains("empty"),
+                    "expected credential-materialise error, got: {error}"
+                );
+                assert!(
+                    !dest.exists(),
+                    "dest must not be created on materialise error"
+                );
+            }
+            CloneOutcome::Ok { .. } => panic!("expected Err, got Ok"),
         }
     }
 
@@ -6575,6 +6749,7 @@ mod tests {
                 repo_url: url,
                 workspace_path: dest.display().to_string(),
                 credential_id: None,
+                credential: None,
             },
         );
         handle_server_message(&state, &envelope).await;
@@ -6630,6 +6805,7 @@ mod tests {
                 repo_url: "/tmp/branchwork-no-such-repo-ever".into(),
                 workspace_path: dest.display().to_string(),
                 credential_id: None,
+                credential: None,
             },
         );
         handle_server_message(&state, &envelope).await;
