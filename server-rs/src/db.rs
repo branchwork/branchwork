@@ -1026,6 +1026,44 @@ fn migrate(conn: &Connection) {
             holder_meta  TEXT,
             taken_at     TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        -- ── Projects (Phase 2.1 of runner-daemon-workspace) ─────────────────
+        -- Server-driven project creation flow: clone existing OR create new
+        -- on host. Both paths target $HOME/<name> (or operator-overridden
+        -- workspace_path). One row per project. Plans + agents pick up an
+        -- optional project_id FK so the dashboard can render which project a
+        -- plan belongs to without re-parsing cwd strings.
+        --
+        -- Fields:
+        -- - id is a UUID generated server-side.
+        -- - name is operator-friendly (a slug); does NOT need to match the
+        --   on-disk directory basename (workspace_path is the source of
+        --   truth for the on-disk location).
+        -- - repo_url is the clone URL (https:// or git@host:...). Required.
+        -- - host enum: github | gitlab | bitbucket | other. Phase 2.3 uses
+        --   this to dispatch to the right host API for create mode.
+        -- - owner is the host-side owner (org/user); nullable for the other
+        --   host where the concept does not apply.
+        -- - default_credential_id is a forward-looking FK; the credentials
+        --   table lands in Phase 3.1. NULL today.
+        -- - workspace_path is the resolved absolute path on the runner host
+        --   (or local fs in standalone mode); defaults to $HOME/<name> if
+        --   the caller does not override.
+        CREATE TABLE IF NOT EXISTS projects (
+            id                     TEXT PRIMARY KEY,
+            name                   TEXT NOT NULL,
+            repo_url               TEXT NOT NULL,
+            host                   TEXT NOT NULL DEFAULT 'other',
+            owner                  TEXT,
+            default_credential_id  TEXT,
+            workspace_path         TEXT NOT NULL,
+            org_id                 TEXT NOT NULL DEFAULT 'default-org',
+            created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_org_name
+            ON projects(org_id, name);
+        CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(org_id);
         ",
     )
     .expect("failed to run schema migration");
@@ -1331,6 +1369,20 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE agents ADD COLUMN spawn_error TEXT;")
         .ok();
 
+    // Optional project FK on `agents` and `plan_project` (Phase 2.1 of
+    // runner-daemon-workspace). NULL on legacy rows. Future plans created
+    // via the new "New Project" flow will carry a non-NULL value; the
+    // dashboard can then render "agent X belongs to project Y" without
+    // re-parsing `cwd`. No FK constraint declared — SQLite enforces FKs
+    // only when `PRAGMA foreign_keys = ON`, and the rest of the schema
+    // intentionally does not depend on that pragma. Project deletion
+    // logic in `api::projects::delete_project` explicitly nulls these
+    // columns (or leaves them dangling for the operator to clean up).
+    conn.execute_batch("ALTER TABLE agents ADD COLUMN project_id TEXT;")
+        .ok();
+    conn.execute_batch("ALTER TABLE plan_project ADD COLUMN project_id TEXT;")
+        .ok();
+
     // Spawning runner identity (Task 5.5,
     // runner-install-and-spawn-reliability plan). Populated by
     // `spawn_ops::start_agent_via_runner` in SaaS mode with the runner
@@ -1448,6 +1500,7 @@ mod tests {
         assert!(tables.contains(&"plan_snapshots".to_string()));
         assert!(tables.contains(&"plan_runner_affinity".to_string()));
         assert!(tables.contains(&"master_push_lock".to_string()));
+        assert!(tables.contains(&"projects".to_string()));
     }
 
     #[test]

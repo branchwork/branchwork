@@ -173,6 +173,18 @@ pub mod actions {
     pub const SSO_PROVIDER_CREATE: &str = "sso.provider_create";
     pub const SSO_PROVIDER_UPDATE: &str = "sso.provider_update";
     pub const SSO_PROVIDER_DELETE: &str = "sso.provider_delete";
+    /// `POST /api/projects` — operator created a project row via the
+    /// dashboard's New Project flow (Phase 2.1 of
+    /// runner-daemon-workspace). Diff carries `{project_id, name,
+    /// repo_url, host, workspace_path}` so the activity feed can render a
+    /// row pointing at the resolved on-disk location.
+    pub const PROJECT_CREATE: &str = "project.create";
+    /// `DELETE /api/projects/{id}` — operator removed a project. Diff
+    /// carries `{project_id, name, repo_url, workspace_path,
+    /// wipe_on_disk, wipe_failed}` so a post-mortem can tell whether the
+    /// row was the only thing removed or whether the workspace was also
+    /// wiped (and if so, whether the wipe succeeded).
+    pub const PROJECT_DELETE: &str = "project.delete";
 }
 
 /// Resource types for audit entries.
@@ -186,6 +198,7 @@ pub mod resources {
     pub const CONFIG: &str = "config";
     pub const SSO_PROVIDER: &str = "sso_provider";
     pub const RUNNER: &str = "runner";
+    pub const PROJECT: &str = "project";
 }
 
 /// A single audit log entry as returned by the API.

@@ -4,5 +4,6 @@ pub mod ci;
 pub mod git;
 pub mod health;
 pub mod plans;
+pub mod projects;
 pub mod runners;
 pub mod settings;

@@ -424,6 +424,14 @@ async fn run_server(cli: Cli) {
             "/api/plans/{name}/start-session",
             post(api::plans::start_plan_session),
         )
+        // Projects (Phase 2.1 of runner-daemon-workspace). Server-driven
+        // project records: clone OR create-new flow lands rows here; the
+        // dashboard's New Project modal POSTs to this endpoint.
+        .route(
+            "/api/projects",
+            get(api::projects::list_projects).post(api::projects::create_project),
+        )
+        .route("/api/projects/{id}", delete(api::projects::delete_project))
         // Settings
         .route(
             "/api/settings",
