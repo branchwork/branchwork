@@ -40,6 +40,15 @@ pub struct TestDashboard {
 
 impl TestDashboard {
     pub fn new() -> Self {
+        Self::new_with_env(&[])
+    }
+
+    /// Same as [`Self::new`] but passes extra `KEY=VALUE` env vars
+    /// through to the spawned server. Used by tests that need to
+    /// redirect the host-API base URLs at a local mock (Phase 2.3 of
+    /// `runner-daemon-workspace`: `BRANCHWORK_GITHUB_API_BASE`,
+    /// `BRANCHWORK_GITLAB_API_BASE`).
+    pub fn new_with_env(extras: &[(&str, &str)]) -> Self {
         let dir = tempfile::TempDir::new().expect("create tempdir");
         let claude_dir = dir.path().join(".claude");
         let plans_dir = claude_dir.join("plans");
@@ -62,38 +71,40 @@ impl TestDashboard {
 
         let port = free_port();
         let bin = env!("CARGO_BIN_EXE_branchwork-server");
-        let child = Command::new(bin)
-            .args([
-                "--port",
-                &port.to_string(),
-                "--claude-dir",
-                &claude_dir.to_string_lossy(),
-            ])
-            // HOME=tmpdir so `project_dir_for` (home.join(plan.project))
-            // resolves to the scratch project when the YAML's `project:`
-            // field is a bare directory name. USERPROFILE is set as a
-            // best-effort hedge for any caller that does read it, but
-            // `dirs::home_dir()` on Windows goes through
-            // `SHGetKnownFolderPath(FOLDERID_Profile)` and ignores both
-            // env vars — tests that need to redirect home-dir scans on
-            // Windows must use absolute paths or skip (see
-            // `tests/recovery.rs:16` and `tests/folders.rs`).
-            .env("HOME", dir.path())
-            .env("USERPROFILE", dir.path())
-            // Silence server stdout/stderr during tests unless the user
-            // asked for it. Route to piped so we can drain on drop.
-            .stdout(if std::env::var("TEST_SERVER_LOG").is_ok() {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .stderr(if std::env::var("TEST_SERVER_LOG").is_ok() {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .spawn()
-            .expect("spawn branchwork-server");
+        let mut cmd = Command::new(bin);
+        cmd.args([
+            "--port",
+            &port.to_string(),
+            "--claude-dir",
+            &claude_dir.to_string_lossy(),
+        ])
+        // HOME=tmpdir so `project_dir_for` (home.join(plan.project))
+        // resolves to the scratch project when the YAML's `project:`
+        // field is a bare directory name. USERPROFILE is set as a
+        // best-effort hedge for any caller that does read it, but
+        // `dirs::home_dir()` on Windows goes through
+        // `SHGetKnownFolderPath(FOLDERID_Profile)` and ignores both
+        // env vars — tests that need to redirect home-dir scans on
+        // Windows must use absolute paths or skip (see
+        // `tests/recovery.rs:16` and `tests/folders.rs`).
+        .env("HOME", dir.path())
+        .env("USERPROFILE", dir.path())
+        // Silence server stdout/stderr during tests unless the user
+        // asked for it. Route to piped so we can drain on drop.
+        .stdout(if std::env::var("TEST_SERVER_LOG").is_ok() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .stderr(if std::env::var("TEST_SERVER_LOG").is_ok() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
+        for (k, v) in extras {
+            cmd.env(*k, *v);
+        }
+        let child = cmd.spawn().expect("spawn branchwork-server");
 
         let base_url = format!("http://127.0.0.1:{port}");
         wait_healthy(&base_url);

@@ -3,6 +3,8 @@ pub mod billing;
 pub mod ci;
 pub mod credentials;
 pub mod git;
+pub mod github;
+pub mod gitlab;
 pub mod health;
 pub mod plans;
 pub mod projects;
