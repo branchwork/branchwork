@@ -244,7 +244,7 @@ impl Drop for Fixture {
 /// dependencies merged.
 #[test]
 fn diamond_no_conflict_completes_with_clean_history() {
-    run_diamond(Fixture::with_actions(actions_yaml_disjoint_files()));
+    run_diamond(Fixture::with_actions(actions_yaml_disjoint_files()), "task");
 }
 
 /// T1.2 and T1.3 both append to `lib.txt`. Branches share T1.1 as
@@ -252,10 +252,33 @@ fn diamond_no_conflict_completes_with_clean_history() {
 /// this is where the duplicate-history pattern lives.
 #[test]
 fn diamond_same_file_completes_with_clean_history() {
-    run_diamond(Fixture::with_actions(actions_yaml_same_file()));
+    run_diamond(Fixture::with_actions(actions_yaml_same_file()), "task");
 }
 
-fn run_diamond(server: Fixture) {
+/// Phase-cadence variant. With `merge_cadence='phase'` the per-task
+/// merge step doesn't fire between tasks — fan-out tasks (T1.2 + T1.3)
+/// should be able to run truly concurrently because neither is blocked
+/// on the other's merge. The parallelism assertion at the end of
+/// `run_diamond` is the canary: if T1.2 and T1.3 don't overlap, the
+/// dispatcher is serialising parallelisable work, which is the bug
+/// class worktree-per-agent isolation is meant to unblock.
+///
+/// `#[ignore]` for now because the canary is failing as-of 2026-05-22:
+/// the dispatcher serialises T1.2 and T1.3 (single-cwd model, no
+/// per-agent worktrees), so this would keep CI red until the fix
+/// lands. Run explicitly with
+/// `cargo test --features e2e --test diamond_dispatch -- --include-ignored`
+/// to verify when the dispatcher learns to parallelise.
+#[test]
+#[ignore = "documents known parallelism bug; unignore when dispatcher fan-out lands"]
+fn diamond_phase_cadence_runs_fan_out_concurrently() {
+    run_diamond(
+        Fixture::with_actions(actions_yaml_disjoint_files()),
+        "phase",
+    );
+}
+
+fn run_diamond(server: Fixture, cadence: &str) {
     let plan_path = server.plans_dir.join(format!("{PLAN_NAME}.yaml"));
     std::fs::write(&plan_path, plan_yaml()).unwrap();
     let (s, body) = server.put(
@@ -273,10 +296,10 @@ fn run_diamond(server: Fixture) {
     {
         let db = server.db();
         db.execute(
-            "UPDATE plan_auto_mode SET merge_cadence = 'task' WHERE plan_name = ?1",
-            rusqlite::params![PLAN_NAME],
+            "UPDATE plan_auto_mode SET merge_cadence = ?2 WHERE plan_name = ?1",
+            rusqlite::params![PLAN_NAME, cadence],
         )
-        .expect("pin merge_cadence='task'");
+        .expect("pin merge_cadence");
     }
 
     let (s, _) = server.put(
@@ -329,11 +352,16 @@ fn run_diamond(server: Fixture) {
             if !agent_completed {
                 continue;
             }
-            let merged_seen = audit_rows_for_action(&db, "auto_mode.merged")
-                .iter()
-                .any(|(rid, _)| rid.as_deref() == Some(&agent_id));
-            if !merged_seen {
-                continue;
+            // With cadence='task' the auto_mode.merged audit row lands
+            // per task; with cadence='phase' merges are batched at phase
+            // boundary, so we only require auto_finish + completed here.
+            if cadence == "task" {
+                let merged_seen = audit_rows_for_action(&db, "auto_mode.merged")
+                    .iter()
+                    .any(|(rid, _)| rid.as_deref() == Some(&agent_id));
+                if !merged_seen {
+                    continue;
+                }
             }
             drop(db);
             let (s, body) = server.put(
@@ -402,7 +430,27 @@ fn run_diamond(server: Fixture) {
 
     // ── git-history invariants on the scratch project's master ───────
 
-    let log = git_log_subjects(&server.project);
+    // Under cadence='phase' the per-task merges are deferred to the
+    // phase boundary; the merges fire AFTER the task PUTs above. Wait
+    // until every task subject is reachable from master before snapping
+    // the git log — otherwise the assertion races the merge worker.
+    let merge_deadline = Instant::now() + Duration::from_secs(30);
+    let log = loop {
+        let log = git_log_subjects(&server.project);
+        let all_present = all_tasks
+            .iter()
+            .all(|t| log.iter().any(|m| m.contains(&format!("T{t} "))));
+        if all_present {
+            break log;
+        }
+        if Instant::now() >= merge_deadline {
+            panic!(
+                "timed out waiting for all task commits to land on master under \
+                 cadence='{cadence}'; current log: {log:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
 
     // Each task's commit message appears exactly once. Today's
     // duplicate-merge bug (parallel-history merge bringing the same
@@ -430,6 +478,33 @@ fn run_diamond(server: Fixture) {
         is_ancestor(&server.project, &t13, &t14),
         "T1.3 ({t13}) is not an ancestor of T1.4 ({t14})"
     );
+
+    // Parallelism canary: T1.2 and T1.3 are sibling leaves of T1.1 and
+    // have no deps on each other, so an ideal dispatcher runs them
+    // concurrently. We measure overlap by `started_at` / `finished_at`
+    // on the agent rows. Failure here is the signal we're after:
+    // "parallelisable tasks are being serialised."
+    //
+    // Only enforced under `merge_cadence='phase'`; under `'task'` the
+    // post-T1.2 merge step blocks T1.3's dispatch by design, so
+    // overlap is impossible there and the failure would be noise.
+    let db = server.db();
+    if cadence == "phase" {
+        let t12_window = agent_time_window(&db, PLAN_NAME, "1.2");
+        let t13_window = agent_time_window(&db, PLAN_NAME, "1.3");
+        if let (Some((s12, e12)), Some((s13, e13))) = (t12_window, t13_window) {
+            let overlap = s12 < e13 && s13 < e12;
+            assert!(
+                overlap,
+                "T1.2 ({s12}..{e12}) and T1.3 ({s13}..{e13}) ran serialised \
+                 under cadence='phase' — dispatcher is not parallelising \
+                 deps-independent tasks"
+            );
+        } else {
+            panic!("missing started_at / finished_at on T1.2 or T1.3 agent row");
+        }
+    }
+    drop(db);
 
     let _ = &server.dir; // suppress unused on debug-only field
 }
@@ -546,6 +621,27 @@ fn task_status(db: &rusqlite::Connection, plan: &str, task: &str) -> Option<Stri
         |row| row.get::<_, String>(0),
     )
     .ok()
+}
+
+fn agent_time_window(
+    db: &rusqlite::Connection,
+    plan: &str,
+    task: &str,
+) -> Option<(String, String)> {
+    db.query_row(
+        "SELECT started_at, finished_at FROM agents \
+         WHERE plan_name = ?1 AND task_id = ?2 \
+         ORDER BY started_at DESC LIMIT 1",
+        rusqlite::params![plan, task],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        },
+    )
+    .ok()
+    .filter(|(s, e)| !s.is_empty() && !e.is_empty())
 }
 
 fn git_log_subjects(cwd: &Path) -> Vec<String> {
