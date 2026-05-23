@@ -218,19 +218,34 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
         }
     };
 
-    // Push the source branch so CI on the remote can fire.
+    // Push the source branch so CI on the remote can fire. The push may
+    // rebase on a non-fast-forward rejection (auto-bump bot pushed first
+    // is the canonical case on this very repo); we capture the
+    // POST-rebase sha out of the report so the `ci_runs` row below uses
+    // the sha that actually landed on `origin/<branch>` — which is the
+    // sha GitHub Actions runs CI on — instead of the pre-rebase
+    // `merged_sha`. Pre-fix, recording `merged_sha` made
+    // `gh run list --commit <sha>` come back empty forever on every
+    // rebased push, the poller never found a run, and the row aged out
+    // to `status="unknown"` after `MAX_RUN_AGE_SECS`. That was the
+    // Branchwork-only "CI never gets captured" symptom (Reglyze has no
+    // auto-bump bot so its task sha == its pushed sha and the bug never
+    // fired). Empty `retries` (the common case, first-attempt push
+    // landed) falls through to `merged_sha`.
     let push =
         crate::agents::git_ops::push_branch(&db, &runners, &org_id, &cwd, &source_branch).await;
-    match push {
+    let effective_sha = match push {
         Ok(Ok(report)) => {
-            println!("[ci] pushed {source_branch} ({merged_sha}) to origin");
             // One audit row + one WS broadcast per rebase retry. Empty
             // `retries` means the very first push attempt landed cleanly
             // (the common case); a non-empty list means a sibling
             // agent / auto-bump won the race and we rebased to absorb it.
             // SaaS-mode runners discard `retries` today (see
             // `agents::git_ops::push_branch` docstring) — only standalone
-            // produces this trail.
+            // produces this trail, which also means the sha-fix below
+            // only fires on the standalone path. SaaS mode keeps the
+            // pre-existing behaviour (records `merged_sha`) until the
+            // wire protocol grows a way to carry the post-rebase sha.
             for retry in &report.retries {
                 let diff = serde_json::json!({
                     "kind": "auto_push_rebase_retry",
@@ -266,6 +281,13 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
                     }),
                 );
             }
+            let sha = report
+                .retries
+                .last()
+                .map(|r| r.last_rebase_sha.clone())
+                .unwrap_or_else(|| merged_sha.clone());
+            println!("[ci] pushed {source_branch} ({sha}) to origin");
+            sha
         }
         Ok(Err(crate::git_helpers::PushError::RebaseConflict { files })) => {
             // Same-line overlap between the rebased commit and a commit
@@ -325,9 +347,14 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
             eprintln!("[ci] push dispatch failed for {source_branch}: {e}");
             return;
         }
-    }
+    };
 
-    // Record pending row.
+    // Record pending row. `effective_sha` is the sha that actually landed
+    // on `origin/<branch>` — equal to `merged_sha` when the first push
+    // attempt succeeded, or `report.retries.last().last_rebase_sha` when
+    // a non-fast-forward forced a rebase. The poller in `poll_once` keys
+    // its `gh run list --commit <sha>` lookup off `commit_sha`, so this
+    // is the value that has to match GitHub Actions' headSha.
     let run_id = {
         let conn = db.lock().unwrap();
         conn.execute(
@@ -338,7 +365,7 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
                 plan_name,
                 task_number,
                 agent_id,
-                merged_sha,
+                effective_sha,
                 task_branch,
                 org_id
             ],
@@ -355,7 +382,7 @@ pub async fn trigger_after_merge(args: TriggerArgs) {
             "plan_name": plan_name,
             "task_number": task_number,
             "status": "pending",
-            "commit_sha": merged_sha,
+            "commit_sha": effective_sha,
             "run_url": serde_json::Value::Null,
             "run_id": run_id,
         }),

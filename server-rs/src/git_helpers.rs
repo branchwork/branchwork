@@ -263,7 +263,12 @@ pub struct RebaseRetry {
     /// `attempt: 1` and `attempt: 2`.
     pub attempt: usize,
     /// `git rev-parse HEAD` AFTER `git pull --rebase --autostash` — the
-    /// local SHA we will retry-push. Diagnostic only.
+    /// local SHA we retry-pushed (and, on success of the final attempt,
+    /// the sha that actually landed on `origin/<branch>`). Consumed by
+    /// `ci::trigger_after_merge` to record the *post-rebase* sha in
+    /// `ci_runs.commit_sha`, because that's the headSha GitHub Actions
+    /// keys its `gh run list --commit <sha>` against; the pre-rebase
+    /// sha is invisible to GitHub's CI lookup.
     pub last_rebase_sha: String,
     /// `git rev-parse refs/remotes/origin/<branch>` AFTER the rebase — the
     /// origin HEAD that beat us in the race (i.e. the SHA we rebased
