@@ -38,6 +38,7 @@ const CredentialsPage = lazy(() =>
 );
 import { Toaster } from "./components/Toaster.js";
 import { ConnectionBanner } from "./components/ConnectionBanner.js";
+import { LearningsDuePanel } from "./components/LearningsDuePanel.js";
 import { RunnerStatus } from "./components/RunnerStatus.js";
 import { OrgChip } from "./components/OrgChip.js";
 import { EnsurePlan } from "./components/EnsurePlan.js";
@@ -140,6 +141,11 @@ export function App() {
 
       <main className="flex-1 flex overflow-hidden min-h-0">
         <div className="flex-1 overflow-auto">
+          {/* Pending-learning queue (Phase 1.4 of learning-hub-ci-failure-
+              capture). Mounts at the top of every route so an agent
+              blocked on a CI failure is always visible until somebody
+              captures a learning. Self-hides on empty queue. */}
+          <LearningsDuePanel />
           <Routes>
             <Route path="/" element={<ProjectDashboard />} />
             <Route path="/plans" element={<ProjectDashboard />} />

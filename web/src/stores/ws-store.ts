@@ -7,6 +7,7 @@ import {
 import { getInFlightAgentsFetch, useAgentStore } from "./agent-store.js";
 import { useSettingsStore } from "./settings-store.js";
 import { useRunnerStore, type RunnerDriverInfo } from "./runner-store.js";
+import { useLearningsStore } from "./learnings-store.js";
 import { parseWsMessage, type WsMessage } from "../schemas/ws-events.js";
 import { notify } from "../lib/notifications.js";
 
@@ -168,6 +169,14 @@ export const useWsStore = create<WsStore>((set, get) => ({
         for (const planName of Object.keys(planStore.planConfigs)) {
           planStore.fetchPlanConfig(planName).catch(() => {});
         }
+        // Pending-learnings queue: any `ci_failure_observed` /
+        // resolution that fired during the disconnect was lost. Only
+        // matters when the panel is mounted, but the fetch is cheap
+        // and idempotent — refetch unconditionally on reconnect.
+        useLearningsStore
+          .getState()
+          .fetchPending()
+          .catch(() => {});
       }
     };
 
@@ -641,6 +650,17 @@ function dispatch(msg: WsMessage) {
         // collapse with plan_updated events.
         schedulePlansRefetch();
       });
+      // Pending-learnings panel: any task-status change can imply a
+      // resolved `ci_failure_events` row (e.g. agent ran
+      // `capture_learning` followed by `update_task_status`, or HTTP
+      // `add_task_learning` cleared the gate then the agent advanced).
+      // Refetch the queue so the panel re-renders empty without
+      // polling. Fire-and-forget — fetch failures are swallowed and
+      // logged inside the store.
+      useLearningsStore
+        .getState()
+        .fetchPending()
+        .catch(() => {});
       break;
     }
     case "ci_status_changed": {
@@ -680,6 +700,21 @@ function dispatch(msg: WsMessage) {
         error: d.error,
         timestamp: Date.now(),
       });
+      break;
+    }
+    case "ci_failure_observed": {
+      // Phase 1, Task 1.4: a typed CI failure was observed on a live
+      // agent's branch and a `ci_failure_events` row was inserted with
+      // `resolved_at IS NULL` — the pending-learning gate is now active
+      // for that (plan, task). Refetch the queue so the "Learnings due"
+      // panel renders the new row without polling. The event payload
+      // already has everything the row needs but the server-side LEFT
+      // JOIN with `agents` adds `agentStatus` so we'd have to mirror
+      // that JOIN client-side to patch in place — cheaper to refetch.
+      useLearningsStore
+        .getState()
+        .fetchPending()
+        .catch(() => {});
       break;
     }
     case "phase_advanced": {

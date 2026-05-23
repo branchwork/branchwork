@@ -492,6 +492,27 @@ const CloneFailed = v.object({
   }),
 });
 
+/// A typed CI failure event was observed on a live agent's branch
+/// (Phase 1, Task 1.1). Fires from `ci.rs::record_ci_failure_observed`
+/// at most once per `(agent_id, run_id)` pair. The "Learnings due"
+/// panel listens for this to refetch its queue without polling.
+const CiFailureObserved = v.object({
+  type: v.literal("ci_failure_observed"),
+  data: v.object({
+    agent_id: v.string(),
+    plan_name: v.string(),
+    task_number: NullishStr,
+    branch: v.string(),
+    run_id: v.string(),
+    run_url: NullishStr,
+    workflow: NullishStr,
+    conclusion: NullishStr,
+    failed_job: v.nullish(v.unknown()),
+    summary: NullishStr,
+    org_id: v.string(),
+  }),
+});
+
 export const WsMessageSchema = v.variant("type", [
   Connected,
   PlanUpdated,
@@ -534,6 +555,7 @@ export const WsMessageSchema = v.variant("type", [
   CloneStarted,
   CloneDone,
   CloneFailed,
+  CiFailureObserved,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;

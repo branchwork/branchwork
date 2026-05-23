@@ -7,6 +7,7 @@ import { useToastStore } from "../stores/toast-store.js";
 import { useWsStore } from "../stores/ws-store.js";
 import { useCredentialsStore } from "../stores/credentials-store.js";
 import { useProjectsStore } from "../stores/projects-store.js";
+import { useLearningsStore } from "../stores/learnings-store.js";
 
 /// Drop every dashboard store (except `auth-store`) back to its initial
 /// shape. Single source of truth for the "I just signed out, drop the
@@ -53,5 +54,10 @@ export function resetAllStores(): void {
   // user A's projects to user B during a signup-after-logout flow on
   // the same machine.
   useProjectsStore.getState().reset();
+  // Org-scoped: pending learnings are listed via `GET /api/learnings/pending`
+  // filtered by the caller's org so a logout MUST wipe them to avoid
+  // showing user A's pending failures to user B during a signup-after-
+  // logout flow on the same machine.
+  useLearningsStore.getState().reset();
   useToastStore.getState().clear();
 }

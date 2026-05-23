@@ -6,6 +6,7 @@ pub mod git;
 pub mod github;
 pub mod gitlab;
 pub mod health;
+pub mod learnings;
 pub mod plans;
 pub mod projects;
 pub mod runners;

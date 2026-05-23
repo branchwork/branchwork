@@ -412,6 +412,15 @@ async fn run_server(cli: Cli) {
             axum::routing::delete(api::ci::dismiss_run),
         )
         .route("/api/ci/{ci_run_id}/failure-log", get(api::ci::failure_log))
+        // Pending-learning queue (Phase 1.4 of learning-hub-ci-failure-capture):
+        // dashboard surface for ci_failure_events rows where resolved_at IS NULL.
+        // The list endpoint is the data source for the "Learnings due" panel;
+        // the log endpoint backs its per-row drilldown.
+        .route("/api/learnings/pending", get(api::learnings::list_pending))
+        .route(
+            "/api/learnings/pending/{event_id}/log",
+            get(api::learnings::fetch_log),
+        )
         // Per-branch push lock: external auto-bump CI shares the same
         // master_push_lock table the in-process auto-mode flow holds
         // during merge → push, so the two never race to push to origin.
