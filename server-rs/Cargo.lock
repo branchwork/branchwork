@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "branchwork-server"
-version = "0.5.90"
+version = "0.5.91"
 dependencies = [
  "aes-gcm",
  "axum",
