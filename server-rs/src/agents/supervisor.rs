@@ -195,6 +195,16 @@ pub fn log_path(socket: &Path) -> PathBuf {
     socket.with_extension("log")
 }
 
+/// Path of the exit-code sibling to `socket`. The supervisor writes the
+/// PTY child's wait()-reported exit code here just before unlinking the
+/// pidfile, so `on_agent_exit` can distinguish a non-zero agent exit
+/// (failed) from a clean exit (completed). Missing file is treated as
+/// "no information" → defaults to the pre-exit-code-tracking behaviour
+/// (clean exit = completed) for backwards-compat with older daemons.
+pub fn exitcode_path(socket: &Path) -> PathBuf {
+    socket.with_extension("exitcode")
+}
+
 /// Build the argv passed to `branchwork-server session …` for a new agent
 /// daemon. Pure: returns owned strings so tests can inspect them without
 /// chasing lifetimes through `spawn_detached`.
@@ -472,11 +482,23 @@ async fn run_daemon(args: SessionArgs) -> io::Result<()> {
         }
     }
 
-    // Best-effort cleanup: kill the child, drop the pidfile, and on Unix
-    // unlink the socket file. The log file is already flushed on every chunk.
-    {
+    // Best-effort cleanup: kill the child (idempotent if already exited),
+    // wait() it to reap + capture the exit code, drop the pidfile, and on
+    // Unix unlink the socket file. The log file is already flushed on
+    // every chunk.
+    //
+    // The exit code is persisted to `<socket>.exitcode` BEFORE the pidfile
+    // is unlinked so `on_agent_exit` can read it: a non-zero code means
+    // the agent process died with an error (panic, scripted_agent
+    // exit_code, real-claude crash, …) and the row should land as
+    // `failed` rather than `completed`. Pre-fix this was conflated.
+    let exit_code: Option<i32> = {
         let mut c = child.lock().unwrap();
         let _ = c.kill();
+        c.wait().ok().map(|s| s.exit_code() as i32)
+    };
+    if let Some(code) = exit_code {
+        let _ = std::fs::write(exitcode_path(&socket), code.to_string());
     }
     let _ = std::fs::remove_file(pidfile_path(&socket));
     #[cfg(unix)]

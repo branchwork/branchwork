@@ -535,12 +535,29 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
     let socket_path = registry.socket_for(agent_id);
     let supervisor_crashed = supervisor::pidfile_path(&socket_path).exists();
 
+    // The supervisor writes the PTY child's exit code to a sibling file
+    // just before unlinking the pidfile; absent file means "old daemon,
+    // no signal" and we fall back to the pre-fix completed default.
+    // Non-zero exit means the agent process died with an error
+    // (panic / scripted_agent crash / real-claude SIGKILL during a hook /
+    // ...) and the row must surface that rather than masquerade as a
+    // clean completion. See the diamond_dispatch harness's
+    // `agent_crash_before_commit` + `agent_crash_after_commit` probes.
+    let child_exit_code: Option<i32> =
+        std::fs::read_to_string(supervisor::exitcode_path(&socket_path))
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+
     // Only flip `running → <terminal>`. If the row is already `killed` (from
     // kill_agent) or `failed` we leave the terminal status alone — but we
     // still stamp cost_usd so the UI reports spend accurately regardless of
     // how the agent ended.
-    let (new_status, stop_reason) = if supervisor_crashed {
-        ("failed", Some("supervisor_unreachable"))
+    let (new_status, stop_reason): (&str, Option<String>) = if supervisor_crashed {
+        ("failed", Some("supervisor_unreachable".to_string()))
+    } else if let Some(c) = child_exit_code
+        && c != 0
+    {
+        ("failed", Some(format!("agent_exit_{c}")))
     } else {
         ("completed", None)
     };
@@ -577,11 +594,12 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
 
     registry.agents.lock().await.remove(agent_id);
 
-    // Clean up the per-agent socket / pidfile siblings. Log stays so the
-    // full transcript is still recoverable post-mortem.
+    // Clean up the per-agent socket / pidfile / exitcode siblings. Log
+    // stays so the full transcript is still recoverable post-mortem.
     #[cfg(unix)]
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(supervisor::pidfile_path(&socket_path));
+    let _ = std::fs::remove_file(supervisor::exitcode_path(&socket_path));
 
     // Clean up the per-session settings file written by `start_pty_agent`.
     // Best-effort, mirrors the silence of the socket/pidfile lines above:
