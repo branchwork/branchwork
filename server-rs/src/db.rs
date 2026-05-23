@@ -1064,6 +1064,35 @@ fn migrate(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_ci_runs_plan_task ON ci_runs(plan_name, task_number);
         CREATE INDEX IF NOT EXISTS idx_ci_runs_status ON ci_runs(status);
 
+        -- Typed log of CI failures observed on a branch owned by a live
+        -- agent. One row per (agent_id, run_id) pair — the UNIQUE index
+        -- gives us cheap idempotency on retry: re-polling the same red
+        -- run for the same agent does NOT duplicate the row. Written by
+        -- ci.rs whenever a ci_runs row transitions to status=failure
+        -- and a matching agent (status IN running|starting and branch
+        -- equal to the ci_runs branch) is found. Out-of-band tools that
+        -- accumulate per-agent learnings (Phase 1.2+) consume this
+        -- table; rows with no surviving agent are not inserted.
+        CREATE TABLE IF NOT EXISTS ci_failure_events (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id     TEXT    NOT NULL,
+            plan_name    TEXT    NOT NULL,
+            task_number  TEXT,
+            branch       TEXT    NOT NULL,
+            run_id       TEXT    NOT NULL,
+            run_url      TEXT,
+            workflow     TEXT,
+            conclusion   TEXT,
+            failed_job   TEXT,
+            summary      TEXT,
+            org_id       TEXT    NOT NULL DEFAULT 'default-org',
+            observed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ci_failure_events_agent_run
+            ON ci_failure_events(agent_id, run_id);
+        CREATE INDEX IF NOT EXISTS idx_ci_failure_events_plan_task
+            ON ci_failure_events(plan_name, task_number);
+
         -- Multi-tenancy: organizations and membership
         CREATE TABLE IF NOT EXISTS organizations (
             id         TEXT PRIMARY KEY,
@@ -1799,6 +1828,125 @@ mod tests {
         assert!(tables.contains(&"master_push_lock".to_string()));
         assert!(tables.contains(&"projects".to_string()));
         assert!(tables.contains(&"credentials".to_string()));
+        assert!(tables.contains(&"ci_failure_events".to_string()));
+    }
+
+    /// Phase 1, Task 1.1: `ci_failure_events` schema round-trip plus
+    /// the load-bearing UNIQUE INDEX on `(agent_id, run_id)`. Inserting
+    /// the same pair twice must fail at the DB layer — that is the
+    /// substrate `record_ci_failure_observed` rides for idempotency.
+    #[test]
+    fn ci_failure_events_unique_per_agent_and_run() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ci_failure_events \
+                 (agent_id, plan_name, task_number, branch, run_id, \
+                  run_url, workflow, conclusion, failed_job, summary) \
+             VALUES ('agent-1', 'plan-a', '1.1', 'branchwork/x/1.1', \
+                     '12345', 'https://gh/.../runs/12345', \
+                     'tests.yml', 'failure', NULL, 'CI tripped')",
+            [],
+        )
+        .unwrap();
+
+        let dup = conn.execute(
+            "INSERT INTO ci_failure_events \
+                 (agent_id, plan_name, task_number, branch, run_id) \
+             VALUES ('agent-1', 'plan-a', '1.1', 'branchwork/x/1.1', '12345')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "second insert with same (agent_id, run_id) must trip the UNIQUE index"
+        );
+
+        // Different agent, same run id ⇒ allowed (a fix-agent on the
+        // same branch is its own learning author).
+        conn.execute(
+            "INSERT INTO ci_failure_events \
+                 (agent_id, plan_name, task_number, branch, run_id) \
+             VALUES ('agent-2', 'plan-a', '1.1', 'branchwork/x/1.1', '12345')",
+            [],
+        )
+        .expect("different agent_id ⇒ different (agent_id, run_id) tuple ⇒ allowed");
+
+        // Same agent, different run id ⇒ allowed (the agent may
+        // observe multiple red runs across time).
+        conn.execute(
+            "INSERT INTO ci_failure_events \
+                 (agent_id, plan_name, task_number, branch, run_id) \
+             VALUES ('agent-1', 'plan-a', '1.1', 'branchwork/x/1.1', '99999')",
+            [],
+        )
+        .expect("different run_id ⇒ allowed");
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ci_failure_events WHERE plan_name = 'plan-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 3, "three legitimate rows survived the constraint");
+    }
+
+    /// Defaults: `observed_at = datetime('now')`, `org_id = 'default-org'`
+    /// when unspecified, optional metadata columns nullable.
+    #[test]
+    fn ci_failure_events_defaults_round_trip() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ci_failure_events \
+                 (agent_id, plan_name, branch, run_id) \
+             VALUES ('agent-1', 'plan-a', 'branchwork/x/1.1', '12345')",
+            [],
+        )
+        .unwrap();
+
+        type Defaults = (
+            String,         // org_id
+            Option<String>, // task_number
+            Option<String>, // run_url
+            Option<String>, // workflow
+            Option<String>, // conclusion
+            Option<String>, // failed_job
+            Option<String>, // summary
+            String,         // observed_at
+        );
+        let (org_id, task_number, run_url, workflow, conclusion, failed_job, summary, observed_at): Defaults = conn
+            .query_row(
+                "SELECT org_id, task_number, run_url, workflow, \
+                        conclusion, failed_job, summary, observed_at \
+                   FROM ci_failure_events WHERE agent_id = 'agent-1'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(org_id, "default-org");
+        assert_eq!(task_number, None);
+        assert_eq!(run_url, None);
+        assert_eq!(workflow, None);
+        assert_eq!(conclusion, None);
+        assert_eq!(failed_job, None);
+        assert_eq!(summary, None);
+        assert!(
+            !observed_at.is_empty(),
+            "observed_at must default to datetime('now')"
+        );
     }
 
     #[test]

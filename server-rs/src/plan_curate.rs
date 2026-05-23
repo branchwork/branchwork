@@ -586,6 +586,18 @@ mod tests {
             params![plan],
         )
         .unwrap();
+        // Phase 1, Task 1.1: one ci_failure_events row so the
+        // snapshot round-trip test exercises this cascade table too.
+        conn.execute(
+            "INSERT INTO ci_failure_events \
+                 (agent_id, plan_name, task_number, branch, run_id, \
+                  workflow, conclusion, summary) \
+             VALUES ('agent-audit-cf', ?1, '1.1', 'branchwork/x/1.1', \
+                     '99999', 'tests.yml', 'failure', \
+                     'workflow `tests.yml` finished as `failure` (run 99999)')",
+            params![plan],
+        )
+        .unwrap();
     }
 
     fn read_snapshot_row(

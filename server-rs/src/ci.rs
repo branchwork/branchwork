@@ -415,12 +415,17 @@ async fn poll_once(state: &AppState, project_dirs: &std::collections::HashMap<St
 
     // Snapshot open rows — hold the lock only briefly. Joining through
     // agents to pick up org_id; rows with NULL agent_id (legacy/manual
-    // inserts) get NULL here and we skip them.
+    // inserts) get NULL here and we skip them. `branch` lifts off the
+    // ci_runs row itself (not the agent join) so a CiFailureObserved
+    // event can be recorded even when the original spawning agent has
+    // since exited — the live-agent lookup in
+    // `record_ci_failure_observed` re-resolves by (plan_name, branch).
     struct Row {
         id: i64,
         plan_name: String,
         task_number: String,
         commit_sha: Option<String>,
+        branch: Option<String>,
         status: String,
         age_secs: i64,
         org_id: Option<String>,
@@ -428,7 +433,8 @@ async fn poll_once(state: &AppState, project_dirs: &std::collections::HashMap<St
     let rows: Vec<Row> = {
         let conn = db.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT c.id, c.plan_name, c.task_number, c.commit_sha, c.status, \
+            "SELECT c.id, c.plan_name, c.task_number, c.commit_sha, c.branch, \
+                    c.status, \
                     CAST(strftime('%s','now') - strftime('%s', c.created_at) AS INTEGER), \
                     a.org_id \
              FROM ci_runs c \
@@ -445,9 +451,10 @@ async fn poll_once(state: &AppState, project_dirs: &std::collections::HashMap<St
                 plan_name: r.get(1)?,
                 task_number: r.get(2)?,
                 commit_sha: r.get(3)?,
-                status: r.get(4)?,
-                age_secs: r.get(5)?,
-                org_id: r.get(6)?,
+                branch: r.get(4)?,
+                status: r.get(5)?,
+                age_secs: r.get(6)?,
+                org_id: r.get(7)?,
             })
         })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
@@ -535,6 +542,41 @@ async fn poll_once(state: &AppState, project_dirs: &std::collections::HashMap<St
                         run_url.as_deref(),
                         agg.failing_run_id.as_deref(),
                     );
+
+                    // Phase 1, Task 1.1: typed event on RED transition.
+                    // Only the failure ⇢ {anything ≠ failure} edge fires
+                    // a CiFailureObserved row; aging out from
+                    // pending/running to failure is the canonical
+                    // trigger. The row.status guard above (new_status
+                    // != row.status) plus this `new_status == failure`
+                    // check together mean we never re-emit on subsequent
+                    // poll cycles that observe the same failed status,
+                    // and the UNIQUE INDEX inside
+                    // `record_ci_failure_observed` is the
+                    // belt-and-braces against any pathological case
+                    // (e.g. a manual UPDATE flipped the row back to
+                    // pending and CI failed again later — that is a
+                    // legitimately new failure observation and gets a
+                    // fresh row).
+                    if new_status == "failure"
+                        && let Some(run_id) = agg.failing_run_id.as_deref()
+                    {
+                        let workflow = failing_workflow_name(&agg);
+                        let summary =
+                            compose_failure_summary(workflow, agg.conclusion.as_deref(), run_id);
+                        record_ci_failure_observed(
+                            db,
+                            broadcast_tx,
+                            &row.plan_name,
+                            Some(&row.task_number),
+                            row.branch.as_deref(),
+                            run_id,
+                            run_url.as_deref(),
+                            workflow,
+                            agg.conclusion.as_deref(),
+                            Some(&summary),
+                        );
+                    }
                 }
             }
             None => {
@@ -644,6 +686,185 @@ fn update_row(
     println!("[ci] {plan_name}/{task_number} → {status}{note}");
 }
 
+// ── CiFailureObserved (Phase 1, Task 1.1) ───────────────────────────────────
+
+/// Result of an attempt to record a typed CI failure event for a live
+/// agent. Returned by [`record_ci_failure_observed`] so the caller can
+/// decide whether to also fire the WS broadcast (only on first insert,
+/// never on duplicate-on-retry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureObservedRecord {
+    /// First time this `(agent_id, run_id)` pair was seen — row written,
+    /// broadcast follows.
+    Inserted,
+    /// Pair already on file (idempotent retry). No-op; no broadcast.
+    Existing,
+    /// No live agent currently owns the branch the failing run lives on.
+    /// Per the Phase 1 contract, no row is written — the learning
+    /// substrate only accumulates events tied to a known author. The
+    /// caller logs and moves on.
+    NoLiveAgent,
+}
+
+/// Resolve the live agent that owns `branch` on `plan_name`, INSERT OR
+/// IGNORE a `ci_failure_events` row, and broadcast `ci_failure_observed`
+/// when (and only when) the insert actually happened.
+///
+/// Idempotency is enforced by the UNIQUE INDEX on
+/// `(agent_id, run_id)` declared in `db::migrate` — a re-poll of the
+/// same red run for the same agent collapses to `Existing` with zero
+/// extra work. Cross-agent retries (e.g. a fix-agent on the same
+/// branch ref racing the original task agent) are intentionally
+/// allowed: a fresh `(agent_id, run_id)` pair gets its own row.
+///
+/// "Live agent" = `agents` row where `status IN ('running', 'starting')`
+/// AND `branch = ?1` AND `plan_name = ?2`. Ties broken by most-recent
+/// `started_at`; the schema doesn't UNIQUE-constrain (plan_name, branch)
+/// so an extra defensive sort costs nothing.
+///
+/// `failed_job` stays NULL in v1 — populating it requires walking
+/// `gh run view <id> --json jobs` which is a follow-up to keep this
+/// helper synchronous and SaaS-mode-friendly. Downstream consumers
+/// should treat `failed_job` as best-effort metadata, not a contract.
+#[allow(clippy::too_many_arguments)] // every arg is wire-shape, not refactorable.
+fn record_ci_failure_observed(
+    db: &Db,
+    broadcast_tx: &broadcast::Sender<String>,
+    plan_name: &str,
+    task_number: Option<&str>,
+    branch: Option<&str>,
+    run_id: &str,
+    run_url: Option<&str>,
+    workflow: Option<&str>,
+    conclusion: Option<&str>,
+    summary: Option<&str>,
+) -> FailureObservedRecord {
+    // No branch on the ci_runs row means there's nothing for an agent to
+    // own — legacy/manual inserts pre-multi-tenancy can land in that
+    // shape. Treat as "no live agent" rather than fabricating ownership.
+    let Some(branch) = branch else {
+        return FailureObservedRecord::NoLiveAgent;
+    };
+
+    // Resolve owning live agent + the row's org_id in one shot. The
+    // `status IN ('running','starting')` filter is the load-bearing
+    // gate: completed/killed/failed agents are not part of the
+    // learning substrate (the auto-mode loop already audits their
+    // terminal state via agent_stopped + auto_mode_paused). The JOIN
+    // returns NULL for agents without a row in `organizations` —
+    // fine, we just fall back to `default-org` to match the rest of
+    // ci.rs.
+    let agent: Option<(String, String)> = {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT id, COALESCE(org_id, 'default-org') \
+               FROM agents \
+              WHERE plan_name = ?1 \
+                AND branch = ?2 \
+                AND status IN ('running', 'starting') \
+              ORDER BY started_at DESC \
+              LIMIT 1",
+            params![plan_name, branch],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()
+    };
+
+    let Some((agent_id, org_id)) = agent else {
+        return FailureObservedRecord::NoLiveAgent;
+    };
+
+    // INSERT OR IGNORE leans on the UNIQUE index on (agent_id, run_id)
+    // — `changes()` tells us whether the row was actually written.
+    let inserted = {
+        let conn = db.lock().unwrap();
+        let affected = conn
+            .execute(
+                "INSERT OR IGNORE INTO ci_failure_events \
+                     (agent_id, plan_name, task_number, branch, \
+                      run_id, run_url, workflow, conclusion, \
+                      failed_job, summary, org_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
+                params![
+                    agent_id,
+                    plan_name,
+                    task_number,
+                    branch,
+                    run_id,
+                    run_url,
+                    workflow,
+                    conclusion,
+                    summary,
+                    org_id,
+                ],
+            )
+            .unwrap_or(0);
+        affected > 0
+    };
+
+    if !inserted {
+        return FailureObservedRecord::Existing;
+    }
+
+    broadcast_event(
+        broadcast_tx,
+        "ci_failure_observed",
+        serde_json::json!({
+            "agent_id": agent_id,
+            "plan_name": plan_name,
+            "task_number": task_number,
+            "branch": branch,
+            "run_id": run_id,
+            "run_url": run_url,
+            "workflow": workflow,
+            "conclusion": conclusion,
+            "failed_job": serde_json::Value::Null,
+            "summary": summary,
+            "org_id": org_id,
+        }),
+    );
+
+    println!(
+        "[ci-failure] {plan_name}/{} ({workflow}): red run {run_id} \
+         observed on branch {branch} (agent {agent_id})",
+        task_number.unwrap_or("?"),
+        workflow = workflow.unwrap_or("?"),
+    );
+
+    FailureObservedRecord::Inserted
+}
+
+/// Compose a one-line human-readable summary for a `ci_failure_events`
+/// row from the aggregate verdict. Kept here (not inline) so any
+/// future enrichment — e.g. pulling the failing-job name out of an
+/// expanded aggregate — has a single place to land.
+fn compose_failure_summary(
+    workflow: Option<&str>,
+    conclusion: Option<&str>,
+    failing_run_id: &str,
+) -> String {
+    match (workflow, conclusion) {
+        (Some(w), Some(c)) => format!("workflow `{w}` finished as `{c}` (run {failing_run_id})"),
+        (Some(w), None) => format!("workflow `{w}` finished as a failure (run {failing_run_id})"),
+        (None, Some(c)) => format!("ci failed as `{c}` (run {failing_run_id})"),
+        (None, None) => format!("ci failed (run {failing_run_id})"),
+    }
+}
+
+/// Helper: from a [`crate::saas::runner_protocol::CiAggregate`] resolved
+/// to status=failure, derive the workflow name for the canonical
+/// failing run. Returns `None` if `failing_run_id` is unset (rare —
+/// the aggregator always sets it when conclusion==failure) or the
+/// matching summary is absent (extremely rare — the runner re-emits
+/// all run summaries it polled).
+fn failing_workflow_name(agg: &crate::saas::runner_protocol::CiAggregate) -> Option<&str> {
+    let id = agg.failing_run_id.as_deref()?;
+    agg.runs
+        .iter()
+        .find(|r| r.run_id == id)
+        .map(|r| r.workflow_name.as_str())
+}
+
 /// Spawn the background poller. Runs forever; cancellation happens on process
 /// exit. Safe to call once from main.
 ///
@@ -716,6 +937,7 @@ pub async fn backfill_aggregates(state: AppState) {
         plan_name: String,
         task_number: String,
         commit_sha: String,
+        branch: Option<String>,
         org_id: Option<String>,
         old_status: String,
         old_run_id: Option<String>,
@@ -723,8 +945,8 @@ pub async fn backfill_aggregates(state: AppState) {
     let rows: Vec<Row> = {
         let conn = state.db.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT c.id, c.plan_name, c.task_number, c.commit_sha, a.org_id, \
-                    c.status, c.run_id \
+            "SELECT c.id, c.plan_name, c.task_number, c.commit_sha, c.branch, \
+                    a.org_id, c.status, c.run_id \
              FROM ci_runs c \
              LEFT JOIN agents a ON c.agent_id = a.id \
              WHERE c.commit_sha IS NOT NULL \
@@ -742,9 +964,10 @@ pub async fn backfill_aggregates(state: AppState) {
                 plan_name: r.get(1)?,
                 task_number: r.get(2)?,
                 commit_sha: r.get(3)?,
-                org_id: r.get(4)?,
-                old_status: r.get(5)?,
-                old_run_id: r.get(6)?,
+                branch: r.get(4)?,
+                org_id: r.get(5)?,
+                old_status: r.get(6)?,
+                old_run_id: r.get(7)?,
             })
         })
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
@@ -844,6 +1067,33 @@ pub async fn backfill_aggregates(state: AppState) {
             run_url.as_deref(),
             new_run_id,
         );
+
+        // Phase 1, Task 1.1: typed event for any backfilled row that
+        // resolves to failure AND still has a live agent on its
+        // branch. Branch-keyed agent lookup means stale backfills
+        // (agent long gone, plan archived) silently skip — the
+        // learning substrate only collects events tied to a known
+        // author. The UNIQUE INDEX inside `record_ci_failure_observed`
+        // is what keeps re-running the backfill from duplicating
+        // rows; per-row idempotency, not a global gate.
+        if new_status == "failure"
+            && let Some(run_id) = new_run_id
+        {
+            let workflow = failing_workflow_name(&agg);
+            let summary = compose_failure_summary(workflow, agg.conclusion.as_deref(), run_id);
+            record_ci_failure_observed(
+                &state.db,
+                &state.broadcast_tx,
+                &row.plan_name,
+                Some(&row.task_number),
+                row.branch.as_deref(),
+                run_id,
+                run_url.as_deref(),
+                workflow,
+                agg.conclusion.as_deref(),
+                Some(&summary),
+            );
+        }
     }
 
     set_backfill_gate(&state.db);
@@ -1102,6 +1352,34 @@ pub async fn backfill_missing_ci_runs(state: AppState) {
                 "commit_sha": row.commit_sha,
             }),
         );
+
+        // Phase 1, Task 1.1: typed event for the freshly-backfilled row
+        // when the verdict is failure AND a live agent still owns the
+        // target branch. The historical merge audit's `agent_id` is
+        // recorded on the new ci_runs row, but the live-agent gate
+        // inside `record_ci_failure_observed` is the load-bearing
+        // filter — long-dead agents do not contribute to the learning
+        // substrate even when their commit happens to be the SHA we
+        // are backfilling.
+        if new_status == "failure"
+            && let Some(run_id) = new_run_id
+        {
+            let workflow = failing_workflow_name(&agg);
+            let summary = compose_failure_summary(workflow, agg.conclusion.as_deref(), run_id);
+            record_ci_failure_observed(
+                &state.db,
+                &state.broadcast_tx,
+                &row.plan_name,
+                Some(&row.task_number),
+                branch,
+                run_id,
+                run_url.as_deref(),
+                workflow,
+                agg.conclusion.as_deref(),
+                Some(&summary),
+            );
+        }
+
         inserted += 1;
         eprintln!(
             "[ci-backfill-missing] {}/{}: inserted ci_runs id={id} sha={} → status={new_status}",
@@ -1700,6 +1978,15 @@ mod tests {
     /// `backfill_aggregates` reads/writes its idempotency gate from.
     fn poll_test_db(org_id: &str, runner_id: &str, plan_name: &str, sha: &str) -> Db {
         let conn = Connection::open_in_memory().unwrap();
+        // Schema mirrors what production migrate() yields for the columns
+        // touched by poll_once / backfill_aggregates /
+        // backfill_missing_ci_runs. `agents.branch` + `agents.status` +
+        // `agents.started_at` exist so the Task 1.1
+        // `record_ci_failure_observed` live-agent JOIN can succeed when
+        // a test arms it; defaults keep agents-row INSERTs that don't
+        // care about branch ownership working without changes.
+        // `ci_failure_events` matches the production CREATE TABLE +
+        // UNIQUE INDEX so idempotency assertions ride the same code path.
         conn.execute_batch(
             "CREATE TABLE runners ( \
                id TEXT PRIMARY KEY, name TEXT, org_id TEXT, status TEXT, \
@@ -1708,7 +1995,9 @@ mod tests {
              ); \
              CREATE TABLE agents ( \
                id TEXT PRIMARY KEY, plan_name TEXT, task_id TEXT, \
-               org_id TEXT, cwd TEXT \
+               org_id TEXT, cwd TEXT, branch TEXT, \
+               status TEXT NOT NULL DEFAULT 'running', \
+               started_at TEXT NOT NULL DEFAULT (datetime('now')) \
              ); \
              CREATE TABLE ci_runs ( \
                id INTEGER PRIMARY KEY AUTOINCREMENT, plan_name TEXT, \
@@ -1721,7 +2010,17 @@ mod tests {
              ); \
              CREATE TABLE settings ( \
                key TEXT PRIMARY KEY, value TEXT \
-             );",
+             ); \
+             CREATE TABLE ci_failure_events ( \
+               id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, \
+               plan_name TEXT NOT NULL, task_number TEXT, \
+               branch TEXT NOT NULL, run_id TEXT NOT NULL, run_url TEXT, \
+               workflow TEXT, conclusion TEXT, failed_job TEXT, \
+               summary TEXT, org_id TEXT NOT NULL DEFAULT 'default-org', \
+               observed_at TEXT NOT NULL DEFAULT (datetime('now')) \
+             ); \
+             CREATE UNIQUE INDEX idx_ci_failure_events_agent_run \
+               ON ci_failure_events(agent_id, run_id);",
         )
         .unwrap();
         conn.execute(
@@ -1970,6 +2269,463 @@ mod tests {
         assert_eq!(conclusion.as_deref(), Some("success"));
         assert_eq!(run_url, None);
         assert_eq!(run_id, None);
+    }
+
+    // ── Phase 1, Task 1.1: CiFailureObserved emission on red transition ──
+    //
+    // The poller writes a typed `ci_failure_events` row whenever a CI run
+    // transitions to failure AND a live agent owns the branch. Idempotent
+    // on retry via the UNIQUE INDEX on (agent_id, run_id). No live agent
+    // ⇒ no row.
+
+    /// Arm the seeded agent row (created by `poll_test_db` with
+    /// branch=NULL) so it owns the same branch the ci_runs row is
+    /// pointing at — that's what makes the live-agent lookup inside
+    /// `record_ci_failure_observed` resolve. Pure helper; takes only
+    /// the values the helper actually consults.
+    fn arm_live_agent_for_branch(db: &Db, branch: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET branch = ?1, status = 'running' \
+             WHERE id = 'agent-1'",
+            params![branch],
+        )
+        .unwrap();
+    }
+
+    fn count_ci_failure_events(db: &Db, plan_name: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM ci_failure_events WHERE plan_name = ?1",
+            params![plan_name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Headline acceptance: a poll that flips a row from pending to
+    /// failure inserts one `ci_failure_events` row carrying the agent
+    /// id, branch, failing_run_id, workflow name (the failing one,
+    /// NOT the Docker badge), and the summary string.
+    #[tokio::test]
+    async fn poll_records_ci_failure_event_when_live_agent_owns_branch() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "live-agent-plan";
+        let sha = "12d31ceb6a9a93d906a017a9a7a85b269361ab91";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        arm_live_agent_for_branch(&db, "master");
+        let runners = new_runner_registry();
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/cep/cep.git"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+
+        let plans_dir = PathBuf::from("/tmp/branchwork-test-plans-failure-event");
+        let state = poll_test_app_state(db.clone(), runners, plans_dir);
+        let mut project_dirs = std::collections::HashMap::new();
+        project_dirs.insert(plan_name.to_string(), cwd.to_path_buf());
+
+        poll_once(&state, &project_dirs).await;
+
+        // Row written with the failing-CI workflow + run_id, NOT the
+        // Docker informational badge.
+        type CiFailureRow = (
+            String,         // agent_id
+            String,         // branch
+            String,         // run_id
+            Option<String>, // workflow
+            Option<String>, // conclusion
+            Option<String>, // run_url
+            Option<String>, // summary
+        );
+        let conn = db.lock().unwrap();
+        let (agent_id, branch, run_id, workflow, conclusion, run_url, summary): CiFailureRow = conn
+            .query_row(
+                "SELECT agent_id, branch, run_id, workflow, conclusion, \
+                        run_url, summary \
+                   FROM ci_failure_events \
+                  WHERE plan_name = ?1",
+                params![plan_name],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .expect("expected exactly one ci_failure_events row");
+
+        assert_eq!(agent_id, "agent-1");
+        assert_eq!(branch, "master");
+        assert_eq!(run_id, "25520540172", "must point at failing CI run");
+        assert_eq!(workflow.as_deref(), Some("CI"));
+        assert_eq!(conclusion.as_deref(), Some("failure"));
+        assert_eq!(
+            run_url.as_deref(),
+            Some("https://github.com/cep/cep/actions/runs/25520540172"),
+        );
+        let s = summary.expect("summary must be populated");
+        assert!(s.contains("CI"), "summary mentions workflow: {s:?}");
+        assert!(s.contains("25520540172"), "summary mentions run id: {s:?}");
+    }
+
+    /// Same setup but with no live agent (branch left NULL, status
+    /// not 'running'). The poller still flips the ci_runs row to
+    /// failure but writes NO `ci_failure_events` row — the learning
+    /// substrate only collects events tied to a known author.
+    #[tokio::test]
+    async fn poll_skips_ci_failure_event_when_no_live_agent_owns_branch() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "no-live-agent-plan";
+        let sha = "12d31ceb6a9a93d906a017a9a7a85b269361ab91";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        // Deliberately do NOT arm the agent — branch stays NULL so the
+        // helper falls through to NoLiveAgent.
+        let runners = new_runner_registry();
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/cep/cep.git"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+
+        let plans_dir = PathBuf::from("/tmp/branchwork-test-plans-no-live-agent");
+        let state = poll_test_app_state(db.clone(), runners, plans_dir);
+        let mut project_dirs = std::collections::HashMap::new();
+        project_dirs.insert(plan_name.to_string(), cwd.to_path_buf());
+
+        poll_once(&state, &project_dirs).await;
+
+        // ci_runs row still got the verdict — the failure-event gate is
+        // independent of the dashboard's status update.
+        {
+            let conn = db.lock().unwrap();
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM ci_runs WHERE plan_name = ?1",
+                    params![plan_name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "failure");
+        }
+        // But no failure-event row.
+        assert_eq!(count_ci_failure_events(&db, plan_name), 0);
+    }
+
+    /// Idempotency: re-running the poll for the same red run + same
+    /// live agent does NOT duplicate the row. The UNIQUE INDEX on
+    /// (agent_id, run_id) is the load-bearing constraint — the
+    /// `INSERT OR IGNORE` keeps both polls returning successfully.
+    /// Note: in practice the outer `new_status != row.status` guard
+    /// also short-circuits the second call, but the helper-level
+    /// idempotency matters for the legitimate retry case where the
+    /// status was manually flipped back to pending and CI failed
+    /// again on the same run.
+    #[tokio::test]
+    async fn poll_ci_failure_event_is_idempotent_across_retries() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "idempotent-plan";
+        let sha = "12d31ceb6a9a93d906a017a9a7a85b269361ab91";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        arm_live_agent_for_branch(&db, "master");
+        let runners = new_runner_registry();
+        install_aggregate_responder(&runners, runner_id, cep_multi_workflow_aggregate()).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/cep/cep.git"])
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+
+        let plans_dir = PathBuf::from("/tmp/branchwork-test-plans-idempotent");
+        let state = poll_test_app_state(db.clone(), runners, plans_dir);
+        let mut project_dirs = std::collections::HashMap::new();
+        project_dirs.insert(plan_name.to_string(), cwd.to_path_buf());
+
+        poll_once(&state, &project_dirs).await;
+        // Force the ci_runs row back to pending to simulate the retry
+        // case (manual reset, or the row aged out and was re-polled).
+        // Without this, the second `poll_once` short-circuits at the
+        // status-unchanged guard and never reaches the helper.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE ci_runs SET status = 'pending' WHERE plan_name = ?1",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+        poll_once(&state, &project_dirs).await;
+
+        // Exactly one ci_failure_events row, even after the second
+        // poll re-encountered the same red run.
+        assert_eq!(count_ci_failure_events(&db, plan_name), 1);
+    }
+
+    /// Pure-helper test: prove the UNIQUE INDEX + INSERT OR IGNORE
+    /// contract directly. Calling `record_ci_failure_observed` twice
+    /// for the same (agent_id, run_id) returns `Inserted` then
+    /// `Existing`. Independent of poll_once so a future caller (e.g.
+    /// CI failure-log audit Phase 1.2) gets the same guarantee.
+    #[tokio::test]
+    async fn record_ci_failure_observed_helper_is_idempotent() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "helper-plan";
+        let sha = "deadbeef";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        arm_live_agent_for_branch(&db, "master");
+
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
+
+        let first = record_ci_failure_observed(
+            &db,
+            &tx,
+            plan_name,
+            Some("1.3"),
+            Some("master"),
+            "99999",
+            Some("https://github.com/cep/cep/actions/runs/99999"),
+            Some("tests.yml"),
+            Some("failure"),
+            Some("summary"),
+        );
+        assert_eq!(first, FailureObservedRecord::Inserted);
+
+        let second = record_ci_failure_observed(
+            &db,
+            &tx,
+            plan_name,
+            Some("1.3"),
+            Some("master"),
+            "99999",
+            Some("https://github.com/cep/cep/actions/runs/99999"),
+            Some("tests.yml"),
+            Some("failure"),
+            Some("summary"),
+        );
+        assert_eq!(second, FailureObservedRecord::Existing);
+
+        assert_eq!(count_ci_failure_events(&db, plan_name), 1);
+    }
+
+    /// Pure-helper test: live-agent gate — no agent matching
+    /// (plan_name, branch, status IN running|starting) ⇒ NoLiveAgent,
+    /// no row. Branch mismatch is the canonical case (the ci_runs row
+    /// targets a branch the agent was never on, e.g. a stale fix
+    /// agent on a different branch).
+    #[tokio::test]
+    async fn record_ci_failure_observed_helper_skips_without_live_agent() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "no-agent-plan";
+        let sha = "deadbeef";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        // arm_live_agent_for_branch sets branch='master'; we point the
+        // event at 'feature/x' so the WHERE branch=?2 clause misses.
+        arm_live_agent_for_branch(&db, "master");
+
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
+
+        let outcome = record_ci_failure_observed(
+            &db,
+            &tx,
+            plan_name,
+            Some("1.3"),
+            Some("feature/x"),
+            "99999",
+            None,
+            Some("tests.yml"),
+            Some("failure"),
+            Some("summary"),
+        );
+        assert_eq!(outcome, FailureObservedRecord::NoLiveAgent);
+        assert_eq!(count_ci_failure_events(&db, plan_name), 0);
+    }
+
+    /// Pure-helper test: branch=None on the ci_runs row (legacy /
+    /// manual insert) ⇒ NoLiveAgent without even consulting the
+    /// agents table.
+    #[tokio::test]
+    async fn record_ci_failure_observed_helper_skips_when_branch_is_none() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "no-branch-plan";
+        let sha = "deadbeef";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        arm_live_agent_for_branch(&db, "master");
+
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
+
+        let outcome = record_ci_failure_observed(
+            &db,
+            &tx,
+            plan_name,
+            Some("1.3"),
+            None,
+            "99999",
+            None,
+            Some("tests.yml"),
+            Some("failure"),
+            Some("summary"),
+        );
+        assert_eq!(outcome, FailureObservedRecord::NoLiveAgent);
+        assert_eq!(count_ci_failure_events(&db, plan_name), 0);
+    }
+
+    /// Completed agents don't count as "live". A row with
+    /// status='completed' on the right branch must NOT match the
+    /// live-agent lookup — the learning event is for the live owner,
+    /// not whoever happened to land the commit weeks ago.
+    #[tokio::test]
+    async fn record_ci_failure_observed_helper_ignores_completed_agents() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "completed-agent-plan";
+        let sha = "deadbeef";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        // Arm + immediately flip the agent to completed.
+        arm_live_agent_for_branch(&db, "master");
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET status = 'completed' WHERE id = 'agent-1'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
+
+        let outcome = record_ci_failure_observed(
+            &db,
+            &tx,
+            plan_name,
+            Some("1.3"),
+            Some("master"),
+            "99999",
+            None,
+            Some("tests.yml"),
+            Some("failure"),
+            Some("summary"),
+        );
+        assert_eq!(outcome, FailureObservedRecord::NoLiveAgent);
+        assert_eq!(count_ci_failure_events(&db, plan_name), 0);
+    }
+
+    /// `starting` status is treated as live (matches the auto-mode
+    /// loop's gate). A fresh agent that hasn't yet flipped to
+    /// `running` still owns the branch and any failure during that
+    /// window should be captured.
+    #[tokio::test]
+    async fn record_ci_failure_observed_helper_accepts_starting_agents() {
+        let org_id = "org-cep";
+        let runner_id = "cep-runner";
+        let plan_name = "starting-agent-plan";
+        let sha = "deadbeef";
+
+        let db = poll_test_db(org_id, runner_id, plan_name, sha);
+        arm_live_agent_for_branch(&db, "master");
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET status = 'starting' WHERE id = 'agent-1'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
+
+        let outcome = record_ci_failure_observed(
+            &db,
+            &tx,
+            plan_name,
+            Some("1.3"),
+            Some("master"),
+            "99999",
+            None,
+            Some("tests.yml"),
+            Some("failure"),
+            Some("summary"),
+        );
+        assert_eq!(outcome, FailureObservedRecord::Inserted);
+        assert_eq!(count_ci_failure_events(&db, plan_name), 1);
+    }
+
+    /// Summary composition: workflow + conclusion both present ⇒
+    /// the canonical form. The other branches are exercised by the
+    /// inline assertions in `poll_records_ci_failure_event_*`.
+    #[test]
+    fn compose_failure_summary_includes_workflow_and_conclusion() {
+        let s = compose_failure_summary(Some("CI"), Some("failure"), "100");
+        assert!(s.contains("CI"));
+        assert!(s.contains("failure"));
+        assert!(s.contains("100"));
+    }
+
+    #[test]
+    fn compose_failure_summary_falls_back_when_workflow_is_unknown() {
+        let s = compose_failure_summary(None, Some("failure"), "100");
+        assert!(s.contains("failure"));
+        assert!(s.contains("100"));
+        // No `workflow` placeholder leaks when the name is missing.
+        assert!(!s.contains("`None`"));
+        assert!(!s.contains("`?`"));
+    }
+
+    #[test]
+    fn failing_workflow_name_resolves_via_failing_run_id() {
+        let agg = cep_multi_workflow_aggregate();
+        assert_eq!(failing_workflow_name(&agg), Some("CI"));
+    }
+
+    #[test]
+    fn failing_workflow_name_is_none_when_failing_run_id_missing() {
+        let mut agg = cep_multi_workflow_aggregate();
+        agg.failing_run_id = None;
+        assert_eq!(failing_workflow_name(&agg), None);
     }
 
     // ── Backfill regression: legacy ci_runs rows written by the

@@ -4902,6 +4902,7 @@ pub struct DeletePlanQuery {
 /// |----------------------|--------------------------|-----------|
 /// | task_status          | NOT NULL, PK part        | cascade   |
 /// | ci_runs              | NOT NULL                 | cascade   |
+/// | ci_failure_events    | NOT NULL                 | cascade   |
 /// | plan_auto_mode       | PRIMARY KEY              | cascade   |
 /// | plan_auto_advance    | PRIMARY KEY              | cascade   |
 /// | task_fix_attempts    | NOT NULL, PK part        | cascade   |
@@ -4943,6 +4944,7 @@ pub struct DeletePlanQuery {
 pub(crate) const PLAN_CASCADE_TABLES: &[&str] = &[
     "task_status",
     "ci_runs",
+    "ci_failure_events",
     "plan_auto_mode",
     "plan_auto_advance",
     "task_fix_attempts",
@@ -6919,6 +6921,14 @@ mod cascade_audit_tests {
             conn.execute(
                 "INSERT INTO ci_runs (plan_name, task_number, status) \
                  VALUES (?1, '1.1', 'success')",
+                params![plan],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ci_failure_events \
+                     (agent_id, plan_name, task_number, branch, run_id) \
+                 VALUES ('agent-audit-cf', ?1, '1.1', \
+                         'branchwork/test/1.1', '99999')",
                 params![plan],
             )
             .unwrap();
