@@ -65,7 +65,10 @@ impl BranchworkMcp {
     pub fn new(ctx: McpContext) -> Self {
         Self {
             ctx,
-            tool_router: Self::hello_router() + Self::plans_router() + Self::status_router(),
+            tool_router: Self::hello_router()
+                + Self::plans_router()
+                + Self::status_router()
+                + Self::learnings_router(),
         }
     }
 
@@ -86,7 +89,7 @@ impl ServerHandler for BranchworkMcp {
             .with_instructions(
                 "Branchwork MCP server. Tools: hello, list_plans, get_plan, get_task, \
                  get_task_context, create_plan, update_task_status, report_cost, \
-                 report_blocker."
+                 report_blocker, capture_learning."
                     .to_string(),
             )
     }

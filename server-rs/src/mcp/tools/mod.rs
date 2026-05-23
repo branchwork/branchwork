@@ -4,5 +4,6 @@
 //! [`super::BranchworkMcp`] with a named router; `BranchworkMcp::new` combines
 //! them.
 
+pub mod learnings;
 pub mod plans;
 pub mod status;
