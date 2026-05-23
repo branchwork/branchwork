@@ -52,9 +52,17 @@ struct TaskAction {
     /// landing a clean tree.
     #[serde(default)]
     skip_commit: bool,
-    /// Exit non-zero before committing. Repros crashed-mid-task.
+    /// Exit non-zero BEFORE applying edits / committing. Repros agent
+    /// crashes that lose all the in-flight work.
     #[serde(default)]
     exit_code: Option<i32>,
+    /// Exit non-zero AFTER edits + commit but BEFORE the Stop hook
+    /// POST. Repros the country-awareness/2.2 shape: agent completes
+    /// its task work and lands a commit, then is SIGKILL'd during
+    /// the stop-hook stage. Auto-mode has to choose whether the
+    /// committed work counts as "task done" or "task failed".
+    #[serde(default)]
+    crash_after_commit: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -116,6 +124,11 @@ fn main() {
                 format!("scripted: {}", task_id.as_deref().unwrap_or(&session_id))
             });
             git_commit(&cwd, &msg);
+        }
+        if action.crash_after_commit {
+            // Exit non-zero before the Stop hook fires. Mirrors the
+            // SIGKILL-mid-stop-hook pattern from country-awareness/2.2.
+            std::process::exit(99);
         }
         if !action.skip_stop_hook {
             post_stop_hook(&session_id);

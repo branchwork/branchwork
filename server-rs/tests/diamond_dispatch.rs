@@ -160,6 +160,20 @@ fn actions_yaml_crash_before_commit() -> &'static str {
 "#
 }
 
+/// T1.1 commits work then exits non-zero before the Stop hook fires —
+/// matches the country-awareness/2.2 shape from 2026-05-22 (commit
+/// 77b0a62 landed, agent SIGKILL'd during stop-hook stage).
+fn actions_yaml_crash_after_commit() -> &'static str {
+    r#""1.1":
+  edits:
+    - kind: write
+      file: lib.txt
+      write: "T1.1 work landed before crash\n"
+  commit_message: "T1.1 commit before crash"
+  crash_after_commit: true
+"#
+}
+
 /// Same plan topology as the disjoint variant, but T1.2 and T1.3 both
 /// *append* to `lib.txt`. T1.2's branch and T1.3's branch start from
 /// the same base (T1.1's commit); when one merges to master the other
@@ -560,6 +574,76 @@ fn agent_crash_before_commit_reaches_failure_state() {
         outcome, "completed",
         "crashed agent (exit_code=1) was marked 'completed' — should be \
          killed/failed/orphaned to surface the failure to the operator"
+    );
+}
+
+/// T1.1 commits its work then exits non-zero before posting the Stop
+/// hook. Matches country-awareness/2.2 (the commit lands, the agent
+/// dies during cleanup). Auto-mode must NOT mark this "completed" —
+/// the operator needs to know the commit landed but the agent died
+/// mid-cleanup so they can decide whether to claim the work or retry.
+#[test]
+#[ignore = "exploratory: documents commit-then-crash recovery"]
+fn agent_crash_after_commit_preserves_work_and_surfaces_failure() {
+    let server = Fixture::with_actions(actions_yaml_crash_after_commit());
+    setup_plan(&server, "task");
+    let (s, _) = server.post(
+        "/api/actions/start-task",
+        json!({
+            "planName": PLAN_NAME,
+            "phaseNumber": 1,
+            "taskNumber": "1.1",
+        }),
+    );
+    assert_eq!(s, 200);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = loop {
+        let db = server.db();
+        let status: Option<String> = db
+            .query_row(
+                "SELECT status FROM agents WHERE plan_name = ?1 AND task_id = '1.1' \
+                 ORDER BY started_at DESC LIMIT 1",
+                rusqlite::params![PLAN_NAME],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        match status.as_deref() {
+            Some("killed") | Some("failed") | Some("orphaned") | Some("completed") => {
+                break status.unwrap();
+            }
+            _ => {}
+        }
+        drop(db);
+        if Instant::now() >= deadline {
+            break "no_terminal_state".to_string();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    eprintln!("[crash-after-commit] terminal status: {outcome}");
+    assert_ne!(
+        outcome, "no_terminal_state",
+        "agent never reached a terminal status after committing + crashing"
+    );
+    assert_ne!(
+        outcome, "completed",
+        "agent that crashed mid-cleanup (after commit) was marked 'completed' — \
+         country-awareness/2.2 pattern: work landed but failure must be surfaced"
+    );
+
+    // The commit MUST be on the task branch (the agent did land it
+    // before crashing). This is the "preserve operator's work" half
+    // of the invariant.
+    let task_branch = format!("branchwork/{PLAN_NAME}/1.1");
+    let out = std::process::Command::new("git")
+        .args(["log", "--pretty=format:%s", &task_branch])
+        .current_dir(&server.project)
+        .output()
+        .expect("git log on task branch");
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        log.contains("T1.1 commit before crash"),
+        "agent's commit was lost — branch log: {log}"
     );
 }
 
