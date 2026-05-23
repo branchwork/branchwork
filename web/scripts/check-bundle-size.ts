@@ -18,7 +18,14 @@ import { gzipSync } from "node:zlib";
 //     gained pausedFiles list + Resume-anyway + Mark-as-operational
 //     diff preview (dirty-tree-check-stop-pausing-on-write-noise
 //     task 3.2, commit 1a71763). Real product surface, not bloat.
-const MAX_GZIPPED_BYTES = 168_000;
+//   - 2026-05-24: 168_000 → 176_000 (~+8 KB). Learnings-due dashboard
+//     panel (learning-hub-ci-failure-capture T1.4, commit d536321)
+//     tipped the entry chunk from ~167 KB to ~168.1 KB gzipped — i.e.
+//     145 bytes over the previous budget — and master CI flipped red
+//     on every auto-bump because the chunk hashes vary by a handful
+//     of bytes build-to-build at the edge. Real product surface, +8 KB
+//     keeps the same ~5% headroom the previous bump targeted.
+const MAX_GZIPPED_BYTES = 176_000;
 
 const distAssets = join(import.meta.dirname, "..", "dist", "assets");
 
