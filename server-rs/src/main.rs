@@ -421,6 +421,17 @@ async fn run_server(cli: Cli) {
             "/api/learnings/pending/{event_id}/log",
             get(api::learnings::fetch_log),
         )
+        // Org-shared learnings store (Phase 2.2 of
+        // learning-hub-ci-failure-capture): list / get / archive surface
+        // for the durable lessons captured by `capture_learning` (Phase
+        // 1.3). Append-only — corrections happen by archiving + writing
+        // a new entry, preserving the audit trail.
+        .route("/api/learnings", get(api::learnings::list_learnings))
+        .route("/api/learnings/{id}", get(api::learnings::get_learning))
+        .route(
+            "/api/learnings/{id}/archive",
+            post(api::learnings::archive_learning),
+        )
         // Per-branch push lock: external auto-bump CI shares the same
         // master_push_lock table the in-process auto-mode flow holds
         // during merge → push, so the two never race to push to origin.

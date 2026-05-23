@@ -203,6 +203,14 @@ pub mod actions {
     /// with 409 + `credential_in_use` (and no audit row) when at least
     /// one `projects.default_credential_id` still points at this row.
     pub const CREDENTIAL_DELETE: &str = "credential.delete";
+    /// `POST /api/learnings/{id}/archive` — operator soft-deleted an
+    /// org-shared learning (Phase 2.2 of learning-hub-ci-failure-capture).
+    /// Diff carries `{learning_id, kind, slug, category, reason}`.
+    /// Editing is intentionally out of scope: corrections happen by
+    /// archiving + writing a new entry, preserving the audit trail.
+    /// Refused with 422 (missing/empty `reason`) or 410 (already archived);
+    /// no audit row on either refusal.
+    pub const LEARNING_ARCHIVE: &str = "learning.archive";
 }
 
 /// Resource types for audit entries.
@@ -218,6 +226,7 @@ pub mod resources {
     pub const RUNNER: &str = "runner";
     pub const PROJECT: &str = "project";
     pub const CREDENTIAL: &str = "credential";
+    pub const LEARNING: &str = "learning";
 }
 
 /// A single audit log entry as returned by the API.
