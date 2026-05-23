@@ -970,6 +970,283 @@ pub fn archive_credential(db: &Db, id: &str) -> Result<bool, CredentialError> {
     Ok(n > 0)
 }
 
+// ── Org-shared learnings (Phase 2 of learning-hub-ci-failure-capture) ─────
+
+/// Taxonomy for the `learnings` table. Mirrors the per-agent auto-memory
+/// types (user / feedback / project / reference) but pruned to the three
+/// kinds that make sense as org-shared lessons: `feedback` (rules learned
+/// the hard way), `project` (active context other agents will need), and
+/// `reference` (pointers to external systems). `user` is intentionally
+/// excluded — it is a property of a single operator, not the org.
+#[allow(dead_code)] // consumed by API + dashboard in later phases
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearningKind {
+    Feedback,
+    Project,
+    Reference,
+}
+
+impl LearningKind {
+    /// Wire-form (also the on-disk column value).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LearningKind::Feedback => "feedback",
+            LearningKind::Project => "project",
+            LearningKind::Reference => "reference",
+        }
+    }
+
+    /// Parse the wire form. Unknown values return None so a corrupted row
+    /// or future schema reshuffle does not panic. Mirrors the lenient parse
+    /// used by [`CredentialKind::parse`] and [`parse_merge_cadence`].
+    #[allow(dead_code)] // consumed by API + dashboard in later phases
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "feedback" => Some(LearningKind::Feedback),
+            "project" => Some(LearningKind::Project),
+            "reference" => Some(LearningKind::Reference),
+            _ => None,
+        }
+    }
+}
+
+/// What [`create_learning`] takes — caller-supplied fields. `id` is the
+/// stable UUID the caller mints; `slug` is the kebab-case handle that
+/// participates in the `(org_id, kind, slug)` uniqueness constraint.
+#[allow(dead_code)] // consumed by API + dashboard in later phases
+#[derive(Debug, Clone)]
+pub struct LearningInput<'a> {
+    pub id: &'a str,
+    pub org_id: &'a str,
+    pub kind: LearningKind,
+    pub category: &'a str,
+    pub slug: &'a str,
+    pub body_md: &'a str,
+    pub source_agent_id: Option<&'a str>,
+    pub source_ci_run_id: Option<i64>,
+}
+
+/// What [`get_learning`] / [`list_learnings_for_org`] return. Fields
+/// renamed via `rename_all = "camelCase"` so the same struct works as a
+/// JSON wire payload directly when an API handler returns it.
+#[allow(dead_code)] // consumed by API + dashboard in later phases
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Learning {
+    pub id: String,
+    pub org_id: String,
+    /// Wire form of [`LearningKind`] — keep as String so a row written by a
+    /// future code path with an unknown kind still serialises through.
+    pub kind: String,
+    pub category: String,
+    pub slug: String,
+    pub body_md: String,
+    pub source_agent_id: Option<String>,
+    pub source_ci_run_id: Option<i64>,
+    pub created_at: String,
+    pub archived_at: Option<String>,
+    pub archived_reason: Option<String>,
+}
+
+/// Errors from the learning round-trip path. Kept as a small enum so
+/// callers can map `NotFound` to 404 and `SlugCollision` to 409 without
+/// pattern-matching on rusqlite's `Error` variants directly.
+#[allow(dead_code)] // consumed by API in later phases
+#[derive(Debug)]
+pub enum LearningError {
+    NotFound,
+    /// `(org_id, kind, slug)` already exists. The unique-index trip is the
+    /// canonical signal a caller is re-writing instead of patching.
+    SlugCollision,
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for LearningError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LearningError::NotFound => f.write_str("learning not found"),
+            LearningError::SlugCollision => {
+                f.write_str("learning slug already exists for this org+kind")
+            }
+            LearningError::Db(e) => write!(f, "learning db error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LearningError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LearningError::Db(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for LearningError {
+    fn from(e: rusqlite::Error) -> Self {
+        // Detect the `(org_id, kind, slug)` unique-index trip up front so the
+        // caller does not have to inspect raw SQLite extended codes. SQLite
+        // reports the failure by column-name signature (e.g.
+        // "UNIQUE constraint failed: learnings.org_id, learnings.kind,
+        // learnings.slug"), NOT by the index name — so match on the table-
+        // qualified slug column instead.
+        if let rusqlite::Error::SqliteFailure(ref err, ref msg) = e
+            && err.code == rusqlite::ErrorCode::ConstraintViolation
+            && msg.as_deref().is_some_and(|m| {
+                m.contains("UNIQUE constraint failed") && m.contains("learnings.slug")
+            })
+        {
+            return LearningError::SlugCollision;
+        }
+        LearningError::Db(e)
+    }
+}
+
+/// INSERT a new learning row. `created_at` is filled by the schema
+/// default; `archived_at` / `archived_reason` start NULL.
+///
+/// The `(org_id, kind, slug)` triple must be unique within the org —
+/// trying to recreate an existing learning surfaces as
+/// [`LearningError::SlugCollision`]. Callers that want "patch the body"
+/// semantics should issue a separate UPDATE; this helper is INSERT-only
+/// so the audit trail can record creation vs. mutation distinctly.
+#[allow(dead_code)] // consumed by API in later phases
+pub fn create_learning(db: &Db, input: &LearningInput<'_>) -> Result<(), LearningError> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO learnings \
+            (id, org_id, kind, category, slug, body_md, \
+             source_agent_id, source_ci_run_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            input.id,
+            input.org_id,
+            input.kind.as_str(),
+            input.category,
+            input.slug,
+            input.body_md,
+            input.source_agent_id,
+            input.source_ci_run_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Look up a learning by `id`. Returns archived rows too so the Activity
+/// tab can render "this learning was archived because <reason>"; callers
+/// that want only active learnings should check `archived_at.is_none()`.
+#[allow(dead_code)] // consumed by API in later phases
+pub fn get_learning(db: &Db, id: &str) -> Result<Learning, LearningError> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT id, org_id, kind, category, slug, body_md, \
+                source_agent_id, source_ci_run_id, created_at, \
+                archived_at, archived_reason \
+           FROM learnings WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(Learning {
+                id: row.get(0)?,
+                org_id: row.get(1)?,
+                kind: row.get(2)?,
+                category: row.get(3)?,
+                slug: row.get(4)?,
+                body_md: row.get(5)?,
+                source_agent_id: row.get(6)?,
+                source_ci_run_id: row.get(7)?,
+                created_at: row.get(8)?,
+                archived_at: row.get(9)?,
+                archived_reason: row.get(10)?,
+            })
+        },
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => LearningError::NotFound,
+        other => LearningError::Db(other),
+    })
+}
+
+/// List every active (non-archived) learning for `org_id`, newest first.
+/// Pass `include_archived = true` to surface tombstones for the audit
+/// view. Optionally filter by `kind` so the dashboard can render a
+/// per-kind tab.
+#[allow(dead_code)] // consumed by API in later phases
+pub fn list_learnings_for_org(
+    db: &Db,
+    org_id: &str,
+    kind: Option<LearningKind>,
+    include_archived: bool,
+) -> Vec<Learning> {
+    let conn = db.lock().unwrap();
+    // Build the SQL up-front so the optional `kind` filter can splice in
+    // without dragging in a query builder dep. Parameter slots remain
+    // numbered so we can keep using `params!`.
+    let mut sql = String::from(
+        "SELECT id, org_id, kind, category, slug, body_md, \
+                source_agent_id, source_ci_run_id, created_at, \
+                archived_at, archived_reason \
+           FROM learnings \
+          WHERE org_id = ?1",
+    );
+    if !include_archived {
+        sql.push_str(" AND archived_at IS NULL");
+    }
+    if kind.is_some() {
+        sql.push_str(" AND kind = ?2");
+    }
+    sql.push_str(" ORDER BY created_at DESC, id DESC");
+
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return Vec::new();
+    };
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Learning> {
+        Ok(Learning {
+            id: row.get(0)?,
+            org_id: row.get(1)?,
+            kind: row.get(2)?,
+            category: row.get(3)?,
+            slug: row.get(4)?,
+            body_md: row.get(5)?,
+            source_agent_id: row.get(6)?,
+            source_ci_run_id: row.get(7)?,
+            created_at: row.get(8)?,
+            archived_at: row.get(9)?,
+            archived_reason: row.get(10)?,
+        })
+    };
+    let rows = if let Some(k) = kind {
+        stmt.query_map(params![org_id, k.as_str()], map_row)
+            .and_then(|r| r.collect::<Result<Vec<_>, _>>())
+    } else {
+        stmt.query_map(params![org_id], map_row)
+            .and_then(|r| r.collect::<Result<Vec<_>, _>>())
+    };
+    rows.unwrap_or_default()
+}
+
+/// Soft-delete a learning. Sets `archived_at = datetime('now')` and
+/// stores the operator-supplied `reason` so the audit trail can show
+/// why a once-canonical lesson is no longer active. Idempotent —
+/// archiving an already-archived row leaves the original timestamp
+/// and reason untouched.
+///
+/// Returns `Ok(true)` when a row flipped from active to archived,
+/// `Ok(false)` when the row was already archived (or did not exist —
+/// the caller should distinguish by reading [`get_learning`] first if
+/// that matters).
+#[allow(dead_code)] // consumed by API in later phases
+pub fn archive_learning(db: &Db, id: &str, reason: &str) -> Result<bool, LearningError> {
+    let conn = db.lock().unwrap();
+    let n = conn.execute(
+        "UPDATE learnings \
+            SET archived_at = datetime('now'), \
+                archived_reason = ?2 \
+          WHERE id = ?1 AND archived_at IS NULL",
+        params![id, reason],
+    )?;
+    Ok(n > 0)
+}
+
 /// Open (or create) the database at `db_path` and run migrations.
 pub fn init(db_path: &Path) -> Db {
     if let Some(parent) = db_path.parent() {
@@ -1472,6 +1749,55 @@ fn migrate(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_credentials_owner ON credentials(owner_user_id);
         CREATE INDEX IF NOT EXISTS idx_credentials_active
             ON credentials(owner_user_id) WHERE archived_at IS NULL;
+
+        -- Org-shared learnings store (Phase 2 of learning-hub-ci-failure-capture).
+        -- One row per durable lesson the org wants future agents to read on
+        -- the way into similar work. Body is markdown so the on-disk auto-memory
+        -- format under ~/.claude/projects/<project>/memory/<slug>.md survives a
+        -- paste in either direction and the dashboard can render it trivially.
+        --
+        -- Fields:
+        -- - id is a UUID generated server-side.
+        -- - org_id scopes the row to an organisation (FK CASCADE so a deleted
+        --   org takes its learnings with it). Default keeps pre-migration
+        --   tooling sane.
+        -- - kind enumerates feedback | project | reference, mirroring the
+        --   per-agent auto-memory taxonomy. Stored as the snake_case wire
+        --   string so reading is grep-friendly and parsing is lenient.
+        -- - category is an operator-friendly grouping label (e.g. testing,
+        --   deploy, ci) free-form but indexed for org+kind+category lookups.
+        -- - slug is a stable kebab-case handle (operator-supplied or derived).
+        --   Unique within (org_id, kind) so a repeat write surfaces as a
+        --   constraint violation instead of silently shadowing the old row.
+        -- - body_md is markdown — never sanitised at store time; consumers
+        --   render it.
+        -- - source_agent_id / source_ci_run_id link the learning back to its
+        --   origin so the Activity tab can render which fix-attempt and red
+        --   CI run produced it. Both nullable (a hand-authored learning has
+        --   no source).
+        -- - archived_at + archived_reason capture soft-delete with intent
+        --   (e.g. outdated-by-ADR, no-longer-applicable) so the audit
+        --   trail survives a delete.
+        CREATE TABLE IF NOT EXISTS learnings (
+            id                 TEXT PRIMARY KEY,
+            org_id             TEXT NOT NULL DEFAULT 'default-org',
+            kind               TEXT NOT NULL,
+            category           TEXT NOT NULL,
+            slug               TEXT NOT NULL,
+            body_md            TEXT NOT NULL,
+            source_agent_id    TEXT,
+            source_ci_run_id   INTEGER,
+            created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+            archived_at        TEXT,
+            archived_reason    TEXT,
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_learnings_org_kind_slug
+            ON learnings(org_id, kind, slug);
+        CREATE INDEX IF NOT EXISTS idx_learnings_org_active
+            ON learnings(org_id) WHERE archived_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_learnings_source_ci
+            ON learnings(source_ci_run_id) WHERE source_ci_run_id IS NOT NULL;
         ",
     )
     .expect("failed to run schema migration");
@@ -1929,6 +2255,7 @@ mod tests {
         assert!(tables.contains(&"projects".to_string()));
         assert!(tables.contains(&"credentials".to_string()));
         assert!(tables.contains(&"ci_failure_events".to_string()));
+        assert!(tables.contains(&"learnings".to_string()));
     }
 
     /// Phase 1, Task 1.1: `ci_failure_events` schema round-trip plus
@@ -4009,5 +4336,256 @@ mod tests {
             err,
             CredentialError::Crypto(crate::crypto::CryptoError::EncryptionFailed(_))
         ));
+    }
+
+    // ── Org-shared learnings (Phase 2 of learning-hub-ci-failure-capture) ──
+
+    fn sample_learning(id: &str, slug: &str) -> LearningInput<'static> {
+        LearningInput {
+            id: Box::leak(id.to_string().into_boxed_str()),
+            org_id: "default-org",
+            kind: LearningKind::Feedback,
+            category: "testing",
+            slug: Box::leak(slug.to_string().into_boxed_str()),
+            body_md: "**Why:** because.\n\n**How to apply:** carefully.",
+            source_agent_id: None,
+            source_ci_run_id: None,
+        }
+    }
+
+    #[test]
+    fn learning_kind_round_trips_through_wire_form() {
+        for k in [
+            LearningKind::Feedback,
+            LearningKind::Project,
+            LearningKind::Reference,
+        ] {
+            assert_eq!(LearningKind::parse(k.as_str()), Some(k));
+        }
+        assert_eq!(LearningKind::parse("user"), None);
+        assert_eq!(LearningKind::parse(""), None);
+        assert_eq!(LearningKind::parse("Feedback"), None); // case-sensitive
+    }
+
+    #[test]
+    fn create_and_get_learning_round_trips() {
+        let (db, _dir) = test_db();
+        create_learning(&db, &sample_learning("L-1", "no-mocks-in-integration")).unwrap();
+
+        let got = get_learning(&db, "L-1").unwrap();
+        assert_eq!(got.id, "L-1");
+        assert_eq!(got.org_id, "default-org");
+        assert_eq!(got.kind, "feedback");
+        assert_eq!(got.category, "testing");
+        assert_eq!(got.slug, "no-mocks-in-integration");
+        assert!(got.body_md.starts_with("**Why:**"));
+        assert_eq!(got.source_agent_id, None);
+        assert_eq!(got.source_ci_run_id, None);
+        assert_eq!(got.archived_at, None);
+        assert_eq!(got.archived_reason, None);
+        assert!(!got.created_at.is_empty());
+    }
+
+    #[test]
+    fn get_missing_learning_returns_not_found() {
+        let (db, _dir) = test_db();
+        let err = get_learning(&db, "nope").unwrap_err();
+        assert!(matches!(err, LearningError::NotFound));
+    }
+
+    #[test]
+    fn duplicate_slug_within_same_org_and_kind_collides() {
+        let (db, _dir) = test_db();
+        create_learning(&db, &sample_learning("L-1", "stable-handle")).unwrap();
+        // Same (org_id, kind, slug) ⇒ unique-index trip.
+        let err = create_learning(&db, &sample_learning("L-2", "stable-handle")).unwrap_err();
+        assert!(
+            matches!(err, LearningError::SlugCollision),
+            "duplicate slug must surface as SlugCollision, got {err:?}"
+        );
+
+        // Same slug but different kind ⇒ allowed (unique is on the triple).
+        let mut as_project = sample_learning("L-3", "stable-handle");
+        as_project.kind = LearningKind::Project;
+        create_learning(&db, &as_project).expect("different kind ⇒ different triple ⇒ allowed");
+    }
+
+    #[test]
+    fn list_filters_by_org_and_kind_and_archive_state() {
+        let (db, _dir) = test_db();
+        // Seed two orgs' worth of rows. The default org row is created by
+        // `ensure_default_org`; add a second org so the FK is happy.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO organizations (id, name, slug) VALUES (?1, ?2, ?3)",
+                params!["org-2", "Second Org", "second-org"],
+            )
+            .unwrap();
+        }
+
+        create_learning(&db, &sample_learning("L-1", "feedback-a")).unwrap();
+
+        let mut project = sample_learning("L-2", "project-a");
+        project.kind = LearningKind::Project;
+        create_learning(&db, &project).unwrap();
+
+        let mut other_org = sample_learning("L-3", "feedback-a");
+        other_org.org_id = "org-2";
+        create_learning(&db, &other_org).unwrap();
+
+        // Default org, no kind filter, active only.
+        let active_default = list_learnings_for_org(&db, "default-org", None, false);
+        let ids: Vec<&str> = active_default.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "two active rows in default-org, got {ids:?}");
+        assert!(ids.contains(&"L-1"));
+        assert!(ids.contains(&"L-2"));
+
+        // Org filter excludes the other org's row.
+        let org_2_rows = list_learnings_for_org(&db, "org-2", None, false);
+        assert_eq!(org_2_rows.len(), 1);
+        assert_eq!(org_2_rows[0].id, "L-3");
+
+        // Kind filter restricts to feedback within default-org.
+        let feedback_only =
+            list_learnings_for_org(&db, "default-org", Some(LearningKind::Feedback), false);
+        assert_eq!(feedback_only.len(), 1);
+        assert_eq!(feedback_only[0].id, "L-1");
+
+        // Archive L-1; active list drops to one, archived-inclusive list
+        // restores both.
+        assert!(archive_learning(&db, "L-1", "outdated-by-adr-0009").unwrap());
+        let active_after = list_learnings_for_org(&db, "default-org", None, false);
+        assert_eq!(active_after.len(), 1);
+        assert_eq!(active_after[0].id, "L-2");
+        let all_after = list_learnings_for_org(&db, "default-org", None, true);
+        assert_eq!(all_after.len(), 2);
+    }
+
+    #[test]
+    fn archive_learning_is_idempotent_and_records_reason() {
+        let (db, _dir) = test_db();
+        create_learning(&db, &sample_learning("L-1", "to-archive")).unwrap();
+
+        let first = archive_learning(&db, "L-1", "no-longer-applicable").unwrap();
+        assert!(first, "first archive flips the row");
+
+        let got = get_learning(&db, "L-1").unwrap();
+        assert!(got.archived_at.is_some());
+        assert_eq!(got.archived_reason.as_deref(), Some("no-longer-applicable"));
+
+        let original_archived_at = got.archived_at.clone();
+
+        // Second archive: NOT a flip (already archived). Original
+        // timestamp + reason MUST survive — operators rely on the first
+        // archive timestamp to bound the audit window.
+        let second = archive_learning(&db, "L-1", "different-reason-2nd-try").unwrap();
+        assert!(!second, "re-archiving an archived row is a no-op flip");
+
+        let got_after = get_learning(&db, "L-1").unwrap();
+        assert_eq!(got_after.archived_at, original_archived_at);
+        assert_eq!(
+            got_after.archived_reason.as_deref(),
+            Some("no-longer-applicable"),
+            "the original reason must survive the re-archive attempt"
+        );
+    }
+
+    #[test]
+    fn learning_links_back_to_ci_failure_event_row() {
+        // Acceptance criterion: "an entry with source_ci_run_id linked
+        // back to the originating event row." Seed a ci_failure_events
+        // row, capture its autoincrement id, then write a learning
+        // pointing at it. Confirm the round-trip preserves the link AND
+        // a JOIN-style read recovers the original event row from the
+        // learning's source_ci_run_id alone.
+        let (db, _dir) = test_db();
+
+        let event_id: i64 = {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO ci_failure_events \
+                     (agent_id, plan_name, task_number, branch, run_id, \
+                      workflow, conclusion, summary) \
+                 VALUES ('agent-1', 'plan-a', '1.1', 'branchwork/x/1.1', \
+                         '12345', 'tests.yml', 'failure', 'rustfmt tripped')",
+                [],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        assert!(event_id > 0);
+
+        let mut linked = sample_learning("L-1", "always-run-fmt-locally");
+        linked.source_agent_id = Some("agent-1");
+        linked.source_ci_run_id = Some(event_id);
+        create_learning(&db, &linked).unwrap();
+
+        // Direct field check.
+        let got = get_learning(&db, "L-1").unwrap();
+        assert_eq!(got.source_ci_run_id, Some(event_id));
+        assert_eq!(got.source_agent_id.as_deref(), Some("agent-1"));
+
+        // JOIN-style navigation: from the learning's source_ci_run_id
+        // alone, recover the originating event row's run_id + workflow.
+        // This is the readback the dashboard's "where did this come
+        // from?" affordance will use.
+        let (origin_run_id, origin_workflow, origin_branch): (String, String, String) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT e.run_id, e.workflow, e.branch \
+                   FROM ci_failure_events e \
+                   JOIN learnings l ON l.source_ci_run_id = e.id \
+                  WHERE l.id = ?1",
+                params!["L-1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(origin_run_id, "12345");
+        assert_eq!(origin_workflow, "tests.yml");
+        assert_eq!(origin_branch, "branchwork/x/1.1");
+    }
+
+    #[test]
+    fn fk_cascade_deletes_learnings_when_org_is_deleted() {
+        // Deleting an org must take its learnings with it. Mirrors the
+        // FK-cascade contract `credentials` rides for owner_user_id.
+        let (db, _dir) = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO organizations (id, name, slug) VALUES (?1, ?2, ?3)",
+                params!["org-9", "Doomed Org", "doomed"],
+            )
+            .unwrap();
+        }
+        let mut input = sample_learning("L-1", "in-doomed-org");
+        input.org_id = "org-9";
+        create_learning(&db, &input).unwrap();
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("DELETE FROM organizations WHERE id = ?1", params!["org-9"])
+                .unwrap();
+        }
+        let err = get_learning(&db, "L-1").unwrap_err();
+        assert!(matches!(err, LearningError::NotFound));
+    }
+
+    #[test]
+    fn body_md_is_stored_byte_for_byte() {
+        // The brief is explicit that bodies are markdown to match the
+        // on-disk memory format. Verify the round-trip preserves bytes
+        // — including newlines, backticks, and the [[link]] wikilinks
+        // the auto-memory format uses to cross-reference other entries.
+        let (db, _dir) = test_db();
+        let body = "# Title\n\nSome body with `code` and [[other-memory]].\n";
+        let mut input = sample_learning("L-1", "verbatim-body");
+        input.body_md = body;
+        create_learning(&db, &input).unwrap();
+
+        let got = get_learning(&db, "L-1").unwrap();
+        assert_eq!(got.body_md, body);
     }
 }
