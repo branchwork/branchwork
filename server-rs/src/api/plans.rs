@@ -3140,6 +3140,36 @@ pub async fn set_task_status(
         );
     }
 
+    // Phase 1, Task 1.2: pending-learning gate. If a CI failure was observed
+    // on this task's branch (Phase 1.1 wrote a ci_failure_events row) and
+    // the agent / user has not yet captured a learning that addresses it
+    // (POST /api/plans/:name/tasks/:num/learnings flips resolved_at), refuse
+    // to mark the task `completed`. Mirrors the working_tree_dirty 409
+    // shape; agents grep `code: "pending_learning"` to detect the situation
+    // programmatically, the dashboard renders `failures[]` as a sticky
+    // banner with a Capture-learning CTA.
+    if body.status == "completed" {
+        let pending = crate::db::pending_ci_failures(&state.db, &name, &task_number);
+        if !pending.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "pending_learning",
+                    "code": "pending_learning",
+                    "message": format!(
+                        "Cannot mark task completed — {n} CI failure(s) need a learning \
+                         before this task can be closed. POST /api/plans/{plan}/tasks/{task}/learnings \
+                         to capture, then retry update_task_status(completed).",
+                        n = pending.len(),
+                        plan = name,
+                        task = task_number,
+                    ),
+                    "failures": pending,
+                })),
+            );
+        }
+    }
+
     let db = state.db.lock().unwrap();
 
     // Capture previous status for audit diff
@@ -3282,13 +3312,21 @@ pub async fn add_task_learning(
             .into_response();
     }
 
-    let db = state.db.lock().unwrap();
-    db.execute(
-        "INSERT INTO task_learnings (plan_name, task_number, learning) VALUES (?1, ?2, ?3)",
-        params![plan_name, task_number, learning],
-    )
-    .unwrap();
-    let id = db.last_insert_rowid();
+    let id = {
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO task_learnings (plan_name, task_number, learning) VALUES (?1, ?2, ?3)",
+            params![plan_name, task_number, learning],
+        )
+        .unwrap();
+        db.last_insert_rowid()
+    };
+
+    // Phase 1, Task 1.2: capturing any learning clears the pending-learning
+    // gate for this task. Counts as a side effect rather than a separate
+    // endpoint so the agent does not need a new contract — the existing
+    // learning-write path is the natural hand-off point.
+    let resolved = crate::db::mark_ci_failures_resolved(&state.db, &plan_name, &task_number);
 
     (
         StatusCode::CREATED,
@@ -3298,6 +3336,7 @@ pub async fn add_task_learning(
             "planName": plan_name,
             "taskNumber": task_number,
             "learning": learning,
+            "resolvedCiFailures": resolved,
         })),
     )
         .into_response()

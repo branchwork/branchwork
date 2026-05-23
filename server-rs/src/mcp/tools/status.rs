@@ -143,6 +143,46 @@ impl BranchworkMcp {
             ));
         }
 
+        // Phase 1, Task 1.2: pending-learning gate. A `ci_failure_events` row
+        // landed for this task (T1.1 dispatcher) and no learning has cleared
+        // it yet. Refuse with the structured `code: pending_learning` payload
+        // so the agent can react programmatically — call
+        // `report_blocker` (which writes a learning) or POST to
+        // `/api/plans/<plan>/tasks/<task>/learnings`, then retry.
+        if req.status == "completed" {
+            let pending = crate::db::pending_ci_failures(&self.ctx.db, &req.plan, &req.task);
+            if !pending.is_empty() {
+                let summary = pending
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            "run {} ({})",
+                            f.run_id,
+                            f.workflow.as_deref().unwrap_or("workflow ?")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Cannot mark task completed — pending_learning: {n} CI failure(s) \
+                         need a learning before this task can be closed: {summary}. \
+                         Call `report_blocker` or POST a learning to \
+                         /api/plans/{plan}/tasks/{task}/learnings, then retry.",
+                        n = pending.len(),
+                        plan = req.plan,
+                        task = req.task,
+                    ),
+                    Some(serde_json::json!({
+                        "code": "pending_learning",
+                        "plan": req.plan,
+                        "task": req.task,
+                        "failures": pending,
+                    })),
+                ));
+            }
+        }
+
         {
             let db = self.ctx.db.lock().unwrap();
             db.execute(
@@ -171,6 +211,18 @@ impl BranchworkMcp {
                     params![req.plan, req.task, reason],
                 );
             }
+        }
+
+        // Phase 1, Task 1.2: any learning capture clears the pending-learning
+        // gate. Fires whenever `reason` was set (the branch above wrote a
+        // task_learnings row); a no-reason status update is a no-op here.
+        if req
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+        {
+            crate::db::mark_ci_failures_resolved(&self.ctx.db, &req.plan, &req.task);
         }
 
         crate::ws::broadcast_event(
@@ -303,6 +355,12 @@ impl BranchworkMcp {
             );
         }
 
+        // Phase 1, Task 1.2: report_blocker writes a `BLOCKED:` learning, so
+        // it clears the pending-learning gate as a side effect. An operator
+        // who unblocks the task later can `update_task_status(completed)`
+        // without re-tripping the gate on the originally-pending failure.
+        crate::db::mark_ci_failures_resolved(&self.ctx.db, &req.plan, &req.task);
+
         crate::ws::broadcast_event(
             &self.ctx.broadcast_tx,
             "task_status_changed",
@@ -321,5 +379,206 @@ impl BranchworkMcp {
             status: "failed".to_string(),
             reason: reason.to_string(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the Phase 1, Task 1.2 pending-learning gate on the
+    //! MCP side. The HTTP path is pinned in `tests/pending_learning_gate.rs`;
+    //! these tests cover the McpError shape (code lives in `data`, not the
+    //! JSON-RPC `code` field) and the resolve-on-`reason` side effect of
+    //! `update_task_status` + `report_blocker`.
+    //!
+    //! Mirrors the McpContext construction pattern in `mcp/tools/plans.rs`.
+    use super::*;
+    use crate::agents::AgentRegistry;
+    use crate::config::Effort;
+    use crate::db;
+    use crate::mcp::{BranchworkMcp, McpContext};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+    use tokio::sync::broadcast;
+
+    fn test_mcp() -> (BranchworkMcp, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let db = db::init(&dir.path().join("test.db"));
+        let (tx, _rx) = broadcast::channel::<String>(32);
+        let registry = AgentRegistry::new(
+            db.clone(),
+            tx.clone(),
+            None,
+            PathBuf::from("/tmp/branchwork-test-sockets"),
+            PathBuf::from("/nonexistent/branchwork-server"),
+            3100,
+            true,
+        );
+        let ctx = McpContext {
+            plans_dir,
+            db,
+            broadcast_tx: tx,
+            registry,
+            effort: Arc::new(Mutex::new(Effort::High)),
+            port: 3100,
+        };
+        (BranchworkMcp::new(ctx), dir)
+    }
+
+    /// Seed a pending `ci_failure_events` row via direct SQL. Mirrors
+    /// the `tests/pending_learning_gate.rs::seed_pending_failure` helper
+    /// — kept inline because integration-test helpers cannot be reached
+    /// from binary-crate unit tests.
+    fn seed_pending_failure(mcp: &BranchworkMcp, plan: &str, task: &str, run_id: &str) {
+        let conn = mcp.ctx.db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ci_failure_events \
+                 (agent_id, plan_name, task_number, branch, run_id, \
+                  run_url, workflow, conclusion, summary, org_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'default-org')",
+            params![
+                format!("agent-{}", run_id),
+                plan,
+                task,
+                format!("branchwork/{}/{}", plan, task),
+                run_id,
+                format!("https://github.com/owner/repo/actions/runs/{}", run_id),
+                "tests.yml",
+                "failure",
+                format!("workflow tests.yml failed (run {})", run_id),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_task_status_completed_returns_mcp_error_with_pending_learning_data() {
+        let (mcp, _dir) = test_mcp();
+        seed_pending_failure(&mcp, "p", "1.1", "12345");
+
+        let res = mcp
+            .update_task_status(Parameters(UpdateTaskStatusRequest {
+                plan: "p".to_string(),
+                task: "1.1".to_string(),
+                status: "completed".to_string(),
+                reason: None,
+            }))
+            .await;
+        // rmcp::Json<T> doesn't impl Debug, so we can't .expect_err — pattern
+        // match instead.
+        let err = match res {
+            Ok(_) => panic!("expected pending_learning McpError, got Ok"),
+            Err(e) => e,
+        };
+
+        // The JSON-RPC `code` field stays INVALID_PARAMS (-32602) per the
+        // protocol; the structured `code: "pending_learning"` payload
+        // lives in `data` so agents that grep on the message string OR
+        // on data.code both detect it.
+        assert!(
+            err.message.contains("pending_learning"),
+            "message must mention pending_learning: {}",
+            err.message
+        );
+        let data = err.data.expect("data payload is required");
+        assert_eq!(data["code"], "pending_learning", "{data}");
+        assert_eq!(data["plan"], "p");
+        assert_eq!(data["task"], "1.1");
+        let failures = data["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["runId"], "12345");
+    }
+
+    #[tokio::test]
+    async fn update_task_status_non_completed_bypasses_pending_learning_gate() {
+        let (mcp, _dir) = test_mcp();
+        seed_pending_failure(&mcp, "p", "1.1", "12345");
+
+        for st in ["in_progress", "failed", "skipped", "pending"] {
+            let res = mcp
+                .update_task_status(Parameters(UpdateTaskStatusRequest {
+                    plan: "p".to_string(),
+                    task: "1.1".to_string(),
+                    status: st.to_string(),
+                    reason: None,
+                }))
+                .await;
+            // rmcp::Json<T> doesn't impl Debug; report the error message
+            // on failure rather than the whole Result.
+            if let Err(err) = res {
+                panic!("status={st} should bypass gate, got Err: {}", err.message);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn update_task_status_with_reason_resolves_the_gate_for_next_call() {
+        let (mcp, _dir) = test_mcp();
+        seed_pending_failure(&mcp, "p", "1.1", "12345");
+
+        // status=in_progress + reason="..." writes a learning, which
+        // resolves the pending failure. Subsequent completed succeeds.
+        mcp.update_task_status(Parameters(UpdateTaskStatusRequest {
+            plan: "p".to_string(),
+            task: "1.1".to_string(),
+            status: "in_progress".to_string(),
+            reason: Some("CI tripped because of fmt".to_string()),
+        }))
+        .await
+        .expect("in_progress+reason should succeed");
+
+        // Verify resolved.
+        let pending = crate::db::pending_ci_failures(&mcp.ctx.db, "p", "1.1");
+        assert!(pending.is_empty(), "reason should have cleared the gate");
+
+        // Retry completed: succeeds.
+        mcp.update_task_status(Parameters(UpdateTaskStatusRequest {
+            plan: "p".to_string(),
+            task: "1.1".to_string(),
+            status: "completed".to_string(),
+            reason: None,
+        }))
+        .await
+        .expect("post-resolve completed should succeed");
+    }
+
+    #[tokio::test]
+    async fn report_blocker_writes_blocked_learning_and_resolves_pending_failures() {
+        let (mcp, _dir) = test_mcp();
+        seed_pending_failure(&mcp, "p", "1.1", "12345");
+
+        mcp.report_blocker(Parameters(ReportBlockerRequest {
+            plan: "p".to_string(),
+            task: "1.1".to_string(),
+            reason: "waiting on flaky CI runner upstream".to_string(),
+        }))
+        .await
+        .expect("report_blocker should succeed");
+
+        let pending = crate::db::pending_ci_failures(&mcp.ctx.db, "p", "1.1");
+        assert!(
+            pending.is_empty(),
+            "report_blocker must resolve pending failures so an unblock-then-complete \
+             flow does not re-trip the gate"
+        );
+    }
+
+    /// A task with NO pending failures must complete cleanly via MCP —
+    /// the gate is a strict guard, not an annotation that requires
+    /// learnings for every task.
+    #[tokio::test]
+    async fn update_task_status_completed_succeeds_when_no_pending_failures() {
+        let (mcp, _dir) = test_mcp();
+        // No seed → no pending rows.
+        mcp.update_task_status(Parameters(UpdateTaskStatusRequest {
+            plan: "p".to_string(),
+            task: "1.1".to_string(),
+            status: "completed".to_string(),
+            reason: None,
+        }))
+        .await
+        .expect("no pending rows → completed must succeed");
     }
 }

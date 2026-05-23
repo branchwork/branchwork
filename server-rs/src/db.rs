@@ -463,6 +463,88 @@ pub fn fix_attempt_for_agent(db: &Db, plan_name: &str, agent_id: &str) -> Option
     .ok()
 }
 
+// ── Pending-learning gate (Phase 1, Task 1.2) ───────────────────────────────
+
+/// A `ci_failure_events` row that is still pending a learning capture.
+/// Returned by [`pending_ci_failures`] and embedded in the 409 response
+/// payload of [`crate::api::plans::set_task_status`] and the equivalent
+/// `McpError` raised by `mcp::tools::status::update_task_status`.
+///
+/// Wire-shape: camelCase serialization matches the rest of the HTTP API
+/// (`runId`, `runUrl`, `observedAt`). Fields are intentionally a strict
+/// subset of `ci_failure_events` — `agent_id`, `branch`, and `org_id` are
+/// authoring metadata the caller already knows from context.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingCiFailure {
+    pub id: i64,
+    pub run_id: String,
+    pub run_url: Option<String>,
+    pub workflow: Option<String>,
+    pub conclusion: Option<String>,
+    pub summary: Option<String>,
+    pub observed_at: String,
+}
+
+/// List every `ci_failure_events` row for `(plan_name, task_number)` that
+/// has not yet been resolved by a captured learning (`resolved_at IS
+/// NULL`). The partial index `idx_ci_failure_events_pending` is the
+/// hot-path lookup; the surrounding sort keeps the response stable so a
+/// dashboard rendering the failures list does not jitter on poll.
+///
+/// Returns an empty Vec when the task has no pending failures — that's
+/// the signal that the `completed` gate may proceed.
+pub fn pending_ci_failures(db: &Db, plan_name: &str, task_number: &str) -> Vec<PendingCiFailure> {
+    let conn = db.lock().unwrap();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, run_id, run_url, workflow, conclusion, summary, observed_at \
+           FROM ci_failure_events \
+          WHERE plan_name = ?1 \
+            AND task_number = ?2 \
+            AND resolved_at IS NULL \
+          ORDER BY observed_at ASC, id ASC",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map(params![plan_name, task_number], |row| {
+        Ok(PendingCiFailure {
+            id: row.get(0)?,
+            run_id: row.get(1)?,
+            run_url: row.get(2)?,
+            workflow: row.get(3)?,
+            conclusion: row.get(4)?,
+            summary: row.get(5)?,
+            observed_at: row.get(6)?,
+        })
+    })
+    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    .unwrap_or_default()
+}
+
+/// Mark every pending `ci_failure_events` row for `(plan_name,
+/// task_number)` as resolved (`resolved_at = datetime('now')`). Returns
+/// the number of rows updated, which doubles as a "did we just clear the
+/// gate?" signal for callers.
+///
+/// Idempotent: a second call after the first matches no rows (the
+/// `WHERE resolved_at IS NULL` filter is the gate) and returns 0. Callers
+/// fire this from any path that captures a learning (HTTP
+/// `add_task_learning`, MCP `report_blocker`, MCP `update_task_status`
+/// when `reason` is set) so the gate clears as a side effect of the
+/// existing learning-write — no new agent contract.
+pub fn mark_ci_failures_resolved(db: &Db, plan_name: &str, task_number: &str) -> usize {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "UPDATE ci_failure_events \
+            SET resolved_at = datetime('now') \
+          WHERE plan_name = ?1 \
+            AND task_number = ?2 \
+            AND resolved_at IS NULL",
+        params![plan_name, task_number],
+    )
+    .unwrap_or(0)
+}
+
 // ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
 
 /// Default TTL for a `master_push_lock` row. A holder that hasn't touched
@@ -1726,6 +1808,24 @@ fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE agents ADD COLUMN runner_id TEXT;")
         .ok();
 
+    // Phase 1, Task 1.2: pending-learning gate. A `ci_failure_events` row is
+    // "pending" while `resolved_at IS NULL` — it blocks the task from being
+    // marked `completed` until a learning is captured (see
+    // `pending_ci_failures` and `mark_ci_failures_resolved`). Existing rows
+    // pre-1.2 default to NULL (pending) so the gate engages immediately on
+    // upgrade; that's safe because the only way to clear NULL is to write a
+    // learning, which the agent / dashboard can always do. Partial index
+    // accelerates the gate's hot-path lookup (per-task scan filtered to
+    // unresolved rows only).
+    conn.execute_batch("ALTER TABLE ci_failure_events ADD COLUMN resolved_at TEXT;")
+        .ok();
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_ci_failure_events_pending \
+            ON ci_failure_events(plan_name, task_number) \
+            WHERE resolved_at IS NULL;",
+    )
+    .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 
@@ -1946,6 +2046,150 @@ mod tests {
         assert!(
             !observed_at.is_empty(),
             "observed_at must default to datetime('now')"
+        );
+    }
+
+    // ── Phase 1, Task 1.2: pending-learning gate ───────────────────────────
+
+    /// Seed a `ci_failure_events` row with a given `resolved_at` value so
+    /// each pending-learning test can exercise either the pending or
+    /// resolved branch directly.
+    fn seed_ci_failure(
+        db: &Db,
+        plan_name: &str,
+        task_number: Option<&str>,
+        run_id: &str,
+        resolved_at: Option<&str>,
+    ) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ci_failure_events \
+                 (agent_id, plan_name, task_number, branch, run_id, \
+                  run_url, workflow, conclusion, summary, resolved_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                format!("agent-{}", run_id),
+                plan_name,
+                task_number,
+                "branchwork/x/0.1",
+                run_id,
+                format!("https://gh/.../runs/{}", run_id),
+                "tests.yml",
+                "failure",
+                format!("workflow tests.yml failed (run {})", run_id),
+                resolved_at,
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn pending_ci_failures_returns_only_unresolved_for_the_task() {
+        let (db, _dir) = test_db();
+        seed_ci_failure(&db, "p", Some("1.1"), "111", None); // pending
+        seed_ci_failure(&db, "p", Some("1.1"), "112", Some("2026-05-23T10:00:00")); // resolved
+        seed_ci_failure(&db, "p", Some("1.2"), "113", None); // different task
+        seed_ci_failure(&db, "p", None, "114", None); // null task — not the target
+        let pending = pending_ci_failures(&db, "p", "1.1");
+        assert_eq!(pending.len(), 1, "only the unresolved 1.1 row qualifies");
+        assert_eq!(pending[0].run_id, "111");
+        assert_eq!(pending[0].workflow.as_deref(), Some("tests.yml"));
+        assert_eq!(pending[0].conclusion.as_deref(), Some("failure"));
+    }
+
+    #[test]
+    fn pending_ci_failures_returns_empty_when_no_rows_or_all_resolved() {
+        let (db, _dir) = test_db();
+        assert!(pending_ci_failures(&db, "p", "1.1").is_empty());
+        seed_ci_failure(&db, "p", Some("1.1"), "111", Some("2026-05-23T10:00:00"));
+        assert!(
+            pending_ci_failures(&db, "p", "1.1").is_empty(),
+            "resolved row must not surface"
+        );
+    }
+
+    #[test]
+    fn pending_ci_failures_orders_by_observed_at_ascending() {
+        let (db, _dir) = test_db();
+        // SQLite datetime('now') resolution is 1s; insert in known order
+        // and use the (id) tie-breaker to pin a deterministic sort.
+        let id_a = seed_ci_failure(&db, "p", Some("1.1"), "111", None);
+        let id_b = seed_ci_failure(&db, "p", Some("1.1"), "222", None);
+        let id_c = seed_ci_failure(&db, "p", Some("1.1"), "333", None);
+        let pending = pending_ci_failures(&db, "p", "1.1");
+        let ids: Vec<i64> = pending.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![id_a, id_b, id_c]);
+    }
+
+    #[test]
+    fn mark_ci_failures_resolved_flips_all_unresolved_for_the_task() {
+        let (db, _dir) = test_db();
+        seed_ci_failure(&db, "p", Some("1.1"), "111", None);
+        seed_ci_failure(&db, "p", Some("1.1"), "112", None);
+        seed_ci_failure(&db, "p", Some("1.2"), "113", None);
+        let count = mark_ci_failures_resolved(&db, "p", "1.1");
+        assert_eq!(count, 2, "both 1.1 rows resolved, 1.2 untouched");
+        assert!(pending_ci_failures(&db, "p", "1.1").is_empty());
+        assert_eq!(pending_ci_failures(&db, "p", "1.2").len(), 1);
+    }
+
+    #[test]
+    fn mark_ci_failures_resolved_is_idempotent() {
+        let (db, _dir) = test_db();
+        seed_ci_failure(&db, "p", Some("1.1"), "111", None);
+        assert_eq!(mark_ci_failures_resolved(&db, "p", "1.1"), 1);
+        // Second call matches no pending rows.
+        assert_eq!(mark_ci_failures_resolved(&db, "p", "1.1"), 0);
+        // And does not unset the resolution.
+        assert!(pending_ci_failures(&db, "p", "1.1").is_empty());
+    }
+
+    #[test]
+    fn mark_ci_failures_resolved_does_not_touch_other_plans_or_tasks() {
+        let (db, _dir) = test_db();
+        seed_ci_failure(&db, "p", Some("1.1"), "111", None);
+        seed_ci_failure(&db, "q", Some("1.1"), "222", None);
+        let count = mark_ci_failures_resolved(&db, "p", "1.1");
+        assert_eq!(count, 1);
+        assert_eq!(
+            pending_ci_failures(&db, "q", "1.1").len(),
+            1,
+            "cross-plan rows must be untouched"
+        );
+    }
+
+    /// Resolved column must accept NULL on existing pre-1.2 rows (the
+    /// ALTER TABLE ADD COLUMN backfills NULL by default) and round-trip
+    /// a TEXT timestamp.
+    #[test]
+    fn ci_failure_events_resolved_at_column_round_trips() {
+        let (db, _dir) = test_db();
+        let id = seed_ci_failure(&db, "p", Some("1.1"), "111", None);
+        let conn = db.lock().unwrap();
+        let resolved_at: Option<String> = conn
+            .query_row(
+                "SELECT resolved_at FROM ci_failure_events WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_at, None);
+        drop(conn);
+
+        // Update via the helper and re-read.
+        mark_ci_failures_resolved(&db, "p", "1.1");
+        let conn = db.lock().unwrap();
+        let resolved_at: Option<String> = conn
+            .query_row(
+                "SELECT resolved_at FROM ci_failure_events WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            resolved_at.is_some_and(|s| !s.is_empty()),
+            "resolved_at must be a non-empty timestamp post-resolve"
         );
     }
 
