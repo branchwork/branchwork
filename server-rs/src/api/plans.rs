@@ -3367,6 +3367,138 @@ pub async fn list_task_learnings(
     Json(rows)
 }
 
+// ── GET /api/plans/:name/tasks/:num/relevant-learnings ───────────────────────
+//
+// Surface the SAME curated list of learnings that
+// [`agents::spawn_ops::inject_learnings_into_prompt`] would prepend to a
+// fresh agent's prompt for this task. Powers the "Past learnings" panel
+// on the task view (Phase 3.2 of the learning-hub-ci-failure-capture
+// plan): a human can spot-check that the agent received the lesson it
+// should have, without scraping logs.
+//
+// **Contract**: the items returned MUST be exactly the same set, in the
+// same order, that `build_learnings_block` would render. The endpoint
+// must therefore route through
+// [`learnings_context::task_file_paths_for_plan`] +
+// [`learnings_context::select_relevant_learnings`] verbatim — any
+// divergent selector here is a bug.
+//
+// Each item carries the full `Learning` row plus two derived fields the
+// frontend uses for the drilldown:
+// - `sourceRunUrl`: the GitHub Actions run URL for the CI failure that
+//   triggered the learning capture (when `source_ci_run_id` is set and
+//   the matching `ci_failure_events` row exists).
+// - `sourceWorkflow`: the workflow display name from the same row.
+// Both are `None` for learnings authored by the migrate-memories CLI or
+// manual API writes — those don't link back to any specific CI run.
+
+/// One row in the `GET /api/plans/:name/tasks/:num/relevant-learnings`
+/// response. Wraps the canonical `Learning` (flattened so the wire shape
+/// is the same camelCase columns the rest of `/api/learnings` uses) and
+/// adds the derived `sourceRunUrl` / `sourceWorkflow` fields the
+/// drilldown needs.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelevantLearningRow {
+    #[serde(flatten)]
+    learning: crate::db::Learning,
+    /// URL of the GitHub Actions run referenced by the learning's
+    /// `source_ci_run_id` backlink, if the matching `ci_failure_events`
+    /// row exists and has a non-NULL `run_url`. `None` for learnings
+    /// without a CI backlink, or when the backlink row was purged.
+    source_run_url: Option<String>,
+    /// Workflow display name from the same `ci_failure_events` row.
+    /// `None` under the same conditions as `sourceRunUrl`.
+    source_workflow: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelevantLearningsResponse {
+    items: Vec<RelevantLearningRow>,
+}
+
+pub async fn list_relevant_learnings_for_task(
+    State(state): State<AppState>,
+    Path((plan_name, task_number)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // Mirror spawn_ops::inject_learnings_into_prompt verbatim: resolve
+    // the task's file_paths off disk, then drive the SAME selector with
+    // the SAME top_k. Any drift here would silently break the "panel
+    // matches the agent's prompt" acceptance criterion.
+    let file_paths = crate::agents::learnings_context::task_file_paths_for_plan(
+        &state.plans_dir,
+        &plan_name,
+        &task_number,
+    );
+    let learnings = crate::agents::learnings_context::select_relevant_learnings(
+        &state.db,
+        &plan_name,
+        &file_paths,
+        crate::agents::learnings_context::DEFAULT_LEARNINGS_TOP_K,
+    );
+
+    // Batch-fetch CI backlink metadata in a single SELECT — the selector
+    // already filtered to active rows, so the in-scope ids are bounded
+    // by DEFAULT_LEARNINGS_TOP_K (5 today). A per-row JOIN would be
+    // cheaper code but would lock+release the DB mutex N times.
+    let backlinks: HashMap<i64, (Option<String>, Option<String>)> = {
+        let event_ids: Vec<i64> = learnings
+            .iter()
+            .filter_map(|l| l.source_ci_run_id)
+            .collect();
+        if event_ids.is_empty() {
+            HashMap::new()
+        } else {
+            let placeholders = event_ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, run_url, workflow FROM ci_failure_events WHERE id IN ({placeholders})"
+            );
+            let conn = state.db.lock().unwrap();
+            conn.prepare(&sql)
+                .and_then(|mut stmt| {
+                    let params: Vec<&dyn rusqlite::ToSql> = event_ids
+                        .iter()
+                        .map(|id| id as &dyn rusqlite::ToSql)
+                        .collect();
+                    stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            (
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ),
+                        ))
+                    })?
+                    .collect::<Result<HashMap<_, _>, _>>()
+                })
+                .unwrap_or_default()
+        }
+    };
+
+    let items: Vec<RelevantLearningRow> = learnings
+        .into_iter()
+        .map(|l| {
+            let (source_run_url, source_workflow) = l
+                .source_ci_run_id
+                .and_then(|id| backlinks.get(&id).cloned())
+                .unwrap_or((None, None));
+            RelevantLearningRow {
+                learning: l,
+                source_run_url,
+                source_workflow,
+            }
+        })
+        .collect();
+
+    Json(RelevantLearningsResponse { items })
+}
+
 // ── POST /api/actions/start-task ────────────────────────────────────────────
 
 #[derive(Deserialize)]

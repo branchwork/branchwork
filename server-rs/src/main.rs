@@ -401,6 +401,16 @@ async fn run_server(cli: Cli) {
             "/api/plans/{name}/tasks/{task_number}/learnings",
             get(api::plans::list_task_learnings).post(api::plans::add_task_learning),
         )
+        // Phase 3.2 of the learning-hub-ci-failure-capture plan: the panel
+        // mirrors the agent's spawn-time learnings injection (T3.1). The
+        // shared selector lives in `agents::learnings_context`; both this
+        // endpoint and `spawn_ops::inject_learnings_into_prompt` MUST
+        // route through it so the dashboard's "did the agent see this?"
+        // signal stays truthful.
+        .route(
+            "/api/plans/{name}/tasks/{task_number}/relevant-learnings",
+            get(api::plans::list_relevant_learnings_for_task),
+        )
         .route("/api/plans/create", post(api::plans::create_plan))
         .route("/api/plans/convert-all", post(api::plans::convert_all))
         .route("/api/plans/{name}/convert", post(api::plans::convert_plan))

@@ -1012,6 +1012,13 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
           remounts (via the count-keyed key) after each save so the
           previously-typed text doesn't linger in the next edit pass. */}
       <TaskLearnings planName={planName} taskNumber={task.number} />
+
+      {/* Past learnings — mirror of what an agent spawned for this task
+          would see prepended to its prompt (T3.1). Auditable: a human
+          can spot-check the agent received the lesson it should have
+          without scraping logs. Same lazy-on-expand pattern as
+          TaskLearnings to keep the dashboard cheap on large plans. */}
+      <RelevantLearnings planName={planName} taskNumber={task.number} />
     </div>
   );
 }
@@ -1116,6 +1123,178 @@ function TaskLearnings({ planName, taskNumber }: TaskLearningsProps) {
               editClassName="text-[11px]"
             />
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/// One row in the `GET /api/plans/:name/tasks/:num/relevant-learnings`
+/// response — mirrors `server-rs/src/api/plans.rs::RelevantLearningRow`
+/// verbatim. Flattens the canonical `Learning` shape (camelCase) and
+/// adds the derived `sourceRunUrl` / `sourceWorkflow` fields the
+/// drilldown uses. Both are `null` for learnings that weren't authored
+/// from a CI failure (migrate-memories CLI, manual API writes).
+export interface RelevantLearning {
+  id: string;
+  orgId: string;
+  kind: string;
+  category: string;
+  slug: string;
+  bodyMd: string;
+  sourceAgentId: string | null;
+  sourceCiRunId: number | null;
+  createdAt: string;
+  archivedAt: string | null;
+  archivedReason: string | null;
+  sourceRunUrl: string | null;
+  sourceWorkflow: string | null;
+}
+
+interface RelevantLearningsResponse {
+  items: RelevantLearning[];
+}
+
+interface RelevantLearningsProps {
+  planName: string;
+  taskNumber: string;
+}
+
+/// "Past learnings" panel on the task view (T3.2 of the
+/// learning-hub-ci-failure-capture plan). Surfaces the same curated
+/// list that `agents::spawn_ops::inject_learnings_into_prompt` would
+/// prepend to a fresh agent's prompt for this task.
+///
+/// Collapsed by default; on first expand fires
+/// `GET /api/plans/:name/tasks/:num/relevant-learnings`. Each row shows
+/// a one-line preview (kind + category + creation time); clicking the
+/// row toggles a full markdown body. Items with a CI backlink render a
+/// "Source: run" link straight to GitHub Actions.
+///
+/// Empty-state copy distinguishes "no learnings for this task" (the
+/// agent saw nothing) from "loading" (we just haven't fetched yet).
+export function RelevantLearnings({ planName, taskNumber }: RelevantLearningsProps) {
+  const [open, setOpen] = useState(false);
+  const [rows, setRows] = useState<RelevantLearning[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await fetchJson<RelevantLearningsResponse>(
+        `/api/plans/${encodeURIComponent(planName)}/tasks/${encodeURIComponent(
+          taskNumber,
+        )}/relevant-learnings`,
+      );
+      setRows(data.items ?? []);
+    } catch (e) {
+      toastError(e, "Load past learnings failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (open && rows === null && !loading) {
+      load();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  function toggleItem(id: string) {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  const count = rows?.length ?? 0;
+  const countLabel = rows ? ` (${count})` : "";
+
+  return (
+    <div className="mt-1.5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="text-[10px] text-gray-500 hover:text-gray-300 transition flex items-center gap-1"
+        title="Show or hide the past learnings the agent will see at spawn time"
+        data-testid={`relevant-learnings-toggle-${taskNumber}`}
+      >
+        <span aria-hidden="true">{open ? "▾" : "▸"}</span>
+        Past learnings{countLabel}
+      </button>
+      {open && (
+        <div className="mt-1 space-y-1" data-testid={`relevant-learnings-panel-${taskNumber}`}>
+          {loading && rows === null && (
+            <div className="text-[10px] text-gray-600 italic">Loading…</div>
+          )}
+          {rows && rows.length === 0 && !loading && (
+            <div className="text-[10px] text-gray-600 italic">
+              No past learnings will be injected for this task.
+            </div>
+          )}
+          {rows?.map((row) => {
+            const expanded = expandedIds.has(row.id);
+            return (
+              <div
+                key={row.id}
+                className="text-[11px] text-gray-300 bg-gray-900/40 border border-gray-800/50 rounded px-1.5 py-1"
+                data-testid={`relevant-learning-${row.id}`}
+              >
+                <button
+                  type="button"
+                  onClick={() => toggleItem(row.id)}
+                  aria-expanded={expanded}
+                  className="w-full text-left flex items-center gap-1 hover:text-gray-100 transition"
+                  title={expanded ? "Hide full body" : "Show full body"}
+                >
+                  <span aria-hidden="true" className="text-gray-500">
+                    {expanded ? "▾" : "▸"}
+                  </span>
+                  <span className="text-[10px] uppercase tracking-wide text-gray-500">
+                    {row.kind}
+                  </span>
+                  <span className="font-mono text-[10px] text-gray-400">{row.category}</span>
+                  {row.sourceWorkflow && (
+                    <span
+                      className="text-[10px] text-amber-400/80 border border-amber-700/40 rounded px-1"
+                      title={`Captured from failure of ${row.sourceWorkflow}`}
+                    >
+                      ci
+                    </span>
+                  )}
+                </button>
+                {expanded && (
+                  <div className="mt-1 pt-1 border-t border-gray-800/50 space-y-1">
+                    <div className="whitespace-pre-wrap break-words text-[11px] text-gray-200">
+                      {row.bodyMd}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-[9px] text-gray-500">
+                      <span title={row.createdAt}>captured {formatRelative(row.createdAt)}</span>
+                      {row.sourceRunUrl && (
+                        <a
+                          href={row.sourceRunUrl}
+                          target="_blank"
+                          rel="noreferrer noopener"
+                          className="text-sky-400 hover:text-sky-300 underline underline-offset-2"
+                          data-testid={`relevant-learning-source-${row.id}`}
+                        >
+                          source: {row.sourceWorkflow ?? "CI run"} ↗
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
