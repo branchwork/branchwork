@@ -1,6 +1,7 @@
 pub mod check_agent;
 pub mod driver;
 pub mod git_ops;
+pub mod learnings_context;
 pub mod phase_check;
 pub mod prompt;
 pub mod pty_agent;

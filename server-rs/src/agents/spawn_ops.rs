@@ -56,16 +56,51 @@ use crate::ws::broadcast_event;
 /// The `org_id` argument selects which deployment we're in via
 /// [`org_has_runner`]. When false, this is a passthrough to the
 /// existing local path.
+///
+/// Before either dispatch path runs, the agent's prompt is augmented
+/// with a `<learnings>...</learnings>` block (Task 3.1) carrying the
+/// top-K most-relevant prior learnings for this task's
+/// `(plan project, file_paths, CI-failure workflows)`. Both standalone
+/// and SaaS paths get the same prepended block — the surfacing is
+/// dispatcher-level so it survives any future driver/mode split.
 pub async fn start_agent_dispatch(
     state: &AppState,
     org_id: &str,
-    opts: StartPtyOpts<'_>,
+    mut opts: StartPtyOpts<'_>,
 ) -> String {
+    inject_learnings_into_prompt(state, &mut opts);
     if org_has_runner(&state.db, org_id) {
         start_agent_via_runner(state, org_id, opts).await
     } else {
         pty_agent::start_pty_agent(&state.registry, opts).await
     }
+}
+
+/// Prepend the `<learnings>` block to `opts.prompt` when there are
+/// learnings worth surfacing for this task. No-op when:
+/// - The agent has no plan/task context (e.g. plan-creation flow,
+///   ad-hoc spawn) — there's nothing to scope learnings to.
+/// - No active learnings for the plan's org overlap with the task's
+///   `file_paths` or recent CI-failure workflows.
+///
+/// Exposed (via `pub(super)`) so the spawn_ops test module can pin the
+/// "the assembled prompt starts with `<learnings>`" acceptance from the
+/// brief without going through the wire path.
+pub(super) fn inject_learnings_into_prompt(state: &AppState, opts: &mut StartPtyOpts<'_>) {
+    let Some(block) = crate::agents::learnings_context::build_learnings_block(
+        &state.db,
+        &state.plans_dir,
+        opts.plan_name,
+        opts.task_id,
+    ) else {
+        return;
+    };
+    // Prepend so the block is at the very start of the agent's initial
+    // system-prompt slice. The unattended-contract block + IMPORTANT
+    // numbered steps from `build_task_prompt` stay at the end, where
+    // an agent re-reading the prompt for its closing-checklist will
+    // find them.
+    opts.prompt = format!("{block}\n\n{}", opts.prompt);
 }
 
 async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOpts<'_>) -> String {
@@ -857,8 +892,18 @@ mod tests {
     }
 
     fn test_app_state(db: crate::db::Db, runners: RunnerRegistry) -> AppState {
+        test_app_state_with_plans_dir(db, runners, PathBuf::from("/tmp/branchwork-test-plans"))
+    }
+
+    /// Variant that lets a test pin a real on-disk `plans_dir` —
+    /// needed by the T3.1 learnings-injection test so
+    /// `task_file_paths_for_plan` can re-read the plan YAML.
+    fn test_app_state_with_plans_dir(
+        db: crate::db::Db,
+        runners: RunnerRegistry,
+        plans_dir: PathBuf,
+    ) -> AppState {
         let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
-        let plans_dir = PathBuf::from("/tmp/branchwork-test-plans");
         let registry = crate::agents::AgentRegistry::new(
             db.clone(),
             broadcast_tx.clone(),
@@ -2056,5 +2101,201 @@ mod tests {
             .expect("channel still open");
         let envelope: Envelope = serde_json::from_str(&payload).unwrap();
         assert!(matches!(envelope.message, WireMessage::StartAgent { .. }));
+    }
+
+    // ── T3.1: learnings injection ────────────────────────────────────────
+
+    /// Acceptance: "A spawned agent's first system-prompt slice contains
+    /// the most-recent feedback memory whose category matches the task's
+    /// file_paths (verified via an integration test that inspects the
+    /// prompt assembly output)."
+    ///
+    /// Drives the full SaaS dispatch path so we can read the assembled
+    /// prompt off the wire — same envelope-capturing pattern the
+    /// existing `saas_dispatch_emits_start_agent_envelope_to_runner`
+    /// test uses, with a real on-disk plans_dir so
+    /// `task_file_paths_for_plan` finds the YAML.
+    #[tokio::test]
+    async fn dispatch_prepends_learnings_block_when_category_matches_file_paths() {
+        use rusqlite::params;
+
+        let (db, _td_db) = full_db();
+        let org_id = "default-org";
+        seed_runner(&db, "runner-1", org_id, "online");
+
+        // Real plans_dir on disk so the dispatcher's plan re-read finds
+        // the file_paths. Plan title/context kept short; task file_paths
+        // intentionally point at this very module so the relevance
+        // scorer hits on "spawn_ops" via the category match.
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let yaml = r#"title: Learnings Plan
+context: ctx
+phases:
+  - number: 1
+    title: Phase 1
+    tasks:
+      - number: "1.1"
+        title: Wire learnings
+        description: ""
+        file_paths:
+          - server-rs/src/agents/spawn_ops.rs
+        acceptance: ""
+"#;
+        std::fs::write(plans_dir.path().join("learnings-plan.yaml"), yaml).unwrap();
+
+        // Seed two learnings: one whose category overlaps with the task's
+        // file_paths (basename stem = "spawn_ops"), and one unrelated.
+        // The brief asks the most-recent FEEDBACK kind that matches —
+        // both rows are feedback to keep the assertion on category, not
+        // kind. Body text is the load-bearing signal we grep the
+        // assembled prompt for.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO learnings \
+                    (id, org_id, kind, category, slug, body_md, created_at) \
+                 VALUES \
+                    ('match', ?1, 'feedback', 'spawn_ops', 'spawn-ops-gotcha', \
+                     'PARALLEL-AGENT BOUNCE GOTCHA: re-verify branch with `git branch --show-current` before commit.', \
+                     '2026-05-24T10:00:00')",
+                params![org_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO learnings \
+                    (id, org_id, kind, category, slug, body_md, created_at) \
+                 VALUES \
+                    ('miss', ?1, 'feedback', 'completely-unrelated', 'u-slug', \
+                     'this body should not appear in the prompt', \
+                     '2026-05-24T11:00:00')",
+                params![org_id],
+            )
+            .unwrap();
+        }
+
+        let runners = new_runner_registry();
+        let mut rx = install_capturing_runner(&runners, "runner-1").await;
+        let state = test_app_state_with_plans_dir(db, runners, plans_dir.path().to_path_buf());
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        let opts = StartPtyOpts {
+            prompt: "ORIGINAL-USER-PROMPT-MARKER".to_string(),
+            cwd: &cwd,
+            plan_name: Some("learnings-plan"),
+            task_id: Some("1.1"),
+            effort: crate::config::Effort::High,
+            branch: Some("branchwork/learnings-plan/1.1"),
+            is_continue: false,
+            max_budget_usd: None,
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+            runner_id: None,
+        };
+        let _agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        let payload = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("envelope should arrive")
+            .expect("channel still open");
+        let envelope: Envelope = serde_json::from_str(&payload).unwrap();
+        let wire_prompt = match envelope.message {
+            WireMessage::StartAgent { prompt, .. } => prompt,
+            other => panic!("expected StartAgent, got {other:?}"),
+        };
+
+        // Headline acceptance: the assembled prompt's first slice is the
+        // `<learnings>` block, and the original prompt comes AFTER it.
+        assert!(
+            wire_prompt.starts_with("<learnings>"),
+            "prompt's first slice must be the <learnings> block: {wire_prompt:?}"
+        );
+        let block_end = wire_prompt
+            .find("</learnings>")
+            .expect("prompt must contain the closing </learnings> tag");
+        let original_start = wire_prompt
+            .find("ORIGINAL-USER-PROMPT-MARKER")
+            .expect("the original user prompt must survive injection");
+        assert!(
+            block_end < original_start,
+            "the learnings block must precede the original prompt: \
+             block_end={block_end} original_start={original_start}"
+        );
+
+        // The matching feedback memory's body must be present; the
+        // unrelated one must not.
+        assert!(
+            wire_prompt.contains("PARALLEL-AGENT BOUNCE GOTCHA"),
+            "category-matching feedback body must appear in the prompt"
+        );
+        assert!(
+            !wire_prompt.contains("this body should not appear"),
+            "unrelated feedback body must NOT leak into the prompt"
+        );
+    }
+
+    /// Negative: when the org has zero learnings (or none overlap),
+    /// the dispatcher must not prepend an empty `<learnings>` block —
+    /// the prompt goes through untouched.
+    #[tokio::test]
+    async fn dispatch_does_not_inject_block_when_no_learnings_match() {
+        let (db, _td_db) = full_db();
+        let org_id = "default-org";
+        seed_runner(&db, "runner-1", org_id, "online");
+
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let yaml = r#"title: P
+context: c
+phases:
+  - number: 1
+    title: P1
+    tasks:
+      - number: "1.1"
+        title: T
+        description: ""
+        file_paths:
+          - server-rs/src/agents/spawn_ops.rs
+        acceptance: ""
+"#;
+        std::fs::write(plans_dir.path().join("learnings-plan.yaml"), yaml).unwrap();
+
+        let runners = new_runner_registry();
+        let mut rx = install_capturing_runner(&runners, "runner-1").await;
+        let state = test_app_state_with_plans_dir(db, runners, plans_dir.path().to_path_buf());
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        let opts = StartPtyOpts {
+            prompt: "ORIGINAL-PROMPT".to_string(),
+            cwd: &cwd,
+            plan_name: Some("learnings-plan"),
+            task_id: Some("1.1"),
+            effort: crate::config::Effort::High,
+            branch: Some("branchwork/learnings-plan/1.1"),
+            is_continue: false,
+            max_budget_usd: None,
+            driver: Some("claude"),
+            user_id: None,
+            org_id: Some(org_id),
+            runner_id: None,
+        };
+        let _agent_id = start_agent_dispatch(&state, org_id, opts).await;
+
+        let payload = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("envelope should arrive")
+            .expect("channel still open");
+        let envelope: Envelope = serde_json::from_str(&payload).unwrap();
+        let wire_prompt = match envelope.message {
+            WireMessage::StartAgent { prompt, .. } => prompt,
+            other => panic!("expected StartAgent, got {other:?}"),
+        };
+        assert_eq!(
+            wire_prompt, "ORIGINAL-PROMPT",
+            "no learnings = no block = unchanged prompt"
+        );
+        assert!(
+            !wire_prompt.contains("<learnings>"),
+            "empty result must not emit a stub block"
+        );
     }
 }
