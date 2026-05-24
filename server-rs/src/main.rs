@@ -12,6 +12,7 @@ mod file_watcher;
 mod git_helpers;
 mod hooks;
 mod mcp;
+mod migrate_memories;
 mod migrations;
 mod notifications;
 mod persisted_settings;
@@ -123,6 +124,30 @@ fn main() {
             if let Err(e) = rt.block_on(mcp::transport::run_stdio(ctx)) {
                 eprintln!("mcp stdio error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Some(Command::MigrateMemories(args)) => {
+            // Synchronous one-shot CLI: walk the per-user memory dir and
+            // either dry-run or apply imports against the local SQLite
+            // DB. Uses the same `claude-dir` resolution as `Mcp` /
+            // `None`, so a custom `--claude-dir` still works.
+            let config = Config::from_cli(cli);
+            let db = db::init(&config.db_path);
+            match migrate_memories::run(&config.claude_dir, &args.user, &args.org, args.apply, &db)
+            {
+                Ok(report) => {
+                    migrate_memories::print_report(&report);
+                    // Exit 1 if any file failed — operator should see a
+                    // non-zero exit when a migration is partially busted,
+                    // even though we never abort mid-run.
+                    if report.summary.failed > 0 {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("migrate-memories: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Some(Command::Session(_)) => unreachable!("handled above"),

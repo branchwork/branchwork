@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::agents::supervisor::SessionArgs;
 
@@ -77,6 +77,41 @@ pub enum Command {
     /// process and speak JSON-RPC on stdin/stdout. The same MCP handler is
     /// also mounted at `/mcp` on the HTTP listener when running `serve`.
     Mcp,
+
+    /// One-shot migration: import the per-user auto-memory directory
+    /// (`<claude-dir>/projects/<user>/memory/*.md`) into the org-shared
+    /// `learnings` table.
+    ///
+    /// Dry-run by default. Pass `--apply` to actually insert rows. The
+    /// on-disk files are NOT touched — they remain the user-private slot;
+    /// only the rows surfaced by this command land in the org store. Re-
+    /// running is naturally idempotent thanks to the
+    /// `(org_id, kind, slug)` unique constraint.
+    MigrateMemories(MigrateMemoriesArgs),
+}
+
+/// Args for [`Command::MigrateMemories`].
+#[derive(Args, Debug, Clone)]
+pub struct MigrateMemoriesArgs {
+    /// Per-user project subdirectory under
+    /// `<claude-dir>/projects/`. This is the directory name Claude Code
+    /// derives by flattening the project's path (e.g. `/home/cpo/branchwork`
+    /// → `-home-cpo-branchwork`).
+    #[arg(long)]
+    pub user: String,
+
+    /// Destination organisation. Accepts either the canonical org id
+    /// (e.g. `default-org`) OR the human slug (e.g. `default`) — the
+    /// CLI looks up both. A typo surfaces as a hard error rather than
+    /// a silent default-org write.
+    #[arg(long)]
+    pub org: String,
+
+    /// Actually insert rows. Without this flag the CLI only prints what
+    /// it *would* do — safer default for the demo / first-time-on-host
+    /// case (the brief explicitly mandates dry-run-by-default).
+    #[arg(long)]
+    pub apply: bool,
 }
 
 fn default_claude_dir() -> PathBuf {
