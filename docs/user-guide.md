@@ -27,6 +27,7 @@ for the per-OS detach mechanics and testing posture.
 - [Agents](#agents) — starting, attaching, types (PTY vs stream-JSON), stopping, check agents
 - [Drivers](#drivers) — Claude, Aider, Codex, Gemini — auth and how to pick
 - [Git flow](#git-flow) — branch naming, diff review, merge, stale branch cleanup
+- [Worktrees](#worktrees) — per-agent isolation, `BRANCHWORK_WORKTREE_BASE`, cross-filesystem warning
 - [Cost tracking & budgets](#cost-tracking--budgets)
 - [CI integration](#ci-integration)
 - [Auto-mode](#auto-mode) — auto-advance, auto-merge, the status pill, and the disabled Parallel toggle
@@ -486,6 +487,66 @@ and originating agent ID. Branches with zero unique commits ahead of
 deletion happens on the server via `git branch -D`. This is the
 recommended cleanup path; manual `git branch -D branchwork/...`
 works too but you'll have to figure out which branches are safe.
+
+---
+
+## Worktrees
+
+Each agent runs in its own **git worktree** — an independent on-disk
+checkout that shares the project's `.git/` object database. Different
+`cwd`, different working tree, different `HEAD`, so concurrent agents
+on different task branches physically cannot clobber each other's
+files. The full rationale (and the at-merge conflict resolver this
+model enables) is in
+[ADR 0002](adrs/0002-worktree-per-agent-isolation.md).
+
+### Where worktrees live
+
+Worktrees live **outside** the project, under a base directory that
+defaults to `~/.branchwork/worktrees`. The per-agent path is:
+
+```
+~/.branchwork/worktrees/<project-slug>/<plan>/<task>-<agent-id>/
+```
+
+Keeping them outside the project means agent state never lands in a
+project commit (no `.gitignore` footgun), an editor opened on the
+project root isn't polluted with agent directories, and uninstall
+cleanup is one `rm -rf ~/.branchwork/worktrees/`.
+
+The base directory — and every subdirectory under it — is **created
+on first agent start**. There is no `mkdir` to run by hand; point the
+knob below at any path and Branchwork makes the tree the first time it
+spawns an agent. Note this is a separate tree from `~/.claude/` (see
+[`~/.claude/` layout](#claude-layout)) — `~/.branchwork/` holds only
+per-agent worktree state.
+
+### `BRANCHWORK_WORKTREE_BASE`
+
+Set the `BRANCHWORK_WORKTREE_BASE` environment variable to move the
+worktree base somewhere other than `~/.branchwork/worktrees`:
+
+```bash
+BRANCHWORK_WORKTREE_BASE=/mnt/scratch/branchwork-worktrees branchwork-server
+```
+
+Override it when:
+
+- **`$HOME` is small or read-only.** Constrained home directories —
+  containers, locked-down CI hosts, quota'd NFS homes — can't hold N
+  concurrent checkouts. Point the base at a roomier volume.
+- **You want worktrees on a different filesystem with more space.** If
+  your projects sit on a small partition, putting the base on a larger
+  (or faster) one buys headroom for many parallel agents.
+
+> **Cross-filesystem warning.** `git worktree add` works fine when the
+> base directory is on a *different* filesystem from the project's
+> `.git`, but git operations there are **slower** — git can't hardlink
+> object refs across a filesystem boundary, so checkout and status do
+> more I/O. Prefer a base directory on the **same filesystem** as your
+> project repos. Branchwork warns — it does not fail — when it detects
+> the base is on a different filesystem from a project, so you can make
+> an informed call. (See ADR 0002, failure mode #3.)
 
 ---
 
