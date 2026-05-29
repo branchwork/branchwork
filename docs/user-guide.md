@@ -548,6 +548,24 @@ Override it when:
 > the base is on a different filesystem from a project, so you can make
 > an informed call. (See ADR 0002, failure mode #3.)
 
+### Disabling worktrees (deprecated)
+
+`BRANCHWORK_USE_WORKTREES` is a **deprecated** escape hatch that turns
+worktree isolation off. Set it to `0` or `false` to fall back to the
+legacy shared-cwd mode, where every agent checks out its task branch in
+the single shared project working tree:
+
+```bash
+export BRANCHWORK_USE_WORKTREES=0   # legacy shared-cwd mode (unsafe)
+```
+
+This is **unsafe for parallel agents** — they will corrupt each
+other's working tree — and exists only as a temporary fallback.
+The server reads the variable **once at startup** and prints a warning
+when legacy mode is active. Unset it (or set any other value) to keep
+worktrees on, which is the default. **This flag will be removed in the
+next minor version.**
+
 ---
 
 ## Cost tracking & budgets

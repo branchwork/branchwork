@@ -86,6 +86,10 @@ fn main() {
             // Reuse the same config/DB init as the server so stdio tools see
             // the same plans and state.
             let config = Config::from_cli(cli);
+            // Honor the deprecated worktree-isolation flag for
+            // MCP-spawned agents too (no warning duplication concern
+            // — only one subcommand arm runs per process).
+            init_worktree_flag();
             let db = db::init(&config.db_path);
             let (broadcast_tx, _rx) = ws::create_broadcast();
 
@@ -155,7 +159,23 @@ fn main() {
     }
 }
 
+/// Resolve `BRANCHWORK_USE_WORKTREES` once at startup, store it in the
+/// process-wide flag read by [`agents::pty_agent::worktrees_enabled`], and
+/// warn loudly when the deprecated legacy shared-cwd mode is active.
+fn init_worktree_flag() {
+    let enabled = agents::pty_agent::init_worktrees_enabled(
+        std::env::var("BRANCHWORK_USE_WORKTREES").ok().as_deref(),
+    );
+    if !enabled {
+        eprintln!(
+            "[Branchwork] WARNING: BRANCHWORK_USE_WORKTREES=0 — running in legacy shared-cwd mode. Parallel agents WILL corrupt each other's working tree. This flag is removed in the next minor version. Unset it and restart for safe operation."
+        );
+    }
+}
+
 async fn run_server(cli: Cli) {
+    // Resolve the deprecated worktree-isolation flag once, up front.
+    init_worktree_flag();
     let mut config = Config::from_cli(cli);
     let persisted = persisted_settings::PersistedSettings::load(&config.settings_path);
     config.apply_persisted(&persisted);

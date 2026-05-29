@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use interprocess::local_socket::ConnectOptions;
@@ -40,14 +40,30 @@ use crate::ws::broadcast_event;
 /// memory flat when the CLI emits a lot of early chatter.
 const READINESS_BUFFER_CAP: usize = 16 * 1024;
 
-/// Whether worktree-per-agent isolation is enabled (default ON). Each agent
+/// Process-wide worktree-isolation flag, resolved once at startup from
+/// `BRANCHWORK_USE_WORKTREES` by `init_worktrees_enabled`. Defaults to
+/// enabled (true) so any read before init, and every test, behaves as if
+/// worktrees are on.
+static USE_WORKTREES: AtomicBool = AtomicBool::new(true);
+
+/// Resolve `BRANCHWORK_USE_WORKTREES` once and store it in the process-wide
+/// `USE_WORKTREES` flag. Call exactly once at server startup. Returns the
+/// resolved value so the caller can emit the legacy-mode warning. Only the
+/// literal values `0` and `false` (case-insensitive, trimmed) disable
+/// worktrees; unset / empty / any other value keeps them on.
+pub(crate) fn init_worktrees_enabled(raw: Option<&str>) -> bool {
+    let enabled = worktrees_enabled_from(raw);
+    USE_WORKTREES.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+/// Whether worktree-per-agent isolation is enabled (default ON). Reads the
+/// flag resolved once at startup by `init_worktrees_enabled`. Each agent
 /// gets its own git worktree so parallel agents never contend on the single
-/// shared working tree. Only the literal values `0` and `false`
-/// (case-insensitive, surrounding whitespace trimmed) select the legacy
-/// in-place-checkout path — which is unsafe for parallel agents and slated for
+/// shared working tree; the legacy in-place-checkout path is slated for
 /// removal in `0.6.0`.
 pub(crate) fn worktrees_enabled() -> bool {
-    worktrees_enabled_from(std::env::var("BRANCHWORK_USE_WORKTREES").ok().as_deref())
+    USE_WORKTREES.load(Ordering::Relaxed)
 }
 
 /// Pure core of [`worktrees_enabled`], split out so tests can pin every
@@ -141,12 +157,9 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
 
+    // The legacy shared-cwd warning is emitted once at startup (see
+    // `init_worktrees_enabled` / main.rs), not per spawn.
     let use_worktrees = worktrees_enabled();
-    if !use_worktrees {
-        eprintln!(
-            "[Branchwork] WARNING: BRANCHWORK_USE_WORKTREES=0 — parallel agents are unsafe under this flag and the legacy mode will be removed next minor version"
-        );
-    }
 
     // Capture base commit BEFORE switching to the task branch.
     let base_commit = git_head_sha(cwd);
@@ -1729,6 +1742,16 @@ mod tests {
         assert!(!worktrees_enabled_from(Some("False")));
         assert!(!worktrees_enabled_from(Some("  0  ")));
         assert!(!worktrees_enabled_from(Some(" false ")));
+    }
+
+    #[test]
+    fn init_worktrees_enabled_stores_and_reads_resolved_value() {
+        // Only ever stores the default (enabled) value so this cannot race
+        // parallel tests that read the process-wide flag via
+        // `worktrees_enabled()`. Disable-value parsing is covered by
+        // `worktrees_enabled_from_defaults_on_and_only_0_or_false_disable`.
+        assert!(init_worktrees_enabled(None));
+        assert!(worktrees_enabled());
     }
 
     #[test]
