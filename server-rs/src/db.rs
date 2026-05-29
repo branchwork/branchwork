@@ -1247,6 +1247,125 @@ pub fn archive_learning(db: &Db, id: &str, reason: &str) -> Result<bool, Learnin
     Ok(n > 0)
 }
 
+// ── Learning hit-counter + promotion (Phase 4, Task 4.1) ────────────────────
+
+/// How many distinct sessions a learning must be rendered into, within
+/// [`LEARNING_PROMOTION_WINDOW_DAYS`], before the server flags it as a
+/// promotion candidate. The brief's default.
+pub const LEARNING_PROMOTION_THRESHOLD: i64 = 5;
+
+/// Rolling window (days) over which [`record_learning_hit`] counts
+/// distinct-session hits when deciding whether to emit a
+/// `promotion_candidate`.
+pub const LEARNING_PROMOTION_WINDOW_DAYS: i64 = 30;
+
+/// Outcome of recording one learning render against one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearningHitOutcome {
+    /// True when this `(learning_id, agent_id)` pair was new — i.e. the
+    /// learning was rendered into a session it had not been rendered into
+    /// before. False on a re-render within the same session (the
+    /// composite PK swallows the duplicate).
+    pub inserted: bool,
+    /// Distinct sessions in the last [`LEARNING_PROMOTION_WINDOW_DAYS`]
+    /// for this learning, AFTER this hit. Only meaningful when `inserted`
+    /// is true; a duplicate render returns 0 without recounting.
+    pub recent_hit_count: i64,
+    /// True when this hit pushed the learning across the threshold AND a
+    /// `promotion_candidates` row was newly written. The caller fires the
+    /// `promotion_candidate` broadcast only when this is true — every
+    /// later render that re-crosses the (idempotent) threshold returns
+    /// false here.
+    pub promotion_emitted: bool,
+}
+
+/// Record that `learning_id` was rendered into the session identified by
+/// `agent_id`, then decide whether the learning has crossed the
+/// promotion threshold.
+///
+/// Idempotency / no-double-count: `learning_hits` has a composite PRIMARY
+/// KEY `(learning_id, agent_id)`, so a second render of the same learning
+/// within the same session collapses to a no-op `INSERT OR IGNORE`
+/// (`inserted = false`) and the counts are left untouched.
+///
+/// Threshold check (only on a genuinely new hit): count the distinct
+/// sessions this learning was rendered into within the last `window_days`
+/// (each `(learning, session)` pair is exactly one row, so `COUNT(*)` is
+/// the distinct-session count). If that reaches `threshold`, write a
+/// `promotion_candidates` row — `INSERT OR IGNORE` on the `learning_id`
+/// PRIMARY KEY keeps the emission single: a learning is flagged once, not
+/// on every subsequent render past the threshold.
+///
+/// `window_days` is interpolated into the `datetime('now', '-N days')`
+/// modifier because SQLite does not allow binding inside a datetime
+/// modifier (same constraint the CI backfill lookback works around). It
+/// is an `i64` from a server-side const, never user input, so the
+/// `format!` is injection-safe.
+pub fn record_learning_hit(
+    db: &Db,
+    learning_id: &str,
+    agent_id: &str,
+    org_id: &str,
+    threshold: i64,
+    window_days: i64,
+) -> LearningHitOutcome {
+    let conn = db.lock().unwrap();
+
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO learning_hits (learning_id, agent_id, org_id) \
+             VALUES (?1, ?2, ?3)",
+            params![learning_id, agent_id, org_id],
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if !inserted {
+        return LearningHitOutcome {
+            inserted: false,
+            recent_hit_count: 0,
+            promotion_emitted: false,
+        };
+    }
+
+    let recent_hit_count: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM learning_hits \
+                  WHERE learning_id = ?1 \
+                    AND rendered_at >= datetime('now', '-{window_days} days')"
+            ),
+            params![learning_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let promotion_emitted = if recent_hit_count >= threshold {
+        conn.execute(
+            "INSERT OR IGNORE INTO promotion_candidates \
+                 (learning_id, org_id, hit_count, threshold, window_days) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                learning_id,
+                org_id,
+                recent_hit_count,
+                threshold,
+                window_days
+            ],
+        )
+        .unwrap_or(0)
+            > 0
+    } else {
+        false
+    };
+
+    LearningHitOutcome {
+        inserted: true,
+        recent_hit_count,
+        promotion_emitted,
+    }
+}
+
 /// Open (or create) the database at `db_path` and run migrations.
 pub fn init(db_path: &Path) -> Db {
     if let Some(parent) = db_path.parent() {
@@ -1798,6 +1917,43 @@ fn migrate(conn: &Connection) {
             ON learnings(org_id) WHERE archived_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_learnings_source_ci
             ON learnings(source_ci_run_id) WHERE source_ci_run_id IS NOT NULL;
+
+        -- Hit-counter on learnings (Phase 4, Task 4.1). One row per
+        -- (learning, session) — `agent_id` is the session proxy. The
+        -- composite PRIMARY KEY makes a re-render within the same session
+        -- a no-op INSERT OR IGNORE, so distinct-session counts never
+        -- double-count. `learning_id` FKs `learnings` so a hard-deleted
+        -- learning takes its hits with it; `org_id` FKs `organizations`
+        -- so an org delete cascades (mirrors the `learnings` table).
+        CREATE TABLE IF NOT EXISTS learning_hits (
+            learning_id  TEXT NOT NULL,
+            agent_id     TEXT NOT NULL,
+            org_id       TEXT NOT NULL DEFAULT 'default-org',
+            rendered_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (learning_id, agent_id),
+            FOREIGN KEY (learning_id) REFERENCES learnings(id) ON DELETE CASCADE,
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
+        -- Windowed COUNT(*) over (learning_id, rendered_at) drives the
+        -- promotion-threshold check.
+        CREATE INDEX IF NOT EXISTS idx_learning_hits_learning_time
+            ON learning_hits(learning_id, rendered_at);
+
+        -- Promotion candidates (Phase 4, Task 4.1). One row per learning,
+        -- written the first time its distinct-session hit count crosses
+        -- the threshold inside the rolling window. PRIMARY KEY on
+        -- `learning_id` + INSERT OR IGNORE keeps the emission idempotent —
+        -- a learning is flagged once, not on every subsequent render.
+        CREATE TABLE IF NOT EXISTS promotion_candidates (
+            learning_id  TEXT PRIMARY KEY,
+            org_id       TEXT NOT NULL DEFAULT 'default-org',
+            hit_count    INTEGER NOT NULL,
+            threshold    INTEGER NOT NULL,
+            window_days  INTEGER NOT NULL,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (learning_id) REFERENCES learnings(id) ON DELETE CASCADE,
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+        );
         ",
     )
     .expect("failed to run schema migration");
@@ -2256,6 +2412,8 @@ mod tests {
         assert!(tables.contains(&"credentials".to_string()));
         assert!(tables.contains(&"ci_failure_events".to_string()));
         assert!(tables.contains(&"learnings".to_string()));
+        assert!(tables.contains(&"learning_hits".to_string()));
+        assert!(tables.contains(&"promotion_candidates".to_string()));
     }
 
     /// Phase 1, Task 1.1: `ci_failure_events` schema round-trip plus
@@ -4587,5 +4745,190 @@ mod tests {
 
         let got = get_learning(&db, "L-1").unwrap();
         assert_eq!(got.body_md, body);
+    }
+
+    // ── Phase 4, Task 4.1: learning hit-counter + promotion ────────────────
+
+    /// Seed an active learning so a `learning_hits` row can satisfy the
+    /// FK to `learnings(id)` (`PRAGMA foreign_keys = ON`).
+    fn seed_learning_for_hits(db: &Db, id: &str) {
+        create_learning(db, &sample_learning(id, &format!("slug-{id}"))).unwrap();
+    }
+
+    /// Count of `learning_hits` rows for a learning, ignoring the window.
+    fn total_hits(db: &Db, learning_id: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM learning_hits WHERE learning_id = ?1",
+            params![learning_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn promotion_row(db: &Db, learning_id: &str) -> Option<(i64, i64, i64)> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT hit_count, threshold, window_days FROM promotion_candidates \
+              WHERE learning_id = ?1",
+            params![learning_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok()
+    }
+
+    #[test]
+    fn record_learning_hit_dedups_within_the_same_session() {
+        let (db, _dir) = test_db();
+        seed_learning_for_hits(&db, "L-1");
+
+        let first = record_learning_hit(&db, "L-1", "agent-A", "default-org", 5, 30);
+        assert!(first.inserted, "first render in a session must insert");
+        assert_eq!(first.recent_hit_count, 1);
+        assert!(!first.promotion_emitted);
+
+        // Same learning, same session → no second row, no recount.
+        let second = record_learning_hit(&db, "L-1", "agent-A", "default-org", 5, 30);
+        assert!(
+            !second.inserted,
+            "re-render in same session must not insert"
+        );
+        assert_eq!(second.recent_hit_count, 0);
+        assert!(!second.promotion_emitted);
+
+        assert_eq!(total_hits(&db, "L-1"), 1, "session must count exactly once");
+    }
+
+    #[test]
+    fn record_learning_hit_counts_distinct_sessions() {
+        let (db, _dir) = test_db();
+        seed_learning_for_hits(&db, "L-1");
+
+        for (i, expected) in (1..=3).enumerate() {
+            let out = record_learning_hit(&db, "L-1", &format!("agent-{i}"), "default-org", 5, 30);
+            assert!(out.inserted);
+            assert_eq!(out.recent_hit_count, expected, "session {i}");
+        }
+        assert_eq!(total_hits(&db, "L-1"), 3);
+    }
+
+    /// Headline acceptance: after 5 distinct sessions render the learning,
+    /// a `promotion_candidates` row exists — emitted on the 5th, exactly
+    /// once, and not re-emitted on later renders.
+    #[test]
+    fn promotion_candidate_emitted_at_threshold_and_only_once() {
+        let (db, _dir) = test_db();
+        seed_learning_for_hits(&db, "L-1");
+
+        // Sessions 1–4: below threshold, no promotion.
+        for i in 0..4 {
+            let out = record_learning_hit(&db, "L-1", &format!("agent-{i}"), "default-org", 5, 30);
+            assert!(out.inserted);
+            assert!(
+                !out.promotion_emitted,
+                "no promotion before the threshold (session {i})"
+            );
+        }
+        assert!(promotion_row(&db, "L-1").is_none());
+
+        // Session 5: crosses the threshold → emit exactly one row.
+        let fifth = record_learning_hit(&db, "L-1", "agent-4", "default-org", 5, 30);
+        assert!(fifth.inserted);
+        assert_eq!(fifth.recent_hit_count, 5);
+        assert!(fifth.promotion_emitted, "5th distinct session must emit");
+        assert_eq!(
+            promotion_row(&db, "L-1"),
+            Some((5, 5, 30)),
+            "promotion row records the count, threshold, and window"
+        );
+
+        // Session 6: still over threshold, but the candidate already
+        // exists → no second emission, row unchanged.
+        let sixth = record_learning_hit(&db, "L-1", "agent-5", "default-org", 5, 30);
+        assert!(sixth.inserted);
+        assert_eq!(sixth.recent_hit_count, 6);
+        assert!(
+            !sixth.promotion_emitted,
+            "promotion is emitted once, not on every render past the threshold"
+        );
+        assert_eq!(
+            promotion_row(&db, "L-1"),
+            Some((5, 5, 30)),
+            "the original promotion row must not be overwritten"
+        );
+    }
+
+    /// Hits older than the window must not count toward the threshold.
+    #[test]
+    fn record_learning_hit_window_excludes_old_hits() {
+        let (db, _dir) = test_db();
+        seed_learning_for_hits(&db, "L-1");
+
+        // Five sessions rendered the learning 40 days ago — outside a
+        // 30-day window.
+        {
+            let conn = db.lock().unwrap();
+            for i in 0..5 {
+                conn.execute(
+                    "INSERT INTO learning_hits (learning_id, agent_id, org_id, rendered_at) \
+                     VALUES ('L-1', ?1, 'default-org', datetime('now', '-40 days'))",
+                    params![format!("old-agent-{i}")],
+                )
+                .unwrap();
+            }
+        }
+
+        // A single fresh session: only this one is inside the window, so
+        // the recent count is 1 — nowhere near the threshold of 5.
+        let out = record_learning_hit(&db, "L-1", "fresh-agent", "default-org", 5, 30);
+        assert!(out.inserted);
+        assert_eq!(
+            out.recent_hit_count, 1,
+            "old hits outside the window must not count"
+        );
+        assert!(!out.promotion_emitted);
+        assert!(promotion_row(&db, "L-1").is_none());
+        // The old rows still physically exist; they just don't count.
+        assert_eq!(total_hits(&db, "L-1"), 6);
+    }
+
+    /// Defensive: recording a hit for a learning that does not exist is a
+    /// no-op (the FK to `learnings(id)` rejects the insert; the error is
+    /// swallowed rather than panicking). Production never hits this — we
+    /// only record hits for learnings we just selected.
+    #[test]
+    fn record_learning_hit_for_unknown_learning_is_a_noop() {
+        let (db, _dir) = test_db();
+        let out = record_learning_hit(&db, "does-not-exist", "agent-A", "default-org", 5, 30);
+        assert!(!out.inserted);
+        assert_eq!(out.recent_hit_count, 0);
+        assert!(!out.promotion_emitted);
+        assert_eq!(total_hits(&db, "does-not-exist"), 0);
+    }
+
+    /// Hard-deleting the learning cascades its hits and promotion row away
+    /// (FK `ON DELETE CASCADE`). Learnings are soft-deleted in practice,
+    /// but the cascade keeps the tables consistent if a hard delete ever
+    /// lands (e.g. an org wipe).
+    #[test]
+    fn deleting_a_learning_cascades_hits_and_promotion() {
+        let (db, _dir) = test_db();
+        seed_learning_for_hits(&db, "L-1");
+        for i in 0..5 {
+            record_learning_hit(&db, "L-1", &format!("agent-{i}"), "default-org", 5, 30);
+        }
+        assert_eq!(total_hits(&db, "L-1"), 5);
+        assert!(promotion_row(&db, "L-1").is_some());
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("DELETE FROM learnings WHERE id = 'L-1'", [])
+                .unwrap();
+        }
+        assert_eq!(total_hits(&db, "L-1"), 0, "hits must cascade away");
+        assert!(
+            promotion_row(&db, "L-1").is_none(),
+            "promotion row must cascade away"
+        );
     }
 }

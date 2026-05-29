@@ -3377,8 +3377,8 @@ pub async fn list_task_learnings(
 // should have, without scraping logs.
 //
 // **Contract**: the items returned MUST be exactly the same set, in the
-// same order, that `build_learnings_block` would render. The endpoint
-// must therefore route through
+// same order, that `build_learnings_block_with_ids` would render. The
+// endpoint must therefore route through
 // [`learnings_context::task_file_paths_for_plan`] +
 // [`learnings_context::select_relevant_learnings`] verbatim — any
 // divergent selector here is a bug.

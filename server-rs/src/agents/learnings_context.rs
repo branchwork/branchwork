@@ -304,20 +304,26 @@ pub fn task_file_paths_for_plan(
 }
 
 /// Compose: pull file_paths off the plan + select relevant learnings +
-/// render the block. Returns `None` when there's nothing to inject
-/// (empty result or top_k=0). The caller (typically
-/// `start_agent_dispatch`) prepends the result to the agent's prompt.
-pub fn build_learnings_block(
+/// render the block, returning both the rendered block AND the ids of the
+/// learnings that went into it. The ids let the caller record one
+/// `learning_hits` row per rendered learning (Task 4.1 hit-counter) so the
+/// counts stay in lock-step with what the agent actually saw.
+///
+/// Returns `None` when there's nothing to inject (no plan/task context,
+/// empty result, or top_k=0).
+pub fn build_learnings_block_with_ids(
     db: &Db,
     plans_dir: &std::path::Path,
     plan_name: Option<&str>,
     task_id: Option<&str>,
-) -> Option<String> {
+) -> Option<(String, Vec<String>)> {
     let plan_name = plan_name?;
     let task_id = task_id?;
     let file_paths = task_file_paths_for_plan(plans_dir, plan_name, task_id);
     let learnings = select_relevant_learnings(db, plan_name, &file_paths, DEFAULT_LEARNINGS_TOP_K);
-    render_learnings_block(&learnings)
+    let block = render_learnings_block(&learnings)?;
+    let ids = learnings.into_iter().map(|l| l.id).collect();
+    Some((block, ids))
 }
 
 #[cfg(test)]
@@ -837,18 +843,18 @@ phases:
         );
     }
 
-    // ── build_learnings_block ──────────────────────────────────────────
+    // ── build_learnings_block_with_ids ─────────────────────────────────
 
     #[test]
-    fn build_learnings_block_returns_none_when_no_plan_or_task() {
+    fn build_learnings_block_with_ids_returns_none_when_no_plan_or_task() {
         let (db, _td) = full_db();
         let plans_dir: PathBuf = "/no/such/path".into();
-        assert!(build_learnings_block(&db, &plans_dir, None, Some("1.1")).is_none());
-        assert!(build_learnings_block(&db, &plans_dir, Some("p"), None).is_none());
+        assert!(build_learnings_block_with_ids(&db, &plans_dir, None, Some("1.1")).is_none());
+        assert!(build_learnings_block_with_ids(&db, &plans_dir, Some("p"), None).is_none());
     }
 
     #[test]
-    fn build_learnings_block_returns_none_when_no_matches() {
+    fn build_learnings_block_with_ids_returns_none_when_no_matches() {
         let (db, _td) = full_db();
         let td = tempfile::TempDir::new().unwrap();
         let yaml = r#"title: P
@@ -865,12 +871,12 @@ phases:
         acceptance: ""
 "#;
         std::fs::write(td.path().join("p.yaml"), yaml).unwrap();
-        let out = build_learnings_block(&db, td.path(), Some("p"), Some("1.1"));
+        let out = build_learnings_block_with_ids(&db, td.path(), Some("p"), Some("1.1"));
         assert!(out.is_none(), "no learnings = no block");
     }
 
     #[test]
-    fn build_learnings_block_produces_xml_when_matches_exist() {
+    fn build_learnings_block_with_ids_produces_xml_and_returns_rendered_ids() {
         let (db, _td) = full_db();
         seed_learning(
             &db,
@@ -896,8 +902,12 @@ phases:
         acceptance: ""
 "#;
         std::fs::write(td.path().join("p.yaml"), yaml).unwrap();
-        let out = build_learnings_block(&db, td.path(), Some("p"), Some("1.1")).unwrap();
-        assert!(out.starts_with("<learnings>"));
-        assert!(out.contains("Refresh runners after dispatch."));
+        let (block, ids) =
+            build_learnings_block_with_ids(&db, td.path(), Some("p"), Some("1.1")).unwrap();
+        assert!(block.starts_with("<learnings>"));
+        assert!(block.contains("Refresh runners after dispatch."));
+        // The returned ids must be exactly the learnings that went into
+        // the block — they're what the caller records hits against.
+        assert_eq!(ids, vec!["match".to_string()]);
     }
 }

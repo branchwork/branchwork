@@ -68,16 +68,71 @@ pub async fn start_agent_dispatch(
     org_id: &str,
     mut opts: StartPtyOpts<'_>,
 ) -> String {
-    inject_learnings_into_prompt(state, &mut opts);
-    if org_has_runner(&state.db, org_id) {
+    let injected_learning_ids = inject_learnings_into_prompt(state, &mut opts);
+    let agent_id = if org_has_runner(&state.db, org_id) {
         start_agent_via_runner(state, org_id, opts).await
     } else {
         pty_agent::start_pty_agent(&state.registry, opts).await
+    };
+    // Now that the session's `agent_id` is known, record one hit per
+    // injected learning (Task 4.1). Done here — at the single dispatch
+    // chokepoint, after the agent_id exists — so both the SaaS and
+    // standalone paths are covered without each one knowing about
+    // hit-counting.
+    record_learning_hits_for_spawn(state, org_id, &agent_id, &injected_learning_ids);
+    agent_id
+}
+
+/// Record one `learning_hits` row per injected learning against this
+/// spawn's `agent_id` (= session), and broadcast `promotion_candidate`
+/// for any learning that just crossed the promotion threshold.
+///
+/// The composite PK on `learning_hits` means a re-render of the same
+/// learning within the same session is a no-op, so distinct-session
+/// counts never inflate (the headline acceptance). A `promotion_candidate`
+/// is emitted at most once per learning thanks to the `learning_id`
+/// PRIMARY KEY on `promotion_candidates`.
+fn record_learning_hits_for_spawn(
+    state: &AppState,
+    org_id: &str,
+    agent_id: &str,
+    learning_ids: &[String],
+) {
+    for learning_id in learning_ids {
+        let outcome = crate::db::record_learning_hit(
+            &state.db,
+            learning_id,
+            agent_id,
+            org_id,
+            crate::db::LEARNING_PROMOTION_THRESHOLD,
+            crate::db::LEARNING_PROMOTION_WINDOW_DAYS,
+        );
+        if outcome.promotion_emitted {
+            crate::ws::broadcast_event(
+                &state.broadcast_tx,
+                "promotion_candidate",
+                serde_json::json!({
+                    "learning_id": learning_id,
+                    "org_id": org_id,
+                    "hit_count": outcome.recent_hit_count,
+                    "threshold": crate::db::LEARNING_PROMOTION_THRESHOLD,
+                    "window_days": crate::db::LEARNING_PROMOTION_WINDOW_DAYS,
+                }),
+            );
+            println!(
+                "[learnings] promotion candidate: learning {learning_id} rendered into \
+                 {hits} distinct sessions within {days} days (org {org_id})",
+                hits = outcome.recent_hit_count,
+                days = crate::db::LEARNING_PROMOTION_WINDOW_DAYS,
+            );
+        }
     }
 }
 
 /// Prepend the `<learnings>` block to `opts.prompt` when there are
-/// learnings worth surfacing for this task. No-op when:
+/// learnings worth surfacing for this task, and return the ids of the
+/// learnings that were rendered (so the caller can record hits against
+/// the spawned session). No-op — returns an empty `Vec` — when:
 /// - The agent has no plan/task context (e.g. plan-creation flow,
 ///   ad-hoc spawn) — there's nothing to scope learnings to.
 /// - No active learnings for the plan's org overlap with the task's
@@ -86,14 +141,19 @@ pub async fn start_agent_dispatch(
 /// Exposed (via `pub(super)`) so the spawn_ops test module can pin the
 /// "the assembled prompt starts with `<learnings>`" acceptance from the
 /// brief without going through the wire path.
-pub(super) fn inject_learnings_into_prompt(state: &AppState, opts: &mut StartPtyOpts<'_>) {
-    let Some(block) = crate::agents::learnings_context::build_learnings_block(
-        &state.db,
-        &state.plans_dir,
-        opts.plan_name,
-        opts.task_id,
-    ) else {
-        return;
+pub(super) fn inject_learnings_into_prompt(
+    state: &AppState,
+    opts: &mut StartPtyOpts<'_>,
+) -> Vec<String> {
+    let Some((block, learning_ids)) =
+        crate::agents::learnings_context::build_learnings_block_with_ids(
+            &state.db,
+            &state.plans_dir,
+            opts.plan_name,
+            opts.task_id,
+        )
+    else {
+        return Vec::new();
     };
     // Prepend so the block is at the very start of the agent's initial
     // system-prompt slice. The unattended-contract block + IMPORTANT
@@ -101,6 +161,7 @@ pub(super) fn inject_learnings_into_prompt(state: &AppState, opts: &mut StartPty
     // an agent re-reading the prompt for its closing-checklist will
     // find them.
     opts.prompt = format!("{block}\n\n{}", opts.prompt);
+    learning_ids
 }
 
 async fn start_agent_via_runner(state: &AppState, org_id: &str, opts: StartPtyOpts<'_>) -> String {
@@ -2296,6 +2357,125 @@ phases:
         assert!(
             !wire_prompt.contains("<learnings>"),
             "empty result must not emit a stub block"
+        );
+    }
+
+    /// Headline acceptance (Task 4.1): after 5 spawn events that each
+    /// render a given learning, a `promotion_candidate` row exists — and
+    /// the server broadcasts `promotion_candidate` exactly once.
+    ///
+    /// Each `start_agent_dispatch` mints a fresh `agent_id`, so the five
+    /// dispatches are five distinct sessions. (The "no double-count within
+    /// the same session" half of the acceptance is pinned at the DB layer
+    /// in `db::tests::record_learning_hit_dedups_within_the_same_session`,
+    /// where the `agent_id` can be held fixed.)
+    #[tokio::test]
+    async fn five_spawns_rendering_a_learning_emit_a_promotion_candidate() {
+        use rusqlite::params;
+
+        let (db, _td_db) = full_db();
+        let org_id = "default-org";
+        seed_runner(&db, "runner-1", org_id, "online");
+
+        let plans_dir = tempfile::TempDir::new().unwrap();
+        let yaml = r#"title: Promote Plan
+context: ctx
+phases:
+  - number: 1
+    title: Phase 1
+    tasks:
+      - number: "1.1"
+        title: Wire learnings
+        description: ""
+        file_paths:
+          - server-rs/src/agents/spawn_ops.rs
+        acceptance: ""
+"#;
+        std::fs::write(plans_dir.path().join("promote-plan.yaml"), yaml).unwrap();
+
+        // One learning whose category overlaps the task's file_paths
+        // (basename stem "spawn_ops"), so it's rendered on every spawn.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO learnings \
+                    (id, org_id, kind, category, slug, body_md, created_at) \
+                 VALUES \
+                    ('L-promote', ?1, 'feedback', 'spawn_ops', 'spawn-ops-rule', \
+                     'Always re-verify the branch before commit.', '2026-05-24T10:00:00')",
+                params![org_id],
+            )
+            .unwrap();
+        }
+
+        let runners = new_runner_registry();
+        // Drain envelopes off the capturing runner so the unbounded
+        // channel never matters; we only care about the DB + broadcast.
+        let _rx = install_capturing_runner(&runners, "runner-1").await;
+        let state =
+            test_app_state_with_plans_dir(db.clone(), runners, plans_dir.path().to_path_buf());
+
+        // Subscribe BEFORE dispatching so the broadcast is observable.
+        let mut events_rx = state.broadcast_tx.subscribe();
+
+        let cwd = PathBuf::from("/runner/projects/demo");
+        for _ in 0..5 {
+            let opts = StartPtyOpts {
+                prompt: "PROMPT".to_string(),
+                cwd: &cwd,
+                plan_name: Some("promote-plan"),
+                task_id: Some("1.1"),
+                effort: crate::config::Effort::High,
+                branch: Some("branchwork/promote-plan/1.1"),
+                is_continue: false,
+                max_budget_usd: None,
+                driver: Some("claude"),
+                user_id: None,
+                org_id: Some(org_id),
+                runner_id: None,
+            };
+            // Each dispatch is its own session (fresh agent_id).
+            let _agent_id = start_agent_dispatch(&state, org_id, opts).await;
+        }
+
+        // Five distinct sessions rendered the learning → five hit rows.
+        let hit_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM learning_hits WHERE learning_id = 'L-promote'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(hit_count, 5, "five distinct sessions = five hits");
+
+        // The promotion candidate row exists.
+        let promo: Option<i64> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT hit_count FROM promotion_candidates WHERE learning_id = 'L-promote'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        assert_eq!(
+            promo,
+            Some(5),
+            "5 spawns must produce a promotion_candidate row recording the count"
+        );
+
+        // The server broadcast `promotion_candidate` exactly once.
+        let mut promo_broadcasts = 0;
+        while let Ok(msg) = events_rx.try_recv() {
+            if msg.contains("\"promotion_candidate\"") && msg.contains("L-promote") {
+                promo_broadcasts += 1;
+            }
+        }
+        assert_eq!(
+            promo_broadcasts, 1,
+            "promotion_candidate must broadcast exactly once, on the threshold-crossing spawn"
         );
     }
 }
