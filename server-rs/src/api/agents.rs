@@ -978,7 +978,7 @@ pub async fn merge_agent_branch_inner(
     // return early, so a conflicted worktree is left in place for the Phase 3
     // at-merge resolver. Runs for every merge route (manual dashboard merge,
     // auto-mode loop, cadence drain) because they all converge here.
-    crate::agents::cleanup_worktree_after_merge(std::path::Path::new(&cwd));
+    crate::agents::remove_agent_worktree(std::path::Path::new(&cwd));
 
     MergeOutcome {
         merged_sha: Some(merged_sha),

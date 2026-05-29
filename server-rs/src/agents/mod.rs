@@ -334,13 +334,21 @@ pub(crate) fn setup_agent_worktree_in(
     )
 }
 
-/// Best-effort removal of a per-agent worktree after its task branch has been
-/// successfully merged — the success-path counterpart to
-/// [`setup_agent_worktree`]. Called from
-/// [`crate::api::agents::merge_agent_branch_inner`] on the merge-success path,
-/// so every merge route converges here: the manual dashboard merge, the
-/// auto-mode loop (`auto_mode::run_merge_step`), and the cadence batch drain
-/// all reach it through that shared inner.
+/// `merge_status` value marking a worktree that has been handed off to the
+/// Phase 3 at-merge conflict resolver. The kill/fail cleanup
+/// ([`cleanup_worktree_for_terminated_agent`]) skips any agent row carrying it
+/// so the resolver keeps the conflicted tree to work in. **Phase 3.2 wires the
+/// hand-off contract** (it sets this marker when a merge conflict hands the
+/// worktree off); until then no row ever carries it, so the guard is a
+/// forward-looking no-op today.
+pub(crate) const MERGE_STATUS_HELD_FOR_RESOLVER: &str = "held_for_resolver";
+
+/// Best-effort removal of a per-agent worktree, given its `cwd`. The
+/// path-based core shared by every "this worktree has done its job" route:
+/// the merge-success path ([`crate::api::agents::merge_agent_branch_inner`],
+/// which every merge route converges on — manual dashboard merge, the
+/// auto-mode loop, and the cadence batch drain) and the kill / fail paths
+/// (via [`cleanup_worktree_for_terminated_agent`]).
 ///
 /// No-op (returns without touching anything) in every case where there is no
 /// linked worktree to remove:
@@ -358,14 +366,17 @@ pub(crate) fn setup_agent_worktree_in(
 /// On a genuine linked worktree it shells out via [`worktree::remove_worktree`],
 /// which escalates force as needed and logs the outcome (`Removed` /
 /// `ForceRemoved` / `ManuallyRemoved`) at info level. A failure is logged but
-/// never propagated — the merge has already landed; a leaked worktree is reaped
-/// by the startup orphan sweep. The merged task branch ref is left intact
-/// (`git worktree remove` drops only the working tree, not the branch).
+/// never propagated — a leaked worktree is reaped by the startup orphan sweep.
+/// The task branch ref is left intact (`git worktree remove` drops only the
+/// working tree, not the branch), so a merged or recoverable branch survives.
 ///
-/// **Only ever called on merge success.** Conflicts and other merge failures
-/// return early in `merge_agent_branch_inner` before reaching the call site, so
-/// a conflicted worktree stays in place for the Phase 3 at-merge resolver.
-pub(crate) fn cleanup_worktree_after_merge(agent_cwd: &Path) {
+/// **Resolver hand-off:** callers that might be removing a conflicted worktree
+/// destined for the Phase 3 resolver must gate on
+/// [`MERGE_STATUS_HELD_FOR_RESOLVER`] before calling this — see
+/// [`cleanup_worktree_for_terminated_agent`]. The merge-success caller never
+/// reaches this on conflict (it returns early in `merge_agent_branch_inner`),
+/// so a conflicted worktree stays in place there too.
+pub(crate) fn remove_agent_worktree(agent_cwd: &Path) {
     // Honour the legacy escape hatch explicitly (task contract). Even with the
     // env var unset (worktrees on by default) the `.git`-is-a-file check below
     // is the real safety belt; this is the cheap, explicit early-out.
@@ -386,7 +397,7 @@ pub(crate) fn cleanup_worktree_after_merge(agent_cwd: &Path) {
     let Some(main_root) = main_worktree_root(agent_cwd) else {
         eprintln!(
             "[worktree] could not resolve the main worktree for {} — skipping \
-             post-merge cleanup (startup orphan sweep will reap it)",
+             cleanup (startup orphan sweep will reap it)",
             agent_cwd.display()
         );
         return;
@@ -394,11 +405,63 @@ pub(crate) fn cleanup_worktree_after_merge(agent_cwd: &Path) {
 
     if let Err(e) = worktree::remove_worktree(&main_root, agent_cwd) {
         eprintln!(
-            "[worktree] post-merge cleanup of {} failed: {e} — leaving for the \
+            "[worktree] cleanup of {} failed: {e} — leaving for the \
              startup orphan sweep",
             agent_cwd.display()
         );
     }
+}
+
+/// Remove the per-agent worktree for an agent that was **killed** or
+/// **failed**, looked up by `agent_id`. Reads the agent row's `cwd` and
+/// delegates to [`remove_agent_worktree`] (which carries the
+/// `.git`-is-a-file safety belt, main-worktree resolution, and force
+/// escalation). Best-effort: every failure is logged inside the core and
+/// never propagated to the caller.
+///
+/// Call sites (every terminal transition that won't be followed by a merge):
+/// - [`AgentRegistry::kill_agent`] — explicit user kill mid-task.
+/// - `pty_agent::start_pty_agent` failure branches — the agent failed to
+///   start (supervisor spawn error / socket connect error), so its freshly
+///   created worktree would otherwise leak.
+/// - `pty_agent::on_agent_exit` failed branches — the agent ran then crashed
+///   (supervisor SIGKILL'd / non-zero CLI exit); no merge is coming.
+///
+/// **Resolver exception:** skips removal when the row's `merge_status` is
+/// [`MERGE_STATUS_HELD_FOR_RESOLVER`], i.e. the worktree has been handed to
+/// the Phase 3 at-merge conflict resolver, which needs the conflicted tree to
+/// keep working in. Phase 3.2 sets that marker; until then no row carries it,
+/// so the guard is a forward-looking no-op.
+///
+/// Not wired into the boot-reconcile (`mark_orphaned` / `mark_supervisor_died`)
+/// or heartbeat (`mark_supervisor_unreachable`) paths: a heartbeat-unreachable
+/// supervisor may still have a live CLI child writing into the tree, and
+/// boot-time orphan reaping is owned by the dedicated startup orphan sweep
+/// ([`worktree::list_orphans`]) which canonicalises paths against the live-cwd
+/// set rather than removing per row.
+pub(crate) fn cleanup_worktree_for_terminated_agent(db: &Db, agent_id: &str) {
+    let row: Option<(Option<String>, Option<String>)> = {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT cwd, merge_status FROM agents WHERE id = ?1",
+            rusqlite::params![agent_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .ok()
+    };
+    let Some((Some(cwd), merge_status)) = row else {
+        return;
+    };
+    if merge_status.as_deref() == Some(MERGE_STATUS_HELD_FOR_RESOLVER) {
+        // Handed to the Phase 3 at-merge resolver — leave the worktree in place.
+        return;
+    }
+    remove_agent_worktree(Path::new(&cwd));
 }
 
 /// Resolve the main worktree's root directory by scanning
@@ -1145,6 +1208,13 @@ impl AgentRegistry {
             if let Some(p) = pid {
                 process_terminate(p);
             }
+            // Worktree-per-agent cleanup (Task 2.4): the agent was killed
+            // mid-task, so its isolated worktree is junk — remove it (unless
+            // it's held for the Phase 3 resolver). Best-effort + self-gating;
+            // a no-op under BRANCHWORK_USE_WORKTREES=0 or for in-place / SaaS
+            // rows. The reader task's later `on_agent_exit` sees the row is
+            // already `killed`, so it won't try to remove it again.
+            cleanup_worktree_for_terminated_agent(&self.db, agent_id);
             return true;
         }
 
@@ -1174,17 +1244,22 @@ impl AgentRegistry {
             let _ = std::fs::remove_file(socket);
             let _ = std::fs::remove_file(supervisor::pidfile_path(socket));
         }
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "UPDATE agents SET status = 'killed', finished_at = datetime('now'), branch = NULL WHERE id = ?",
-            rusqlite::params![agent_id],
-        )
-        .ok();
+        {
+            let db = self.db.lock().unwrap();
+            db.execute(
+                "UPDATE agents SET status = 'killed', finished_at = datetime('now'), branch = NULL WHERE id = ?",
+                rusqlite::params![agent_id],
+            )
+            .ok();
+        }
         broadcast_event(
             &self.broadcast_tx,
             "agent_stopped",
             serde_json::json!({"id": agent_id, "status": "killed"}),
         );
+        // Same worktree cleanup as the live-agent branch above. Scoped the DB
+        // write so the lock is released before this re-locks internally.
+        cleanup_worktree_for_terminated_agent(&self.db, agent_id);
         true
     }
 }

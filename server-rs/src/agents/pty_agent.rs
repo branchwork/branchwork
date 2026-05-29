@@ -364,17 +364,25 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
                 "[agent {}] Failed to start session daemon: {err_msg}",
                 &id[..8]
             );
-            let db = registry.db.lock().unwrap();
-            db.execute(
-                "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
-                params![id],
-            )
-            .ok();
+            {
+                let db = registry.db.lock().unwrap();
+                db.execute(
+                    "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
+                    params![id],
+                )
+                .ok();
+            }
             broadcast_event(
                 &registry.broadcast_tx,
                 "agent_stopped",
                 serde_json::json!({"id": id, "status": "failed", "error": err_msg}),
             );
+            // Worktree-per-agent cleanup (Task 2.4): the agent failed to start,
+            // so its per-agent worktree (created above) would otherwise leak.
+            // Best-effort + self-gating; a no-op when worktrees are disabled or
+            // no worktree was created (freestanding agent → cwd is the project
+            // root, which the `.git`-is-a-file safety belt skips).
+            crate::agents::cleanup_worktree_for_terminated_agent(&registry.db, &id);
             return id;
         }
     };
@@ -403,17 +411,23 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
             &id[..8],
             socket_path.display()
         );
-        let db = registry.db.lock().unwrap();
-        db.execute(
-            "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
-            params![id],
-        )
-        .ok();
+        {
+            let db = registry.db.lock().unwrap();
+            db.execute(
+                "UPDATE agents SET status = 'failed', finished_at = datetime('now') WHERE id = ?",
+                params![id],
+            )
+            .ok();
+        }
         broadcast_event(
             &registry.broadcast_tx,
             "agent_stopped",
             serde_json::json!({"id": id, "status": "failed", "error": format!("connect: {e}")}),
         );
+        // Worktree-per-agent cleanup (Task 2.4): the daemon is up but
+        // unreachable from us, so the agent is dead-on-arrival — remove its
+        // per-agent worktree rather than leak it.
+        crate::agents::cleanup_worktree_for_terminated_agent(&registry.db, &id);
         return id;
     }
 
@@ -792,6 +806,27 @@ async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
             payload["exit_code"] = serde_json::Value::from(0);
         }
         broadcast_event(&registry.broadcast_tx, "agent_stopped", payload);
+    }
+
+    // Worktree-per-agent cleanup (Task 2.4): an agent whose supervisor crashed
+    // (SIGKILL / OOM → row flipped to `failed`/`supervisor_unreachable`) won't
+    // be merged, so its per-agent worktree is junk — remove it. Gated on
+    // `marked` so we only act on the running → failed transition we own here:
+    // a row already `killed`/`failed` (e.g. kill_agent ran first) has
+    // `marked=false` and was cleaned up by that path.
+    //
+    // Two terminal cases are deliberately NOT removed here:
+    // - clean completion (`new_status == "completed"`) — that worktree is left
+    //   for the merge step, which removes it on success.
+    // - a non-zero CLI exit that is *not* a supervisor crash — the auto-mode
+    //   merge-on-completion hook below fires for it (it gates only on
+    //   `!supervisor_crashed`), spawning a concurrent merge task. Removing the
+    //   worktree here would race that merge (and, once Phase 3 makes
+    //   worktree-merge succeed, could discard a branch that still merges).
+    //   The merge path owns that worktree; the startup orphan sweep is the
+    //   backstop if the merge never lands.
+    if marked && supervisor_crashed {
+        crate::agents::cleanup_worktree_for_terminated_agent(&registry.db, agent_id);
     }
 
     // Auto-mode unattended-contract diagnostic. If the agent exited cleanly
@@ -1714,11 +1749,16 @@ mod tests {
         assert_eq!(project_slug_for_worktree(Path::new("/")), "project");
     }
 
-    /// Headline acceptance: with worktrees enabled (default), a branched PTY
-    /// agent's `agents.cwd` is the per-agent worktree path, not the project
-    /// root. The session-daemon spawn fails here (server_exe is
+    /// Headline acceptance (Task 2.2): with worktrees enabled (default), a
+    /// branched PTY agent's `agents.cwd` is the per-agent worktree path, not
+    /// the project root. The session-daemon spawn fails here (server_exe is
     /// `/nonexistent`), but `cwd` is written at INSERT — *before* the spawn —
-    /// so the assertion holds regardless of spawn outcome.
+    /// so the cwd assertion holds regardless of spawn outcome. (The fact that
+    /// `cwd` is the worktree path, not `project_dir`, also proves the worktree
+    /// was created: a setup *failure* records `project_dir` instead.)
+    ///
+    /// Task 2.4 then cleans the worktree up on the spawn failure, so we also
+    /// assert the directory is gone — a freebie fail-to-start-cleanup check.
     #[tokio::test]
     async fn worktrees_enabled_start_records_worktree_cwd() {
         if !worktrees_enabled() {
@@ -1773,9 +1813,12 @@ mod tests {
             expected.as_path(),
             "agents.cwd must be the worktree path"
         );
+        // Task 2.4: the session-daemon spawn fails (server_exe is
+        // `/nonexistent`), so `start_pty_agent` runs the fail-to-start
+        // worktree cleanup — the worktree must be gone, not leaked.
         assert!(
-            expected.is_dir(),
-            "worktree dir should exist on disk: {}",
+            !expected.exists(),
+            "worktree dir must be cleaned up after the spawn failure: {}",
             expected.display()
         );
         assert_ne!(
@@ -1882,5 +1925,125 @@ mod tests {
                 .any(|e| e.contains("agent_stopped") && e.contains(&id) && e.contains("failed")),
             "expected an agent_stopped/failed broadcast: {events:?}"
         );
+    }
+
+    // ── Worktree cleanup on kill / fail (Task 2.4) ───────────────────────
+
+    /// Build a real linked worktree for `agent_id` under `base` and insert a
+    /// matching `running` agent row pointing at it. Returns the worktree path.
+    /// The row is NOT registered in the live in-process registry, so
+    /// `kill_agent` takes its not-in-registry branch (the realistic shape
+    /// after a server restart or for a row whose session we never held).
+    fn seed_worktree_agent(
+        db: &Db,
+        base: &Path,
+        project_dir: &Path,
+        agent_id: &str,
+        merge_status: Option<&str>,
+    ) -> PathBuf {
+        let branch = format!("branchwork/p/{agent_id}");
+        let worktree_path = crate::agents::setup_agent_worktree_in(
+            base,
+            project_dir,
+            "repo",
+            Some("p"),
+            Some("1.1"),
+            agent_id,
+            &branch,
+            Some("master"),
+            false,
+        )
+        .expect("worktree should be created");
+        assert!(worktree_path.is_dir(), "worktree must exist before kill");
+        // Sanity: it's a *linked* worktree (`.git` is a file, not a dir) — the
+        // load-bearing safety belt that distinguishes it from the main tree.
+        assert!(
+            worktree_path.join(".git").is_file(),
+            "linked worktree should carry a `.git` pointer file"
+        );
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, cwd, status, mode, plan_name, task_id, branch, merge_status) \
+                 VALUES (?1, ?2, 'running', 'pty', 'p', '1.1', ?3, ?4)",
+                params![
+                    agent_id,
+                    worktree_path.to_str().unwrap(),
+                    branch,
+                    merge_status,
+                ],
+            )
+            .unwrap();
+        }
+        worktree_path
+    }
+
+    /// Acceptance (Task 2.4): killing an agent mid-task removes its per-agent
+    /// worktree.
+    #[tokio::test]
+    async fn kill_agent_removes_worktree() {
+        if !worktrees_enabled() {
+            return;
+        }
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (registry, _rx) = test_registry(db.clone(), sockets_dir);
+
+        let project_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        git_init_with_commit(&project_dir);
+
+        let base = dir.path().join("worktrees");
+        let worktree_path = seed_worktree_agent(&db, &base, &project_dir, "agent-kill", None);
+
+        assert!(registry.kill_agent("agent-kill").await);
+
+        assert!(
+            !worktree_path.exists(),
+            "worktree dir must be gone after kill: {}",
+            worktree_path.display()
+        );
+        // The project's main worktree is untouched.
+        assert!(project_dir.join(".git").is_dir(), "project root preserved");
+        let (status, _) = status_and_reason(&db, "agent-kill");
+        assert_eq!(status, "killed");
+    }
+
+    /// Resolver exception (Task 2.4): a worktree handed off to the Phase 3
+    /// at-merge resolver (`merge_status = 'held_for_resolver'`) is NOT removed
+    /// on kill — the resolver needs the conflicted tree to keep working in.
+    #[tokio::test]
+    async fn kill_agent_keeps_worktree_held_for_resolver() {
+        if !worktrees_enabled() {
+            return;
+        }
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (registry, _rx) = test_registry(db.clone(), sockets_dir);
+
+        let project_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        git_init_with_commit(&project_dir);
+
+        let base = dir.path().join("worktrees");
+        let worktree_path = seed_worktree_agent(
+            &db,
+            &base,
+            &project_dir,
+            "agent-held",
+            Some(crate::agents::MERGE_STATUS_HELD_FOR_RESOLVER),
+        );
+
+        assert!(registry.kill_agent("agent-held").await);
+
+        assert!(
+            worktree_path.is_dir(),
+            "worktree held for the resolver must survive the kill: {}",
+            worktree_path.display()
+        );
+        let (status, _) = status_and_reason(&db, "agent-held");
+        assert_eq!(status, "killed");
     }
 }
