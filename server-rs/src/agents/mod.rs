@@ -334,6 +334,103 @@ pub(crate) fn setup_agent_worktree_in(
     )
 }
 
+/// Best-effort removal of a per-agent worktree after its task branch has been
+/// successfully merged — the success-path counterpart to
+/// [`setup_agent_worktree`]. Called from
+/// [`crate::api::agents::merge_agent_branch_inner`] on the merge-success path,
+/// so every merge route converges here: the manual dashboard merge, the
+/// auto-mode loop (`auto_mode::run_merge_step`), and the cadence batch drain
+/// all reach it through that shared inner.
+///
+/// No-op (returns without touching anything) in every case where there is no
+/// linked worktree to remove:
+/// - `BRANCHWORK_USE_WORKTREES=0` — the legacy in-place start path never
+///   created a worktree; the agent's cwd *is* the shared project tree and must
+///   never be removed.
+/// - `agent_cwd` is the **main** worktree (its `.git` is a directory, not a
+///   `gitdir:` pointer file) — a row spawned in-place, or a freestanding agent
+///   that ran in the project root. Removing the project root would be
+///   catastrophic, so the `.git`-is-a-file check is the load-bearing safety belt.
+/// - `agent_cwd` does not exist / is not a git worktree on this host — e.g.
+///   SaaS, where the worktree lives on the runner and removal is dispatched
+///   there (worktree-per-agent Phase 2.7), so the server-side path is absent.
+///
+/// On a genuine linked worktree it shells out via [`worktree::remove_worktree`],
+/// which escalates force as needed and logs the outcome (`Removed` /
+/// `ForceRemoved` / `ManuallyRemoved`) at info level. A failure is logged but
+/// never propagated — the merge has already landed; a leaked worktree is reaped
+/// by the startup orphan sweep. The merged task branch ref is left intact
+/// (`git worktree remove` drops only the working tree, not the branch).
+///
+/// **Only ever called on merge success.** Conflicts and other merge failures
+/// return early in `merge_agent_branch_inner` before reaching the call site, so
+/// a conflicted worktree stays in place for the Phase 3 at-merge resolver.
+pub(crate) fn cleanup_worktree_after_merge(agent_cwd: &Path) {
+    // Honour the legacy escape hatch explicitly (task contract). Even with the
+    // env var unset (worktrees on by default) the `.git`-is-a-file check below
+    // is the real safety belt; this is the cheap, explicit early-out.
+    if !pty_agent::worktrees_enabled() {
+        return;
+    }
+
+    // A linked worktree's `.git` is a *file* (`gitdir: …`); the main worktree's
+    // `.git` is a *directory*. Only ever remove a linked worktree. A missing
+    // `.git` also lands here (path absent in SaaS, or not a repo) → skip.
+    if !agent_cwd.join(".git").is_file() {
+        return;
+    }
+
+    // Find the main worktree to run `git worktree remove` from — git refuses to
+    // remove the worktree you're standing in, so we cannot run it from
+    // `agent_cwd` itself.
+    let Some(main_root) = main_worktree_root(agent_cwd) else {
+        eprintln!(
+            "[worktree] could not resolve the main worktree for {} — skipping \
+             post-merge cleanup (startup orphan sweep will reap it)",
+            agent_cwd.display()
+        );
+        return;
+    };
+
+    if let Err(e) = worktree::remove_worktree(&main_root, agent_cwd) {
+        eprintln!(
+            "[worktree] post-merge cleanup of {} failed: {e} — leaving for the \
+             startup orphan sweep",
+            agent_cwd.display()
+        );
+    }
+}
+
+/// Resolve the main worktree's root directory by scanning
+/// `git worktree list --porcelain` for the entry whose `.git` is a real
+/// directory (the main worktree), as opposed to the `gitdir:` pointer files
+/// linked worktrees carry. Ordering of the porcelain output is *not* reliable
+/// across git versions (git 2.43 lists the *current* worktree first, not the
+/// main one), so the main worktree is identified structurally rather than
+/// positionally.
+///
+/// Returns `None` when `from` is not a git worktree or the command fails.
+fn main_worktree_root(from: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(from)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            let p = PathBuf::from(rest);
+            if p.join(".git").is_dir() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 pub struct AgentRegistry {
     pub agents: Arc<Mutex<HashMap<AgentId, ManagedAgent>>>,

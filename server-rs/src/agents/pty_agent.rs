@@ -46,7 +46,7 @@ const READINESS_BUFFER_CAP: usize = 16 * 1024;
 /// (case-insensitive, surrounding whitespace trimmed) select the legacy
 /// in-place-checkout path — which is unsafe for parallel agents and slated for
 /// removal in `0.6.0`.
-fn worktrees_enabled() -> bool {
+pub(crate) fn worktrees_enabled() -> bool {
     worktrees_enabled_from(std::env::var("BRANCHWORK_USE_WORKTREES").ok().as_deref())
 }
 

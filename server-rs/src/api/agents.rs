@@ -970,6 +970,16 @@ pub async fn merge_agent_branch_inner(
         }));
     }
 
+    // Worktree-per-agent cleanup (Task 2.3). The branch landed cleanly, so the
+    // agent's isolated worktree has done its job. Best-effort + self-gating:
+    // a no-op when worktrees are disabled (`BRANCHWORK_USE_WORKTREES=0`) or
+    // when `cwd` is the shared project tree (SaaS / legacy in-place spawn).
+    // Reached ONLY on merge success — the conflict / failure arms above all
+    // return early, so a conflicted worktree is left in place for the Phase 3
+    // at-merge resolver. Runs for every merge route (manual dashboard merge,
+    // auto-mode loop, cadence drain) because they all converge here.
+    crate::agents::cleanup_worktree_after_merge(std::path::Path::new(&cwd));
+
     MergeOutcome {
         merged_sha: Some(merged_sha),
         target_branch: target,
