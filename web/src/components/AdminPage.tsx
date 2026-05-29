@@ -14,6 +14,7 @@ import { KillSwitchTab } from "./admin/KillSwitchTab.js";
 import { UserQuotasTab } from "./admin/UserQuotasTab.js";
 import { SsoTab } from "./admin/SsoTab.js";
 import { DiagnosticsTab } from "./admin/DiagnosticsTab.js";
+import { PromotionsTab } from "./admin/PromotionsTab.js";
 import {
   NOTIFICATION_CLASSES,
   NOTIFICATION_CLASS_ORDER,
@@ -63,6 +64,7 @@ export function isAdminRole(role: string | null | undefined): boolean {
 const ADMIN_TABS = [
   "settings",
   "diagnostics",
+  "promotions",
   "members",
   "budget",
   "kill-switch",
@@ -74,6 +76,7 @@ export type AdminTab = (typeof ADMIN_TABS)[number];
 const TAB_LABELS: Record<AdminTab, string> = {
   settings: "Settings",
   diagnostics: "Diagnostics",
+  promotions: "Promotions",
   members: "Members",
   budget: "Budget",
   "kill-switch": "Kill switch",
@@ -111,7 +114,7 @@ export function AdminPage() {
     // Diagnostics is read-only triage and is universally useful (server
     // version, uptime, WS connections). Visible on both standalone and
     // SaaS, regardless of role.
-    const t: AdminTab[] = ["settings", "diagnostics"];
+    const t: AdminTab[] = ["settings", "diagnostics", "promotions"];
     if (showOrgTabs) t.push("members");
     if (showAdminTabs) t.push("budget", "kill-switch", "quotas", "sso");
     return t;
@@ -154,6 +157,7 @@ export function AdminPage() {
 
       {activeTab === "settings" && <SettingsTab />}
       {activeTab === "diagnostics" && <DiagnosticsTab />}
+      {activeTab === "promotions" && <PromotionsTab />}
       {activeTab === "members" && current && (
         <MembersTab orgSlug={current.slug} callerRole={role} callerUserId={user?.id ?? null} />
       )}

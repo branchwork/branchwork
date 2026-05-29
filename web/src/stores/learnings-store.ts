@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { fetchJson } from "../api.js";
+import { fetchJson, postJson } from "../api.js";
 
 /// One row in the "Learnings due" panel — mirrors
 /// `server-rs/src/api/learnings.rs::PendingLearningRow` verbatim
@@ -40,6 +40,45 @@ interface PendingLearningsResponse {
   items: PendingLearningRow[];
 }
 
+/// One promotion candidate — a learning that crossed the promotion
+/// threshold (rendered into >= N distinct agent sessions within the
+/// window). Mirrors `api/learnings.rs::PromotionCandidateRow` (the
+/// flattened `PromotionCandidate` plus `appendPreview`).
+///
+/// `appendPreview` is the exact markdown block the promote flow would
+/// append under `## Other rules` in `CLAUDE.md` — the dashboard renders
+/// it as the diff preview without any GitHub round trip.
+///
+/// `promotedPrUrl` is non-null once the candidate has been approved and a
+/// PR opened; the panel then renders the PR link instead of a Promote
+/// button.
+export interface PromotionCandidate {
+  learningId: string;
+  orgId: string;
+  kind: string;
+  category: string;
+  slug: string;
+  bodyMd: string;
+  hitCount: number;
+  threshold: number;
+  windowDays: number;
+  createdAt: string;
+  promotedPrUrl: string | null;
+  promotedAt: string | null;
+  appendPreview: string;
+}
+
+interface PromotionCandidatesResponse {
+  items: PromotionCandidate[];
+}
+
+/// Result of a successful `POST /api/learnings/{id}/promote`.
+export interface PromoteResult {
+  ok: boolean;
+  prUrl: string;
+  prNumber: number;
+}
+
 /// Cache key for the per-row log drilldown. Avoids a separate fetch
 /// when the operator collapses + re-expands the same row inside one
 /// session.
@@ -64,23 +103,42 @@ interface LearningsState {
   /// `logsByEventId` cache so the component can render the entry
   /// synchronously on the next render.
   fetchLog: (eventId: number) => Promise<void>;
+
+  /// Promotion candidates (Phase 4.2). Learnings that crossed the
+  /// promotion threshold, surfaced in the Promotions admin tab.
+  candidates: PromotionCandidate[];
+  candidatesLoaded: boolean;
+  candidatesLoading: boolean;
+  /// Module-deduped fetch — overlapping callers share one promise.
+  fetchCandidates: () => Promise<void>;
+  /// Approve a candidate: POST the promote request, which opens the PR
+  /// server-side and stamps the candidate. Returns the PR url/number on
+  /// success; rejects (HttpError) on 4xx/5xx so the caller can surface
+  /// the message. Refetches the candidate list on success so the row
+  /// flips to "promoted".
+  promote: (learningId: string, projectId: string, credentialId?: string) => Promise<PromoteResult>;
+
   /// Test escape hatch — resets every slice and clears in-flight
   /// markers. Called from `lib/reset-all.ts` on logout.
   reset: () => void;
 }
 
 let inFlightPendingFetch: Promise<void> | null = null;
+let inFlightCandidatesFetch: Promise<void> | null = null;
 
 /// Per-event in-flight log fetches. Concurrent expand+collapse-and-
 /// re-expand should not double-fire the log fetch (which can shell out
 /// to `gh` on the runner host and is slow).
 const inFlightLogFetches: Map<number, Promise<void>> = new Map();
 
-export const useLearningsStore = create<LearningsState>((set) => ({
+export const useLearningsStore = create<LearningsState>((set, get) => ({
   items: [],
   loading: false,
   loaded: false,
   logsByEventId: {},
+  candidates: [],
+  candidatesLoaded: false,
+  candidatesLoading: false,
 
   fetchPending: async () => {
     if (inFlightPendingFetch) return inFlightPendingFetch;
@@ -167,10 +225,71 @@ export const useLearningsStore = create<LearningsState>((set) => ({
     return promise;
   },
 
+  fetchCandidates: async () => {
+    if (inFlightCandidatesFetch) return inFlightCandidatesFetch;
+    set({ candidatesLoading: true });
+    let handle: Promise<void> | null = null;
+    const promise: Promise<void> = (async () => {
+      try {
+        const res = await fetchJson<PromotionCandidatesResponse>(
+          "/api/learnings/promotion-candidates",
+        );
+        set({
+          candidates: res.items ?? [],
+          candidatesLoading: false,
+          candidatesLoaded: true,
+        });
+      } catch {
+        // Leave `candidatesLoaded` false so a retry re-fires; `api.ts`
+        // already toasted on 401/403.
+        set({ candidatesLoading: false });
+      } finally {
+        if (inFlightCandidatesFetch === handle) {
+          inFlightCandidatesFetch = null;
+        }
+      }
+    })();
+    handle = promise;
+    inFlightCandidatesFetch = promise;
+    return promise;
+  },
+
+  promote: async (learningId, projectId, credentialId) => {
+    const body: { projectId: string; credentialId?: string } = { projectId };
+    if (credentialId) body.credentialId = credentialId;
+    const res = await postJson<PromoteResult>(
+      `/api/learnings/${encodeURIComponent(learningId)}/promote`,
+      body,
+    );
+    // Optimistically stamp the candidate so the row flips before the
+    // WS `learning_promoted` event lands; the next fetch reconciles.
+    set((s) => ({
+      candidates: s.candidates.map((c) =>
+        c.learningId === learningId ? { ...c, promotedPrUrl: res.prUrl } : c,
+      ),
+    }));
+    // Refetch authoritatively (picks up promotedAt + any concurrent
+    // changes). Fire-and-forget — the optimistic patch already updated
+    // the row.
+    get()
+      .fetchCandidates()
+      .catch(() => {});
+    return res;
+  },
+
   reset: () => {
     inFlightPendingFetch = null;
+    inFlightCandidatesFetch = null;
     inFlightLogFetches.clear();
-    set({ items: [], loading: false, loaded: false, logsByEventId: {} });
+    set({
+      items: [],
+      loading: false,
+      loaded: false,
+      logsByEventId: {},
+      candidates: [],
+      candidatesLoaded: false,
+      candidatesLoading: false,
+    });
   },
 }));
 
@@ -195,6 +314,7 @@ export function getInFlightPendingFetch(): Promise<void> | null {
 /// from `reset-all.ts` (which a unit test would not want to invoke).
 export function clearInFlightForTests(): void {
   inFlightPendingFetch = null;
+  inFlightCandidatesFetch = null;
   inFlightLogFetches.clear();
 }
 

@@ -4,8 +4,28 @@ import {
   lastNLines,
   useLearningsStore,
   type PendingLearningRow,
+  type PromotionCandidate,
 } from "./learnings-store.js";
 import { useAuthStore } from "./auth-store.js";
+
+function fakeCandidate(overrides: Partial<PromotionCandidate> = {}): PromotionCandidate {
+  return {
+    learningId: "L-1",
+    orgId: "default-org",
+    kind: "feedback",
+    category: "ci",
+    slug: "deploy-by-sha",
+    bodyMd: "**Why:** because.",
+    hitCount: 6,
+    threshold: 5,
+    windowDays: 30,
+    createdAt: "2026-05-23T00:00:00Z",
+    promotedPrUrl: null,
+    promotedAt: null,
+    appendPreview: "### Deploy by sha\n\n**Why:** because.",
+    ...overrides,
+  };
+}
 
 function fakeRow(overrides: Partial<PendingLearningRow> = {}): PendingLearningRow {
   return {
@@ -159,18 +179,116 @@ describe("learnings-store.fetchLog", () => {
   });
 });
 
+describe("learnings-store.fetchCandidates", () => {
+  it("populates candidates on success", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ items: [fakeCandidate({ learningId: "L-9" })] })),
+    );
+    await useLearningsStore.getState().fetchCandidates();
+    const s = useLearningsStore.getState();
+    expect(s.candidatesLoaded).toBe(true);
+    expect(s.candidatesLoading).toBe(false);
+    expect(s.candidates.map((c) => c.learningId)).toEqual(["L-9"]);
+  });
+
+  it("leaves candidatesLoaded=false on failure so a retry re-fires", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network");
+      }),
+    );
+    await useLearningsStore.getState().fetchCandidates();
+    expect(useLearningsStore.getState().candidatesLoaded).toBe(false);
+  });
+});
+
+describe("learnings-store.promote", () => {
+  it("POSTs the promote request and optimistically stamps the row", async () => {
+    useLearningsStore.setState({ candidates: [fakeCandidate({ learningId: "L-1" })] });
+    const calls: { url: string; method: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        calls.push({ url, method, body: init?.body });
+        if (method === "POST") {
+          return jsonResponse({
+            ok: true,
+            prUrl: "https://github.com/o/r/pull/5",
+            prNumber: 5,
+          });
+        }
+        // The fire-and-forget refetch — keep the row promoted.
+        return jsonResponse({
+          items: [
+            fakeCandidate({ learningId: "L-1", promotedPrUrl: "https://github.com/o/r/pull/5" }),
+          ],
+        });
+      }),
+    );
+
+    const res = await useLearningsStore.getState().promote("L-1", "proj-1", "cred-1");
+    expect(res.prUrl).toBe("https://github.com/o/r/pull/5");
+
+    // The POST went to the right URL with both ids in the body.
+    const post = calls.find((c) => c.method === "POST")!;
+    expect(post.url).toContain("/api/learnings/L-1/promote");
+    const body = JSON.parse(String(post.body));
+    expect(body).toEqual({ projectId: "proj-1", credentialId: "cred-1" });
+
+    // Optimistic stamp landed (independent of the refetch timing).
+    expect(useLearningsStore.getState().candidates[0].promotedPrUrl).toBe(
+      "https://github.com/o/r/pull/5",
+    );
+  });
+
+  it("omits credentialId from the body when not supplied", async () => {
+    useLearningsStore.setState({ candidates: [fakeCandidate()] });
+    let postBody: unknown;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if ((init?.method ?? "GET") === "POST") {
+          postBody = init?.body;
+          return jsonResponse({ ok: true, prUrl: "u", prNumber: 1 });
+        }
+        return jsonResponse({ items: [] });
+      }),
+    );
+    await useLearningsStore.getState().promote("L-1", "proj-1");
+    expect(JSON.parse(String(postBody))).toEqual({ projectId: "proj-1" });
+  });
+
+  it("propagates the error and does not stamp on failure", async () => {
+    useLearningsStore.setState({ candidates: [fakeCandidate({ learningId: "L-1" })] });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ error: "unsupported_host" }, 422)),
+    );
+    await expect(useLearningsStore.getState().promote("L-1", "proj-1")).rejects.toBeTruthy();
+    expect(useLearningsStore.getState().candidates[0].promotedPrUrl).toBeNull();
+  });
+});
+
 describe("learnings-store.reset", () => {
-  it("wipes items + cache + loaded flags", () => {
+  it("wipes items + cache + loaded flags + candidates", () => {
     useLearningsStore.setState({
       items: [fakeRow()],
       loaded: true,
       logsByEventId: { 1: { status: "ok", text: "hi", error: null } },
+      candidates: [fakeCandidate()],
+      candidatesLoaded: true,
     });
     useLearningsStore.getState().reset();
     const s = useLearningsStore.getState();
     expect(s.items).toEqual([]);
     expect(s.loaded).toBe(false);
     expect(s.logsByEventId).toEqual({});
+    expect(s.candidates).toEqual([]);
+    expect(s.candidatesLoaded).toBe(false);
   });
 });
 

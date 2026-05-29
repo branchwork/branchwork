@@ -1366,6 +1366,123 @@ pub fn record_learning_hit(
     }
 }
 
+// ── Promotion candidates → CLAUDE.md (Phase 4, Task 4.2) ────────────────────
+
+/// A promotion candidate joined to its learning. One row per learning
+/// that has crossed the promotion threshold; carries the candidate
+/// counters (`hit_count` / `threshold` / `window_days`) plus the
+/// learning's content (`category` / `slug` / `kind` / `body_md`) so the
+/// dashboard can render the diff preview without a second fetch, and the
+/// promote endpoint can build the rule block. `promoted_pr_url` is the
+/// URL of the PR opened when the candidate was approved — `None` until
+/// then.
+#[allow(dead_code)] // consumed by the learnings API + dashboard
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromotionCandidate {
+    pub learning_id: String,
+    pub org_id: String,
+    pub kind: String,
+    pub category: String,
+    pub slug: String,
+    pub body_md: String,
+    pub hit_count: i64,
+    pub threshold: i64,
+    pub window_days: i64,
+    pub created_at: String,
+    pub promoted_pr_url: Option<String>,
+    pub promoted_at: Option<String>,
+}
+
+/// List promotion candidates for `org_id`, newest first. Joins
+/// `learnings` so the caller gets the body in one round trip. Archived
+/// learnings are excluded — a candidate whose learning was archived
+/// after flagging is no longer something we want to promote.
+#[allow(dead_code)] // consumed by the learnings API
+pub fn list_promotion_candidates(db: &Db, org_id: &str) -> Vec<PromotionCandidate> {
+    let conn = db.lock().unwrap();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT p.learning_id, p.org_id, l.kind, l.category, l.slug, l.body_md, \
+                p.hit_count, p.threshold, p.window_days, p.created_at, \
+                p.promoted_pr_url, p.promoted_at \
+           FROM promotion_candidates p \
+           JOIN learnings l ON l.id = p.learning_id \
+          WHERE p.org_id = ?1 AND l.archived_at IS NULL \
+          ORDER BY p.created_at DESC, p.learning_id DESC",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map(params![org_id], map_promotion_candidate)
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default()
+}
+
+/// Fetch a single promotion candidate by learning id, scoped to `org_id`.
+/// Returns `None` when the learning has no candidate row, is archived, or
+/// belongs to another org. The promote endpoint uses this to (a) gate
+/// promotion on candidacy and (b) read `promoted_pr_url` to refuse a
+/// duplicate.
+#[allow(dead_code)] // consumed by the learnings API
+pub fn get_promotion_candidate(
+    db: &Db,
+    learning_id: &str,
+    org_id: &str,
+) -> Option<PromotionCandidate> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT p.learning_id, p.org_id, l.kind, l.category, l.slug, l.body_md, \
+                p.hit_count, p.threshold, p.window_days, p.created_at, \
+                p.promoted_pr_url, p.promoted_at \
+           FROM promotion_candidates p \
+           JOIN learnings l ON l.id = p.learning_id \
+          WHERE p.learning_id = ?1 AND p.org_id = ?2 AND l.archived_at IS NULL",
+        params![learning_id, org_id],
+        map_promotion_candidate,
+    )
+    .ok()
+}
+
+fn map_promotion_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromotionCandidate> {
+    Ok(PromotionCandidate {
+        learning_id: row.get(0)?,
+        org_id: row.get(1)?,
+        kind: row.get(2)?,
+        category: row.get(3)?,
+        slug: row.get(4)?,
+        body_md: row.get(5)?,
+        hit_count: row.get(6)?,
+        threshold: row.get(7)?,
+        window_days: row.get(8)?,
+        created_at: row.get(9)?,
+        promoted_pr_url: row.get(10)?,
+        promoted_at: row.get(11)?,
+    })
+}
+
+/// Stamp a promotion candidate as promoted, recording the PR URL.
+///
+/// Guarded on `promoted_pr_url IS NULL` so a concurrent double-promote
+/// converges on first-writer-wins: the second caller's UPDATE affects 0
+/// rows and returns `Ok(false)`, letting the API surface a 409 with the
+/// original URL. Scoped to `org_id` so a cross-org learning id can never
+/// flip another org's candidate.
+#[allow(dead_code)] // consumed by the learnings API
+pub fn mark_learning_promoted(
+    db: &Db,
+    learning_id: &str,
+    org_id: &str,
+    pr_url: &str,
+) -> Result<bool, rusqlite::Error> {
+    let conn = db.lock().unwrap();
+    let n = conn.execute(
+        "UPDATE promotion_candidates \
+            SET promoted_pr_url = ?3, promoted_at = datetime('now') \
+          WHERE learning_id = ?1 AND org_id = ?2 AND promoted_pr_url IS NULL",
+        params![learning_id, org_id, pr_url],
+    )?;
+    Ok(n > 0)
+}
+
 /// Open (or create) the database at `db_path` and run migrations.
 pub fn init(db_path: &Path) -> Db {
     if let Some(parent) = db_path.parent() {
@@ -1997,6 +2114,16 @@ fn migrate(conn: &Connection) {
     // red badge can be cleared without affecting the underlying GitHub
     // pipeline or future runs for the same commit.
     conn.execute_batch("ALTER TABLE ci_runs ADD COLUMN dismissed_at TEXT;")
+        .ok();
+
+    // Promotion lifecycle on `promotion_candidates` (Phase 4, Task 4.2).
+    // When an operator approves a candidate, the server opens a PR against
+    // the project repo appending the rule under `## Other rules`; the PR URL
+    // (and the timestamp) land on the candidate row so the dashboard can
+    // render "promoted → <PR link>" and refuse a duplicate promote.
+    conn.execute_batch("ALTER TABLE promotion_candidates ADD COLUMN promoted_pr_url TEXT;")
+        .ok();
+    conn.execute_batch("ALTER TABLE promotion_candidates ADD COLUMN promoted_at TEXT;")
         .ok();
 
     // ── Multi-tenancy: org_id on every data table ───────────────────────────
@@ -4929,6 +5056,124 @@ mod tests {
         assert!(
             promotion_row(&db, "L-1").is_none(),
             "promotion row must cascade away"
+        );
+    }
+
+    // ── Phase 4, Task 4.2: promote a candidate to CLAUDE.md ────────────────
+
+    /// Seed a learning and push it past the threshold so a
+    /// `promotion_candidates` row exists. Returns once the candidate is
+    /// flagged. The org row is created first so the `org_id` FK on
+    /// `learnings` / `promotion_candidates` is satisfied (the real DB runs
+    /// with `PRAGMA foreign_keys = ON`).
+    fn seed_candidate(db: &Db, id: &str, org_id: &str) {
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO organizations (id, name, slug) VALUES (?1, ?1, ?1)",
+                params![org_id],
+            )
+            .unwrap();
+        }
+        let mut input = sample_learning(id, &format!("slug-{id}"));
+        input.org_id = Box::leak(org_id.to_string().into_boxed_str());
+        create_learning(db, &input).unwrap();
+        for i in 0..5 {
+            record_learning_hit(db, id, &format!("{id}-agent-{i}"), org_id, 5, 30);
+        }
+        assert!(get_promotion_candidate(db, id, org_id).is_some());
+    }
+
+    #[test]
+    fn list_promotion_candidates_joins_learning_and_scopes_by_org() {
+        let (db, _dir) = test_db();
+        seed_candidate(&db, "L-1", "default-org");
+        seed_candidate(&db, "L-2", "other-org");
+
+        let mine = list_promotion_candidates(&db, "default-org");
+        assert_eq!(mine.len(), 1, "org scoping: only default-org's candidate");
+        let c = &mine[0];
+        assert_eq!(c.learning_id, "L-1");
+        assert_eq!(c.org_id, "default-org");
+        assert_eq!(c.kind, "feedback");
+        assert_eq!(c.category, "testing");
+        assert_eq!(c.slug, "slug-L-1");
+        assert!(c.body_md.starts_with("**Why:**"), "body joined in");
+        assert_eq!(c.hit_count, 5);
+        assert!(c.promoted_pr_url.is_none());
+    }
+
+    #[test]
+    fn list_promotion_candidates_excludes_archived_learnings() {
+        let (db, _dir) = test_db();
+        seed_candidate(&db, "L-1", "default-org");
+        archive_learning(&db, "L-1", "no longer relevant").unwrap();
+        assert!(
+            list_promotion_candidates(&db, "default-org").is_empty(),
+            "a candidate whose learning was archived drops out of the list"
+        );
+        assert!(
+            get_promotion_candidate(&db, "L-1", "default-org").is_none(),
+            "and out of the single-fetch path too"
+        );
+    }
+
+    #[test]
+    fn get_promotion_candidate_is_none_for_non_candidate_or_cross_org() {
+        let (db, _dir) = test_db();
+        // A learning with no hits is not a candidate.
+        create_learning(&db, &sample_learning("L-plain", "plain")).unwrap();
+        assert!(get_promotion_candidate(&db, "L-plain", "default-org").is_none());
+
+        seed_candidate(&db, "L-1", "default-org");
+        // Right learning, wrong org.
+        assert!(get_promotion_candidate(&db, "L-1", "other-org").is_none());
+    }
+
+    #[test]
+    fn mark_learning_promoted_stamps_url_then_refuses_second_write() {
+        let (db, _dir) = test_db();
+        seed_candidate(&db, "L-1", "default-org");
+
+        let first =
+            mark_learning_promoted(&db, "L-1", "default-org", "https://github.com/o/r/pull/7")
+                .unwrap();
+        assert!(first, "first promote flips the row");
+
+        let got = get_promotion_candidate(&db, "L-1", "default-org").unwrap();
+        assert_eq!(
+            got.promoted_pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/7")
+        );
+        assert!(got.promoted_at.is_some(), "promoted_at stamped");
+
+        // Second promote is a no-op (guarded on promoted_pr_url IS NULL).
+        let second =
+            mark_learning_promoted(&db, "L-1", "default-org", "https://github.com/o/r/pull/9")
+                .unwrap();
+        assert!(!second, "duplicate promote affects 0 rows");
+        let still = get_promotion_candidate(&db, "L-1", "default-org").unwrap();
+        assert_eq!(
+            still.promoted_pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/7"),
+            "the original PR URL must survive a second attempt"
+        );
+    }
+
+    #[test]
+    fn mark_learning_promoted_is_org_scoped() {
+        let (db, _dir) = test_db();
+        seed_candidate(&db, "L-1", "default-org");
+        // A caller resolving the wrong org cannot flip the row.
+        let flipped =
+            mark_learning_promoted(&db, "L-1", "other-org", "https://github.com/o/r/pull/1")
+                .unwrap();
+        assert!(!flipped);
+        assert!(
+            get_promotion_candidate(&db, "L-1", "default-org")
+                .unwrap()
+                .promoted_pr_url
+                .is_none()
         );
     }
 }

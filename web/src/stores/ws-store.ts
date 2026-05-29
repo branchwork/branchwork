@@ -717,6 +717,18 @@ function dispatch(msg: WsMessage) {
         .catch(() => {});
       break;
     }
+    case "promotion_candidate":
+    case "learning_promoted": {
+      // Phase 4.2: a learning crossed the promotion threshold, or a
+      // candidate was just promoted (PR opened). Either way, refetch the
+      // candidate list so the Promotions tab reflects the new state
+      // (new row / flipped-to-promoted) without polling.
+      useLearningsStore
+        .getState()
+        .fetchCandidates()
+        .catch(() => {});
+      break;
+    }
     case "phase_advanced": {
       // Cross-phase advance from `try_auto_advance`. Refresh the selected
       // plan so the new phase's tasks render with their current statuses

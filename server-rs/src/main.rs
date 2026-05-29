@@ -462,10 +462,25 @@ async fn run_server(cli: Cli) {
         // 1.3). Append-only — corrections happen by archiving + writing
         // a new entry, preserving the audit trail.
         .route("/api/learnings", get(api::learnings::list_learnings))
+        // Promotion to CLAUDE.md (Phase 4, Task 4.2): list the learnings
+        // that crossed the promotion threshold (with the diff preview of
+        // what would be appended), and approve one — opening a PR against
+        // the project repo and stamping the candidate with the PR URL.
+        // Registered before the `{id}` param route; the static
+        // `promotion-candidates` segment wins (same precedence the
+        // `/pending` static sibling already relies on).
+        .route(
+            "/api/learnings/promotion-candidates",
+            get(api::learnings::list_promotion_candidates),
+        )
         .route("/api/learnings/{id}", get(api::learnings::get_learning))
         .route(
             "/api/learnings/{id}/archive",
             post(api::learnings::archive_learning),
+        )
+        .route(
+            "/api/learnings/{id}/promote",
+            post(api::learnings::promote_learning),
         )
         // Per-branch push lock: external auto-bump CI shares the same
         // master_push_lock table the in-process auto-mode flow holds

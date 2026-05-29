@@ -211,6 +211,13 @@ pub mod actions {
     /// Refused with 422 (missing/empty `reason`) or 410 (already archived);
     /// no audit row on either refusal.
     pub const LEARNING_ARCHIVE: &str = "learning.archive";
+
+    /// A promotion candidate was approved and a PR was opened against the
+    /// project repo appending the rule under `## Other rules` (Phase 4,
+    /// Task 4.2). Diff carries `{learning_id, slug, project_id, repo,
+    /// pr_url}`. Written only on a successfully-opened PR — host-API
+    /// failures and validation refusals do not audit.
+    pub const LEARNING_PROMOTE: &str = "learning.promote";
 }
 
 /// Resource types for audit entries.

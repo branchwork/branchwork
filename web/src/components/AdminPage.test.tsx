@@ -467,33 +467,34 @@ describe("AdminPage tab gating", () => {
     });
   }
 
-  it("standalone deployments render Settings + Diagnostics", () => {
+  it("standalone deployments render Settings + Diagnostics + Promotions", () => {
     // Default beforeEach already sets mode=standalone + no memberships.
-    // Diagnostics is a universal triage view (added in 9.2), so the
-    // tab bar now appears on standalone too — but only those two tabs.
+    // Diagnostics (9.2) and Promotions (4.2) are universal views, so the
+    // tab bar appears on standalone too — but only those three tabs.
     render(<AdminPage />);
     const tabs = screen.getAllByRole("tab").map((t) => (t.textContent ?? "").trim());
-    expect(tabs).toEqual(["Settings", "Diagnostics"]);
+    expect(tabs).toEqual(["Settings", "Diagnostics", "Promotions"]);
     // Settings tab content still renders (effort buttons present).
     expect(screen.getByText(/^Low$/)).toBeTruthy();
   });
 
-  it("SaaS members see Settings + Diagnostics + Members", () => {
+  it("SaaS members see Settings + Diagnostics + Promotions + Members", () => {
     asSaasMember();
     render(<AdminPage />);
     const tablist = screen.getByRole("tablist");
     expect(tablist).toBeTruthy();
     const tabs = screen.getAllByRole("tab").map((t) => (t.textContent ?? "").trim());
-    expect(tabs).toEqual(["Settings", "Diagnostics", "Members"]);
+    expect(tabs).toEqual(["Settings", "Diagnostics", "Promotions", "Members"]);
   });
 
-  it("SaaS owners see all admin tabs (Diagnostics included)", () => {
+  it("SaaS owners see all admin tabs (Diagnostics + Promotions included)", () => {
     asSaasAdmin();
     render(<AdminPage />);
     const tabs = screen.getAllByRole("tab").map((t) => (t.textContent ?? "").trim());
     expect(tabs).toEqual([
       "Settings",
       "Diagnostics",
+      "Promotions",
       "Members",
       "Budget",
       "Kill switch",

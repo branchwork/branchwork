@@ -513,6 +513,34 @@ const CiFailureObserved = v.object({
   }),
 });
 
+/// A learning crossed the promotion threshold (Phase 4, Task 4.1).
+/// Fires from `spawn_ops::record_learning_hits_for_spawn` at most once
+/// per learning. The Promotions admin tab listens for this to refetch
+/// its candidate list without polling.
+const PromotionCandidate = v.object({
+  type: v.literal("promotion_candidate"),
+  data: v.object({
+    learning_id: v.string(),
+    org_id: v.string(),
+    hit_count: v.number(),
+    threshold: v.number(),
+    window_days: v.number(),
+  }),
+});
+
+/// A promotion candidate was approved and a PR was opened against the
+/// project repo (Phase 4, Task 4.2). Fires from
+/// `api/learnings.rs::promote_learning` on a successfully-opened PR. The
+/// Promotions tab refetches so the row flips to "promoted → <PR link>".
+const LearningPromoted = v.object({
+  type: v.literal("learning_promoted"),
+  data: v.object({
+    learning_id: v.string(),
+    org_id: v.string(),
+    pr_url: v.string(),
+  }),
+});
+
 export const WsMessageSchema = v.variant("type", [
   Connected,
   PlanUpdated,
@@ -556,6 +584,8 @@ export const WsMessageSchema = v.variant("type", [
   CloneDone,
   CloneFailed,
   CiFailureObserved,
+  PromotionCandidate,
+  LearningPromoted,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;

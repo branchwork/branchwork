@@ -39,9 +39,11 @@ use axum::{
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use crate::api::github;
 use crate::audit;
 use crate::auth::OptionalAuthUser;
-use crate::db::{Learning, LearningError, LearningKind};
+use crate::crypto::{self, MasterKey, resolve_master_key_path};
+use crate::db::{CredentialKind, Learning, LearningError, LearningKind, PromotionCandidate};
 use crate::state::AppState;
 
 /// A single pending CI-failure waiting on a learning capture. Wire shape
@@ -505,6 +507,446 @@ pub async fn archive_learning(
     .into_response()
 }
 
+// ── Promotion to CLAUDE.md (Phase 4, Task 4.2) ──────────────────────────────
+
+/// One promotion candidate plus the exact markdown block the promote
+/// flow would append under `## Other rules` in `CLAUDE.md`. The
+/// `appendPreview` lets the dashboard render the diff preview ("here is
+/// what would be appended") without any GitHub round trip — it is built
+/// purely from the learning body.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromotionCandidateRow {
+    #[serde(flatten)]
+    pub candidate: PromotionCandidate,
+    pub append_preview: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromotionCandidatesResponse {
+    pub items: Vec<PromotionCandidateRow>,
+}
+
+/// `GET /api/learnings/promotion-candidates`
+///
+/// Org-scoped list of learnings that have crossed the promotion
+/// threshold, newest first, each with the rule block that would be
+/// appended to `CLAUDE.md`. Already-promoted candidates stay in the list
+/// (carrying their `promotedPrUrl`) so the dashboard can render the PR
+/// link rather than dropping the row.
+pub async fn list_promotion_candidates(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+) -> impl IntoResponse {
+    let org_id = auth.org_id().to_string();
+    let items = crate::db::list_promotion_candidates(&state.db, &org_id)
+        .into_iter()
+        .map(|candidate| {
+            let append_preview = format_rule_block(&candidate);
+            PromotionCandidateRow {
+                candidate,
+                append_preview,
+            }
+        })
+        .collect();
+    Json(PromotionCandidatesResponse { items })
+}
+
+/// Body for `POST /api/learnings/{id}/promote`. `projectId` names the
+/// repo to open the PR against (its `repo_url` + `host` + default
+/// credential). `credentialId` overrides the project's default credential
+/// (must be a `gh_pat`); when omitted the project's
+/// `default_credential_id` is used.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromoteBody {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub credential_id: Option<String>,
+}
+
+/// `POST /api/learnings/{id}/promote`
+///
+/// Approve a promotion candidate: open a PR against the project repo that
+/// appends the rule (wrapped in an H3 heading) under `## Other rules` in
+/// `CLAUDE.md`, then stamp the candidate row with the PR URL.
+///
+/// Status codes:
+/// - 200: PR opened. Body `{ ok, prUrl, prNumber }`.
+/// - 400: `projectId` missing.
+/// - 404: learning is not a promotion candidate (or cross-org / archived);
+///   project not found in the caller's org.
+/// - 409: already promoted (body carries the existing `prUrl`).
+/// - 422: unsupported host, unparseable repo URL, no usable PAT credential.
+/// - 502: the GitHub API rejected one of the calls (body carries `step`
+///   + the upstream message).
+///
+/// Only a successfully-opened PR writes the audit row + broadcasts
+/// `learning_promoted`; every refusal path leaves state untouched.
+pub async fn promote_learning(
+    State(state): State<AppState>,
+    Path(learning_id): Path<String>,
+    auth: OptionalAuthUser,
+    Json(body): Json<PromoteBody>,
+) -> Response {
+    let org_id = auth.org_id().to_string();
+
+    // Must be a live candidate in this org.
+    let Some(candidate) = crate::db::get_promotion_candidate(&state.db, &learning_id, &org_id)
+    else {
+        return json_err(
+            StatusCode::NOT_FOUND,
+            "not_a_candidate",
+            "learning is not a promotion candidate",
+        );
+    };
+    if let Some(existing) = candidate.promoted_pr_url.as_deref() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "already_promoted",
+                "message": "this learning was already promoted",
+                "prUrl": existing,
+            })),
+        )
+            .into_response();
+    }
+
+    // Resolve the target repo from the project.
+    let Some(project_id) = body
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "project_required",
+            "projectId is required",
+        );
+    };
+    let project: Option<(String, String, Option<String>)> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT repo_url, host, default_credential_id FROM projects \
+              WHERE id = ?1 AND org_id = ?2",
+            params![project_id, org_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok()
+    };
+    let Some((repo_url, host, default_credential_id)) = project else {
+        return json_err(
+            StatusCode::NOT_FOUND,
+            "project_not_found",
+            "no such project in this org",
+        );
+    };
+    if host != "github" {
+        return json_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_host",
+            "promotion currently supports GitHub repos only",
+        );
+    }
+    let Some((owner, repo)) = github::parse_owner_repo(&repo_url) else {
+        return json_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unparseable_repo_url",
+            "could not parse owner/repo from the project's repo_url",
+        );
+    };
+
+    // Resolve a PAT credential: explicit override, else project default.
+    let Some(cred_id) = body
+        .credential_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(default_credential_id)
+    else {
+        return json_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credential_required",
+            "no credential selected and the project has no default credential",
+        );
+    };
+
+    let key = match load_master_key(&state) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[learnings] master key load failed: {e}");
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "master_key_unavailable",
+                &e.to_string(),
+            );
+        }
+    };
+    let cred = match crate::db::get_credential(&state.db, &key, &cred_id) {
+        Ok(c) => c,
+        Err(crate::db::CredentialError::NotFound) => {
+            return json_err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "credential_not_found",
+                "the selected credential does not exist",
+            );
+        }
+        Err(crate::db::CredentialError::Crypto(_)) => {
+            return json_err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "credential_sealed",
+                "the credential is sealed by an older master key — re-enter it",
+            );
+        }
+        Err(crate::db::CredentialError::Db(e)) => {
+            eprintln!("[learnings] credential lookup failed: {e}");
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential_lookup_failed",
+                &e.to_string(),
+            );
+        }
+    };
+    // Ownership guard: an authenticated caller may only use their own
+    // credentials (credentials are user-scoped). Anonymous standalone
+    // callers have no credentials, so this is moot for them.
+    if let Some(user) = auth.0.as_ref()
+        && cred.owner_user_id != user.id
+    {
+        return json_err(
+            StatusCode::FORBIDDEN,
+            "credential_forbidden",
+            "that credential belongs to another user",
+        );
+    }
+    if cred.kind != CredentialKind::GhPat {
+        return json_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credential_not_pat",
+            "promotion needs a GitHub PAT credential (SSH keys cannot open PRs via the API)",
+        );
+    }
+    let Ok(pat) = String::from_utf8(cred.secret_plaintext) else {
+        return json_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credential_invalid",
+            "the credential secret is not valid UTF-8",
+        );
+    };
+
+    // Build the rule block + PR metadata.
+    let rule_block = format_rule_block(&candidate);
+    let title = humanize_slug(&candidate.slug);
+    let branch = format!(
+        "branchwork/promote-learning/{}-{}",
+        slug_for_branch(&candidate.slug),
+        short_hex()
+    );
+    let commit_message = format!(
+        "docs(claude): promote learning '{}' to project rules",
+        candidate.slug
+    );
+    let pr_title = format!("Promote learning: {title}");
+    let pr_body = format!(
+        "Promotes a Branchwork learning that has been surfaced into {hits} agent sessions \
+         (threshold {threshold} within {days} days) to the project's `CLAUDE.md` under \
+         `## Other rules`.\n\nLearning slug: `{slug}` (category: {category}).\n\n\
+         Opened automatically by Branchwork's \"promote to CLAUDE.md\" flow.",
+        hits = candidate.hit_count,
+        threshold = candidate.threshold,
+        days = candidate.window_days,
+        slug = candidate.slug,
+        category = candidate.category,
+    );
+
+    let outcome = github::open_claude_md_pr(github::OpenPrRequest {
+        owner: &owner,
+        repo: &repo,
+        pat: &pat,
+        file_path: "CLAUDE.md",
+        section_heading: "## Other rules",
+        rule_block: &rule_block,
+        branch: &branch,
+        commit_message: &commit_message,
+        pr_title: &pr_title,
+        pr_body: &pr_body,
+    })
+    .await;
+
+    let (html_url, pr_number) = match outcome {
+        github::OpenPrOutcome::Opened { html_url, number } => (html_url, number),
+        github::OpenPrOutcome::Failed {
+            step,
+            http_status,
+            message,
+            body_excerpt,
+        } => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "github_api_failed",
+                    "step": step,
+                    "httpStatus": http_status,
+                    "message": message,
+                    "hostResponseExcerpt": body_excerpt,
+                })),
+            )
+                .into_response();
+        }
+        github::OpenPrOutcome::Transport { step, error } => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "github_unreachable",
+                    "step": step,
+                    "message": error,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Stamp the candidate row. A concurrent double-promote loses the race
+    // here (returns false); we still opened a real PR, so surface our URL
+    // either way — the duplicate is a vanishingly rare two-operator race.
+    match crate::db::mark_learning_promoted(&state.db, &learning_id, &org_id, &html_url) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!(
+                "[learnings] promote {learning_id}: row was already stamped by a concurrent caller; \
+                 returning the freshly-opened PR {html_url} anyway"
+            );
+        }
+        Err(e) => {
+            // The PR is open but we failed to record it. Surface the URL so
+            // the operator can wire it up manually; do not 500.
+            eprintln!("[learnings] promote {learning_id}: mark_learning_promoted failed: {e}");
+        }
+    }
+
+    // Audit + broadcast on the successful open.
+    let diff = serde_json::json!({
+        "learning_id": learning_id,
+        "slug": candidate.slug,
+        "project_id": project_id,
+        "repo": format!("{owner}/{repo}"),
+        "pr_url": html_url,
+    })
+    .to_string();
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            &org_id,
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            audit::actions::LEARNING_PROMOTE,
+            audit::resources::LEARNING,
+            Some(&learning_id),
+            Some(&diff),
+        );
+    }
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "learning_promoted",
+        serde_json::json!({
+            "learning_id": learning_id,
+            "org_id": org_id,
+            "pr_url": html_url,
+        }),
+    );
+
+    Json(serde_json::json!({
+        "ok": true,
+        "prUrl": html_url,
+        "prNumber": pr_number,
+    }))
+    .into_response()
+}
+
+fn json_err(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "error": code, "message": message })),
+    )
+        .into_response()
+}
+
+/// Format the markdown block appended under `## Other rules`: an H3
+/// heading derived from the learning slug, followed by the learning
+/// body verbatim. This is both the diff preview and the content the PR
+/// commits, so the two can never drift.
+fn format_rule_block(c: &PromotionCandidate) -> String {
+    format!("### {}\n\n{}", humanize_slug(&c.slug), c.body_md.trim())
+}
+
+/// Turn a kebab/snake slug into a Title-ish heading: split on `-`/`_`,
+/// capitalise the first word. e.g. `deploy-by-sha-not-edge` →
+/// `Deploy by sha not edge`.
+fn humanize_slug(slug: &str) -> String {
+    let words: String = slug
+        .split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => slug.to_string(),
+    }
+}
+
+/// Sanitise a slug for use inside a git ref name: keep alphanumerics,
+/// `-`, `_`; collapse everything else to `-`. The capture_learning
+/// slugifier already produces a clean slug, but a hand-authored learning
+/// could carry something odd.
+fn slug_for_branch(slug: &str) -> String {
+    let s: String = slug
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = s.trim_matches('-');
+    if trimmed.is_empty() {
+        "learning".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Short random hex suffix so a promote retry never collides with a
+/// half-opened branch from a prior attempt.
+fn short_hex() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
+/// Resolve + load the master key, deriving `claude_dir` from
+/// `settings_path`'s parent (mirrors `api/credentials.rs::load_master_key`).
+fn load_master_key(state: &AppState) -> Result<MasterKey, crypto::CryptoError> {
+    let claude_dir = state
+        .settings_path
+        .parent()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let path = resolve_master_key_path(&claude_dir);
+    crypto::load_or_generate_master_key(&path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +1007,28 @@ mod tests {
              );
              CREATE UNIQUE INDEX idx_learnings_org_kind_slug
                 ON learnings(org_id, kind, slug);
+             -- Promotion candidates + projects (Phase 4.2). No FK in the
+             -- minimal test schema, so org rows do not need to exist.
+             CREATE TABLE promotion_candidates (
+                learning_id      TEXT PRIMARY KEY,
+                org_id           TEXT NOT NULL DEFAULT 'default-org',
+                hit_count        INTEGER NOT NULL,
+                threshold        INTEGER NOT NULL,
+                window_days      INTEGER NOT NULL,
+                created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                promoted_pr_url  TEXT,
+                promoted_at      TEXT
+             );
+             CREATE TABLE projects (
+                id                     TEXT PRIMARY KEY,
+                name                   TEXT NOT NULL,
+                repo_url               TEXT NOT NULL,
+                host                   TEXT NOT NULL DEFAULT 'other',
+                owner                  TEXT,
+                default_credential_id  TEXT,
+                workspace_path         TEXT NOT NULL DEFAULT '',
+                org_id                 TEXT NOT NULL DEFAULT 'default-org'
+             );
              -- audit_logs: archive endpoint writes here.
              CREATE TABLE audit_logs (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1369,5 +1833,251 @@ mod tests {
         };
         assert_eq!(user_id.as_deref(), Some("u-7"));
         assert_eq!(user_email.as_deref(), Some("bob@example.com"));
+    }
+
+    // ── Phase 4.2 — promotion candidates + promote validation ────────────
+
+    /// Seed a learning + a promotion_candidates row (optionally already
+    /// promoted). No FK in the minimal test schema, so org rows are not
+    /// required.
+    fn seed_candidate(state: &AppState, id: &str, org_id: &str, promoted: Option<&str>) {
+        create_learning(
+            &state.db,
+            &input(
+                id,
+                org_id,
+                LearningKind::Feedback,
+                "ci",
+                &format!("slug-{id}"),
+            ),
+        )
+        .unwrap();
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO promotion_candidates \
+                (learning_id, org_id, hit_count, threshold, window_days, promoted_pr_url, promoted_at) \
+             VALUES (?1, ?2, 5, 5, 30, ?3, ?4)",
+            params![id, org_id, promoted, promoted.map(|_| "2026-01-01 00:00:00")],
+        )
+        .unwrap();
+    }
+
+    fn seed_project(
+        state: &AppState,
+        id: &str,
+        org_id: &str,
+        host: &str,
+        repo_url: &str,
+        default_cred: Option<&str>,
+    ) {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_url, host, default_credential_id, org_id) \
+             VALUES (?1, ?1, ?2, ?3, ?4, ?5)",
+            params![id, repo_url, host, default_cred, org_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn humanize_slug_titlecases_first_word() {
+        assert_eq!(
+            humanize_slug("deploy-by-sha-not-edge"),
+            "Deploy by sha not edge"
+        );
+        assert_eq!(humanize_slug("no_mocks_in_tests"), "No mocks in tests");
+        assert_eq!(humanize_slug(""), "");
+    }
+
+    #[test]
+    fn format_rule_block_wraps_body_in_h3() {
+        let c = PromotionCandidate {
+            learning_id: "L-1".into(),
+            org_id: "default-org".into(),
+            kind: "feedback".into(),
+            category: "ci".into(),
+            slug: "check-runner-after-deploy".into(),
+            body_md: "**Why:** prod recreates kill the WS.".into(),
+            hit_count: 5,
+            threshold: 5,
+            window_days: 30,
+            created_at: "2026-01-01 00:00:00".into(),
+            promoted_pr_url: None,
+            promoted_at: None,
+        };
+        let block = format_rule_block(&c);
+        assert!(block.starts_with("### Check runner after deploy\n\n"));
+        assert!(block.contains("**Why:** prod recreates kill the WS."));
+    }
+
+    #[tokio::test]
+    async fn candidates_list_carries_preview_and_promoted_url() {
+        let state = test_state();
+        seed_candidate(&state, "L-1", "default-org", None);
+        seed_candidate(
+            &state,
+            "L-2",
+            "default-org",
+            Some("https://github.com/o/r/pull/3"),
+        );
+        seed_candidate(&state, "L-other", "other-org", None);
+
+        let (status, body) =
+            drive(list_promotion_candidates(State(state.clone()), anon()).await).await;
+        assert_eq!(status, 200);
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "org scoping excludes other-org: {body}");
+        // Each row carries an appendPreview (the H3-wrapped rule).
+        for it in items {
+            assert!(
+                it["appendPreview"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("### Slug"),
+                "appendPreview present: {it}"
+            );
+        }
+        let promoted: Vec<&str> = items
+            .iter()
+            .filter(|i| !i["promotedPrUrl"].is_null())
+            .map(|i| i["learningId"].as_str().unwrap())
+            .collect();
+        assert_eq!(promoted, vec!["L-2"]);
+    }
+
+    async fn promote(
+        state: &AppState,
+        id: &str,
+        auth: OptionalAuthUser,
+        project_id: Option<&str>,
+        credential_id: Option<&str>,
+    ) -> (u16, serde_json::Value) {
+        drive(
+            promote_learning(
+                State(state.clone()),
+                Path(id.to_string()),
+                auth,
+                Json(PromoteBody {
+                    project_id: project_id.map(str::to_string),
+                    credential_id: credential_id.map(str::to_string),
+                }),
+            )
+            .await,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn promote_404s_when_not_a_candidate() {
+        let state = test_state();
+        let (status, body) = promote(&state, "nope", anon(), Some("p-1"), None).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"], "not_a_candidate");
+    }
+
+    #[tokio::test]
+    async fn promote_409s_when_already_promoted() {
+        let state = test_state();
+        seed_candidate(
+            &state,
+            "L-1",
+            "default-org",
+            Some("https://github.com/o/r/pull/9"),
+        );
+        seed_project(
+            &state,
+            "p-1",
+            "default-org",
+            "github",
+            "https://github.com/o/r.git",
+            Some("c-1"),
+        );
+        let (status, body) = promote(&state, "L-1", anon(), Some("p-1"), None).await;
+        assert_eq!(status, 409);
+        assert_eq!(body["error"], "already_promoted");
+        assert_eq!(body["prUrl"], "https://github.com/o/r/pull/9");
+    }
+
+    #[tokio::test]
+    async fn promote_400s_without_project_id() {
+        let state = test_state();
+        seed_candidate(&state, "L-1", "default-org", None);
+        let (status, body) = promote(&state, "L-1", anon(), None, None).await;
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "project_required");
+    }
+
+    #[tokio::test]
+    async fn promote_404s_when_project_missing() {
+        let state = test_state();
+        seed_candidate(&state, "L-1", "default-org", None);
+        let (status, body) = promote(&state, "L-1", anon(), Some("ghost"), None).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"], "project_not_found");
+    }
+
+    #[tokio::test]
+    async fn promote_422s_on_unsupported_host() {
+        let state = test_state();
+        seed_candidate(&state, "L-1", "default-org", None);
+        seed_project(
+            &state,
+            "p-1",
+            "default-org",
+            "gitlab",
+            "https://gitlab.com/o/r.git",
+            Some("c-1"),
+        );
+        let (status, body) = promote(&state, "L-1", anon(), Some("p-1"), None).await;
+        assert_eq!(status, 422);
+        assert_eq!(body["error"], "unsupported_host");
+    }
+
+    #[tokio::test]
+    async fn promote_422s_when_no_credential_resolvable() {
+        let state = test_state();
+        seed_candidate(&state, "L-1", "default-org", None);
+        // GitHub host, valid repo, but no default credential and none in
+        // the body → credential_required (returns before any master-key
+        // / network work).
+        seed_project(
+            &state,
+            "p-1",
+            "default-org",
+            "github",
+            "https://github.com/o/r.git",
+            None,
+        );
+        let (status, body) = promote(&state, "L-1", anon(), Some("p-1"), None).await;
+        assert_eq!(status, 422);
+        assert_eq!(body["error"], "credential_required");
+    }
+
+    #[tokio::test]
+    async fn promote_422s_on_unparseable_repo_url() {
+        let state = test_state();
+        seed_candidate(&state, "L-1", "default-org", None);
+        seed_project(
+            &state,
+            "p-1",
+            "default-org",
+            "github",
+            "not-a-url",
+            Some("c-1"),
+        );
+        let (status, body) = promote(&state, "L-1", anon(), Some("p-1"), None).await;
+        assert_eq!(status, 422);
+        assert_eq!(body["error"], "unparseable_repo_url");
+    }
+
+    #[tokio::test]
+    async fn promote_is_org_scoped_404() {
+        // A candidate seeded in other-org is invisible to a default-org
+        // caller — surfaces as not_a_candidate, never reaches the project.
+        let state = test_state();
+        seed_candidate(&state, "L-1", "other-org", None);
+        let (status, body) = promote(&state, "L-1", anon(), Some("p-1"), None).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"], "not_a_candidate");
     }
 }
