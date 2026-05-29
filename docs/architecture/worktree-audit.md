@@ -314,15 +314,145 @@ the project subtree (the precedent set by the pre-merge gate and phase-check,
 both `/tmp`-based), the runner's `validated_cwd` must learn to also accept the
 worktree root(s) — e.g. allow a configured worktree base dir, or canonicalise
 the worktree path against an allow-list that includes `state.cwd` **and** the
-worktree base. Conversely, if the plan decides worktrees live under the project
-(`<project>/.worktrees/...`), `validated_cwd` needs no change. **This is a
-Phase-0 decision input** (Task 0.1's "where do worktrees live" choice directly
-gates whether `validated_cwd` is must-change or no-change).
+worktree base.
+
+**Decision (Task 0.4):** worktrees live **outside** the project, under
+`BRANCHWORK_WORKTREE_BASE` (default `~/.branchwork/worktrees`) — ADR 0002
+§ Worktree location + Task 0.3 (`docs/user-guide.md` § Worktrees). So
+`validated_cwd` **is must-change**: its allowlist gains the worktree base. See
+**§ G (SaaS dispatch)** for the resolved design — the runner-owns-creation rule,
+the `{ state.cwd } ∪ { worktree_base }` allowlist, and the six-variant wire
+contract.
 
 Note also: `validated_cwd` does `std::fs::canonicalize`, which **fails on a
 non-existent path**. A worktree must already exist on disk before any RPC
 references it — fine for the normal flow (worktree created at spawn), but the
 discard/cleanup ordering matters (don't reference a removed worktree).
+
+---
+
+## G. SaaS dispatch — who owns worktree ops, the sandbox allowlist, the wire contract
+
+This section is the **decision** Task 0.4 makes (Phase 0) and the **contract**
+Phase 2.7 implements. Section F found that `validated_cwd` rejects any worktree
+living outside `state.cwd`; Task 0.3 / ADR 0002 then fixed the worktree base at
+`BRANCHWORK_WORKTREE_BASE` (default `~/.branchwork/worktrees`), which **is**
+outside the project root. So the sandbox is **must-change**, and SaaS needs a
+wire contract for the worktree-lifecycle ops the server cannot perform itself
+(the project filesystem lives on the runner host).
+
+### G.1 Responsibility rule
+
+| Mode | Who creates / removes / lists worktrees | How |
+| --- | --- | --- |
+| **Standalone** | the **server**, in-process | direct call into a shared worktree module (the `git worktree add/remove/list` helpers) — no wire plumbing. Mirrors how `git_helpers.rs` already shares merge/discard logic between server and runner via `#[path]`. |
+| **SaaS** | the **runner** | the runner owns the project filesystem (it lives under `state.cwd` on the runner host; the server has no access). The server **dispatches** via the wire variants in G.3 and only **records** the resulting path in `agents.cwd`. |
+
+This is the same split already used for `CloneProject`, `CreateFolder`, and
+`MergeBranch`: the server decides *what* and *which project*, the runner performs
+the filesystem side-effect and replies with the resolved result.
+
+**Resolved-path principle (important).** The server must **not** pre-compute the
+absolute worktree path — it cannot know the runner's `$HOME` or the runner's
+`BRANCHWORK_WORKTREE_BASE` override. The runner resolves the base against *its
+own* environment, constructs
+`<base>/<project-slug>/<plan>/<task>-<agent-id>/` (the convention in
+`docs/user-guide.md` § Worktrees / ADR 0002 § Worktree location), runs `git
+worktree add`, and returns the **resolved absolute path** in `WorktreeCreated`.
+The server writes that string into `agents.cwd`. This mirrors `CreateFolder →
+FolderCreated { resolved_path }` and `CloneProject → CloneDone { resolved_path }`
+exactly. `agents.cwd` is write-once (Section A.3), so the path the runner returns
+is the agent's cwd for life.
+
+### G.2 Sandbox allowlist change (`validated_cwd`)
+
+`validated_cwd` (`bin/branchwork_runner.rs:2642`) today gates on a single prefix:
+
+```
+if !canonical.starts_with(&state.cwd) { return Err("cwd … outside runner root"); }
+```
+
+**Change:** resolve the worktree base **once at runner startup** from the same
+env-var convention — `BRANCHWORK_WORKTREE_BASE` or default
+`~/.branchwork/worktrees` — canonicalise it (creating it if needed, same as the
+base is created on first agent start), store it on `RunnerState` (e.g.
+`worktree_base: PathBuf`, alongside `cwd` at `bin/branchwork_runner.rs:807`,
+constructed at `:1181`), and accept a path under **either** prefix:
+
+```
+let in_root = canonical.starts_with(&state.cwd);
+let in_wt   = canonical.starts_with(&state.worktree_base);
+if !in_root && !in_wt { return Err("cwd … outside runner root and worktree base"); }
+```
+
+The runtime allowlist is therefore `{ state.cwd } ∪ { state.worktree_base }`.
+
+**On the brief's `<BRANCHWORK_WORKTREE_BASE>/<project-slug>/` framing:** the
+startup-computed allowlist entry is the **base**, not a per-slug path. One runner
+serves N projects under a single base and cannot enumerate slugs at startup. The
+`<project-slug>/<plan>/<task>-<agent-id>` structure is enforced by the path
+**constructor** (runner-side, per G.1), not the sandbox gate; the gate only
+bounds requests to the base subtree.
+
+**Canonicalize-is-an-existence-check caveat (carried from F.3):**
+`validated_cwd` calls `std::fs::canonicalize`, which fails on a non-existent
+path. The worktree must exist on disk before any read/merge/diff RPC references
+it — created at `SetupWorktree`, removed only after the agent's worktree-using
+RPCs are done (discard/cleanup ordering matters).
+
+### G.3 Wire variants (the Phase 2.7 contract)
+
+Six variants, three request/response pairs. **All best-effort** (tied to a live
+HTTP / loop caller; outbox replay would land after the caller times out —
+identical rationale to the folder / branch / merge RPC pairs).
+
+| Dir | Variant | Carries | Runner action / server use |
+| --- | --- | --- | --- |
+| s→r | `SetupWorktree` | `req_id`, `project_dir`, `branch`, `plan`, `task`, `agent_id` | runner resolves base, builds `<base>/<slug>/<plan>/<task>-<agent_id>`, `git worktree add <path> <branch>` (creating the branch off project HEAD if absent), run from the project root |
+| r→s | `WorktreeCreated` | `req_id`, `ok`, `worktree_path?` (resolved abs), `error?` | server writes `agents.cwd = worktree_path` |
+| s→r | `RemoveWorktree` | `req_id`, `worktree_path` | runner `git worktree remove --force <path>` (+ `git worktree prune`); used by discard and post-merge cleanup |
+| r→s | `WorktreeRemoved` | `req_id`, `ok`, `error?` | server proceeds with branch-delete / discard bookkeeping |
+| s→r | `ListWorktreeOrphans` | `req_id`, `project_dir` | runner `git worktree list --porcelain` + base-dir scan → worktrees with no live agent / pruned branch |
+| r→s | `WorktreeOrphansListed` | `req_id`, `orphans: Vec<WorktreeOrphan>` | boot-time reconcile (SaaS analogue of `reconcile_orphaned_branches`, Section A.1) |
+
+`WorktreeOrphan` is a small struct (e.g. `{ worktree_path, branch, head_sha }`) —
+exact shape is Phase 2.7's call; put it on the wire as a plain
+`Serialize`/`Deserialize` struct, like `FolderEntry`.
+
+### G.4 Adding these variants — exhaustive-match touch sites
+
+Adding a `WireMessage` variant in this codebase requires updating every
+exhaustive match. For the six above (locations verified at this branchpoint):
+
+- `saas/runner_protocol.rs` — the six `WireMessage` variants + the
+  `WorktreeOrphan` struct.
+- `saas/runner_protocol.rs::is_best_effort` (`:1082`) — add all six (best-effort
+  arm).
+- `saas/runner_protocol.rs::event_type` (`:1127`) — snake_case strings:
+  `setup_worktree`, `worktree_created`, `remove_worktree`, `worktree_removed`,
+  `list_worktree_orphans`, `worktree_orphans_listed`.
+- `saas/runner_ws.rs::RunnerResponse` (`:36`) — three new reply arms
+  (`WorktreeCreated`, `WorktreeRemoved`, `WorktreeOrphansListed`).
+- `saas/runner_ws.rs::handle_runner_message` (`:685`) — route the three reply
+  variants through `resolve_pending` (`:2200`) into the oneshot.
+- `saas/runner_rpc.rs::req_id_for` (`:171`) — add all six so `runner_request`
+  can correlate request ↔ reply.
+- `bin/branchwork_runner.rs::handle_server_message` (`:1445`) — handle the three
+  **request** variants. `RemoveWorktree` / `ListWorktreeOrphans` resolve a path
+  the runner already created, so they go through `validated_cwd` (which now
+  accepts the worktree base, per G.2); `SetupWorktree` *creates* the path, so it
+  validates the requested location against `worktree_base` directly.
+
+### G.5 Standalone counterpart
+
+Standalone runs the **same** worktree module directly (no wire hop): the server's
+spawn / discard / boot-reconcile paths call `worktree_create` /
+`worktree_remove` / `worktree_list_orphans` in-process. Factor the `git worktree
+add/remove/list --porcelain` logic into a leaf module shared with the runner via
+`#[path]` — the precedent is `git_helpers.rs`, which `bin/branchwork_runner.rs`
+`#[path]`-includes so merge/discard run identically in both binaries. The
+existing `agents/worktree.rs::TempWorktree` (see "Two worktree consumers already
+exist") is the nearest shape to extend.
 
 ---
 
@@ -367,10 +497,22 @@ everything classified no-change/test-only above is excluded.
      + `git show-ref` in `cwd` (`:625-659`).
 
 6. **Runner sandbox accepts the worktree location.**
-   - `bin/branchwork_runner.rs:2642` (`validated_cwd`) — **only if** worktrees
-     live outside `state.cwd` (gated by Task 0.1's location decision).
+   - `bin/branchwork_runner.rs:2642` (`validated_cwd`) — extend the allowlist to
+     `{ state.cwd } ∪ { worktree_base }`, where `worktree_base` is resolved once
+     at runner startup from `BRANCHWORK_WORKTREE_BASE`. **Definitively
+     must-change**: Task 0.4 fixed worktrees outside the project root. See
+     **§ G.2**.
 
 7. **Test fixtures** (Section E): `tests/support/mod.rs` (`create_task_branch`),
    `tests/merge_guard.rs` (`seed_agent`), `tests/recovery.rs`,
    `tests/unattended_auto_mode_e2e.rs`, and the `reconcile_orphaned_branches` /
    Stop-hook unit-test repos.
+
+8. **SaaS worktree dispatch (Phase 2.7).**
+   - Six wire variants (`SetupWorktree`/`WorktreeCreated`,
+     `RemoveWorktree`/`WorktreeRemoved`,
+     `ListWorktreeOrphans`/`WorktreeOrphansListed`) so the runner — which owns
+     the project filesystem — creates / removes / lists worktrees and returns
+     the resolved path; the server records it in `agents.cwd`. Standalone calls
+     the same shared worktree module directly. Full contract + touch-site
+     checklist in **§ G.3 / § G.4 / § G.5**.
