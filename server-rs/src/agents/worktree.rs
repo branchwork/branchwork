@@ -264,8 +264,13 @@ pub fn setup_worktree(
 /// Inner worktree setup against an explicit `base` directory. The public
 /// [`setup_worktree`] resolves `base` from the environment first; tests
 /// call this directly to pin a tempdir without mutating process env.
+///
+/// `pub(crate)` so the `tests/worktree_isolation.rs` integration test
+/// (which `#[path]`-includes this module) can pin a tempdir base the same
+/// way the unit tests below do — never via `BRANCHWORK_WORKTREE_BASE`,
+/// which would be a process-wide env data race in a parallel test binary.
 #[allow(dead_code, clippy::too_many_arguments)] // call sites land in Phase 2
-fn setup_worktree_in(
+pub(crate) fn setup_worktree_in(
     base: &Path,
     project_dir: &Path,
     project_slug: &str,
