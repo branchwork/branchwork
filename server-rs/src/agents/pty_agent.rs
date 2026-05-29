@@ -8,7 +8,7 @@
 //! restarts — this module's [`reattach_agent`] re-establishes the client
 //! side during [`crate::agents::AgentRegistry::cleanup_and_reattach`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -23,19 +23,71 @@ use crate::agents::session_protocol::{self, Message as SessionMessage};
 use crate::agents::session_settings;
 use crate::agents::supervisor;
 // `git_checkout_branch` is `#[deprecated]` in favour of `setup_agent_worktree`
-// (worktree-per-agent isolation). This file is the legacy
-// `BRANCHWORK_USE_WORKTREES=0` start path and is intentionally retained until
-// Task 2.2 migrates it; allow the deprecated import here so the migration
-// window stays warning-free under `clippy -D warnings`.
+// (worktree-per-agent isolation). It is now reached only on the legacy
+// `BRANCHWORK_USE_WORKTREES=0` path below; allow the deprecated import so the
+// retained legacy code stays warning-free under `clippy -D warnings`. Slated
+// for removal with the flag in 0.6.0.
 #[allow(deprecated)]
 use crate::agents::git_checkout_branch;
-use crate::agents::{AgentRegistry, ManagedAgent, git_default_branch, git_head_sha};
+use crate::agents::{
+    AgentRegistry, ManagedAgent, git_default_branch, git_head_sha, setup_agent_worktree,
+    setup_agent_worktree_in,
+};
 use crate::config::Effort;
 use crate::ws::broadcast_event;
 
 /// Bound on the rolling accumulator used during readiness detection. Keeps
 /// memory flat when the CLI emits a lot of early chatter.
 const READINESS_BUFFER_CAP: usize = 16 * 1024;
+
+/// Whether worktree-per-agent isolation is enabled (default ON). Each agent
+/// gets its own git worktree so parallel agents never contend on the single
+/// shared working tree. Only the literal values `0` and `false`
+/// (case-insensitive, surrounding whitespace trimmed) select the legacy
+/// in-place-checkout path — which is unsafe for parallel agents and slated for
+/// removal in `0.6.0`.
+fn worktrees_enabled() -> bool {
+    worktrees_enabled_from(std::env::var("BRANCHWORK_USE_WORKTREES").ok().as_deref())
+}
+
+/// Pure core of [`worktrees_enabled`], split out so tests can pin every
+/// `BRANCHWORK_USE_WORKTREES` value without mutating process env (a write would
+/// race parallel test binaries). Unset / unrecognised values default to ON.
+fn worktrees_enabled_from(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false"))
+        }
+        None => true,
+    }
+}
+
+/// Derive the `<project-slug>` path component of a worktree from the project
+/// directory: its last path component, lowercased, with every non-alphanumeric
+/// character replaced by `-`. Falls back to `project` when the directory has no
+/// usable final component (e.g. `/`) or slugifies to empty.
+fn project_slug_for_worktree(project_dir: &Path) -> String {
+    let name = project_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project");
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug
+    }
+}
 
 pub struct StartPtyOpts<'a> {
     pub prompt: String,
@@ -89,6 +141,13 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = uuid::Uuid::new_v4().to_string();
 
+    let use_worktrees = worktrees_enabled();
+    if !use_worktrees {
+        eprintln!(
+            "[Branchwork] WARNING: BRANCHWORK_USE_WORKTREES=0 — parallel agents are unsafe under this flag and the legacy mode will be removed next minor version"
+        );
+    }
+
     // Capture base commit BEFORE switching to the task branch.
     let base_commit = git_head_sha(cwd);
 
@@ -100,12 +159,106 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     // in the merge dropdown.
     let source_branch = git_default_branch(cwd);
 
-    // Checkout the task branch if specified.
-    // Legacy in-place checkout; Task 2.2 migrates this to `setup_agent_worktree`.
-    #[allow(deprecated)]
-    if let Some(branch_name) = branch {
-        git_checkout_branch(cwd, branch_name, is_continue);
-    }
+    // The original shared project working tree. With worktrees enabled this is
+    // only the *parent* repo we add a worktree against; `cwd` is rebound to the
+    // per-agent worktree path below so the DB row, driver argv, and session
+    // daemon all run inside the isolated tree.
+    let project_dir = cwd;
+    let worktree_path: Option<PathBuf> = if use_worktrees {
+        match branch {
+            Some(name) => {
+                let project_slug = project_slug_for_worktree(project_dir);
+                // Production resolves `$BRANCHWORK_WORKTREE_BASE` inside
+                // `setup_agent_worktree`. Tests pin an explicit base via the
+                // registry override (the race-free `_in` seam) instead.
+                let setup = match &registry.worktree_base_override {
+                    Some(base) => setup_agent_worktree_in(
+                        base,
+                        project_dir,
+                        &project_slug,
+                        plan_name,
+                        task_id,
+                        &id,
+                        name,
+                        source_branch.as_deref(),
+                        is_continue,
+                    ),
+                    None => setup_agent_worktree(
+                        project_dir,
+                        &project_slug,
+                        plan_name,
+                        task_id,
+                        &id,
+                        name,
+                        source_branch.as_deref(),
+                        is_continue,
+                    ),
+                };
+                match setup {
+                    Ok(path) => Some(path),
+                    Err(e) => {
+                        // Loud failure: do NOT silently fall back to the shared
+                        // working tree (that is the contention bug this plan
+                        // fixes). Record a `failed` row so the dashboard
+                        // surfaces it — there is no `start_error` column;
+                        // `spawn_error` is the canonical agent-could-not-start
+                        // column the spawn-error banner reads.
+                        let err_msg = format!("worktree setup failed: {e}");
+                        eprintln!(
+                            "[agent {}] {err_msg} (project_dir={}, branch={name}) — failing agent start",
+                            &id[..8.min(id.len())],
+                            project_dir.display(),
+                        );
+                        {
+                            let db = registry.db.lock().unwrap();
+                            db.execute(
+                                "INSERT INTO agents (id, session_id, cwd, status, mode, plan_name, task_id, prompt, base_commit, branch, source_branch, driver, user_id, org_id, spawn_error)
+                                 VALUES (?1, ?2, ?3, 'failed', 'pty', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                params![
+                                    id,
+                                    session_id,
+                                    project_dir.to_str().unwrap_or(""),
+                                    plan_name,
+                                    task_id,
+                                    prompt,
+                                    base_commit,
+                                    branch,
+                                    source_branch,
+                                    driver_name,
+                                    user_id,
+                                    org_id.unwrap_or("default-org"),
+                                    err_msg,
+                                ],
+                            )
+                            .ok();
+                        }
+                        broadcast_event(
+                            &registry.broadcast_tx,
+                            "agent_stopped",
+                            serde_json::json!({"id": id, "status": "failed", "error": err_msg}),
+                        );
+                        return id;
+                    }
+                }
+            }
+            // Freestanding agent with no branch: nothing to isolate; run in the
+            // shared project dir exactly as before.
+            None => None,
+        }
+    } else {
+        // Legacy in-place checkout: mutates the single shared working tree
+        // (warning already emitted at the top). Verbatim pre-worktree path.
+        #[allow(deprecated)]
+        if let Some(branch_name) = branch {
+            git_checkout_branch(project_dir, branch_name, is_continue);
+        }
+        None
+    };
+
+    // Rebind `cwd` to the worktree path (when one was created) for the rest of
+    // the function: the `agents.cwd` INSERT below, the driver argv, and the
+    // session daemon's working directory all read this binding.
+    let cwd: &Path = worktree_path.as_deref().unwrap_or(project_dir);
 
     // Insert into DB (socket path filled in once the daemon reports its PID)
     let socket_path = registry.socket_for(&id);
@@ -1490,5 +1643,244 @@ mod tests {
         // rewrite their own argv via extra_env.
         let post_sep: Vec<String> = args[separator + 1..].to_vec();
         assert_eq!(post_sep, cmd, "post-'--' argv must equal cli cmd: {args:?}");
+    }
+
+    // ── Worktree-per-agent start path (Task 2.2) ─────────────────────────
+
+    fn git_init_with_commit(dir: &Path) {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git available");
+        };
+        run(&["init", "-b", "master"]);
+        run(&["config", "user.email", "t@t.t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["commit", "--allow-empty", "-m", "init"]);
+    }
+
+    fn agent_cwd(db: &Db, id: &str) -> String {
+        let conn = db.lock().unwrap();
+        conn.query_row("SELECT cwd FROM agents WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    fn agent_status_and_spawn_error(db: &Db, id: &str) -> (String, Option<String>) {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT status, spawn_error FROM agents WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn worktrees_enabled_from_defaults_on_and_only_0_or_false_disable() {
+        // Unset / unrecognised => ON.
+        assert!(worktrees_enabled_from(None));
+        assert!(worktrees_enabled_from(Some("1")));
+        assert!(worktrees_enabled_from(Some("true")));
+        assert!(worktrees_enabled_from(Some("yes")));
+        assert!(worktrees_enabled_from(Some("")));
+        // Only "0" / "false" (case-insensitive, trimmed) disable.
+        assert!(!worktrees_enabled_from(Some("0")));
+        assert!(!worktrees_enabled_from(Some("false")));
+        assert!(!worktrees_enabled_from(Some("FALSE")));
+        assert!(!worktrees_enabled_from(Some("False")));
+        assert!(!worktrees_enabled_from(Some("  0  ")));
+        assert!(!worktrees_enabled_from(Some(" false ")));
+    }
+
+    #[test]
+    fn project_slug_for_worktree_lowercases_and_kebabs_last_component() {
+        assert_eq!(
+            project_slug_for_worktree(Path::new("/home/cpo/branchwork")),
+            "branchwork"
+        );
+        assert_eq!(
+            project_slug_for_worktree(Path::new("/home/cpo/My Project")),
+            "my-project"
+        );
+        assert_eq!(
+            project_slug_for_worktree(Path::new("/tmp/Foo_Bar.v2")),
+            "foo-bar-v2"
+        );
+        // No usable final component => fallback.
+        assert_eq!(project_slug_for_worktree(Path::new("/")), "project");
+    }
+
+    /// Headline acceptance: with worktrees enabled (default), a branched PTY
+    /// agent's `agents.cwd` is the per-agent worktree path, not the project
+    /// root. The session-daemon spawn fails here (server_exe is
+    /// `/nonexistent`), but `cwd` is written at INSERT — *before* the spawn —
+    /// so the assertion holds regardless of spawn outcome.
+    #[tokio::test]
+    async fn worktrees_enabled_start_records_worktree_cwd() {
+        if !worktrees_enabled() {
+            // Env explicitly disables worktrees in this run; the worktree-cwd
+            // assertion doesn't apply. We never set the env ourselves (a write
+            // would race parallel test binaries — see worktrees_enabled_from).
+            return;
+        }
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (mut registry, _rx) = test_registry(db.clone(), sockets_dir);
+
+        // Real git repo to add a worktree against.
+        let project_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        git_init_with_commit(&project_dir);
+
+        // Pin the worktree base to a tempdir — never via $BRANCHWORK_WORKTREE_BASE.
+        let base = dir.path().join("worktrees");
+        registry.worktree_base_override = Some(base.clone());
+
+        let plan = "wt-plan";
+        let task = "1.1";
+        let branch = format!("branchwork/{plan}/{task}");
+        let id = start_pty_agent(
+            &registry,
+            StartPtyOpts {
+                prompt: "do it".to_string(),
+                cwd: &project_dir,
+                plan_name: Some(plan),
+                task_id: Some(task),
+                effort: Effort::Medium,
+                branch: Some(&branch),
+                is_continue: false,
+                max_budget_usd: None,
+                driver: None,
+                user_id: None,
+                org_id: None,
+                runner_id: None,
+            },
+        )
+        .await;
+
+        let cwd = agent_cwd(&db, &id);
+        let expected = base
+            .join("repo")
+            .join(plan)
+            .join(format!("{task}-{}", &id[..8]));
+        assert_eq!(
+            Path::new(&cwd),
+            expected.as_path(),
+            "agents.cwd must be the worktree path"
+        );
+        assert!(
+            expected.is_dir(),
+            "worktree dir should exist on disk: {}",
+            expected.display()
+        );
+        assert_ne!(
+            cwd.as_str(),
+            project_dir.to_str().unwrap(),
+            "cwd must not be the project root"
+        );
+    }
+
+    /// A freestanding agent (no task branch) is not isolated into a worktree —
+    /// it runs in the project dir (no worktree created), independent of the
+    /// flag.
+    #[tokio::test]
+    async fn no_branch_agent_runs_in_project_dir() {
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (mut registry, _rx) = test_registry(db.clone(), sockets_dir);
+        registry.worktree_base_override = Some(dir.path().join("worktrees"));
+
+        let project_dir = dir.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let id = start_pty_agent(
+            &registry,
+            StartPtyOpts {
+                prompt: "do it".to_string(),
+                cwd: &project_dir,
+                plan_name: Some("p"),
+                task_id: Some("0.1"),
+                effort: Effort::Medium,
+                branch: None,
+                is_continue: false,
+                max_budget_usd: None,
+                driver: None,
+                user_id: None,
+                org_id: None,
+                runner_id: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            agent_cwd(&db, &id).as_str(),
+            project_dir.to_str().unwrap(),
+            "no-branch agent should run in the project dir"
+        );
+    }
+
+    /// Worktree setup failure fails the agent start loudly (status=failed,
+    /// `spawn_error` recorded) and does NOT silently fall back to the shared
+    /// working tree. Trigger: worktrees on + a branch, but the project dir is
+    /// not a git repo, so `git worktree add` fails.
+    #[tokio::test]
+    async fn worktree_setup_failure_fails_agent_with_spawn_error() {
+        if !worktrees_enabled() {
+            return;
+        }
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (mut registry, mut rx) = test_registry(db.clone(), sockets_dir);
+        registry.worktree_base_override = Some(dir.path().join("worktrees"));
+
+        // NOT a git repo => `git worktree add` fails.
+        let project_dir = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let branch = "branchwork/p/1.1";
+        let id = start_pty_agent(
+            &registry,
+            StartPtyOpts {
+                prompt: "do it".to_string(),
+                cwd: &project_dir,
+                plan_name: Some("p"),
+                task_id: Some("1.1"),
+                effort: Effort::Medium,
+                branch: Some(branch),
+                is_continue: false,
+                max_budget_usd: None,
+                driver: None,
+                user_id: None,
+                org_id: None,
+                runner_id: None,
+            },
+        )
+        .await;
+
+        let (status, spawn_error) = agent_status_and_spawn_error(&db, &id);
+        assert_eq!(status, "failed", "worktree failure must fail the start");
+        let err = spawn_error.expect("spawn_error must be recorded");
+        assert!(
+            err.contains("worktree setup failed"),
+            "spawn_error should explain the worktree failure: {err}"
+        );
+        // Did not silently fall back: the failed row records the project dir
+        // (no worktree was created).
+        assert_eq!(agent_cwd(&db, &id).as_str(), project_dir.to_str().unwrap());
+
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("agent_stopped") && e.contains(&id) && e.contains("failed")),
+            "expected an agent_stopped/failed broadcast: {events:?}"
+        );
     }
 }

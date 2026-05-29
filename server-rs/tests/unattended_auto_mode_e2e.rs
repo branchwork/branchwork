@@ -219,6 +219,16 @@ impl E2EServer {
             .env("USERPROFILE", dir.path())
             .env("PATH", &path_var)
             .env("BRANCHWORK_HOOK_URL", format!("{base_url}/hooks"))
+            // Pin the legacy shared-tree start path. This e2e exercises the
+            // full spawn → commit → MERGE → CI → advance chain, but the merge
+            // (`merge_branch_local`'s `git checkout <target>`) still runs in
+            // `agents.cwd` — which under worktree-per-agent isolation is the
+            // agent's linked worktree, where `git checkout master` fails
+            // because master is checked out in the main tree. Adapting merge to
+            // run at the project root is Phase 3 (the at-merge conflict
+            // resolver); until it lands, run this test in the still-supported
+            // legacy mode. See docs/architecture/worktree-audit.md (MERGE).
+            .env("BRANCHWORK_USE_WORKTREES", "0")
             .stdout(if std::env::var("TEST_SERVER_LOG").is_ok() {
                 Stdio::inherit()
             } else {

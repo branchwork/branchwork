@@ -263,11 +263,9 @@ pub fn git_checkout_branch(cwd: &std::path::Path, branch: &str, is_continue: boo
 /// Path segment substituted for a freestanding agent that carries no plan
 /// name, so its worktree still lands at a deterministic location instead of an
 /// empty path component.
-#[allow(dead_code)] // consumed alongside `setup_agent_worktree`; call site lands in Task 2.2
 const NO_PLAN_SEGMENT: &str = "_no-plan";
 /// Path segment substituted for an agent with no task id — see
 /// [`NO_PLAN_SEGMENT`].
-#[allow(dead_code)] // consumed alongside `setup_agent_worktree`; call site lands in Task 2.2
 const NO_TASK_SEGMENT: &str = "_no-task";
 
 /// Set up the per-agent git worktree for a spawning agent and return its
@@ -281,7 +279,7 @@ const NO_TASK_SEGMENT: &str = "_no-task";
 /// the resolved worktree path component is never empty. Branch / continue
 /// semantics and `$BRANCHWORK_WORKTREE_BASE` resolution are entirely owned by
 /// `worktree::setup_worktree`.
-#[allow(dead_code, clippy::too_many_arguments)] // call site lands in Task 2.2
+#[allow(clippy::too_many_arguments)] // 8-arg signature mirrors `worktree::setup_worktree`
 pub fn setup_agent_worktree(
     project_dir: &Path,
     project_slug: &str,
@@ -311,7 +309,7 @@ pub fn setup_agent_worktree(
 /// seam `worktree::setup_worktree_in` exposes, never via
 /// `BRANCHWORK_WORKTREE_BASE` (a process-wide env write would race a parallel
 /// test binary).
-#[allow(dead_code, clippy::too_many_arguments)] // call site lands in Task 2.2
+#[allow(clippy::too_many_arguments)] // 8-arg signature mirrors `worktree::setup_worktree_in`
 pub(crate) fn setup_agent_worktree_in(
     base: &Path,
     project_dir: &Path,
@@ -375,6 +373,13 @@ pub struct AgentRegistry {
     /// matters. Tests that don't set this skip the auto-mode hook
     /// silently.
     pub app_state: Arc<OnceLock<crate::state::AppState>>,
+    /// Test-only override for the worktree base directory. Production leaves
+    /// this `None`, and [`setup_agent_worktree`] resolves
+    /// `$BRANCHWORK_WORKTREE_BASE` (default `~/.branchwork/worktrees`) itself.
+    /// Tests set it to a tempdir so [`pty_agent::start_pty_agent`]'s worktree
+    /// path can be exercised without mutating process env — the same race-free
+    /// seam [`worktree::setup_worktree_in`] exposes for the primitives.
+    pub worktree_base_override: Option<PathBuf>,
 }
 
 /// In-process state for a live agent whose PTY runs inside a detached
@@ -415,6 +420,7 @@ impl AgentRegistry {
             drivers: DriverRegistry::with_defaults(),
             skip_permissions: Arc::new(AtomicBool::new(skip_permissions)),
             app_state: Arc::new(OnceLock::new()),
+            worktree_base_override: None,
         }
     }
 
@@ -2592,7 +2598,7 @@ mod tests {
     /// touching the filesystem or network.
     fn test_registry(db: Db) -> (AgentRegistry, tokio::sync::broadcast::Receiver<String>) {
         let (tx, rx) = tokio::sync::broadcast::channel::<String>(32);
-        let registry = AgentRegistry::new(
+        let mut registry = AgentRegistry::new(
             db,
             tx,
             None,
@@ -2601,6 +2607,14 @@ mod tests {
             3100,
             true,
         );
+        // Auto-advance tests spawn against fake project dirs
+        // (`branchwork-no-such-dir-*`), so `git worktree add` always fails —
+        // but `setup_worktree` still `create_dir_all`s the base first. Pin the
+        // base under the OS temp dir so that pollution never lands in the real
+        // `~/.branchwork/worktrees`. Never set `$BRANCHWORK_WORKTREE_BASE`
+        // here: a process-wide env write would race parallel test binaries.
+        registry.worktree_base_override =
+            Some(std::env::temp_dir().join("branchwork-mod-test-worktrees"));
         (registry, rx)
     }
 
