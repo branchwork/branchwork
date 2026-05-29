@@ -188,9 +188,24 @@ pub fn git_current_branch(cwd: &std::path::Path) -> Option<String> {
 // `agents/git_ops.rs` so it's not re-exported.
 pub use crate::git_helpers::git_default_branch;
 
-/// Create or checkout a git branch. Returns true if successful.
+/// Create or checkout a git branch **in-place**. Returns true if successful.
 /// For "start" mode: creates the branch (or checks it out if it already exists).
 /// For "continue" mode: checks out the existing branch.
+///
+/// # Deprecated
+///
+/// In-place checkout mutates the single shared project working tree, which is
+/// the root cause of the parallel-agent contention this plan fixes. It is
+/// retained **only** for the legacy `BRANCHWORK_USE_WORKTREES=0` code path and
+/// is superseded by [`setup_agent_worktree`], which gives each agent its own
+/// isolated worktree. Deprecation window: one minor version — slated for
+/// removal in `0.6.0`. Do not add new callers.
+#[deprecated(
+    since = "0.5.100",
+    note = "use `setup_agent_worktree` for the worktree-per-agent start path; \
+            `git_checkout_branch` is retained only for the legacy \
+            BRANCHWORK_USE_WORKTREES=0 path and is slated for removal in 0.6.0"
+)]
 pub fn git_checkout_branch(cwd: &std::path::Path, branch: &str, is_continue: bool) -> bool {
     if is_continue {
         // Try to checkout the existing branch
@@ -243,6 +258,82 @@ pub fn git_checkout_branch(cwd: &std::path::Path, branch: &str, is_continue: boo
             }
         }
     }
+}
+
+/// Path segment substituted for a freestanding agent that carries no plan
+/// name, so its worktree still lands at a deterministic location instead of an
+/// empty path component.
+#[allow(dead_code)] // consumed alongside `setup_agent_worktree`; call site lands in Task 2.2
+const NO_PLAN_SEGMENT: &str = "_no-plan";
+/// Path segment substituted for an agent with no task id — see
+/// [`NO_PLAN_SEGMENT`].
+#[allow(dead_code)] // consumed alongside `setup_agent_worktree`; call site lands in Task 2.2
+const NO_TASK_SEGMENT: &str = "_no-task";
+
+/// Set up the per-agent git worktree for a spawning agent and return its
+/// absolute on-disk path. This is the worktree-per-agent replacement for the
+/// in-place [`git_checkout_branch`] start path (used when
+/// `BRANCHWORK_USE_WORKTREES` is not `0`).
+///
+/// Thin adapter over [`worktree::setup_worktree`]: the only thing it adds is
+/// substituting deterministic placeholders for the rare freestanding agent
+/// that has no plan ([`NO_PLAN_SEGMENT`]) or no task ([`NO_TASK_SEGMENT`]), so
+/// the resolved worktree path component is never empty. Branch / continue
+/// semantics and `$BRANCHWORK_WORKTREE_BASE` resolution are entirely owned by
+/// `worktree::setup_worktree`.
+#[allow(dead_code, clippy::too_many_arguments)] // call site lands in Task 2.2
+pub fn setup_agent_worktree(
+    project_dir: &Path,
+    project_slug: &str,
+    plan_name: Option<&str>,
+    task_id: Option<&str>,
+    agent_id: &str,
+    branch: &str,
+    base_branch: Option<&str>,
+    is_continue: bool,
+) -> Result<PathBuf, worktree::WorktreeError> {
+    worktree::setup_worktree(
+        project_dir,
+        project_slug,
+        plan_name.unwrap_or(NO_PLAN_SEGMENT),
+        task_id.unwrap_or(NO_TASK_SEGMENT),
+        agent_id,
+        branch,
+        base_branch,
+        is_continue,
+    )
+}
+
+/// Inner [`setup_agent_worktree`] against an explicit worktree `base`,
+/// delegating to [`worktree::setup_worktree_in`]. The public
+/// [`setup_agent_worktree`] resolves `base` from the environment first; tests
+/// call this directly to pin a tempdir without mutating process env — the same
+/// seam `worktree::setup_worktree_in` exposes, never via
+/// `BRANCHWORK_WORKTREE_BASE` (a process-wide env write would race a parallel
+/// test binary).
+#[allow(dead_code, clippy::too_many_arguments)] // call site lands in Task 2.2
+pub(crate) fn setup_agent_worktree_in(
+    base: &Path,
+    project_dir: &Path,
+    project_slug: &str,
+    plan_name: Option<&str>,
+    task_id: Option<&str>,
+    agent_id: &str,
+    branch: &str,
+    base_branch: Option<&str>,
+    is_continue: bool,
+) -> Result<PathBuf, worktree::WorktreeError> {
+    worktree::setup_worktree_in(
+        base,
+        project_dir,
+        project_slug,
+        plan_name.unwrap_or(NO_PLAN_SEGMENT),
+        task_id.unwrap_or(NO_TASK_SEGMENT),
+        agent_id,
+        branch,
+        base_branch,
+        is_continue,
+    )
 }
 
 #[derive(Clone)]
@@ -3074,6 +3165,117 @@ mod tests {
             |row| row.get::<_, Option<String>>(0),
         )
         .unwrap()
+    }
+
+    // ── setup_agent_worktree (Task 2.1) ──────────────────────────────
+
+    #[test]
+    fn setup_agent_worktree_substitutes_placeholders_for_freestanding_agent() {
+        // Pin the on-disk path shape: a freestanding agent (no plan / no
+        // task) must still land at a deterministic, non-empty path component
+        // rather than `<base>/<slug>//-<id>`.
+        assert_eq!(NO_PLAN_SEGMENT, "_no-plan");
+        assert_eq!(NO_TASK_SEGMENT, "_no-task");
+
+        let proj = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        git_init_with_commit(proj.path(), "master");
+
+        let path = setup_agent_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            None, // no plan
+            None, // no task
+            "abcdef1234567890",
+            "branchwork/freestanding/solo",
+            None,
+            false,
+        )
+        .expect("freestanding worktree should be created");
+
+        assert_eq!(
+            path,
+            base.path()
+                .join("proj")
+                .join("_no-plan")
+                .join("_no-task-abcdef12"),
+            "None plan/task must resolve to the _no-plan/_no-task placeholders"
+        );
+        assert!(path.exists(), "worktree directory should exist");
+    }
+
+    #[test]
+    fn setup_agent_worktree_passes_through_and_partially_substitutes() {
+        // The adapter only fills `None` segments; provided plan/task pass
+        // through to `worktree::setup_worktree_in` verbatim. One real repo,
+        // three distinct (branch, agent) pairs so the worktrees don't collide.
+        let proj = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        git_init_with_commit(proj.path(), "master");
+
+        // Both present → both pass through.
+        let both = setup_agent_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            Some("my-plan"),
+            Some("0.1"),
+            "aaaaaaaa00",
+            "branchwork/my-plan/0.1",
+            None,
+            false,
+        )
+        .expect("worktree should be created");
+        assert_eq!(
+            both,
+            base.path()
+                .join("proj")
+                .join("my-plan")
+                .join("0.1-aaaaaaaa")
+        );
+
+        // Plan present, task absent → only task substituted.
+        let task_only = setup_agent_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            Some("my-plan"),
+            None,
+            "bbbbbbbb00",
+            "branchwork/my-plan/no-task",
+            None,
+            false,
+        )
+        .expect("worktree should be created");
+        assert_eq!(
+            task_only,
+            base.path()
+                .join("proj")
+                .join("my-plan")
+                .join("_no-task-bbbbbbbb")
+        );
+
+        // Plan absent, task present → only plan substituted.
+        let plan_only = setup_agent_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            None,
+            Some("0.2"),
+            "cccccccc00",
+            "branchwork/freestanding/0.2",
+            None,
+            false,
+        )
+        .expect("worktree should be created");
+        assert_eq!(
+            plan_only,
+            base.path()
+                .join("proj")
+                .join("_no-plan")
+                .join("0.2-cccccccc")
+        );
     }
 
     #[tokio::test]

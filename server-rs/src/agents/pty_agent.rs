@@ -22,9 +22,14 @@ use crate::agents::driver::{AgentDriver, SpawnOpts};
 use crate::agents::session_protocol::{self, Message as SessionMessage};
 use crate::agents::session_settings;
 use crate::agents::supervisor;
-use crate::agents::{
-    AgentRegistry, ManagedAgent, git_checkout_branch, git_default_branch, git_head_sha,
-};
+// `git_checkout_branch` is `#[deprecated]` in favour of `setup_agent_worktree`
+// (worktree-per-agent isolation). This file is the legacy
+// `BRANCHWORK_USE_WORKTREES=0` start path and is intentionally retained until
+// Task 2.2 migrates it; allow the deprecated import here so the migration
+// window stays warning-free under `clippy -D warnings`.
+#[allow(deprecated)]
+use crate::agents::git_checkout_branch;
+use crate::agents::{AgentRegistry, ManagedAgent, git_default_branch, git_head_sha};
 use crate::config::Effort;
 use crate::ws::broadcast_event;
 
@@ -95,7 +100,9 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
     // in the merge dropdown.
     let source_branch = git_default_branch(cwd);
 
-    // Checkout the task branch if specified
+    // Checkout the task branch if specified.
+    // Legacy in-place checkout; Task 2.2 migrates this to `setup_agent_worktree`.
+    #[allow(deprecated)]
     if let Some(branch_name) = branch {
         git_checkout_branch(cwd, branch_name, is_continue);
     }
