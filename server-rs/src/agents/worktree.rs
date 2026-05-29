@@ -723,6 +723,35 @@ mod tests {
     }
 
     #[test]
+    fn setup_worktree_yields_clean_working_tree() {
+        // Case 1: a fresh worktree is a *functional* git working tree, not
+        // just a directory — `git status` inside it reports clean.
+        let proj = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        git_init_master(proj.path());
+
+        let path = setup_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            "p",
+            "0.1",
+            "cafef00d99",
+            "branchwork/p/0.1",
+            None,
+            false,
+        )
+        .expect("fresh worktree should be created");
+
+        assert!(path.exists(), "worktree directory should exist");
+        assert_eq!(
+            git_status_porcelain(&path),
+            "",
+            "git status inside the fresh worktree should be clean"
+        );
+    }
+
+    #[test]
     fn setup_worktree_truncates_short_agent_id_safely() {
         let proj = TempDir::new().unwrap();
         let base = TempDir::new().unwrap();
@@ -821,6 +850,54 @@ mod tests {
     }
 
     #[test]
+    fn setup_worktree_path_collision_errors_clearly() {
+        // Case 3 / non-negotiable #2: two agents must never share a
+        // worktree. A second setup with the same (slug, plan, task,
+        // agent_id) resolves to the same path + branch and MUST fail loudly
+        // rather than silently co-tenanting the directory.
+        let proj = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        git_init_master(proj.path());
+
+        setup_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            "p",
+            "0.1",
+            "collide0000",
+            "branchwork/p/0.1",
+            None,
+            false,
+        )
+        .expect("first setup should succeed");
+
+        let err = setup_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            "p",
+            "0.1",
+            "collide0000",
+            "branchwork/p/0.1",
+            None,
+            false,
+        )
+        .expect_err("second setup at the same path must fail");
+
+        match err {
+            WorktreeError::GitCommandFailed { stderr, .. } => {
+                let lower = stderr.to_lowercase();
+                assert!(
+                    lower.contains("already checked out") || lower.contains("already exists"),
+                    "stderr should name the collision, got: {stderr}"
+                );
+            }
+            other => panic!("expected GitCommandFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn remove_worktree_removes_clean() {
         let proj = TempDir::new().unwrap();
         let base = TempDir::new().unwrap();
@@ -887,6 +964,51 @@ mod tests {
     }
 
     #[test]
+    fn remove_worktree_with_held_file_escalates_force() {
+        // Case 5: a dirty worktree makes the plain `git worktree remove`
+        // refuse, so removal escalates to `--force` (Unix) or the manual
+        // `rm -rf` fallback (where, on Windows, an open handle blocks git).
+        // Either way the path is gone afterwards.
+        let proj = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        git_init_master(proj.path());
+
+        let path = setup_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            "p",
+            "0.3",
+            "held00face0",
+            "branchwork/p/0.3",
+            None,
+            false,
+        )
+        .unwrap();
+
+        // An untracked file makes the worktree dirty so the tier-1
+        // `git worktree remove` refuses on every platform. We also hold it
+        // open: harmless on Unix (the untracked file does the forcing),
+        // it's the escalation driver on Windows.
+        let held = std::fs::File::create(path.join("held.txt")).unwrap();
+
+        let outcome = remove_worktree(proj.path(), &path).expect("escalated remove should succeed");
+        drop(held);
+
+        assert!(
+            matches!(
+                outcome,
+                RemoveOutcome::ForceRemoved | RemoveOutcome::ManuallyRemoved
+            ),
+            "dirty/held worktree should escalate past a plain remove, got {outcome:?}"
+        );
+        assert!(
+            !path.exists(),
+            "worktree directory should be gone after removal"
+        );
+    }
+
+    #[test]
     fn list_orphans_finds_unclaimed_worktrees_under_scope() {
         let proj = TempDir::new().unwrap();
         let base = TempDir::new().unwrap();
@@ -921,6 +1043,13 @@ mod tests {
         live_cwds.insert(live.clone());
 
         let orphans = list_orphans_in(base.path(), proj.path(), "proj", &live_cwds);
+        // Case 6: with one of the two worktrees claimed, exactly the other
+        // one is reported.
+        assert_eq!(
+            orphans.len(),
+            1,
+            "exactly the one unclaimed worktree should be reported"
+        );
         let orphan_paths: Vec<PathBuf> =
             orphans.iter().map(|o| canonical_or_self(&o.path)).collect();
 
@@ -1018,6 +1147,16 @@ detached
             worktree_base().unwrap().is_absolute(),
             "resolved base must be absolute"
         );
+    }
+
+    /// Test helper: `git status --porcelain` output for `cwd`, trimmed.
+    fn git_status_porcelain(cwd: &Path) -> String {
+        let out = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// Test helper: the worktree paths git knows about for `cwd`.
