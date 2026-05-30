@@ -24,6 +24,7 @@ use crate::ws::broadcast_event;
 use super::outbox;
 use super::runner_protocol::{
     CiAggregate, DriverAuthInfo, Envelope, FolderEntry, GhRun, MergeOutcome, WireMessage,
+    WorktreeOrphan,
 };
 
 // ── Runner registry (in-memory, lives in AppState) ──────────────────────────
@@ -107,6 +108,20 @@ pub enum RunnerResponse {
         log: Option<String>,
         run_id_used: Option<String>,
     },
+
+    // ── Worktree RPC replies (Task 2.7) ─────────────────────────────────────
+    /// Reply to `SetupWorktree`. `Ok(path)` ⇒ the runner created the worktree
+    /// at the absolute `path`; `Err(msg)` ⇒ the git / IO error. The two wire
+    /// variants (`WorktreeCreated` / `WorktreeSetupFailed`) both resolve into
+    /// this single `Result` so the dispatcher has one match arm.
+    WorktreeSetup(Result<String, String>),
+    /// Reply to `RemoveWorktree`. The outcome label (`removed`,
+    /// `force_removed`, `manually_removed`, or `error: <msg>`); the
+    /// dispatcher parses it back into a `RemoveOutcome`.
+    WorktreeRemoved(String),
+    /// Reply to `ListWorktreeOrphans`. The orphan worktrees the runner found
+    /// under the project's scope; empty when none (or on a listing failure).
+    WorktreeOrphansListed(Vec<WorktreeOrphan>),
 }
 
 /// A connected runner's server-side handle.
@@ -1447,6 +1462,50 @@ async fn handle_runner_message(
             .await;
         }
 
+        WireMessage::WorktreeCreated { req_id, path } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "worktree_created",
+                RunnerResponse::WorktreeSetup(Ok(path.clone())),
+            )
+            .await;
+        }
+
+        WireMessage::WorktreeSetupFailed { req_id, error } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "worktree_setup_failed",
+                RunnerResponse::WorktreeSetup(Err(error.clone())),
+            )
+            .await;
+        }
+
+        WireMessage::WorktreeRemoved { req_id, outcome } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "worktree_removed",
+                RunnerResponse::WorktreeRemoved(outcome.clone()),
+            )
+            .await;
+        }
+
+        WireMessage::WorktreeOrphansListed { req_id, orphans } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "worktree_orphans_listed",
+                RunnerResponse::WorktreeOrphansListed(orphans.clone()),
+            )
+            .await;
+        }
+
         WireMessage::RunnerHealth {
             outbox_depth,
             ws_reconnects_24h,
@@ -1569,7 +1628,11 @@ async fn handle_runner_message(
         | WireMessage::MergeAgentBranch { .. }
         | WireMessage::HasGithubActions { .. }
         | WireMessage::GetCiRunStatus { .. }
-        | WireMessage::CiFailureLog { .. } => {}
+        | WireMessage::CiFailureLog { .. }
+        // Worktree request variants (Task 2.7) are saas→runner only.
+        | WireMessage::SetupWorktree { .. }
+        | WireMessage::RemoveWorktree { .. }
+        | WireMessage::ListWorktreeOrphans { .. } => {}
     }
 }
 

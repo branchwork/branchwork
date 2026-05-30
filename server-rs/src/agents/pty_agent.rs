@@ -29,10 +29,7 @@ use crate::agents::supervisor;
 // for removal with the flag in 0.6.0.
 #[allow(deprecated)]
 use crate::agents::git_checkout_branch;
-use crate::agents::{
-    AgentRegistry, ManagedAgent, git_default_branch, git_head_sha, setup_agent_worktree,
-    setup_agent_worktree_in,
-};
+use crate::agents::{AgentRegistry, ManagedAgent, git_default_branch, git_head_sha};
 use crate::config::Effort;
 use crate::ws::broadcast_event;
 
@@ -181,31 +178,50 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         match branch {
             Some(name) => {
                 let project_slug = project_slug_for_worktree(project_dir);
-                // Production resolves `$BRANCHWORK_WORKTREE_BASE` inside
-                // `setup_agent_worktree`. Tests pin an explicit base via the
-                // registry override (the race-free `_in` seam) instead.
-                let setup = match &registry.worktree_base_override {
-                    Some(base) => setup_agent_worktree_in(
-                        base,
-                        project_dir,
-                        &project_slug,
-                        plan_name,
-                        task_id,
-                        &id,
-                        name,
-                        source_branch.as_deref(),
-                        is_continue,
-                    ),
-                    None => setup_agent_worktree(
-                        project_dir,
-                        &project_slug,
-                        plan_name,
-                        task_id,
-                        &id,
-                        name,
-                        source_branch.as_deref(),
-                        is_continue,
-                    ),
+                // Route worktree setup through the mode-aware dispatcher
+                // (`git_ops::setup_worktree`). This is the standalone spawn
+                // path — the SaaS spawn path routes via
+                // `spawn_ops::start_agent_via_runner` — so `org_has_runner`
+                // is false here and the dispatcher always shells out locally,
+                // honouring the test base override. Going through the
+                // dispatcher keeps the worktree entry point single + ready for
+                // the SaaS spawn path to reuse.
+                //
+                // The dispatcher needs the runner registry; standalone never
+                // touches it. When `app_state` isn't wired (unit-test
+                // registries) fall back to a fresh empty registry —
+                // `org_has_runner` returns false there too.
+                let runners_holder;
+                let runners: &crate::saas::runner_ws::RunnerRegistry =
+                    match registry.app_state.get() {
+                        Some(s) => &s.runners,
+                        None => {
+                            runners_holder = crate::saas::runner_ws::new_runner_registry();
+                            &runners_holder
+                        }
+                    };
+                let setup = crate::agents::git_ops::setup_worktree(
+                    &registry.db,
+                    runners,
+                    org_id.unwrap_or("default-org"),
+                    project_dir,
+                    &project_slug,
+                    plan_name,
+                    task_id,
+                    &id,
+                    name,
+                    source_branch.as_deref(),
+                    is_continue,
+                    registry.worktree_base_override.as_deref(),
+                )
+                .await;
+                // Collapse the nested result: `Ok(Ok(path))` succeeds; both
+                // `Ok(Err(git_err))` (worktree setup failed) and
+                // `Err(rpc_err)` (SaaS runner unreachable) are start-time
+                // failures recorded on the agent row.
+                let setup: Result<PathBuf, String> = match setup {
+                    Ok(inner) => inner,
+                    Err(rpc_err) => Err(format!("runner unreachable: {rpc_err}")),
                 };
                 match setup {
                     Ok(path) => Some(path),

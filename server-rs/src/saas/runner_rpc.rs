@@ -199,7 +199,14 @@ fn req_id_for(msg: &WireMessage) -> Option<&str> {
         | WireMessage::GetCiRunStatus { req_id, .. }
         | WireMessage::CiRunStatusResolved { req_id, .. }
         | WireMessage::CiFailureLog { req_id, .. }
-        | WireMessage::CiFailureLogResolved { req_id, .. } => Some(req_id),
+        | WireMessage::CiFailureLogResolved { req_id, .. }
+        | WireMessage::SetupWorktree { req_id, .. }
+        | WireMessage::WorktreeCreated { req_id, .. }
+        | WireMessage::WorktreeSetupFailed { req_id, .. }
+        | WireMessage::RemoveWorktree { req_id, .. }
+        | WireMessage::WorktreeRemoved { req_id, .. }
+        | WireMessage::ListWorktreeOrphans { req_id, .. }
+        | WireMessage::WorktreeOrphansListed { req_id, .. } => Some(req_id),
         _ => None,
     }
 }

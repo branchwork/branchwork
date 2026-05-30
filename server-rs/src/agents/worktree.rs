@@ -38,7 +38,12 @@ use std::time::SystemTime;
 /// The brief calls for `git worktree add /tmp/bw-gate-<agent_id> <branch>`
 /// → run checks → `git worktree remove --force /tmp/bw-gate-<agent_id>`
 /// in a defer/drop guard. This struct is that guard.
+///
+/// `#[allow(dead_code)]`: used by the pre-merge gate in the server binary, but
+/// this file is also `#[path]`-included by `branchwork-runner` (which only
+/// needs the per-agent manager below), where `TempWorktree` is dead.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct TempWorktree {
     /// Project root the worktree was added FROM. We need this for the
     /// `git worktree remove` cleanup, which has to run in the original
@@ -49,6 +54,7 @@ pub struct TempWorktree {
     worktree_path: Option<PathBuf>,
 }
 
+#[allow(dead_code)] // server-only (pre-merge gate); dead in the runner #[path] include
 impl TempWorktree {
     /// Create a fresh `git worktree` at `/tmp/bw-gate-<agent_id>` checked
     /// out at `branch`'s tip in detached-HEAD mode. Returns the wrapper
@@ -89,6 +95,7 @@ impl Drop for TempWorktree {
 /// caller is expected to use a fresh `/tmp/bw-gate-<agent_id>`-shaped
 /// path so a previous gate's leak (if cleanup somehow failed) doesn't
 /// collide.
+#[allow(dead_code)] // server-only (TempWorktree); dead in the runner #[path] include
 fn add_worktree_at(project_dir: &Path, path: &Path, branch: &str) -> Result<(), String> {
     let path_str = path
         .to_str()
@@ -113,6 +120,7 @@ fn add_worktree_at(project_dir: &Path, path: &Path, branch: &str) -> Result<(), 
 /// failures are logged but don't propagate — the gate runner's verdict
 /// has already shipped by the time Drop runs and any reader has moved
 /// on.
+#[allow(dead_code)] // server-only (TempWorktree Drop); dead in the runner #[path] include
 fn remove_worktree_at(project_dir: &Path, path: &Path) {
     let path_str = match path.to_str() {
         Some(s) => s,
@@ -371,9 +379,14 @@ pub fn list_orphans(
 }
 
 /// Inner orphan listing against an explicit `base`. Tests call this to
-/// pin a tempdir; the public [`list_orphans`] resolves `base` from env.
+/// pin a tempdir; the public [`list_orphans`] resolves `base` from env. The
+/// runner binary calls it with its startup-resolved `state.worktree_base` so
+/// the listing base exactly matches the sandbox base.
+///
+/// `pub(crate)` so the runner binary (which `#[path]`-includes this module)
+/// can reach it the same way it reaches [`setup_worktree_in`].
 #[allow(dead_code)] // call sites land in Phase 2
-fn list_orphans_in(
+pub(crate) fn list_orphans_in(
     base: &Path,
     project_dir: &Path,
     project_slug: &str,
@@ -422,8 +435,13 @@ fn list_orphans_in(
 /// Resolve the worktree base directory: `$BRANCHWORK_WORKTREE_BASE` if set
 /// and non-empty, else `~/.branchwork/worktrees`. Always returns an
 /// absolute path so callers get a stable, cwd-independent location.
+///
+/// `pub` so the runner binary (which `#[path]`-includes this module) can
+/// resolve the same base at startup and widen its `validated_cwd` sandbox
+/// to accept per-agent worktree paths in addition to `--cwd` (Phase 2.7 /
+/// ADR 0002 §SaaS: the runner owns the filesystem).
 #[allow(dead_code)] // call sites land in Phase 2
-fn worktree_base() -> Result<PathBuf, WorktreeError> {
+pub fn worktree_base() -> Result<PathBuf, WorktreeError> {
     let base = match std::env::var_os("BRANCHWORK_WORKTREE_BASE") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => dirs::home_dir()

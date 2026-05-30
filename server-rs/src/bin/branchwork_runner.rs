@@ -31,6 +31,12 @@ mod project_scaffold;
 pub mod runner_protocol;
 #[path = "../agents/session_protocol.rs"]
 mod session_protocol;
+// Per-agent worktree primitives (setup / remove / list_orphans). Shared with
+// the server crate via `#[path]` the same way `git_helpers` is — the runner
+// runs the actual `git worktree` shell-outs in SaaS mode (Phase 0.4: the
+// runner owns the project filesystem). Self-contained (no `crate::` deps).
+#[path = "../agents/worktree.rs"]
+mod worktree;
 
 // `git_helpers.rs` references types via `crate::saas::runner_protocol` so
 // the same `use` statement compiles in both the server crate (where the
@@ -812,6 +818,13 @@ struct RunnerState {
     /// Channel to send messages to the WebSocket writer.
     ws_tx: mpsc::UnboundedSender<String>,
     cwd: PathBuf,
+    /// Canonical per-agent worktree base, resolved once at startup from
+    /// `$BRANCHWORK_WORKTREE_BASE` (default `~/.branchwork/worktrees`). The
+    /// `validated_cwd` sandbox accepts paths under this base in addition to
+    /// `cwd`, because in SaaS mode an agent's cwd IS its worktree path under
+    /// the base (Phase 0.4 / Task 2.7). Canonicalised + created at startup so
+    /// the prefix check matches the canonicalised request paths.
+    worktree_base: PathBuf,
     server_bin: PathBuf,
     /// SaaS server URL (http[s] form), captured from `--saas-url`. Used by
     /// the `UpgradeRunner` handler to derive the default install-script URL
@@ -995,6 +1008,22 @@ fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve paths.
     let cwd = std::fs::canonicalize(&cli.cwd)?;
+
+    // Resolve the per-agent worktree base once at startup (Task 2.7). Per-agent
+    // worktrees live under `$BRANCHWORK_WORKTREE_BASE` (default
+    // `~/.branchwork/worktrees`); `validated_cwd` widens its sandbox to accept
+    // paths under this base in addition to `--cwd`. Create + canonicalise it so
+    // the prefix check matches the canonicalised request paths (the worktree dir
+    // may be a symlink target, e.g. `/home` → `/mnt/home`).
+    let worktree_base = {
+        let base = worktree::worktree_base().unwrap_or_else(|e| {
+            eprintln!("[runner] could not resolve worktree base ({e}); defaulting under cwd");
+            cwd.join(".branchwork-worktrees")
+        });
+        let _ = std::fs::create_dir_all(&base);
+        std::fs::canonicalize(&base).unwrap_or(base)
+    };
+
     let db_path = cli.db_path.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -1088,6 +1117,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             &cli.saas_url,
             &runner_id,
             &cwd,
+            &worktree_base,
             &server_bin,
             server_bin_diagnostic.clone(),
             db.clone(),
@@ -1148,6 +1178,7 @@ async fn connect_and_run(
     saas_url: &str,
     runner_id: &str,
     cwd: &Path,
+    worktree_base: &Path,
     server_bin: &Path,
     server_bin_diagnostic: runner_protocol::ServerBinDiagnostic,
     db: Arc<Mutex<Connection>>,
@@ -1184,6 +1215,7 @@ async fn connect_and_run(
         agents: Arc::new(Mutex::new(HashMap::new())),
         ws_tx: ws_tx.clone(),
         cwd: cwd.to_path_buf(),
+        worktree_base: worktree_base.to_path_buf(),
         server_bin: server_bin.to_path_buf(),
         saas_url: saas_url.to_string(),
         plan_cwd: Arc::new(Mutex::new(HashMap::new())),
@@ -2572,6 +2604,136 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             );
         }
 
+        // ── Worktree primitives (Task 2.7) ──────────────────────────────────
+        WireMessage::SetupWorktree {
+            req_id,
+            project_dir,
+            project_slug,
+            plan,
+            task,
+            agent_id,
+            branch,
+            base_branch,
+            is_continue,
+        } => {
+            let req_id = req_id.clone();
+            let project_slug = project_slug.clone();
+            let plan = plan.clone();
+            let task = task.clone();
+            let agent_id = agent_id.clone();
+            let branch = branch.clone();
+            let base_branch = base_branch.clone();
+            let is_continue = *is_continue;
+            // Create under the runner's startup-resolved base (the same path
+            // `validated_cwd` sandboxes against) rather than re-reading the env
+            // each call — guarantees the creation base == the sandbox base.
+            let base = state.worktree_base.clone();
+            // `project_dir` is the project root under the runner's `--cwd`.
+            let reply = match validated_cwd(state, project_dir) {
+                Ok(proj) => {
+                    let result = run_blocking_with_timeout(WORKTREE_TIMEOUT, move || {
+                        worktree::setup_worktree_in(
+                            &base,
+                            &proj,
+                            &project_slug,
+                            &plan,
+                            &task,
+                            &agent_id,
+                            &branch,
+                            base_branch.as_deref(),
+                            is_continue,
+                        )
+                    })
+                    .await;
+                    match result {
+                        Some(Ok(path)) => WireMessage::WorktreeCreated {
+                            req_id,
+                            path: path.to_string_lossy().to_string(),
+                        },
+                        Some(Err(e)) => WireMessage::WorktreeSetupFailed {
+                            req_id,
+                            error: e.to_string(),
+                        },
+                        None => WireMessage::WorktreeSetupFailed {
+                            req_id,
+                            error: format!(
+                                "setup_worktree timed out after {}s",
+                                WORKTREE_TIMEOUT.as_secs()
+                            ),
+                        },
+                    }
+                }
+                Err(e) => WireMessage::WorktreeSetupFailed { req_id, error: e },
+            };
+            send_best_effort(state, reply);
+        }
+
+        WireMessage::RemoveWorktree {
+            req_id,
+            project_dir,
+            path,
+        } => {
+            let req_id = req_id.clone();
+            let path = path.clone();
+            // Validate BOTH the project root (under `--cwd`) and the worktree
+            // path (under the base). The latter gates `remove_worktree`'s
+            // `rm -rf` fallback tier against an arbitrary-path delete.
+            let outcome = match (
+                validated_cwd(state, project_dir),
+                validated_worktree_path(state, &path),
+            ) {
+                (Ok(proj), Ok(wt)) => {
+                    match run_blocking_with_timeout(WORKTREE_TIMEOUT, move || {
+                        worktree::remove_worktree(&proj, &wt)
+                    })
+                    .await
+                    {
+                        Some(Ok(o)) => remove_outcome_label(o),
+                        Some(Err(e)) => format!("error: {e}"),
+                        None => format!(
+                            "error: remove timed out after {}s",
+                            WORKTREE_TIMEOUT.as_secs()
+                        ),
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    log_warn!("[runner] remove_worktree rejected path: {e}");
+                    format!("error: {e}")
+                }
+            };
+            send_best_effort(state, WireMessage::WorktreeRemoved { req_id, outcome });
+        }
+
+        WireMessage::ListWorktreeOrphans {
+            req_id,
+            project_dir,
+            project_slug,
+            live_cwds,
+        } => {
+            let req_id = req_id.clone();
+            let project_slug = project_slug.clone();
+            let live: std::collections::HashSet<PathBuf> =
+                live_cwds.iter().map(PathBuf::from).collect();
+            // List under the startup-resolved base (matches the sandbox base).
+            let base = state.worktree_base.clone();
+            let orphans = match validated_cwd(state, project_dir) {
+                Ok(proj) => run_blocking_with_timeout(WORKTREE_TIMEOUT, move || {
+                    worktree::list_orphans_in(&base, &proj, &project_slug, &live)
+                })
+                .await
+                .unwrap_or_default(),
+                Err(e) => {
+                    log_warn!("[runner] list_worktree_orphans rejected cwd: {e}");
+                    Vec::new()
+                }
+            };
+            let orphans = orphans.into_iter().map(local_orphan_to_wire).collect();
+            send_best_effort(
+                state,
+                WireMessage::WorktreeOrphansListed { req_id, orphans },
+            );
+        }
+
         // Runner doesn't receive these from server (runner→saas direction
         // only; the server sending them would be a protocol violation).
         WireMessage::RunnerHello { .. }
@@ -2598,6 +2760,12 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
         | WireMessage::GithubActionsDetected { .. }
         | WireMessage::CiRunStatusResolved { .. }
         | WireMessage::CiFailureLogResolved { .. }
+        // Worktree reply variants (Task 2.7) are runner→saas; the server
+        // sending one back is a protocol violation we drop.
+        | WireMessage::WorktreeCreated { .. }
+        | WireMessage::WorktreeSetupFailed { .. }
+        | WireMessage::WorktreeRemoved { .. }
+        | WireMessage::WorktreeOrphansListed { .. }
         // The runner is the producer of `RunnerLogLine` and
         // `RunnerHealth`; receiving either back from the server is a
         // protocol violation we silently drop.
@@ -2624,6 +2792,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MERGE_TIMEOUT: Duration = Duration::from_secs(30);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wall-clock cap on a worktree op. `git worktree add` checks out a working
+/// set, comparable to the other git shell-outs; same 30s budget.
+const WORKTREE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Wall-clock cap on a single `git clone`. Large enough to cover a real
 /// network clone (cold object pack on a slow upstream) but short enough
 /// that a wedged remote does not permanently park the request slot.
@@ -2632,25 +2803,103 @@ const GH_TIMEOUT: Duration = Duration::from_secs(30);
 /// instead of hanging on `runner_request`.
 const CLONE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Validate a request-supplied `cwd` against the runner's canonical
-/// `--cwd`. Refuses anything outside the canonical root so a buggy or
-/// malicious server can't pivot the runner into an arbitrary directory.
+/// Validate a request-supplied `cwd` against the runner's sandbox. Refuses
+/// anything outside the canonical root so a buggy or malicious server can't
+/// pivot the runner into an arbitrary directory.
 ///
-/// The runner already canonicalises `state.cwd` once at startup. We
-/// canonicalise the request path here too — which doubles as an existence
+/// The sandbox is two prefixes: the runner's canonical `--cwd` AND its
+/// worktree base (`state.worktree_base`). In SaaS mode an agent's cwd IS its
+/// per-agent worktree path under the base (Phase 0.4: the runner owns the
+/// filesystem), so a worktree path lives outside `--cwd` and must still be
+/// accepted. Both `state.cwd` and `state.worktree_base` are canonicalised at
+/// startup.
+///
+/// We canonicalise the request path here too — which doubles as an existence
 /// check, since `canonicalize` errors on missing components.
 fn validated_cwd(state: &RunnerState, requested: &str) -> Result<PathBuf, String> {
     let req = PathBuf::from(requested);
     let canonical = std::fs::canonicalize(&req)
         .map_err(|e| format!("cwd not canonicalisable ({}): {e}", req.display()))?;
-    if !canonical.starts_with(&state.cwd) {
-        return Err(format!(
-            "cwd {} outside runner root {}",
+    if canonical.starts_with(&state.cwd) || canonical.starts_with(&state.worktree_base) {
+        Ok(canonical)
+    } else {
+        Err(format!(
+            "cwd {} outside runner root {} and worktree base {}",
             canonical.display(),
-            state.cwd.display()
+            state.cwd.display(),
+            state.worktree_base.display()
+        ))
+    }
+}
+
+/// Validate a request-supplied worktree `path` lives under the runner's
+/// worktree base. Unlike [`validated_cwd`], the worktree directory may already
+/// be gone (deleted behind git's back — see
+/// `worktree::remove_worktree_tolerates_dir_deleted_behind_gits_back`), so we
+/// canonicalise the nearest *existing* ancestor instead of the path itself and
+/// reject any `..` traversal in the request.
+///
+/// This guards the `RemoveWorktree` handler's `rm -rf` fallback tier: without
+/// it a buggy server could ask the runner to delete an arbitrary directory.
+fn validated_worktree_path(state: &RunnerState, requested: &str) -> Result<PathBuf, String> {
+    let req = PathBuf::from(requested);
+    // Reject parent-dir traversal outright — a lexical `..` could otherwise
+    // escape the base after the canonical-ancestor check below.
+    if req
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("worktree path contains '..': {requested}"));
+    }
+    // Walk up to the nearest existing ancestor and canonicalise it — the
+    // worktree leaf may already be gone.
+    let mut ancestor = req.as_path();
+    let canon_ancestor = loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(c) => break c,
+            Err(_) => match ancestor.parent() {
+                Some(p) => ancestor = p,
+                None => {
+                    return Err(format!(
+                        "worktree path has no canonicalisable ancestor: {requested}"
+                    ));
+                }
+            },
+        }
+    };
+    if !canon_ancestor.starts_with(&state.worktree_base) {
+        return Err(format!(
+            "worktree path {requested} outside worktree base {}",
+            state.worktree_base.display()
         ));
     }
-    Ok(canonical)
+    Ok(req)
+}
+
+/// Map a [`worktree::RemoveOutcome`] to the wire `WorktreeRemoved.outcome`
+/// label the SaaS dispatcher parses (`removed` / `force_removed` /
+/// `manually_removed`). Failures are encoded separately as `error: <msg>`.
+fn remove_outcome_label(outcome: worktree::RemoveOutcome) -> String {
+    match outcome {
+        worktree::RemoveOutcome::Removed => "removed",
+        worktree::RemoveOutcome::ForceRemoved => "force_removed",
+        worktree::RemoveOutcome::ManuallyRemoved => "manually_removed",
+    }
+    .to_string()
+}
+
+/// Convert a runner-side [`worktree::OrphanWorktree`] to the wire
+/// [`runner_protocol::WorktreeOrphan`] (`SystemTime` → Unix epoch seconds).
+fn local_orphan_to_wire(o: worktree::OrphanWorktree) -> runner_protocol::WorktreeOrphan {
+    runner_protocol::WorktreeOrphan {
+        path: o.path.to_string_lossy().to_string(),
+        branch: o.branch,
+        last_modified_secs: o.last_modified.and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        }),
+    }
 }
 
 /// Run `f` on a blocking thread, racing it against `timeout`. Returns
@@ -4695,17 +4944,32 @@ mod tests {
     /// alongside the receive side of the writer channel so tests can read
     /// envelopes the handler emits.
     fn make_test_state(cwd: PathBuf) -> (Arc<RunnerState>, mpsc::UnboundedReceiver<String>) {
+        // Default worktree base lives UNDER cwd so existing handler tests
+        // (which don't touch worktree ops) are unaffected. Tests exercising the
+        // widened sandbox / worktree round-trip use `make_test_state_with_base`
+        // with a base OUTSIDE cwd.
+        let base = cwd.join(".bw-worktree-base");
+        std::fs::create_dir_all(&base).ok();
+        make_test_state_with_base(cwd, base)
+    }
+
+    fn make_test_state_with_base(
+        cwd: PathBuf,
+        worktree_base: PathBuf,
+    ) -> (Arc<RunnerState>, mpsc::UnboundedReceiver<String>) {
         let conn = Connection::open_in_memory().expect("open in-memory sqlite");
         outbox::init_runner_outbox(&conn);
         outbox::init_seq_tracker(&conn);
         let (ws_tx, ws_rx) = mpsc::unbounded_channel::<String>();
         let canonical = std::fs::canonicalize(&cwd).expect("canonicalize tempdir");
+        let worktree_base = std::fs::canonicalize(&worktree_base).unwrap_or(worktree_base);
         let state = Arc::new(RunnerState {
             runner_id: "runner-test".to_string(),
             db: Arc::new(Mutex::new(conn)),
             agents: Arc::new(Mutex::new(HashMap::new())),
             ws_tx,
             cwd: canonical,
+            worktree_base,
             server_bin: PathBuf::from("/usr/bin/true"),
             saas_url: "http://localhost:3100".to_string(),
             plan_cwd: Arc::new(Mutex::new(HashMap::new())),
@@ -6831,5 +7095,295 @@ mod tests {
             }
             other => panic!("expected CloneFailed, got {other:?}"),
         }
+    }
+
+    // ── Worktree primitive handlers (Task 2.7) ───────────────────────────────
+
+    /// Build a project repo + a worktree base OUTSIDE it, so worktree paths
+    /// land outside `--cwd` (exercising the widened sandbox).
+    fn worktree_state() -> (
+        Arc<RunnerState>,
+        mpsc::UnboundedReceiver<String>,
+        TempDir, // project (keeps it alive)
+        TempDir, // base (keeps it alive)
+    ) {
+        let project = TempDir::new().unwrap();
+        git_init_with_commit(project.path(), "master");
+        let base = TempDir::new().unwrap();
+        let (state, rx) =
+            make_test_state_with_base(project.path().to_path_buf(), base.path().to_path_buf());
+        (state, rx, project, base)
+    }
+
+    #[tokio::test]
+    async fn setup_worktree_creates_worktree_under_base_and_replies_path() {
+        let (state, mut rx, _project, _base) = worktree_state();
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::SetupWorktree {
+                req_id: "req-wt-setup".into(),
+                project_dir: state.cwd.display().to_string(),
+                project_slug: "proj".into(),
+                plan: "my-plan".into(),
+                task: "2.7".into(),
+                agent_id: "abcdef1234567890".into(),
+                branch: "branchwork/my-plan/2.7".into(),
+                base_branch: None,
+                is_continue: false,
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::WorktreeCreated { req_id, path } => {
+                assert_eq!(req_id, "req-wt-setup");
+                let p = PathBuf::from(&path);
+                assert!(p.exists(), "worktree dir should exist: {path}");
+                assert!(
+                    p.starts_with(&state.worktree_base),
+                    "path {path} must be under base {}",
+                    state.worktree_base.display()
+                );
+                assert!(p.ends_with("2.7-abcdef12"));
+                // The widened sandbox must now accept this worktree path.
+                assert!(
+                    validated_cwd(&state, &path).is_ok(),
+                    "validated_cwd must accept the freshly-created worktree path"
+                );
+            }
+            other => panic!("expected WorktreeCreated, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_worktree_bad_base_branch_replies_failure() {
+        let (state, mut rx, _project, _base) = worktree_state();
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::SetupWorktree {
+                req_id: "req-wt-fail".into(),
+                project_dir: state.cwd.display().to_string(),
+                project_slug: "proj".into(),
+                plan: "p".into(),
+                task: "0.1".into(),
+                agent_id: "id00".into(),
+                branch: "branchwork/p/0.1".into(),
+                base_branch: Some("no-such-base-branch".into()),
+                is_continue: false,
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::WorktreeSetupFailed { req_id, error } => {
+                assert_eq!(req_id, "req-wt-fail");
+                assert!(!error.is_empty());
+            }
+            other => panic!("expected WorktreeSetupFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_worktree_rejects_project_dir_outside_sandbox() {
+        let (state, mut rx, _project, _base) = worktree_state();
+        // A project_dir outside both `--cwd` and the worktree base must be
+        // refused before any git shell-out.
+        let outside = TempDir::new().unwrap();
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::SetupWorktree {
+                req_id: "req-wt-sandbox".into(),
+                project_dir: outside.path().display().to_string(),
+                project_slug: "proj".into(),
+                plan: "p".into(),
+                task: "0.1".into(),
+                agent_id: "id00".into(),
+                branch: "branchwork/p/0.1".into(),
+                base_branch: None,
+                is_continue: false,
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::WorktreeSetupFailed { error, .. } => {
+                assert!(error.contains("outside runner root"), "got: {error}");
+            }
+            other => panic!("expected WorktreeSetupFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_round_trip_removes_dir() {
+        let (state, mut rx, _project, base) = worktree_state();
+        // Create a worktree directly via the shared primitive.
+        let path = worktree::setup_worktree_in(
+            base.path(),
+            &state.cwd,
+            "proj",
+            "p",
+            "0.1",
+            "rmrm0000",
+            "branchwork/p/0.1",
+            None,
+            false,
+        )
+        .expect("worktree should be created");
+        assert!(path.exists());
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::RemoveWorktree {
+                req_id: "req-wt-rm".into(),
+                project_dir: state.cwd.display().to_string(),
+                path: path.display().to_string(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::WorktreeRemoved { req_id, outcome } => {
+                assert_eq!(req_id, "req-wt-rm");
+                assert!(
+                    matches!(
+                        outcome.as_str(),
+                        "removed" | "force_removed" | "manually_removed"
+                    ),
+                    "unexpected outcome: {outcome}"
+                );
+            }
+            other => panic!("expected WorktreeRemoved, got {other:?}"),
+        }
+        assert!(!path.exists(), "worktree dir should be gone after removal");
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_rejects_path_outside_base() {
+        let (state, mut rx, _project, _base) = worktree_state();
+        // A path outside the worktree base must be refused (guards the
+        // `rm -rf` fallback tier). Use the project root — under `--cwd` but
+        // NOT under the base.
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::RemoveWorktree {
+                req_id: "req-wt-rm-bad".into(),
+                project_dir: state.cwd.display().to_string(),
+                path: state.cwd.display().to_string(),
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::WorktreeRemoved { outcome, .. } => {
+                assert!(
+                    outcome.starts_with("error:") && outcome.contains("outside worktree base"),
+                    "expected an out-of-base error, got: {outcome}"
+                );
+            }
+            other => panic!("expected WorktreeRemoved, got {other:?}"),
+        }
+        // The project root must still exist — the bad request did not delete it.
+        assert!(state.cwd.exists(), "project root must not be removed");
+    }
+
+    #[tokio::test]
+    async fn list_worktree_orphans_reports_unclaimed_worktree() {
+        let (state, mut rx, _project, base) = worktree_state();
+        let live = worktree::setup_worktree_in(
+            base.path(),
+            &state.cwd,
+            "proj",
+            "p",
+            "1.1",
+            "live0000",
+            "branchwork/p/1.1",
+            None,
+            false,
+        )
+        .unwrap();
+        let orphan = worktree::setup_worktree_in(
+            base.path(),
+            &state.cwd,
+            "proj",
+            "p",
+            "1.2",
+            "orph0000",
+            "branchwork/p/1.2",
+            None,
+            false,
+        )
+        .unwrap();
+
+        let reply = dispatch(
+            &state,
+            &mut rx,
+            WireMessage::ListWorktreeOrphans {
+                req_id: "req-wt-list".into(),
+                project_dir: state.cwd.display().to_string(),
+                project_slug: "proj".into(),
+                live_cwds: vec![live.display().to_string()],
+            },
+        )
+        .await;
+        match reply {
+            WireMessage::WorktreeOrphansListed { req_id, orphans } => {
+                assert_eq!(req_id, "req-wt-list");
+                assert_eq!(orphans.len(), 1, "exactly the unclaimed worktree");
+                let reported = &orphans[0];
+                assert_eq!(
+                    std::fs::canonicalize(&reported.path).unwrap(),
+                    std::fs::canonicalize(&orphan).unwrap()
+                );
+                assert_eq!(reported.branch.as_deref(), Some("branchwork/p/1.2"));
+                assert!(reported.last_modified_secs.is_some());
+            }
+            other => panic!("expected WorktreeOrphansListed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validated_cwd_accepts_cwd_and_base_rejects_outside() {
+        let (state, _rx, _project, base) = worktree_state();
+        // A real subdir under the base (must exist — validated_cwd canonicalises).
+        let under_base = base.path().join("proj/p/0.1-aaaa");
+        std::fs::create_dir_all(&under_base).unwrap();
+
+        assert!(
+            validated_cwd(&state, &state.cwd.display().to_string()).is_ok(),
+            "the runner root must validate"
+        );
+        assert!(
+            validated_cwd(&state, &under_base.display().to_string()).is_ok(),
+            "a path under the worktree base must validate"
+        );
+
+        let outside = TempDir::new().unwrap();
+        assert!(
+            validated_cwd(&state, &outside.path().display().to_string()).is_err(),
+            "a path under neither cwd nor base must be rejected"
+        );
+    }
+
+    #[test]
+    fn validated_worktree_path_guards_traversal_and_base() {
+        let (state, _rx, _project, base) = worktree_state();
+        // A not-yet-existing leaf under the base is fine (worktree may have
+        // been deleted behind git's back).
+        let deleted_leaf = base.path().join("proj/p/9.9-gone");
+        assert!(
+            validated_worktree_path(&state, &deleted_leaf.display().to_string()).is_ok(),
+            "a deleted leaf under the base must still validate"
+        );
+        // `..` traversal is refused outright.
+        let traversal = format!("{}/../../etc", base.path().display());
+        assert!(
+            validated_worktree_path(&state, &traversal).is_err(),
+            ".. traversal must be refused"
+        );
+        // Outside the base is refused.
+        assert!(
+            validated_worktree_path(&state, &state.cwd.display().to_string()).is_err(),
+            "a path outside the base must be refused"
+        );
     }
 }

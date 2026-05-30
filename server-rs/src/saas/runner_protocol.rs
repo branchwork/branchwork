@@ -782,6 +782,77 @@ pub enum WireMessage {
         run_id_used: Option<String>,
     },
 
+    // ── Worktree round-trips (saas → runner request, runner → saas reply) ──
+    //
+    // Per Phase 0.4 the runner owns the project filesystem in SaaS mode, so
+    // the per-agent worktree primitives must be dispatched. The three
+    // request variants mirror `agents::worktree::{setup_worktree,
+    // remove_worktree, list_orphans}`; the runner resolves its own
+    // `$BRANCHWORK_WORKTREE_BASE` (the server can't know the runner's `$HOME`
+    // or its base override — RESOLVED-PATH PRINCIPLE) and returns the
+    // absolute on-disk path it created.
+    //
+    // All six variants are best-effort: a live spawn / cleanup caller waits
+    // on the reply with a short timeout, so outbox replay would land after
+    // the caller has given up.
+    /// Set up (or, on continue, re-attach) a per-agent git worktree on the
+    /// runner host and reply with its absolute path. `project_dir` is the
+    /// project root (under the runner's `--cwd`); `plan` / `task` are the
+    /// resolved path segments (the server already substituted the
+    /// freestanding-agent placeholders). The runner runs
+    /// `agents::worktree::setup_worktree` and replies with `WorktreeCreated`
+    /// or `WorktreeSetupFailed`.
+    SetupWorktree {
+        req_id: String,
+        project_dir: String,
+        project_slug: String,
+        plan: String,
+        task: String,
+        agent_id: String,
+        branch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_branch: Option<String>,
+        is_continue: bool,
+    },
+    /// Runner reply: worktree created. `path` is the absolute, runner-resolved
+    /// directory (`<base>/<slug>/<plan>/<task>-<agent-id-short>`); the server
+    /// records it verbatim in `agents.cwd`.
+    WorktreeCreated { req_id: String, path: String },
+    /// Runner reply: worktree setup failed; `error` is the git / IO error
+    /// (the server fails the agent-start with this message).
+    WorktreeSetupFailed { req_id: String, error: String },
+
+    /// Remove a per-agent worktree on the runner host. `project_dir` is the
+    /// project root the worktree was added from (git removal must run there);
+    /// `path` is the worktree directory to remove (under the worktree base).
+    RemoveWorktree {
+        req_id: String,
+        project_dir: String,
+        path: String,
+    },
+    /// Runner reply with the removal outcome label: `removed`,
+    /// `force_removed`, `manually_removed`, or `error: <msg>` when even the
+    /// `rm -rf` fallback failed. Removal is best-effort cleanup, so the
+    /// server logs the label and moves on.
+    WorktreeRemoved { req_id: String, outcome: String },
+
+    /// List orphaned worktrees under `<base>/<project_slug>/` that no live
+    /// agent claims (`live_cwds`) — the candidates a startup sweep reaps.
+    /// `project_dir` is the project root `git worktree list` runs in.
+    ListWorktreeOrphans {
+        req_id: String,
+        project_dir: String,
+        project_slug: String,
+        live_cwds: Vec<String>,
+    },
+    /// Runner reply with the orphan worktrees found (empty when none, or when
+    /// the listing failed — same best-effort posture as the standalone
+    /// `list_orphans`).
+    WorktreeOrphansListed {
+        req_id: String,
+        orphans: Vec<WorktreeOrphan>,
+    },
+
     // ── Bidirectional ───────────────────────────────────────────────────
     /// Acknowledge receipt of a sequenced message. The receiver sends this
     /// after persisting the event so the sender can prune its outbox.
@@ -821,6 +892,25 @@ pub enum WireMessage {
 pub struct FolderEntry {
     pub name: String,
     pub path: String,
+}
+
+// ── Worktree orphan ─────────────────────────────────────────────────────────
+
+/// Wire shape of `agents::worktree::OrphanWorktree` for `WorktreeOrphansListed`.
+/// `last_modified` is rendered as Unix epoch seconds (rather than serde's
+/// `SystemTime` struct form) so it round-trips cleanly through JSON and stays
+/// stable across the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeOrphan {
+    /// Absolute on-disk path of the orphaned worktree (runner-side).
+    pub path: String,
+    /// Branch the worktree was checked out on, if any (`None` for a detached
+    /// HEAD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Filesystem mtime as Unix epoch seconds, if it could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified_secs: Option<u64>,
 }
 
 // ── Credential envelope (Phase 3.3 of runner-daemon-workspace) ──────────────
@@ -1118,6 +1208,13 @@ impl WireMessage {
                 | WireMessage::CiRunStatusResolved { .. }
                 | WireMessage::CiFailureLog { .. }
                 | WireMessage::CiFailureLogResolved { .. }
+                | WireMessage::SetupWorktree { .. }
+                | WireMessage::WorktreeCreated { .. }
+                | WireMessage::WorktreeSetupFailed { .. }
+                | WireMessage::RemoveWorktree { .. }
+                | WireMessage::WorktreeRemoved { .. }
+                | WireMessage::ListWorktreeOrphans { .. }
+                | WireMessage::WorktreeOrphansListed { .. }
                 | WireMessage::RunnerLogLine { .. }
                 | WireMessage::RunnerHealth { .. }
         )
@@ -1174,6 +1271,13 @@ impl WireMessage {
             WireMessage::CiRunStatusResolved { .. } => "ci_run_status_resolved",
             WireMessage::CiFailureLog { .. } => "ci_failure_log",
             WireMessage::CiFailureLogResolved { .. } => "ci_failure_log_resolved",
+            WireMessage::SetupWorktree { .. } => "setup_worktree",
+            WireMessage::WorktreeCreated { .. } => "worktree_created",
+            WireMessage::WorktreeSetupFailed { .. } => "worktree_setup_failed",
+            WireMessage::RemoveWorktree { .. } => "remove_worktree",
+            WireMessage::WorktreeRemoved { .. } => "worktree_removed",
+            WireMessage::ListWorktreeOrphans { .. } => "list_worktree_orphans",
+            WireMessage::WorktreeOrphansListed { .. } => "worktree_orphans_listed",
             WireMessage::Ack { .. } => "ack",
             WireMessage::Ping {} => "ping",
             WireMessage::Pong {} => "pong",
@@ -3217,6 +3321,206 @@ mod tests {
         let env: Envelope = serde_json::from_str(json).unwrap();
         match env.message {
             WireMessage::ShutdownRequest { reason } => assert!(reason.is_none()),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    // ── Worktree round-trips (Task 2.7) ──────────────────────────────────────
+
+    #[test]
+    fn setup_worktree_round_trip_and_is_best_effort() {
+        // The request carries the resolved plan/task segments + the optional
+        // base branch; the runner resolves its own base. Best-effort (a live
+        // spawn caller waits on the reply with a short timeout).
+        let msg = WireMessage::SetupWorktree {
+            req_id: "req-wt-1".into(),
+            project_dir: "/home/u/proj".into(),
+            project_slug: "proj".into(),
+            plan: "my-plan".into(),
+            task: "2.7".into(),
+            agent_id: "abcdef1234".into(),
+            branch: "branchwork/my-plan/2.7".into(),
+            base_branch: Some("master".into()),
+            is_continue: false,
+        };
+        assert!(msg.is_best_effort(), "SetupWorktree must be best-effort");
+        assert_eq!(msg.event_type(), "setup_worktree");
+
+        let env = Envelope::best_effort("server".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"type\":\"setup_worktree\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::SetupWorktree {
+                req_id,
+                project_dir,
+                project_slug,
+                plan,
+                task,
+                agent_id,
+                branch,
+                base_branch,
+                is_continue,
+            } => {
+                assert_eq!(req_id, "req-wt-1");
+                assert_eq!(project_dir, "/home/u/proj");
+                assert_eq!(project_slug, "proj");
+                assert_eq!(plan, "my-plan");
+                assert_eq!(task, "2.7");
+                assert_eq!(agent_id, "abcdef1234");
+                assert_eq!(branch, "branchwork/my-plan/2.7");
+                assert_eq!(base_branch.as_deref(), Some("master"));
+                assert!(!is_continue);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_worktree_omits_base_branch_when_none() {
+        // A continue / HEAD-rooted worktree carries no base branch — the
+        // field must drop off the wire so older peers stay compatible.
+        let msg = WireMessage::SetupWorktree {
+            req_id: "req-wt-2".into(),
+            project_dir: "/p".into(),
+            project_slug: "p".into(),
+            plan: "_no-plan".into(),
+            task: "_no-task".into(),
+            agent_id: "id".into(),
+            branch: "b".into(),
+            base_branch: None,
+            is_continue: true,
+        };
+        let env = Envelope::best_effort("server".into(), msg);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("\"base_branch\""));
+    }
+
+    #[test]
+    fn worktree_created_and_setup_failed_round_trip() {
+        let created = WireMessage::WorktreeCreated {
+            req_id: "req-wt-3".into(),
+            path: "/home/u/.branchwork/worktrees/proj/p/2.7-abcdef12".into(),
+        };
+        assert_eq!(created.event_type(), "worktree_created");
+        let json = serde_json::to_string(&Envelope::best_effort("r1".into(), created)).unwrap();
+        assert!(json.contains("\"type\":\"worktree_created\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::WorktreeCreated { req_id, path } => {
+                assert_eq!(req_id, "req-wt-3");
+                assert!(path.ends_with("2.7-abcdef12"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let failed = WireMessage::WorktreeSetupFailed {
+            req_id: "req-wt-3".into(),
+            error: "git worktree add failed: already exists".into(),
+        };
+        assert_eq!(failed.event_type(), "worktree_setup_failed");
+        let json = serde_json::to_string(&Envelope::best_effort("r1".into(), failed)).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::WorktreeSetupFailed { req_id, error } => {
+                assert_eq!(req_id, "req-wt-3");
+                assert!(error.contains("already exists"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_worktree_round_trip() {
+        let msg = WireMessage::RemoveWorktree {
+            req_id: "req-wt-4".into(),
+            project_dir: "/home/u/proj".into(),
+            path: "/home/u/.branchwork/worktrees/proj/p/2.7-abcdef12".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "remove_worktree");
+        let json = serde_json::to_string(&Envelope::best_effort("server".into(), msg)).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::RemoveWorktree {
+                req_id,
+                project_dir,
+                path,
+            } => {
+                assert_eq!(req_id, "req-wt-4");
+                assert_eq!(project_dir, "/home/u/proj");
+                assert!(path.contains("worktrees"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let reply = WireMessage::WorktreeRemoved {
+            req_id: "req-wt-4".into(),
+            outcome: "force_removed".into(),
+        };
+        assert_eq!(reply.event_type(), "worktree_removed");
+        let json = serde_json::to_string(&Envelope::best_effort("r1".into(), reply)).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::WorktreeRemoved { req_id, outcome } => {
+                assert_eq!(req_id, "req-wt-4");
+                assert_eq!(outcome, "force_removed");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_worktree_orphans_round_trip_with_epoch_mtime() {
+        let msg = WireMessage::ListWorktreeOrphans {
+            req_id: "req-wt-5".into(),
+            project_dir: "/home/u/proj".into(),
+            project_slug: "proj".into(),
+            live_cwds: vec!["/home/u/.branchwork/worktrees/proj/p/1.1-aaaa".into()],
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "list_worktree_orphans");
+        let json = serde_json::to_string(&Envelope::best_effort("server".into(), msg)).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::ListWorktreeOrphans {
+                req_id, live_cwds, ..
+            } => {
+                assert_eq!(req_id, "req-wt-5");
+                assert_eq!(live_cwds.len(), 1);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let reply = WireMessage::WorktreeOrphansListed {
+            req_id: "req-wt-5".into(),
+            orphans: vec![
+                WorktreeOrphan {
+                    path: "/home/u/.branchwork/worktrees/proj/p/1.2-bbbb".into(),
+                    branch: Some("branchwork/p/1.2".into()),
+                    last_modified_secs: Some(1_700_000_000),
+                },
+                WorktreeOrphan {
+                    path: "/home/u/.branchwork/worktrees/proj/p/1.3-cccc".into(),
+                    branch: None,
+                    last_modified_secs: None,
+                },
+            ],
+        };
+        assert_eq!(reply.event_type(), "worktree_orphans_listed");
+        let json = serde_json::to_string(&Envelope::best_effort("r1".into(), reply)).unwrap();
+        // A detached orphan must omit branch + mtime on the wire.
+        assert!(json.contains("\"branch\":\"branchwork/p/1.2\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::WorktreeOrphansListed { req_id, orphans } => {
+                assert_eq!(req_id, "req-wt-5");
+                assert_eq!(orphans.len(), 2);
+                assert_eq!(orphans[0].branch.as_deref(), Some("branchwork/p/1.2"));
+                assert_eq!(orphans[0].last_modified_secs, Some(1_700_000_000));
+                assert_eq!(orphans[1].branch, None);
+                assert_eq!(orphans[1].last_modified_secs, None);
+            }
             other => panic!("unexpected variant: {other:?}"),
         }
     }

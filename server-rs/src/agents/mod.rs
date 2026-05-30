@@ -263,10 +263,15 @@ pub fn git_checkout_branch(cwd: &std::path::Path, branch: &str, is_continue: boo
 /// Path segment substituted for a freestanding agent that carries no plan
 /// name, so its worktree still lands at a deterministic location instead of an
 /// empty path component.
-const NO_PLAN_SEGMENT: &str = "_no-plan";
+///
+/// `pub(crate)` so the SaaS worktree dispatcher
+/// ([`crate::agents::git_ops::setup_worktree`]) resolves the same placeholder
+/// before shipping the resolved segment over the wire — the runner has no
+/// access to this constant.
+pub(crate) const NO_PLAN_SEGMENT: &str = "_no-plan";
 /// Path segment substituted for an agent with no task id — see
 /// [`NO_PLAN_SEGMENT`].
-const NO_TASK_SEGMENT: &str = "_no-task";
+pub(crate) const NO_TASK_SEGMENT: &str = "_no-task";
 
 /// Set up the per-agent git worktree for a spawning agent and return its
 /// absolute on-disk path. This is the worktree-per-agent replacement for the
