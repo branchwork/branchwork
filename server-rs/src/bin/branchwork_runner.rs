@@ -3470,12 +3470,22 @@ fn list_home_folders() -> Vec<FolderEntry> {
 /// gate so the binary never blocks at the "Trust this folder?" dialog when
 /// the runner spawns it into a freshly-created project directory.
 fn extra_env_for_driver(driver: &str) -> Vec<(String, String)> {
+    // The ANTHROPIC_API_KEY read is injected so tests exercise the plumbing
+    // without `set_var`-ing the process-global environment (an unsafe,
+    // parallel-test data race — see `resolve_server_bin` for the same hazard).
+    extra_env_for_driver_with(driver, || std::env::var("ANTHROPIC_API_KEY").ok())
+}
+
+fn extra_env_for_driver_with(
+    driver: &str,
+    anthropic_key: impl FnOnce() -> Option<String>,
+) -> Vec<(String, String)> {
     match driver {
         "claude" => vec![("CLAUDE_CODE_SANDBOXED".to_string(), "1".to_string())],
         "bob" => {
             // Bob Shell needs ANTHROPIC_API_KEY to authenticate with the API.
             // Pass it through from the runner's environment if available.
-            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            if let Some(key) = anthropic_key() {
                 vec![("ANTHROPIC_API_KEY".to_string(), key)]
             } else {
                 vec![]
@@ -4337,6 +4347,20 @@ struct ServerBinResolution {
 /// matching reason (the operator typed a bad path; the dashboard should
 /// say so rather than waiting for the inevitable spawn `ENOENT`).
 fn resolve_server_bin(explicit: Option<&Path>) -> ServerBinResolution {
+    // Production walks the live `$PATH` via `which`. The lookup is injected so
+    // tests can force the "not on PATH" branch deterministically instead of
+    // mutating the process-global `PATH` — that mutation races every other
+    // test that spawns a subprocess (the `Command` spawn reads `environ` for
+    // PATH resolution while a concurrent `set_var` rewrites it, a data race
+    // that surfaces as spurious `git`-not-found ENOENT failures in unrelated
+    // tests).
+    resolve_server_bin_with(explicit, || which("branchwork-server"))
+}
+
+fn resolve_server_bin_with(
+    explicit: Option<&Path>,
+    lookup_on_path: impl FnOnce() -> Option<PathBuf>,
+) -> ServerBinResolution {
     if let Some(path) = explicit {
         let display = path.display().to_string();
         // `metadata()` follows symlinks; `is_file()` would return false for
@@ -4368,7 +4392,7 @@ fn resolve_server_bin(explicit: Option<&Path>) -> ServerBinResolution {
                 },
             },
         }
-    } else if let Some(found) = which("branchwork-server") {
+    } else if let Some(found) = lookup_on_path() {
         let canonical = std::fs::canonicalize(&found)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| found.display().to_string());
@@ -4677,22 +4701,18 @@ mod tests {
     fn extra_env_for_driver_passes_anthropic_key_to_bob() {
         // Bob needs ANTHROPIC_API_KEY from the runner's environment.
         // This test only verifies the plumbing — the actual key value
-        // comes from the runner's env at runtime.
-        unsafe {
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key-123");
-        }
-        let env = extra_env_for_driver("bob");
+        // comes from the runner's env at runtime. Inject the key through the
+        // `_with` seam rather than `set_var`, which would race every parallel
+        // test that spawns a subprocess.
+        let env = extra_env_for_driver_with("bob", || Some("test-key-123".to_string()));
         assert!(
             env.iter()
                 .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "test-key-123"),
             "bob driver must pass through ANTHROPIC_API_KEY: {env:?}",
         );
-        unsafe {
-            std::env::remove_var("ANTHROPIC_API_KEY");
-        }
 
         // When ANTHROPIC_API_KEY is not set, bob should return empty.
-        let env_empty = extra_env_for_driver("bob");
+        let env_empty = extra_env_for_driver_with("bob", || None);
         assert!(
             env_empty.is_empty(),
             "bob without API key should return empty"
@@ -6610,27 +6630,12 @@ mod tests {
     /// "not found" state BEFORE the user clicks Start session.
     #[test]
     fn resolve_server_bin_falls_back_to_not_found_when_path_empty() {
-        // Snapshot the host PATH, blank it for the test, restore on exit.
-        // `cargo test` is parallel by default; mutating env is unsafe but
-        // we're inside a single test fn so the window is small. Use the
-        // unsafe-set guard pattern (Edition 2024) and bail on poisoning.
-        struct PathGuard(Option<String>);
-        impl Drop for PathGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.0 {
-                        Some(prev) => std::env::set_var("PATH", prev),
-                        None => std::env::remove_var("PATH"),
-                    }
-                }
-            }
-        }
-        let _guard = PathGuard(std::env::var("PATH").ok());
-        unsafe {
-            std::env::set_var("PATH", "/nonexistent-dir-for-t1-2-tests");
-        }
-
-        let res = resolve_server_bin(None);
+        // Inject an empty `$PATH` lookup (returns None) instead of mutating the
+        // process-global `PATH`. The old approach `set_var`'d PATH to a bogus
+        // dir for the duration of the test, which raced every parallel test
+        // that spawned `git` (the spawn's `environ` read vs. our `set_var` is a
+        // data race) and produced spurious ENOENT failures across the suite.
+        let res = resolve_server_bin_with(None, || None);
         match res.diagnostic {
             runner_protocol::ServerBinDiagnostic::NotFound { searched, reason } => {
                 assert_eq!(searched, "branchwork-server");
