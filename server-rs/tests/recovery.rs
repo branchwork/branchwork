@@ -571,16 +571,22 @@ fn fix_ci_validates_run_state_and_creates_recovery_branch() {
     // merge flow needs. Prompt must carry the failure-log excerpt and the
     // pre-commit checks the task description mandates.
     let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let (db_branch, db_plan, db_task, db_prompt): (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = conn
+    // Turbofish each column so the row type is inferred without a
+    // 6-field tuple annotation (clippy::type_complexity).
+    let (db_branch, db_plan, db_task, db_prompt, db_cwd, db_status) = conn
         .query_row(
-            "SELECT branch, plan_name, task_id, prompt FROM agents WHERE id = ?1",
+            "SELECT branch, plan_name, task_id, prompt, cwd, status FROM agents WHERE id = ?1",
             rusqlite::params![agent_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            },
         )
         .expect("agents row for fix-ci agent");
     assert_eq!(db_branch.as_deref(), Some(expected_branch.as_str()));
@@ -595,5 +601,31 @@ fn fix_ci_validates_run_state_and_creates_recovery_branch() {
     assert!(
         prompt.contains("cargo fmt") && prompt.contains("clippy"),
         "prompt missing pre-commit requirement"
+    );
+
+    // The recovery agent must actually start, not die at worktree setup.
+    // Before the worktree wiring, Fix-CI pre-created the fix branch with
+    // `git checkout -b` in the project root; with worktrees ON that left
+    // the branch checked out in the main tree, so the agent's
+    // `git worktree add <path> <fix_branch>` failed ("already used by
+    // worktree") and `start_pty_agent` recorded a `failed` row whose
+    // cwd is the project root. Both assertions below pin the fix: the
+    // recovery agent gets its OWN per-agent worktree (cwd under the
+    // test's tempdir worktree base, carrying the `<plan>/<task>-<id8>`
+    // path shape), never the shared project root.
+    let cwd = db_cwd.expect("fix-ci agent cwd recorded");
+    assert_ne!(
+        db_status.as_deref(),
+        Some("failed"),
+        "recovery agent should not fail at worktree setup (cwd={cwd})"
+    );
+    assert_ne!(
+        std::path::Path::new(&cwd),
+        d.project.as_path(),
+        "recovery agent must run in a per-agent worktree, not the shared project root"
+    );
+    assert!(
+        cwd.contains(".branchwork-worktrees") && cwd.contains("plan-fix") && cwd.contains("1.1-"),
+        "recovery agent cwd should be its per-agent worktree path, got: {cwd}"
     );
 }

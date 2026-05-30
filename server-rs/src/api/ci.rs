@@ -244,20 +244,27 @@ pub async fn fix_ci(
     }
     let original_branch = crate::agents::git_current_branch(&cwd);
 
-    // Pre-create the recovery branch pointing at the failing SHA. The
-    // spawn path's `git_checkout_branch(..., is_continue=true)` will
-    // then just check it out.
+    // Pre-create the recovery branch pointing at the failing SHA, but do
+    // NOT check it out in the main working tree. The spawn path
+    // (`is_continue=true`, below) attaches the branch itself: with
+    // worktrees ON it runs `git worktree add <path> <fix_branch>`, which
+    // git refuses if the branch is already checked out anywhere — so a
+    // `git checkout -b` here would make the agent's worktree setup fail
+    // with "already used by worktree" and the recovery agent would never
+    // start. `git branch` creates the ref without occupying it; the
+    // legacy (worktrees-off) path's `git_checkout_branch(is_continue=true)`
+    // then checks the now-existing branch out in place exactly as before.
     let fix_branch = format!(
         "branchwork/fix/{plan}/{task}/{run}",
         plan = body.plan_name,
         task = body.task_number,
         run = body.ci_run_id,
     );
-    let checkout = std::process::Command::new("git")
-        .args(["checkout", "-b", &fix_branch, &commit_sha])
+    let create_branch = std::process::Command::new("git")
+        .args(["branch", &fix_branch, &commit_sha])
         .current_dir(&cwd)
         .output();
-    match checkout {
+    match create_branch {
         Ok(out) if !out.status.success() => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             // Benign if it already exists from a prior attempt — fall through.
@@ -265,7 +272,7 @@ pub async fn fix_ci(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
-                        "error": format!("git checkout -b failed: {stderr}"),
+                        "error": format!("git branch failed: {stderr}"),
                     })),
                 )
                     .into_response();
@@ -316,14 +323,15 @@ pub async fn fix_ci(
         log = failure_log,
     );
 
-    // 7. Spawn the agent. `is_continue=true` so the standalone path
-    //    just checks out the (now-existing) fix branch instead of
-    //    trying to create it again. SaaS path goes through the runner
-    //    via start_agent_dispatch — note the standalone-only git dance
-    //    above (master/main checkout, `git checkout -b <fix_branch>`)
-    //    will fail silently in SaaS mode today; full SaaS Fix-CI
-    //    parity is tracked separately (see saas-compat-audit
-    //    group 3).
+    // 7. Spawn the agent. `is_continue=true` so the spawn path attaches
+    //    the (now-existing) fix branch instead of trying to create it
+    //    again — a worktree-ON agent runs `git worktree add <path>
+    //    <fix_branch>`, a legacy agent checks it out in place. SaaS path
+    //    goes through the runner via start_agent_dispatch — note the
+    //    standalone-only git dance above (master/main checkout,
+    //    `git branch <fix_branch>`) will fail silently in SaaS mode
+    //    today; full SaaS Fix-CI parity is tracked separately (see
+    //    saas-compat-audit group 3).
     let effort = *state.effort.lock().unwrap();
     let org_id_str = auth.org_id().to_string();
 

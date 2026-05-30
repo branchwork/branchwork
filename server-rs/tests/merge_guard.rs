@@ -880,6 +880,84 @@ fn merge_to_non_default_skips_ci_run() {
     );
 }
 
+#[test]
+fn parallel_agents_on_distinct_branches_keep_their_changes_isolated() {
+    // Acceptance criterion #1 of the worktree-per-agent-isolation
+    // request: two agents on different task branches that BOTH touch the
+    // SAME file (conflicting writes) in their own per-agent worktrees
+    // must not cross-contaminate. Each task branch ends up carrying only
+    // its own version of the file. Before worktrees, the two agents
+    // shared the project's single working tree + HEAD, so the second
+    // checkout would clobber the first agent's in-flight edit.
+    //
+    // Worktrees are pinned to a per-test tempdir base via
+    // `setup_worktree_for_test` (never the operator's
+    // `~/.branchwork/worktrees`).
+    let d = TestDashboard::new();
+    d.create_plan("mp-par", &minimal_plan("mp-par", &d.project));
+
+    let branch_a = "branchwork/mp-par/1.1";
+    let branch_b = "branchwork/mp-par/1.2";
+
+    let wt_a = d.setup_worktree_for_test("mp-par", "1.1", "agentaaaa0001", branch_a);
+    let wt_b = d.setup_worktree_for_test("mp-par", "1.2", "agentbbbb0002", branch_b);
+    assert_ne!(wt_a, wt_b, "each agent must get a distinct worktree path");
+
+    // Both agents write the SAME path with DIFFERENT content, then commit
+    // on their own branch — the conflicting-edit shape.
+    std::fs::write(wt_a.join("shared.txt"), "from agent A").unwrap();
+    git(&wt_a, &["add", "shared.txt"]);
+    git(&wt_a, &["commit", "-q", "-m", "agent A writes shared.txt"]);
+
+    std::fs::write(wt_b.join("shared.txt"), "from agent B").unwrap();
+    git(&wt_b, &["add", "shared.txt"]);
+    git(&wt_b, &["commit", "-q", "-m", "agent B writes shared.txt"]);
+
+    // Each branch carries ONLY its own change — the isolation guarantee.
+    assert_eq!(
+        show_file(&d.project, branch_a, "shared.txt"),
+        "from agent A",
+        "branch A must carry only agent A's write"
+    );
+    assert_eq!(
+        show_file(&d.project, branch_b, "shared.txt"),
+        "from agent B",
+        "branch B must carry only agent B's write"
+    );
+
+    // The worktrees themselves are independent working copies — neither
+    // stomped the other.
+    assert_eq!(
+        std::fs::read_to_string(wt_a.join("shared.txt")).unwrap(),
+        "from agent A"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt_b.join("shared.txt")).unwrap(),
+        "from agent B"
+    );
+
+    // Clean the worktrees up explicitly so the git worktree refs in the
+    // scratch repo don't dangle before the tempdir teardown.
+    support::worktree::remove_worktree(&d.project, &wt_a).ok();
+    support::worktree::remove_worktree(&d.project, &wt_b).ok();
+}
+
+/// `git show <ref>:<path>` content as a string. Reads a file's committed
+/// contents on a branch without checking it out.
+fn show_file(cwd: &std::path::Path, refname: &str, path: &str) -> String {
+    let out = std::process::Command::new("git")
+        .args(["show", &format!("{refname}:{path}")])
+        .current_dir(cwd)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn git show {refname}:{path}: {e}"));
+    assert!(
+        out.status.success(),
+        "git show {refname}:{path}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 fn git(cwd: &std::path::Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .args(args)

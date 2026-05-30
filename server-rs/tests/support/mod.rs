@@ -17,6 +17,15 @@
 
 pub mod gh;
 
+// Per-agent worktree primitive, pulled in via `#[path]` so
+// `setup_worktree_for_test` below can create worktrees the same way the
+// server does at spawn time. The include also compiles + runs
+// `worktree.rs`'s own `#[cfg(test)] mod tests` inside every test binary
+// that uses `support` — harmless, and matches the
+// `tests/worktree_isolation.rs` precedent.
+#[path = "../../src/agents/worktree.rs"]
+pub mod worktree;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -89,6 +98,17 @@ impl TestDashboard {
         // `tests/recovery.rs:16` and `tests/folders.rs`).
         .env("HOME", dir.path())
         .env("USERPROFILE", dir.path())
+        // Pin the server's per-agent worktrees (worktrees default ON) to
+        // a tempdir inside this test's own scratch dir, so a spawned
+        // agent never writes into the operator's real
+        // `~/.branchwork/worktrees/`. The server resolves this per call
+        // via `worktree_base()`, so a child-process env is sufficient;
+        // the test process's own env is untouched (no race with the
+        // `worktree_base_is_always_absolute` unit test).
+        .env(
+            "BRANCHWORK_WORKTREE_BASE",
+            dir.path().join(".branchwork-worktrees"),
+        )
         // Silence server stdout/stderr during tests unless the user
         // asked for it. Route to piped so we can drain on drop.
         .stdout(if std::env::var("TEST_SERVER_LOG").is_ok() {
@@ -243,6 +263,42 @@ impl TestDashboard {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect()
+    }
+
+    /// Create a per-agent worktree against this dashboard's scratch repo,
+    /// pinned to this test's own tempdir base (never the operator's
+    /// `~/.branchwork/worktrees`). Wraps [`worktree::setup_worktree_in`]
+    /// — the explicit-base variant — so the helper never touches the
+    /// process-wide `BRANCHWORK_WORKTREE_BASE`, which would race
+    /// `worktree.rs`'s `worktree_base_is_always_absolute` unit test
+    /// (that module is `#[path]`-included above and its tests run in
+    /// this binary). Returns the absolute worktree path; panics on
+    /// failure so callers read like the other fixture helpers.
+    pub fn setup_worktree_for_test(
+        &self,
+        plan: &str,
+        task: &str,
+        agent_id: &str,
+        branch: &str,
+    ) -> PathBuf {
+        let base = self.dir.path().join(".branchwork-worktrees");
+        let slug = self
+            .project
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project");
+        worktree::setup_worktree_in(
+            &base,
+            &self.project,
+            slug,
+            plan,
+            task,
+            agent_id,
+            branch,
+            None,  // base off HEAD
+            false, // fresh start, not a continue
+        )
+        .expect("setup_worktree_for_test: git worktree add should succeed")
     }
 }
 
