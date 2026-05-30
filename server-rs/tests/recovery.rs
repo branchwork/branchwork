@@ -573,9 +573,9 @@ fn fix_ci_validates_run_state_and_creates_recovery_branch() {
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     // Turbofish each column so the row type is inferred without a
     // 6-field tuple annotation (clippy::type_complexity).
-    let (db_branch, db_plan, db_task, db_prompt, db_cwd, db_status) = conn
+    let (db_branch, db_plan, db_task, db_prompt, db_cwd, _db_status, db_spawn_error) = conn
         .query_row(
-            "SELECT branch, plan_name, task_id, prompt, cwd, status FROM agents WHERE id = ?1",
+            "SELECT branch, plan_name, task_id, prompt, cwd, status, spawn_error FROM agents WHERE id = ?1",
             rusqlite::params![agent_id],
             |r| {
                 Ok((
@@ -585,6 +585,7 @@ fn fix_ci_validates_run_state_and_creates_recovery_branch() {
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
                 ))
             },
         )
@@ -609,15 +610,26 @@ fn fix_ci_validates_run_state_and_creates_recovery_branch() {
     // the branch checked out in the main tree, so the agent's
     // `git worktree add <path> <fix_branch>` failed ("already used by
     // worktree") and `start_pty_agent` recorded a `failed` row whose
-    // cwd is the project root. Both assertions below pin the fix: the
+    // cwd is the project root. The assertions below pin the fix: the
     // recovery agent gets its OWN per-agent worktree (cwd under the
     // test's tempdir worktree base, carrying the `<plan>/<task>-<id8>`
     // path shape), never the shared project root.
+    //
+    // We assert on `spawn_error`, NOT `status`: in CI there is no `claude`
+    // on PATH, so the driver legitimately fails to exec and the row lands
+    // at `status='failed'` — but that is a *post*-worktree-setup failure
+    // and irrelevant to this test. A worktree-setup failure is the one
+    // signal we care about, and it is recorded distinctly: `start_pty_agent`
+    // writes a `spawn_error` of "worktree setup failed: …" and pins cwd to
+    // the project root. Both of those, not the bare `failed` status, are the
+    // regression shape.
     let cwd = db_cwd.expect("fix-ci agent cwd recorded");
-    assert_ne!(
-        db_status.as_deref(),
-        Some("failed"),
-        "recovery agent should not fail at worktree setup (cwd={cwd})"
+    assert!(
+        !db_spawn_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("worktree setup failed"),
+        "recovery agent must not fail at worktree setup (spawn_error={db_spawn_error:?}, cwd={cwd})"
     );
     assert_ne!(
         std::path::Path::new(&cwd),

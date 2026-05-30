@@ -110,6 +110,56 @@ fn agent_row(d: &TestDashboard, agent_id: &str) -> (Option<String>, Option<Strin
     .expect("agents row for fix-ci agent")
 }
 
+/// The agent's working directory as recorded by `start_pty_agent`. With
+/// worktree-per-agent isolation on (the default), this is the agent's own
+/// linked worktree under `$BRANCHWORK_WORKTREE_BASE`, NOT the shared project
+/// tree — the recovery agent commits its fix here, so the test must too.
+fn agent_cwd(d: &TestDashboard, agent_id: &str) -> std::path::PathBuf {
+    let conn = rusqlite::Connection::open(d.dir.path().join(".claude/branchwork.db")).unwrap();
+    let cwd: String = conn
+        .query_row(
+            "SELECT cwd FROM agents WHERE id = ?1",
+            rusqlite::params![agent_id],
+            |r| r.get(0),
+        )
+        .expect("agents row for fix-ci agent");
+    std::path::PathBuf::from(cwd)
+}
+
+/// Block until the agent reaches a terminal status, then add a grace window
+/// for the supervisor-exit handler to finish. The recovery agent is spawned
+/// with no `claude` on PATH (CI) / a transient one (dev box): either way the
+/// PTY child dies and `on_agent_exit` flips the row to `failed` and *then*
+/// — a few awaits later — may tear down the per-agent worktree
+/// (`cleanup_worktree_for_terminated_agent`). Rebuilding the worktree before
+/// that async cleanup completes is the race that made this test flaky; once
+/// the row is terminal and the grace has elapsed, `on_agent_exit` has fired
+/// exactly once and returned, so nothing async will touch the worktree again.
+fn wait_until_terminal(d: &TestDashboard, agent_id: &str) {
+    let conn = rusqlite::Connection::open(d.dir.path().join(".claude/branchwork.db")).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM agents WHERE id = ?1",
+                rusqlite::params![agent_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if matches!(status.as_deref(), Some("failed" | "completed" | "killed")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent {agent_id} never reached a terminal status (last={status:?})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Grace: let on_agent_exit's post-status cleanup (worktree teardown,
+    // socket/pidfile removal) run to completion before we rebuild.
+    std::thread::sleep(std::time::Duration::from_millis(750));
+}
+
 #[test]
 fn fix_ci_records_trunk_as_source_branch_not_fix_branch() {
     // The bug-catching assertion. Before the b77d9c0 → 8f468f5 fix and
@@ -213,29 +263,67 @@ fn fix_ci_branch_merges_after_a_real_fix_commit() {
     let agent_id = body["agentId"].as_str().unwrap().to_string();
     let fix_branch = body["branch"].as_str().unwrap().to_string();
 
-    // Add a commit on the fix branch — the work the recovery agent
-    // would produce. The fix-CI handler left the working tree on the
-    // fix branch (its last `git checkout -b <fix>`), so we commit
-    // straight there. We also need to mark the agent as `completed`
-    // so the merge endpoint accepts it: `start_pty_agent` inserts the
-    // row at `status='starting'` and the supervisor would normally
-    // flip it to `running`/`completed` on exit, but in the test env
-    // the supervisor never fully spawns (claude isn't on PATH).
-    std::fs::write(d.project.join("fix.txt"), "the fix").unwrap();
+    // Reproduce the end-state of a *completed* recovery agent: a live
+    // per-agent worktree checked out on the fix branch, carrying the fix
+    // commit. With worktree isolation on (the default) the agent runs in its
+    // OWN linked worktree, not the shared project tree — committing in
+    // `d.project` would advance master and leave the fix branch empty.
+    //
+    // We can't run a real `claude` agent here, and the spawn's transient
+    // worktree is environment-dependent: when `claude` is missing (CI) the
+    // supervisor fails to start and `cleanup_worktree_for_terminated_agent`
+    // tears the worktree down, leaving `agents.cwd` pointing at a removed
+    // directory; when `claude` is present (a dev box) it lingers. Normalise
+    // to a known state — drop whatever the spawn left, then re-attach a
+    // worktree to the surviving fix-branch ref at the agent's recorded cwd,
+    // exactly as a completed agent would have left it. The fix-CI handler's
+    // `git branch <fix_branch>` ref survives worktree teardown, so it's always
+    // there to attach.
+    //
+    // First wait for the spawned agent to go terminal and for its async
+    // worktree cleanup to quiesce — otherwise that teardown races (and wins
+    // against) the rebuild below, which is exactly what made this test flaky.
+    wait_until_terminal(&d, &agent_id);
+
+    let worktree = agent_cwd(&d, &agent_id);
+    let worktree_str = worktree.to_str().unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_str])
+        .current_dir(&d.project)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(&d.project)
+        .output();
+    let add_wt = std::process::Command::new("git")
+        .args(["worktree", "add", worktree_str, &fix_branch])
+        .current_dir(&d.project)
+        .output()
+        .unwrap();
+    assert!(
+        add_wt.status.success(),
+        "re-attach worktree to fix branch: {}",
+        String::from_utf8_lossy(&add_wt.stderr)
+    );
+
+    std::fs::write(worktree.join("fix.txt"), "the fix").unwrap();
     let add = std::process::Command::new("git")
         .args(["add", "fix.txt"])
-        .current_dir(&d.project)
+        .current_dir(&worktree)
         .status()
         .unwrap();
     assert!(add.success());
     let commit = std::process::Command::new("git")
         .args(["commit", "-q", "-m", "fix the broken thing"])
-        .current_dir(&d.project)
+        .current_dir(&worktree)
         .status()
         .unwrap();
     assert!(commit.success());
-    let fix_sha = head_sha(&d.project);
+    let fix_sha = head_sha(&worktree);
     assert_ne!(fix_sha, sha, "fix commit should advance the branch");
+    // Branch refs are shared across all worktrees of a repo, so the main
+    // project tree sees the fix branch advance even though the commit was
+    // made in the agent's linked worktree.
     assert_eq!(
         rev_parse(&d.project, &fix_branch),
         fix_sha,
