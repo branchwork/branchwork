@@ -18,7 +18,7 @@
 
 #![allow(dead_code)] // Both binaries include this module but each uses a different subset.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::saas::runner_protocol::{GhRun, MergeOutcome};
@@ -129,6 +129,49 @@ fn git_head_sha(cwd: &Path) -> Option<String> {
 
 // ── Merge / push ────────────────────────────────────────────────────────────
 
+/// Resolve the **main** working tree for the repo containing `cwd`.
+///
+/// Per-agent worktree isolation runs each agent in a *linked* worktree, but a
+/// merge has to `git checkout <trunk>` — and git refuses to check out a branch
+/// already checked out in another worktree (the trunk lives in the main one).
+/// So merge / push must run in the main worktree, never the agent's linked
+/// one. The main worktree is the one whose `.git` is a real *directory*
+/// (linked worktrees carry a `gitdir:` pointer *file*); porcelain ordering is
+/// not stable across git versions, so the main tree is identified structurally
+/// rather than positionally. Falls back to `cwd` when resolution fails (not a
+/// repo, or a single-tree repo) so non-worktree callers are unchanged.
+pub fn main_worktree(cwd: &Path) -> PathBuf {
+    let out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(cwd)
+        .output();
+    if let Ok(o) = out
+        && o.status.success()
+    {
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("worktree ")
+                && Path::new(rest).join(".git").is_dir()
+            {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    cwd.to_path_buf()
+}
+
+/// Best-effort `git branch -D <branch>` in `cwd`. The merge path uses this to
+/// drop a just-merged task branch *after* its linked worktree has been removed
+/// — until then `git branch -d` refuses because the branch is still checked
+/// out there. Silent on failure: a lingering branch ref is cosmetic, not
+/// corrupting, and the dashboard's branch column is cleared in the DB anyway.
+pub fn delete_local_branch(cwd: &Path, branch: &str) {
+    let _ = Command::new("git")
+        .args(["branch", "-D", branch])
+        .current_dir(cwd)
+        .output();
+}
+
 /// Run the five-step merge sequence locally:
 ///
 ///   1. `git rev-list --count <target>..<task_branch>` — empty-branch guard.
@@ -141,6 +184,18 @@ fn git_head_sha(cwd: &Path) -> Option<String> {
 /// flows from both the standalone path and the runner reply into the server's
 /// HTTP layer.
 pub fn merge_branch_local(cwd: &Path, target: &str, task_branch: &str) -> MergeOutcome {
+    // Per-agent worktree isolation: the agent committed on `task_branch` in a
+    // *linked* worktree, but the merge must run in the *main* worktree where
+    // `target` (the trunk) lives — `git checkout <target>` fails inside the
+    // linked tree because the trunk is checked out in the main one. Resolve it
+    // up front; a non-worktree repo resolves to `cwd` itself, so the legacy /
+    // shared-tree path is byte-identical to before. Note: with worktrees on,
+    // step 4's `git branch -d <task_branch>` below cannot drop the branch
+    // (still checked out in the agent's linked worktree) — the merge caller
+    // removes that worktree and then deletes the branch.
+    let main_tree = main_worktree(cwd);
+    let cwd: &Path = &main_tree;
+
     // 1. Empty-branch guard. If `rev-list` itself fails (deleted ref, detached
     //    HEAD, etc) we fall through permissively — the merge below will
     //    return its own clearer error.

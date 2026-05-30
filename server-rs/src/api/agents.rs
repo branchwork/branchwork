@@ -945,6 +945,16 @@ pub async fn merge_agent_branch_inner(
         }),
     );
 
+    // With worktrees on, the merge ran in the *main* worktree (resolved inside
+    // `merge_branch_local`), not the agent's linked `cwd`. Resolve the same
+    // main tree here so the post-merge push and branch cleanup run where the
+    // merged trunk actually lives — the agent's worktree is on `task_branch`
+    // (wrong HEAD for `push_branch`'s rebase path) and is about to be removed.
+    // A non-worktree / legacy `cwd` resolves to itself, so this is a no-op
+    // there.
+    let agent_cwd = std::path::Path::new(&cwd);
+    let main_tree = crate::git_helpers::main_worktree(agent_cwd);
+
     // Kick off CI pipeline (push to origin, record pending run).
     // Only possible when we know which task this agent was for, and when
     // the merged SHA is non-empty (runner-side cleanup may leave it blank
@@ -960,7 +970,7 @@ pub async fn merge_agent_branch_inner(
             runners: state.runners.clone(),
             org_id: org_id.clone(),
             broadcast_tx: state.broadcast_tx.clone(),
-            cwd: std::path::PathBuf::from(&cwd),
+            cwd: main_tree.clone(),
             plan_name: plan,
             task_number: task,
             agent_id: agent_id.to_string(),
@@ -978,7 +988,15 @@ pub async fn merge_agent_branch_inner(
     // return early, so a conflicted worktree is left in place for the Phase 3
     // at-merge resolver. Runs for every merge route (manual dashboard merge,
     // auto-mode loop, cadence drain) because they all converge here.
-    crate::agents::remove_agent_worktree(std::path::Path::new(&cwd));
+    crate::agents::remove_agent_worktree(agent_cwd);
+
+    // Drop the merged task branch. `merge_branch_local`'s own `git branch -d`
+    // (step 4) could not while the branch was checked out in the agent's
+    // linked worktree; now that the worktree is gone, delete it from the main
+    // tree so the branch list / merge dropdown stops advertising a dead ref.
+    // Best-effort + idempotent: a legacy merge already deleted it (this is a
+    // harmless no-op), and a lingering ref is cosmetic, not corrupting.
+    crate::git_helpers::delete_local_branch(&main_tree, &task_branch);
 
     MergeOutcome {
         merged_sha: Some(merged_sha),

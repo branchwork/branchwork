@@ -110,6 +110,22 @@ fn agent_row(d: &TestDashboard, agent_id: &str) -> (Option<String>, Option<Strin
     .expect("agents row for fix-ci agent")
 }
 
+/// The agent's working directory as recorded by `start_pty_agent`. With
+/// worktree-per-agent isolation on (the default), this is the agent's own
+/// linked worktree under `$BRANCHWORK_WORKTREE_BASE`, NOT the shared project
+/// tree — the recovery agent commits its fix here, so the test must too.
+fn agent_cwd(d: &TestDashboard, agent_id: &str) -> std::path::PathBuf {
+    let conn = rusqlite::Connection::open(d.dir.path().join(".claude/branchwork.db")).unwrap();
+    let cwd: String = conn
+        .query_row(
+            "SELECT cwd FROM agents WHERE id = ?1",
+            rusqlite::params![agent_id],
+            |r| r.get(0),
+        )
+        .expect("agents row for fix-ci agent");
+    std::path::PathBuf::from(cwd)
+}
+
 #[test]
 fn fix_ci_records_trunk_as_source_branch_not_fix_branch() {
     // The bug-catching assertion. Before the b77d9c0 → 8f468f5 fix and
@@ -214,28 +230,35 @@ fn fix_ci_branch_merges_after_a_real_fix_commit() {
     let fix_branch = body["branch"].as_str().unwrap().to_string();
 
     // Add a commit on the fix branch — the work the recovery agent
-    // would produce. The fix-CI handler left the working tree on the
-    // fix branch (its last `git checkout -b <fix>`), so we commit
-    // straight there. We also need to mark the agent as `completed`
-    // so the merge endpoint accepts it: `start_pty_agent` inserts the
-    // row at `status='starting'` and the supervisor would normally
-    // flip it to `running`/`completed` on exit, but in the test env
-    // the supervisor never fully spawns (claude isn't on PATH).
-    std::fs::write(d.project.join("fix.txt"), "the fix").unwrap();
+    // would produce. With worktree-per-agent isolation on (the default),
+    // the agent runs in its OWN linked worktree, not the shared project
+    // tree, so the fix-CI handler did NOT check the fix branch out in
+    // `d.project` — committing there would advance master and leave the
+    // fix branch empty. Commit in the agent's worktree (its recorded
+    // `cwd`) so the shared `fix_branch` ref actually advances. We also
+    // mark the agent `completed` so the merge endpoint accepts it:
+    // `start_pty_agent` inserts the row at `status='starting'` and the
+    // supervisor would normally flip it on exit, but in the test env the
+    // supervisor never fully spawns (claude isn't on PATH).
+    let worktree = agent_cwd(&d, &agent_id);
+    std::fs::write(worktree.join("fix.txt"), "the fix").unwrap();
     let add = std::process::Command::new("git")
         .args(["add", "fix.txt"])
-        .current_dir(&d.project)
+        .current_dir(&worktree)
         .status()
         .unwrap();
     assert!(add.success());
     let commit = std::process::Command::new("git")
         .args(["commit", "-q", "-m", "fix the broken thing"])
-        .current_dir(&d.project)
+        .current_dir(&worktree)
         .status()
         .unwrap();
     assert!(commit.success());
-    let fix_sha = head_sha(&d.project);
+    let fix_sha = head_sha(&worktree);
     assert_ne!(fix_sha, sha, "fix commit should advance the branch");
+    // Branch refs are shared across all worktrees of a repo, so the main
+    // project tree sees the fix branch advance even though the commit was
+    // made in the agent's linked worktree.
     assert_eq!(
         rev_parse(&d.project, &fix_branch),
         fix_sha,
