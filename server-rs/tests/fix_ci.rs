@@ -126,6 +126,40 @@ fn agent_cwd(d: &TestDashboard, agent_id: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(cwd)
 }
 
+/// Block until the agent reaches a terminal status, then add a grace window
+/// for the supervisor-exit handler to finish. The recovery agent is spawned
+/// with no `claude` on PATH (CI) / a transient one (dev box): either way the
+/// PTY child dies and `on_agent_exit` flips the row to `failed` and *then*
+/// — a few awaits later — may tear down the per-agent worktree
+/// (`cleanup_worktree_for_terminated_agent`). Rebuilding the worktree before
+/// that async cleanup completes is the race that made this test flaky; once
+/// the row is terminal and the grace has elapsed, `on_agent_exit` has fired
+/// exactly once and returned, so nothing async will touch the worktree again.
+fn wait_until_terminal(d: &TestDashboard, agent_id: &str) {
+    let conn = rusqlite::Connection::open(d.dir.path().join(".claude/branchwork.db")).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM agents WHERE id = ?1",
+                rusqlite::params![agent_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if matches!(status.as_deref(), Some("failed" | "completed" | "killed")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent {agent_id} never reached a terminal status (last={status:?})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Grace: let on_agent_exit's post-status cleanup (worktree teardown,
+    // socket/pidfile removal) run to completion before we rebuild.
+    std::thread::sleep(std::time::Duration::from_millis(750));
+}
+
 #[test]
 fn fix_ci_records_trunk_as_source_branch_not_fix_branch() {
     // The bug-catching assertion. Before the b77d9c0 → 8f468f5 fix and
@@ -245,6 +279,12 @@ fn fix_ci_branch_merges_after_a_real_fix_commit() {
     // exactly as a completed agent would have left it. The fix-CI handler's
     // `git branch <fix_branch>` ref survives worktree teardown, so it's always
     // there to attach.
+    //
+    // First wait for the spawned agent to go terminal and for its async
+    // worktree cleanup to quiesce — otherwise that teardown races (and wins
+    // against) the rebuild below, which is exactly what made this test flaky.
+    wait_until_terminal(&d, &agent_id);
+
     let worktree = agent_cwd(&d, &agent_id);
     let worktree_str = worktree.to_str().unwrap();
     let _ = std::process::Command::new("git")
