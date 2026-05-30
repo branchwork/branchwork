@@ -229,18 +229,43 @@ fn fix_ci_branch_merges_after_a_real_fix_commit() {
     let agent_id = body["agentId"].as_str().unwrap().to_string();
     let fix_branch = body["branch"].as_str().unwrap().to_string();
 
-    // Add a commit on the fix branch — the work the recovery agent
-    // would produce. With worktree-per-agent isolation on (the default),
-    // the agent runs in its OWN linked worktree, not the shared project
-    // tree, so the fix-CI handler did NOT check the fix branch out in
-    // `d.project` — committing there would advance master and leave the
-    // fix branch empty. Commit in the agent's worktree (its recorded
-    // `cwd`) so the shared `fix_branch` ref actually advances. We also
-    // mark the agent `completed` so the merge endpoint accepts it:
-    // `start_pty_agent` inserts the row at `status='starting'` and the
-    // supervisor would normally flip it on exit, but in the test env the
-    // supervisor never fully spawns (claude isn't on PATH).
+    // Reproduce the end-state of a *completed* recovery agent: a live
+    // per-agent worktree checked out on the fix branch, carrying the fix
+    // commit. With worktree isolation on (the default) the agent runs in its
+    // OWN linked worktree, not the shared project tree — committing in
+    // `d.project` would advance master and leave the fix branch empty.
+    //
+    // We can't run a real `claude` agent here, and the spawn's transient
+    // worktree is environment-dependent: when `claude` is missing (CI) the
+    // supervisor fails to start and `cleanup_worktree_for_terminated_agent`
+    // tears the worktree down, leaving `agents.cwd` pointing at a removed
+    // directory; when `claude` is present (a dev box) it lingers. Normalise
+    // to a known state — drop whatever the spawn left, then re-attach a
+    // worktree to the surviving fix-branch ref at the agent's recorded cwd,
+    // exactly as a completed agent would have left it. The fix-CI handler's
+    // `git branch <fix_branch>` ref survives worktree teardown, so it's always
+    // there to attach.
     let worktree = agent_cwd(&d, &agent_id);
+    let worktree_str = worktree.to_str().unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_str])
+        .current_dir(&d.project)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(&d.project)
+        .output();
+    let add_wt = std::process::Command::new("git")
+        .args(["worktree", "add", worktree_str, &fix_branch])
+        .current_dir(&d.project)
+        .output()
+        .unwrap();
+    assert!(
+        add_wt.status.success(),
+        "re-attach worktree to fix branch: {}",
+        String::from_utf8_lossy(&add_wt.stderr)
+    );
+
     std::fs::write(worktree.join("fix.txt"), "the fix").unwrap();
     let add = std::process::Command::new("git")
         .args(["add", "fix.txt"])
