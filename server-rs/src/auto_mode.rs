@@ -5939,7 +5939,9 @@ mod tests {
             }
             WireMessage::MergeBranch { .. } => {
                 Some(RunnerResponse::MergeResult(WireMergeOutcome::Conflict {
-                    stderr: "CONFLICT (content): Merge conflict in foo.txt".into(),
+                    conflicted_paths: vec!["foo.txt".into()],
+                    our_diff: "diff --git a/foo.txt b/foo.txt\n+task side\n".into(),
+                    their_diff: "diff --git a/foo.txt b/foo.txt\n+target side\n".into(),
                 }))
             }
             _ => None,

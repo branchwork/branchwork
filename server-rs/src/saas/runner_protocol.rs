@@ -1010,10 +1010,27 @@ pub enum MergeOutcome {
     /// `git checkout <target>` failed (dirty tree, missing branch, etc).
     /// Server returns HTTP 500 with the captured stderr.
     CheckoutFailed { stderr: String },
-    /// `git merge` reported a conflict; the runner already ran
-    /// `git merge --abort` so the working tree is clean. Server returns
-    /// HTTP 409.
-    Conflict { stderr: String },
+    /// `git merge` reported a true content/tree conflict — `git status
+    /// --porcelain` showed unmerged (`UU` / `AA` / `DD` / …) index entries.
+    /// The runner already ran `git merge --abort` so the working tree is
+    /// clean again. The structured payload is captured *before* the abort
+    /// (the unmerged path list, read off the working tree) and from the
+    /// committed refs (the two diffs against the merge-base), so the Phase 3
+    /// at-merge resolver can reconstruct the three-way conflict without
+    /// re-running the merge. Server returns HTTP 409.
+    Conflict {
+        /// Files git left in an unmerged state, from `git status
+        /// --porcelain`. Always non-empty for this variant — a non-zero
+        /// `git merge` exit with no unmerged entries maps to `Other`.
+        conflicted_paths: Vec<String>,
+        /// `git diff <merge-base> <task_branch>` — what the agent's task
+        /// branch changed since the common ancestor ("our" side, from the
+        /// task's perspective).
+        our_diff: String,
+        /// `git diff <merge-base> <target>` — what the target branch
+        /// changed since the common ancestor ("their" side).
+        their_diff: String,
+    },
     /// Anything else that went wrong (process spawn failed, rev-parse
     /// returned no SHA, runtime error). Server returns HTTP 500.
     Other { stderr: String },
@@ -2377,22 +2394,20 @@ mod tests {
 
     #[test]
     fn merge_result_conflict_round_trip() {
-        let outcome = assert_merge_result_round_trip(
-            "req-15",
-            MergeOutcome::Conflict {
-                stderr: "Auto-merging README.md\nCONFLICT (content): Merge conflict in README.md"
-                    .into(),
-            },
-        );
-        assert_eq!(
-            outcome,
-            MergeOutcome::Conflict {
-                stderr: "Auto-merging README.md\nCONFLICT (content): Merge conflict in README.md"
-                    .into(),
-            }
-        );
+        let conflict = MergeOutcome::Conflict {
+            conflicted_paths: vec!["README.md".into(), "src/lib.rs".into()],
+            our_diff: "diff --git a/README.md b/README.md\n+task side\n".into(),
+            their_diff: "diff --git a/README.md b/README.md\n+target side\n".into(),
+        };
+        let outcome = assert_merge_result_round_trip("req-15", conflict.clone());
+        assert_eq!(outcome, conflict);
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(json.contains("\"kind\":\"conflict\""));
+        // The structured fields must survive the round-trip — the Phase 3
+        // resolver reads conflicted_paths + both diffs off this payload.
+        assert!(json.contains("conflicted_paths"));
+        assert!(json.contains("our_diff"));
+        assert!(json.contains("their_diff"));
     }
 
     #[test]

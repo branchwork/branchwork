@@ -903,13 +903,18 @@ pub async fn merge_agent_branch_inner(
                 error: Some(format!("Failed to checkout {target}: {stderr}")),
             };
         }
-        WireMergeOutcome::Conflict { stderr } => {
+        WireMergeOutcome::Conflict {
+            conflicted_paths, ..
+        } => {
             return MergeOutcome {
                 merged_sha: None,
                 target_branch: target,
                 task_branch,
                 had_conflict: true,
-                error: Some(format!("Merge conflict: {stderr}")),
+                error: Some(format!(
+                    "Merge conflict in: {}",
+                    conflicted_paths.join(", ")
+                )),
             };
         }
         WireMergeOutcome::Other { stderr } => {

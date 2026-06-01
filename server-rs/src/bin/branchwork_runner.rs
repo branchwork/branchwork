@@ -3200,11 +3200,16 @@ fn merge_agent_branch_on_runner(cwd: &Path, into: Option<&str>) -> AgentMergeRes
             had_conflict: false,
             error: Some("empty_branch".to_string()),
         },
-        MergeOutcome::Conflict { stderr } => AgentMergeResult {
+        MergeOutcome::Conflict {
+            conflicted_paths, ..
+        } => AgentMergeResult {
             merged_sha: None,
             target_branch: target,
             had_conflict: true,
-            error: Some(stderr),
+            error: Some(format!(
+                "merge conflict in: {}",
+                conflicted_paths.join(", ")
+            )),
         },
         MergeOutcome::CheckoutFailed { stderr } => AgentMergeResult {
             merged_sha: None,
@@ -5184,8 +5189,16 @@ mod tests {
         match reply {
             WireMessage::MergeResult {
                 req_id,
-                outcome: MergeOutcome::Conflict { stderr: _ },
-            } => assert_eq!(req_id, "req-5"),
+                outcome:
+                    MergeOutcome::Conflict {
+                        conflicted_paths, ..
+                    },
+            } => {
+                assert_eq!(req_id, "req-5");
+                // The runner reports the unmerged path even though it
+                // aborted the merge before replying.
+                assert_eq!(conflicted_paths, vec!["c.txt".to_string()]);
+            }
             other => panic!("expected MergeResult::Conflict, got {other:?}"),
         }
         // Acceptance: runner must have aborted cleanly — no leftover MERGE_HEAD.

@@ -252,18 +252,235 @@ pub fn merge_branch_local(cwd: &Path, target: &str, task_branch: &str) -> MergeO
             MergeOutcome::Ok { merged_sha }
         }
         Ok(output) => {
+            // `git merge` exited non-zero. Distinguish a genuine content/tree
+            // conflict (git left unmerged index entries in the working tree)
+            // from any other merge failure (refusing to merge unrelated
+            // histories, a bad ref, "would overwrite local changes", etc).
+            //
+            // The conflicted-path scan reads the working tree, so it MUST run
+            // before the `git merge --abort` below — the abort throws those
+            // files away. The two diffs read only committed refs, so they're
+            // safe either way; we snapshot them here so the whole payload is
+            // built in one place before we clean up.
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            // Abort the failed merge so the working tree is clean.
+            let conflicted_paths = collect_conflicted_paths(cwd);
+            let outcome = if conflicted_paths.is_empty() {
+                // Non-conflict merge failure — keep the generic variant so
+                // callers can tell "the agent's work conflicts with the
+                // target" (recoverable by the resolver) apart from "git
+                // refused for an unrelated reason" (operator follow-up).
+                MergeOutcome::Other { stderr }
+            } else {
+                let (our_diff, their_diff) = capture_conflict_diffs(cwd, task_branch, target);
+                MergeOutcome::Conflict {
+                    conflicted_paths,
+                    our_diff,
+                    their_diff,
+                }
+            };
+            // Abort the failed merge so the working tree returns to a clean
+            // `target` checkout. Both arms leave a clean tree behind; the
+            // durable conflict payload is already captured above.
             Command::new("git")
                 .args(["merge", "--abort"])
                 .current_dir(cwd)
                 .output()
                 .ok();
-            MergeOutcome::Conflict { stderr }
+            outcome
         }
         Err(e) => MergeOutcome::Other {
             stderr: format!("Failed to run git merge: {e}"),
         },
+    }
+}
+
+/// After a failed `git merge`, collect every path git left in an unmerged
+/// state. `git status --porcelain` is the authoritative signal: any entry
+/// whose two-char XY code is an unmerged state (`DD AU UD UA DU AA UU`) is a
+/// conflict — this covers binary conflicts and delete/delete that carry no
+/// text markers. As a robustness net we also run the in-process conflict-
+/// marker parser over each *modified/added* file's on-disk content (exactly
+/// what git left after the failed merge); a text file that somehow carries
+/// `<<<<<<<` / `=======` / `>>>>>>>` blocks without an unmerged index entry
+/// is still surfaced. Paths are returned sorted + de-duplicated for stable
+/// test / audit output. Empty `Vec` means "no conflict" — the caller routes
+/// the failure to `MergeOutcome::Other` instead.
+fn collect_conflicted_paths(cwd: &Path) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output();
+    if let Ok(out) = &status
+        && out.status.success()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            // Porcelain v1: "XY <path>" — two status chars, a single space,
+            // then the path from column 3 onward.
+            if line.len() < 4 {
+                continue;
+            }
+            let xy = &line[..2];
+            let path = porcelain_path(&line[3..]);
+            if path.is_empty() {
+                continue;
+            }
+            let is_conflict = is_unmerged_status(xy)
+                || (is_modified_status(xy) && file_has_conflict_markers(&cwd.join(&path)));
+            if is_conflict {
+                paths.insert(path);
+            }
+        }
+    }
+
+    paths.into_iter().collect()
+}
+
+/// The seven porcelain XY codes git uses for an unmerged index entry.
+fn is_unmerged_status(xy: &str) -> bool {
+    matches!(xy, "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU")
+}
+
+/// XY codes for a file present + changed in the working tree (added or
+/// modified) — the only place a stray conflict marker could plausibly live.
+fn is_modified_status(xy: &str) -> bool {
+    xy.bytes().any(|c| c == b'M' || c == b'A')
+}
+
+/// Extract the path from the tail of a `git status --porcelain` line
+/// (everything after the "XY " prefix). When `core.quotePath` is on (the
+/// default) paths with unusual bytes are wrapped in double quotes with
+/// C-style escapes; we strip the surrounding quotes so the common case (and
+/// tests) get the bare path. Full unescaping is intentionally skipped — the
+/// conflicted-path list is for display / resolver hinting, not for re-opening
+/// the file by this exact string.
+fn porcelain_path(tail: &str) -> String {
+    let t = tail.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        t[1..t.len() - 1].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Read a file and report whether it contains at least one well-formed
+/// conflict block, via the in-process [`parse_conflict_markers`] parser.
+/// Lossy UTF-8 decode (a binary file won't contain the ASCII marker lines
+/// anyway); a missing/unreadable file is `false`.
+fn file_has_conflict_markers(path: &Path) -> bool {
+    match std::fs::read(path) {
+        Ok(bytes) => !parse_conflict_markers(&String::from_utf8_lossy(&bytes)).is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// A single conflict region parsed out of a file's on-disk content: the
+/// "ours" lines (between `<<<<<<<` and `=======`) and the "theirs" lines
+/// (between `=======` and `>>>>>>>`), captured verbatim from what git left
+/// in the working tree after a failed merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictRegion {
+    pub ours: Vec<String>,
+    pub theirs: Vec<String>,
+}
+
+/// Small in-process parser for git conflict markers — the "file content is
+/// what git left on disk after the failed merge" capture. Walks `content`
+/// line-by-line and pairs each `<<<<<<<` … `=======` … `>>>>>>>` block into
+/// a [`ConflictRegion`]. Tolerant of the diff3 `|||||||` base section (its
+/// lines are skipped). An unterminated block (no closing `>>>>>>>`) is
+/// dropped — only well-formed regions are returned. Empty `Vec` for content
+/// with no markers (the common, non-conflict case).
+fn parse_conflict_markers(content: &str) -> Vec<ConflictRegion> {
+    // Default git conflict-marker width is 7; we match a 7-char run as the
+    // conventional detection (a longer run still starts with these 7).
+    enum Section {
+        Ours,
+        Base,
+        Theirs,
+    }
+    let mut regions = Vec::new();
+    let mut lines = content.lines();
+    while let Some(line) = lines.next() {
+        if !line.starts_with("<<<<<<<") {
+            continue;
+        }
+        let mut ours: Vec<String> = Vec::new();
+        let mut theirs: Vec<String> = Vec::new();
+        let mut section = Section::Ours;
+        let mut closed = false;
+        for inner in lines.by_ref() {
+            if inner.starts_with("|||||||") {
+                section = Section::Base; // diff3 merge-base section — skip.
+            } else if inner.starts_with("=======") {
+                section = Section::Theirs;
+            } else if inner.starts_with(">>>>>>>") {
+                closed = true;
+                break;
+            } else {
+                match section {
+                    Section::Ours => ours.push(inner.to_string()),
+                    Section::Theirs => theirs.push(inner.to_string()),
+                    Section::Base => {}
+                }
+            }
+        }
+        if closed {
+            regions.push(ConflictRegion { ours, theirs });
+        }
+    }
+    regions
+}
+
+/// Snapshot the two sides of a merge conflict as diffs against the
+/// merge-base, so the Phase 3 resolver can reconstruct the three-way merge
+/// without re-running it:
+///   - merge-base = `git merge-base <task_branch> <target>`
+///   - our_diff   = `git diff <merge-base> <task_branch>`  (the agent's work)
+///   - their_diff = `git diff <merge-base> <target>`
+///
+/// All three operate on committed refs, so they're safe to run while the
+/// failed merge is still in progress. If the merge-base can't be resolved
+/// (unrelated histories — which can't reach a conflict anyway), we fall back
+/// to diffing the two branches against each other so the payload is still
+/// populated. Diffs are returned verbatim (empty string only if `git diff`
+/// itself fails).
+fn capture_conflict_diffs(cwd: &Path, task_branch: &str, target: &str) -> (String, String) {
+    let base = git_merge_base(cwd, task_branch, target);
+    let our_from = base.as_deref().unwrap_or(target);
+    let their_from = base.as_deref().unwrap_or(task_branch);
+    let our_diff = git_diff(cwd, our_from, task_branch);
+    let their_diff = git_diff(cwd, their_from, target);
+    (our_diff, their_diff)
+}
+
+/// `git merge-base <a> <b>` — the common ancestor SHA, or `None` when the
+/// two refs share no history (or git fails).
+fn git_merge_base(cwd: &Path, a: &str, b: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["merge-base", a, b])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// `git diff <from> <to>` in `cwd`. Returns captured stdout, or the empty
+/// string if `git diff` fails. Used to snapshot each side of a conflict.
+fn git_diff(cwd: &Path, from: &str, to: &str) -> String {
+    let out = Command::new("git")
+        .args(["diff", from, to])
+        .current_dir(cwd)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => String::new(),
     }
 }
 
@@ -908,7 +1125,10 @@ mod tests {
     }
 
     #[test]
-    fn merge_branch_conflict_aborts_cleanly() {
+    fn merge_branch_conflict_returns_paths_and_diffs() {
+        // Acceptance (Task 3.1): a real conflict returns
+        // MergeOutcome::Conflict with non-empty conflicted_paths and BOTH
+        // diffs populated, and leaves a clean tree behind.
         let dir = TempDir::new().unwrap();
         git_init_with_commit(dir.path(), "master");
         let run = |args: &[&str]| {
@@ -918,7 +1138,8 @@ mod tests {
                 .status()
                 .unwrap();
         };
-        // Set up two divergent commits touching the same file.
+        // Set up two divergent commits touching the same line of the same
+        // file — guaranteed content conflict.
         std::fs::write(dir.path().join("conflict.txt"), "base\n").unwrap();
         run(&["add", "conflict.txt"]);
         run(&["commit", "-m", "base"]);
@@ -934,9 +1155,129 @@ mod tests {
         run(&["commit", "-m", "master change"]);
 
         let outcome = merge_branch_local(dir.path(), "master", "feature/conflict");
-        assert!(matches!(outcome, MergeOutcome::Conflict { .. }));
-        // No leftover MERGE_HEAD.
+        match outcome {
+            MergeOutcome::Conflict {
+                conflicted_paths,
+                our_diff,
+                their_diff,
+            } => {
+                assert_eq!(
+                    conflicted_paths,
+                    vec!["conflict.txt".to_string()],
+                    "expected the one conflicting file"
+                );
+                assert!(!our_diff.is_empty(), "our_diff must be populated");
+                assert!(!their_diff.is_empty(), "their_diff must be populated");
+                // our_diff = base..feature/conflict — carries the task side.
+                assert!(
+                    our_diff.contains("branch side"),
+                    "our_diff should show the task-branch change: {our_diff}"
+                );
+                // their_diff = base..master — carries the target side.
+                assert!(
+                    their_diff.contains("master side"),
+                    "their_diff should show the target change: {their_diff}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        // No leftover MERGE_HEAD — the merge was aborted after capture.
         assert!(!dir.path().join(".git/MERGE_HEAD").exists());
+    }
+
+    #[test]
+    fn merge_branch_non_conflict_failure_returns_other() {
+        // Acceptance (Task 3.1): a merge that fails for a *non-conflict*
+        // reason still maps to the existing `Other` variant, not `Conflict`.
+        // "refusing to merge unrelated histories" is the canonical clean
+        // case — git refuses up front, exits non-zero, and leaves no
+        // unmerged index entries.
+        let dir = TempDir::new().unwrap();
+        git_init_with_commit(dir.path(), "master");
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+        };
+        // A real commit on master so the merge has something to land onto.
+        std::fs::write(dir.path().join("m.txt"), "m\n").unwrap();
+        run(&["add", "m.txt"]);
+        run(&["commit", "-m", "master commit"]);
+
+        // Orphan branch — entirely unrelated history.
+        run(&["checkout", "--orphan", "feature/unrelated"]);
+        std::fs::write(dir.path().join("u.txt"), "u\n").unwrap();
+        run(&["add", "u.txt"]);
+        run(&["commit", "-m", "unrelated root"]);
+        run(&["checkout", "master"]);
+
+        let outcome = merge_branch_local(dir.path(), "master", "feature/unrelated");
+        match outcome {
+            MergeOutcome::Other { stderr } => {
+                assert!(
+                    stderr.to_lowercase().contains("unrelated"),
+                    "expected an unrelated-histories error, got: {stderr}"
+                );
+            }
+            other => panic!("expected Other (non-conflict failure), got {other:?}"),
+        }
+        assert!(!dir.path().join(".git/MERGE_HEAD").exists());
+    }
+
+    #[test]
+    fn parse_conflict_markers_extracts_ours_and_theirs() {
+        let content =
+            "line1\n<<<<<<< HEAD\nours line\n=======\ntheirs line\n>>>>>>> feature\nline2\n";
+        let regions = parse_conflict_markers(content);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].ours, vec!["ours line".to_string()]);
+        assert_eq!(regions[0].theirs, vec!["theirs line".to_string()]);
+    }
+
+    #[test]
+    fn parse_conflict_markers_handles_diff3_base_section() {
+        // diff3 conflict style adds a ||||||| base section between ours and
+        // the ======= separator; those lines must be skipped, not captured.
+        let content =
+            "<<<<<<< HEAD\nA\n||||||| merged common ancestors\nO\n=======\nB\n>>>>>>> x\n";
+        let regions = parse_conflict_markers(content);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].ours, vec!["A".to_string()]);
+        assert_eq!(regions[0].theirs, vec!["B".to_string()]);
+    }
+
+    #[test]
+    fn parse_conflict_markers_none_for_clean_content() {
+        assert!(parse_conflict_markers("just\nnormal\ntext\n").is_empty());
+    }
+
+    #[test]
+    fn parse_conflict_markers_drops_unterminated_block() {
+        // No closing >>>>>>> — a half-written block is not a region.
+        let content = "<<<<<<< HEAD\nours\n=======\ntheirs\n";
+        assert!(parse_conflict_markers(content).is_empty());
+    }
+
+    #[test]
+    fn parse_conflict_markers_multiple_regions() {
+        let content =
+            "<<<<<<< a\n1\n=======\n2\n>>>>>>> b\nmid\n<<<<<<< c\n3\n=======\n4\n>>>>>>> d\n";
+        let regions = parse_conflict_markers(content);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[1].ours, vec!["3".to_string()]);
+        assert_eq!(regions[1].theirs, vec!["4".to_string()]);
+    }
+
+    #[test]
+    fn is_unmerged_status_covers_all_seven_states() {
+        for code in ["DD", "AU", "UD", "UA", "DU", "AA", "UU"] {
+            assert!(is_unmerged_status(code), "{code} should be unmerged");
+        }
+        for code in ["M ", " M", "MM", "A ", "??", "  "] {
+            assert!(!is_unmerged_status(code), "{code} should not be unmerged");
+        }
     }
 
     // ── push_branch_local: non-FF rebase + retry ────────────────────────────
