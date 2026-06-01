@@ -904,8 +904,36 @@ pub async fn merge_agent_branch_inner(
             };
         }
         WireMergeOutcome::Conflict {
-            conflicted_paths, ..
+            conflicted_paths,
+            our_diff,
+            their_diff,
         } => {
+            // Phase 3.2: hand the conflicted worktree off to an at-merge
+            // resolver agent instead of just surfacing the conflict. The
+            // helper gates on standalone + worktrees + auto-mode (and the
+            // fix-attempt cap), so a SaaS / shared-tree / non-auto-mode /
+            // cap-hit merge is a no-op and the conflict falls through to the
+            // existing pause path unchanged (Task 3.3 turns a cap-hit into a
+            // distinct permanent pause). `had_conflict: true` is returned
+            // either way — the resolver runs in the background while the loop
+            // still pauses, and Task 3.3 wires the don't-pause-while-resolving
+            // refinement.
+            let conflict = crate::agents::ConflictPayload {
+                conflicted_paths: conflicted_paths.clone(),
+                our_diff,
+                their_diff,
+            };
+            maybe_spawn_conflict_resolver(
+                state,
+                agent_id,
+                plan_name.as_deref(),
+                task_id.as_deref(),
+                &org_id,
+                &target,
+                cwd_path,
+                conflict,
+            )
+            .await;
             return MergeOutcome {
                 merged_sha: None,
                 target_branch: target,
@@ -1009,6 +1037,86 @@ pub async fn merge_agent_branch_inner(
         task_branch,
         had_conflict: false,
         error: None,
+    }
+}
+
+/// Phase 3.2 at-merge conflict resolver hand-off, called from
+/// [`merge_agent_branch_inner`]'s conflict arm. Spawns a resolver agent in
+/// the conflicted worktree and marks the original agent
+/// [`crate::agents::MERGE_STATUS_HELD_FOR_RESOLVER`] so termination cleanup
+/// leaves the tree in place for it. No-op (the conflict falls through to the
+/// existing pause path unchanged) when any precondition fails:
+/// - the agent has no plan/task (can't scope a resolver to a task),
+/// - worktrees are disabled (no isolated tree to resolve in safely),
+/// - SaaS mode (the worktree lives on the runner; resolver dispatch there is a
+///   follow-up — `start_pty_agent` is the standalone spawn path),
+/// - auto-mode isn't enabled for the plan (the resolver is an auto-mode
+///   feature; manual merges of non-auto-mode plans keep their old behaviour),
+/// - the fix-attempt cap is already spent ([`crate::agents::SpawnError::CapHit`]
+///   — Task 3.3 turns this into a distinct permanent pause).
+#[allow(clippy::too_many_arguments)]
+async fn maybe_spawn_conflict_resolver(
+    state: &AppState,
+    original_agent_id: &str,
+    plan_name: Option<&str>,
+    task_id: Option<&str>,
+    org_id: &str,
+    target: &str,
+    worktree_path: &std::path::Path,
+    conflict: crate::agents::ConflictPayload,
+) {
+    let (Some(plan), Some(task)) = (plan_name, task_id) else {
+        return;
+    };
+    if !crate::agents::pty_agent::worktrees_enabled() {
+        return;
+    }
+    if crate::saas::dispatch::org_has_runner(&state.db, org_id) {
+        return; // SaaS: the worktree lives on the runner — follow-up.
+    }
+    if !crate::db::auto_mode_enabled(&state.db, plan) {
+        return;
+    }
+
+    let attempt = crate::db::task_fix_attempt_count(&state.db, plan, task) + 1;
+    match crate::agents::spawn_conflict_resolver(
+        &state.registry,
+        plan,
+        task,
+        target,
+        &conflict,
+        attempt,
+        worktree_path,
+    )
+    .await
+    {
+        Ok(resolver_id) => {
+            // Hold the original agent's worktree for the resolver (Task 2.4
+            // hand-off contract): termination cleanup skips a row carrying this
+            // marker, so the conflicted tree is never yanked out from under the
+            // resolver while it works.
+            {
+                let conn = state.db.lock().unwrap();
+                conn.execute(
+                    "UPDATE agents SET merge_status = ?2 WHERE id = ?1",
+                    params![
+                        original_agent_id,
+                        crate::agents::MERGE_STATUS_HELD_FOR_RESOLVER
+                    ],
+                )
+                .ok();
+            }
+            eprintln!(
+                "[merge] conflict on {plan}/{task} → spawned resolver {resolver_id} (attempt {attempt})"
+            );
+        }
+        Err(crate::agents::SpawnError::CapHit) => eprintln!(
+            "[merge] conflict on {plan}/{task} → resolver cap hit (attempt {attempt}); \
+             falling through to pause"
+        ),
+        Err(e) => eprintln!(
+            "[merge] conflict on {plan}/{task} → resolver not spawned: {e}; falling through to pause"
+        ),
     }
 }
 

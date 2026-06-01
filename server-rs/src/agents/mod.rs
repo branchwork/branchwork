@@ -469,6 +469,264 @@ pub(crate) fn cleanup_worktree_for_terminated_agent(db: &Db, agent_id: &str) {
     remove_agent_worktree(Path::new(&cwd));
 }
 
+// ── At-merge conflict resolver (Phase 3.2) ──────────────────────────────────
+
+/// Prompt template for the at-merge conflict resolver. Placeholders
+/// (`{{original_task_description}}`, `{{target_branch}}`,
+/// `{{conflicted_paths_list}}`, `{{task_id}}`, `{{our_diff}}`,
+/// `{{their_diff}}`) are substituted by [`build_resolver_prompt`].
+const RESOLVE_CONFLICT_TEMPLATE: &str = include_str!("../prompts/resolve_conflict.md");
+
+/// The structured conflict context captured by `merge_branch_local` (Task
+/// 3.1) and handed to the at-merge resolver: the unmerged paths plus both
+/// sides' diffs against the merge base. Mirrors the fields of
+/// [`crate::saas::runner_protocol::MergeOutcome::Conflict`]; the call site in
+/// [`crate::api::agents::merge_agent_branch_inner`] builds one from that wire
+/// variant.
+#[derive(Debug, Clone)]
+pub struct ConflictPayload {
+    /// Files git left in an unmerged state during the failed merge.
+    pub conflicted_paths: Vec<String>,
+    /// `git diff <merge-base> <task_branch>` — the task branch's changes.
+    pub our_diff: String,
+    /// `git diff <merge-base> <target>` — the target branch's changes.
+    pub their_diff: String,
+}
+
+/// Why [`spawn_conflict_resolver`] declined to spawn. The merge call site
+/// reacts to each: `CapHit` falls through to the permanent-pause path
+/// (Task 3.3); `NoParentAgent` is logged and the conflict surfaces unchanged.
+#[derive(Debug)]
+pub enum SpawnError {
+    /// The task has already used its `plan_auto_mode.max_fix_attempts`
+    /// budget (shared with the CI fix-on-red loop) — no resolver is spawned.
+    CapHit,
+    /// No original task agent row was found for `(plan_name, task_id)`, so
+    /// there is no parent to thread the resolver under.
+    NoParentAgent,
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::CapHit => write!(f, "fix-attempt cap reached"),
+            SpawnError::NoParentAgent => write!(f, "no parent task agent found"),
+        }
+    }
+}
+
+/// Substitute the resolver prompt template's placeholders. Pure (no I/O) so
+/// the prompt shape is unit-testable without spawning anything.
+pub fn build_resolver_prompt(
+    original_task_description: &str,
+    target_branch: &str,
+    task_id: &str,
+    conflict: &ConflictPayload,
+) -> String {
+    let conflicted_paths_list = if conflict.conflicted_paths.is_empty() {
+        "(none reported)".to_string()
+    } else {
+        conflict
+            .conflicted_paths
+            .iter()
+            .map(|p| format!("- {p}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    RESOLVE_CONFLICT_TEMPLATE
+        .replace("{{original_task_description}}", original_task_description)
+        .replace("{{target_branch}}", target_branch)
+        .replace("{{conflicted_paths_list}}", &conflicted_paths_list)
+        .replace("{{task_id}}", task_id)
+        .replace("{{our_diff}}", &conflict.our_diff)
+        .replace("{{their_diff}}", &conflict.their_diff)
+}
+
+/// Load the original task's description from its plan YAML so the resolver
+/// prompt can frame the conflict in terms of the task's intent. Returns
+/// `None` (caller substitutes a placeholder) when `app_state` isn't wired
+/// (unit-test registries) or the plan / task can't be read.
+fn load_task_description(
+    registry: &AgentRegistry,
+    plan_name: &str,
+    task_id: &str,
+) -> Option<String> {
+    let state = registry.app_state.get()?;
+    let plan_path = state.plans_dir.join(format!("{plan_name}.yaml"));
+    let plan = plan_parser::parse_plan_file(&plan_path).ok()?;
+    plan.phases
+        .iter()
+        .flat_map(|p| p.tasks.iter())
+        .find(|t| t.number == task_id)
+        .map(|t| t.description.clone())
+}
+
+/// Re-create the merge conflict on disk in the agent's worktree.
+///
+/// Task 3.1's `merge_branch_local` runs `git merge --abort` after capturing
+/// the structured payload, so no conflict markers survive on disk. The
+/// agent's worktree is still on the task branch with its committed work, so
+/// merging the target branch back in reproduces the same conflict (markers +
+/// unmerged `UU` index entries) the resolver's prompt instructs it to fix.
+///
+/// Best-effort: a clean (non-conflicting) merge just leaves a tidy tree the
+/// resolver finds already resolved, and any git error is logged and ignored —
+/// the prompt still carries both diffs, so the resolver has its context
+/// either way.
+fn reconstruct_merge_conflict(worktree_path: &Path, target_branch: &str) {
+    let out = std::process::Command::new("git")
+        .args(["merge", target_branch, "--no-edit"])
+        .current_dir(worktree_path)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => eprintln!(
+            "[resolver] reconstruct: `git merge {target_branch}` in {} merged cleanly \
+             (no conflict to reproduce)",
+            worktree_path.display()
+        ),
+        Ok(_) => { /* expected: non-zero exit means the conflict is now on disk */ }
+        Err(e) => eprintln!(
+            "[resolver] reconstruct: failed to run `git merge {target_branch}` in {}: {e}",
+            worktree_path.display()
+        ),
+    }
+}
+
+/// Spawn an at-merge conflict resolver agent for a task whose branch failed
+/// to merge cleanly.
+///
+/// Looks up the shared `task_fix_attempts` budget for the task and returns
+/// [`SpawnError::CapHit`] without spawning once `plan_auto_mode.max_fix_attempts`
+/// is exhausted. Otherwise it records the attempt, composes the prompt from
+/// [`RESOLVE_CONFLICT_TEMPLATE`] (task intent + conflicted paths + both
+/// diffs), reconstructs the conflict on disk in `worktree_path` (Task 3.1
+/// aborted the real merge), and spawns a PTY agent **in that same worktree**
+/// (`branch = None` so `start_pty_agent` reuses the conflicted tree rather
+/// than adding a fresh worktree — the target branch is already checked out in
+/// the main worktree, so a fresh `git worktree add <target>` would fail). The
+/// spawned row is badged `mode = 'resolver'` and threaded under the original
+/// task agent via `parent_agent_id` so the dashboard can render it distinctly.
+///
+/// Standalone path only (`start_pty_agent`); the SaaS dispatch caller gates
+/// this out — see [`crate::api::agents::merge_agent_branch_inner`].
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_conflict_resolver(
+    registry: &AgentRegistry,
+    plan_name: &str,
+    task_id: &str,
+    target_branch: &str,
+    conflict: &ConflictPayload,
+    attempt: u32,
+    worktree_path: &Path,
+) -> Result<AgentId, SpawnError> {
+    // 1. Cap check — a conflict resolver counts against the same
+    //    `task_fix_attempts` / `plan_auto_mode.max_fix_attempts` budget as a
+    //    CI fix agent. `count >= max` means the budget is spent; the caller
+    //    turns `CapHit` into a permanent pause (Task 3.3). `attempt` is the
+    //    1-based number of this resolver (the caller passes `count + 1`).
+    let max = crate::db::plan_max_fix_attempts(&registry.db, plan_name);
+    let count = crate::db::task_fix_attempt_count(&registry.db, plan_name, task_id);
+    if count >= max {
+        return Err(SpawnError::CapHit);
+    }
+
+    // 2. Find the original task agent — the parent the dashboard threads the
+    //    resolver under. Most-recent row for this exact (plan, task); fix /
+    //    resolver rows carry suffixed task ids (`-fix-N` / `-resolve-N`) so an
+    //    exact `task_id` match never picks one of them up. Capture its org
+    //    for the spawn.
+    let (parent_agent_id, org_id): (String, String) = {
+        let conn = registry.db.lock().unwrap();
+        conn.query_row(
+            "SELECT id, org_id FROM agents \
+             WHERE plan_name = ?1 AND task_id = ?2 \
+             ORDER BY started_at DESC LIMIT 1",
+            rusqlite::params![plan_name, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| SpawnError::NoParentAgent)?
+    };
+
+    // 3. Record the attempt BEFORE the spawn (agent_id NULL until the spawn
+    //    returns) so a kill mid-spawn still increments the cap count. PK
+    //    (plan, task, attempt) makes this idempotent on retry.
+    {
+        let conn = registry.db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_fix_attempts \
+                (plan_name, task_number, attempt, started_at) \
+             VALUES (?1, ?2, ?3, datetime('now')) \
+             ON CONFLICT(plan_name, task_number, attempt) DO NOTHING",
+            rusqlite::params![plan_name, task_id, attempt as i64],
+        )
+        .ok();
+    }
+
+    // 4. Compose the prompt. Task description comes from the plan YAML (the
+    //    authoritative source of task intent); fall back to a placeholder when
+    //    it isn't reachable (no app_state / missing plan).
+    let original_task_description = load_task_description(registry, plan_name, task_id)
+        .unwrap_or_else(|| "(original task description unavailable)".to_string());
+    let prompt =
+        build_resolver_prompt(&original_task_description, target_branch, task_id, conflict);
+
+    // 5. Re-create the conflict on disk so the prompt's instructions match
+    //    what the resolver sees in its working tree.
+    reconstruct_merge_conflict(worktree_path, target_branch);
+
+    // 6. Spawn in the agent's existing worktree (see the fn doc for the
+    //    `branch = None` rationale). The `-resolve-<n>` task-id marker keeps
+    //    the resolver distinguishable from the original task agent on the
+    //    completion path.
+    let resolver_task_id = format!("{task_id}-resolve-{attempt}");
+    let effort = registry
+        .app_state
+        .get()
+        .map(|s| *s.effort.lock().unwrap())
+        .unwrap_or(Effort::High);
+    let resolver_id = pty_agent::start_pty_agent(
+        registry,
+        pty_agent::StartPtyOpts {
+            prompt,
+            cwd: worktree_path,
+            plan_name: Some(plan_name),
+            task_id: Some(&resolver_task_id),
+            effort,
+            branch: None,
+            is_continue: true,
+            max_budget_usd: None,
+            driver: None,
+            user_id: None,
+            org_id: Some(&org_id),
+            runner_id: None,
+        },
+    )
+    .await;
+
+    // 7. Badge the row as a resolver threaded under its parent.
+    {
+        let conn = registry.db.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET mode = 'resolver', parent_agent_id = ?2 WHERE id = ?1",
+            rusqlite::params![resolver_id, parent_agent_id],
+        )
+        .ok();
+    }
+
+    // 8. Backfill the attempt row's agent_id (was NULL at step 3).
+    {
+        let conn = registry.db.lock().unwrap();
+        conn.execute(
+            "UPDATE task_fix_attempts SET agent_id = ?1 \
+             WHERE plan_name = ?2 AND task_number = ?3 AND attempt = ?4",
+            rusqlite::params![resolver_id, plan_name, task_id, attempt as i64],
+        )
+        .ok();
+    }
+
+    Ok(resolver_id)
+}
+
 /// Resolve the main worktree's root directory by scanning
 /// `git worktree list --porcelain` for the entry whose `.git` is a real
 /// directory (the main worktree), as opposed to the `gitdir:` pointer files
@@ -3648,6 +3906,236 @@ mod tests {
             !events.iter().any(|e| e.contains("agent_branch_cleared")),
             "missing cwd must not broadcast: {events:?}"
         );
+    }
+
+    // ── spawn_conflict_resolver tests (Task 3.2) ──────────────────────
+
+    /// Build a git repo on `master` plus a `branchwork/p/1.1` task branch
+    /// that genuinely conflicts with master on `file.txt`, then attach a
+    /// linked worktree at `wt` checked out on the task branch — the state the
+    /// agent leaves behind: committed work on its task branch in its own
+    /// worktree while the trunk moved on.
+    fn setup_conflicting_worktree(repo: &std::path::Path, wt: &std::path::Path) {
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed in {}", dir.display());
+        };
+        std::fs::create_dir_all(repo).unwrap();
+        run(repo, &["init", "-b", "master"]);
+        run(repo, &["config", "user.email", "t@t"]);
+        run(repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+        run(repo, &["add", "."]);
+        run(repo, &["commit", "-m", "base"]);
+        // Fork the task branch off the base, before the trunk moves on.
+        run(repo, &["branch", "branchwork/p/1.1"]);
+        // Trunk changes file.txt.
+        std::fs::write(repo.join("file.txt"), "target side\n").unwrap();
+        run(repo, &["commit", "-am", "target change"]);
+        // Attach the agent's worktree on the task branch + commit a
+        // conflicting change there.
+        run(
+            repo,
+            &["worktree", "add", wt.to_str().unwrap(), "branchwork/p/1.1"],
+        );
+        std::fs::write(wt.join("file.txt"), "task side\n").unwrap();
+        run(wt, &["commit", "-am", "task change"]);
+    }
+
+    #[test]
+    fn build_resolver_prompt_substitutes_all_placeholders() {
+        let conflict = ConflictPayload {
+            conflicted_paths: vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()],
+            our_diff: "OUR_DIFF_BODY_X".to_string(),
+            their_diff: "THEIR_DIFF_BODY_Y".to_string(),
+        };
+        let prompt =
+            build_resolver_prompt("Add a GET /widgets endpoint.", "master", "1.1", &conflict);
+
+        // Acceptance: the prompt carries the original task description, both
+        // diffs, the conflicted paths, the target, the commit task id, and the
+        // literal conflict markers the resolver is told to look for.
+        assert!(
+            prompt.contains("Add a GET /widgets endpoint."),
+            "missing task description: {prompt}"
+        );
+        assert!(prompt.contains("master"), "missing target branch: {prompt}");
+        assert!(
+            prompt.contains("- src/foo.rs"),
+            "missing conflicted path foo"
+        );
+        assert!(
+            prompt.contains("- src/bar.rs"),
+            "missing conflicted path bar"
+        );
+        assert!(prompt.contains("OUR_DIFF_BODY_X"), "missing our_diff");
+        assert!(prompt.contains("THEIR_DIFF_BODY_Y"), "missing their_diff");
+        assert!(
+            prompt.contains("Resolve merge conflicts for 1.1"),
+            "missing commit-message task id"
+        );
+        assert!(
+            prompt.contains("<<<<<<<") && prompt.contains("=======") && prompt.contains(">>>>>>>"),
+            "missing literal conflict markers"
+        );
+        assert!(
+            !prompt.contains("{{"),
+            "unsubstituted placeholder left: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_conflict_resolver_threads_resolver_under_parent() {
+        let (db, _dbdir) = fresh_db();
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: "p".to_string(),
+        };
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+
+        // Original task agent row — the parent the resolver threads under.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, plan_name, task_id, cwd, status, mode, branch, org_id) \
+                 VALUES ('parent-1', 'p', '1.1', ?1, 'completed', 'pty', 'branchwork/p/1.1', 'default-org')",
+                params![wt.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+
+        let (registry, _rx) = test_registry(db.clone());
+        let conflict = ConflictPayload {
+            conflicted_paths: vec!["file.txt".to_string()],
+            our_diff: "diff a/file.txt b/file.txt (task)".to_string(),
+            their_diff: "diff a/file.txt b/file.txt (target)".to_string(),
+        };
+
+        let resolver_id =
+            spawn_conflict_resolver(&registry, "p", "1.1", "master", &conflict, 1, &wt)
+                .await
+                .expect("resolver should spawn");
+
+        // Resolver row: badged mode='resolver', threaded under the parent, on
+        // a `-resolve-N` task id distinct from the original task.
+        type Row = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let (mode, parent, plan, task, prompt): Row = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT mode, parent_agent_id, plan_name, task_id, prompt FROM agents WHERE id = ?1",
+                params![resolver_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            mode, "resolver",
+            "resolver row must be badged mode='resolver'"
+        );
+        assert_eq!(
+            parent.as_deref(),
+            Some("parent-1"),
+            "parent_agent_id must point at the original task agent"
+        );
+        assert_eq!(plan.as_deref(), Some("p"));
+        assert_eq!(task.as_deref(), Some("1.1-resolve-1"));
+        let prompt = prompt.expect("resolver prompt stored on the row");
+        assert!(
+            prompt.contains("file.txt"),
+            "prompt names the conflicted path"
+        );
+        assert!(
+            prompt.contains("(task)") && prompt.contains("(target)"),
+            "prompt carries both diffs"
+        );
+        assert!(
+            prompt.contains("<<<<<<<"),
+            "prompt carries the conflict-marker instructions"
+        );
+
+        // task_fix_attempts row recorded + backfilled with the resolver id.
+        let attempt_agent: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT agent_id FROM task_fix_attempts \
+                 WHERE plan_name='p' AND task_number='1.1' AND attempt=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            attempt_agent.as_deref(),
+            Some(resolver_id.as_str()),
+            "task_fix_attempts.agent_id must be backfilled with the resolver id"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_conflict_resolver_returns_cap_hit_when_budget_spent() {
+        let (db, _dbdir) = fresh_db();
+        {
+            let conn = db.lock().unwrap();
+            // Cap of 1 with one attempt already on record → count(1) >= max(1).
+            conn.execute(
+                "INSERT INTO plan_auto_mode (plan_name, enabled, max_fix_attempts) VALUES ('p', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_fix_attempts (plan_name, task_number, attempt, started_at) \
+                 VALUES ('p', '1.1', 1, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        let (registry, _rx) = test_registry(db.clone());
+        let conflict = ConflictPayload {
+            conflicted_paths: vec!["file.txt".to_string()],
+            our_diff: String::new(),
+            their_diff: String::new(),
+        };
+
+        // The worktree path is never touched — the cap check returns first.
+        let res = spawn_conflict_resolver(
+            &registry,
+            "p",
+            "1.1",
+            "master",
+            &conflict,
+            2,
+            std::path::Path::new("/nonexistent-cap-hit"),
+        )
+        .await;
+
+        assert!(
+            matches!(res, Err(SpawnError::CapHit)),
+            "expected CapHit, got {res:?}"
+        );
+        let resolver_count: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM agents WHERE mode = 'resolver'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(resolver_count, 0, "cap hit must not spawn a resolver");
     }
 
     // ── try_auto_advance tests (Task 3.4) ─────────────────────────────
