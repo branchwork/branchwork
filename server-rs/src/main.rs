@@ -284,9 +284,13 @@ async fn run_server(cli: Cli) {
     // live. For each project that has agent rows, it records any worktree
     // under `<base>/<slug>/` that no live agent claims into the
     // `worktree_orphans` table (idempotent on the `path` PK, so a
-    // re-detected orphan keeps its original `first_detected`). Detached so
-    // the HTTP listener readiness probe is not blocked by the per-project
-    // `git worktree list` shell-outs.
+    // re-detected orphan keeps its original `first_detected`). On the same
+    // pass it logs a loud `[Branchwork] WARNING` line for any recorded
+    // orphan leaked more than `STALE_ORPHAN_DAYS` (7) days ago, on every
+    // boot until an operator reaps it from the dashboard sidebar — there is
+    // no auto-delete (ADR 0002 forbids it). Detached so the HTTP listener
+    // readiness probe is not blocked by the per-project `git worktree list`
+    // shell-outs.
     api::orphan_worktrees::spawn_startup_sweep(state.clone());
 
     // One-shot YAML migration (CI-split Phase 3.1): rewrite

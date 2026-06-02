@@ -293,6 +293,14 @@ fn slug_to_project_dir(state: &AppState) -> HashMap<String, PathBuf> {
 
 // ── server-boot sweep ────────────────────────────────────────────────────
 
+/// A recorded orphan worktree older than this many days draws a loud
+/// `[Branchwork] WARNING` line on every server boot until an operator reaps
+/// it. Internal-only and deliberately NOT exposed in `branchwork.toml`: ADR
+/// 0002 forbids auto-deleting worktrees, so the only escalation a stale leak
+/// can drive is a louder nag — there is no behaviour a knob would tune.
+/// Keeping the surface small avoids implying a leak could ever be auto-reaped.
+const STALE_ORPHAN_DAYS: i64 = 7;
+
 /// Spawn the orphan sweep as a detached task so it never blocks the HTTP
 /// listener readiness probe. Wired into `main::run_server` after
 /// `cleanup_and_reattach` has settled the agent rows.
@@ -300,8 +308,28 @@ pub fn spawn_startup_sweep(state: AppState) {
     tokio::spawn(run_startup_sweep(state));
 }
 
-/// One-shot startup sweep. See module docs for the full contract.
+/// One-shot startup sweep: record this boot's freshly-detected orphans, then
+/// warn loudly about any that have been leaked too long. See module docs for
+/// the full contract.
+///
+/// The stale warning runs unconditionally — even when the fresh-detection
+/// pass finds no projects this boot (e.g. every agent row that anchored an
+/// old orphan was since deleted). An unreaped leak keeps nagging on EVERY
+/// boot until it is cleaned up from the dashboard sidebar (Task 5.2). There
+/// is NO auto-delete; ADR 0002 forbids it.
 pub async fn run_startup_sweep(state: AppState) {
+    record_fresh_orphans(&state).await;
+    {
+        let conn = state.db.lock().unwrap();
+        warn_stale_orphans(&conn);
+    }
+}
+
+/// Detect this boot's orphan worktrees and record them into
+/// `worktree_orphans` (idempotent on the `path` PK). The early `return`s here
+/// skip only the recording pass — [`run_startup_sweep`] still runs the stale
+/// warning afterwards.
+async fn record_fresh_orphans(state: &AppState) {
     // Distinct (cwd, org_id) anchors. We need a still-existing git working
     // tree to derive each project's stable main-worktree root; both live
     // and finished agents contribute a candidate cwd (a leaked worktree's
@@ -412,6 +440,71 @@ pub async fn run_startup_sweep(state: AppState) {
             "[orphan-sweep] {project_slug}: {} orphan(s) under {} ({new_count} newly recorded)",
             orphans.len(),
             project_dir.display()
+        );
+    }
+}
+
+// ── stale-orphan warning (Task 5.3) ──────────────────────────────────────
+
+/// Log a `[Branchwork] WARNING` line for every recorded orphan leaked more
+/// than [`STALE_ORPHAN_DAYS`] ago. There is NO auto-delete (ADR 0002 forbids
+/// it) — this is purely a visibility nag that fires on every boot until an
+/// operator reaps the leak via the dashboard sidebar (Task 5.2).
+///
+/// Logging goes to stderr (the codebase has no `tracing`/`log` crate), with
+/// the same `eprintln!` convention as the `[orphan-sweep]` lines above.
+fn warn_stale_orphans(conn: &rusqlite::Connection) {
+    for o in crate::db::list_stale_orphans(conn, STALE_ORPHAN_DAYS) {
+        eprintln!("{}", stale_orphan_warning_line(&o));
+    }
+}
+
+/// Format the boot-time warning line for one stale orphan. Pure (no I/O) so
+/// the exact `[Branchwork] WARNING: …` wording the task mandates is
+/// unit-testable without a database or stderr capture. `<project>` falls back
+/// to `<unknown>` for the (schema-nullable, never-written-in-practice) case
+/// of a row with no `project_slug`.
+fn stale_orphan_warning_line(o: &crate::db::StaleOrphanRow) -> String {
+    let project = o.project_slug.as_deref().unwrap_or("<unknown>");
+    format!(
+        "[Branchwork] WARNING: orphan worktree {} on {} has been leaked since {} ({} days). Visit the dashboard sidebar to clean up. No auto-delete.",
+        o.path, project, o.first_detected, o.age_days
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::StaleOrphanRow;
+
+    #[test]
+    fn stale_orphan_warning_line_matches_spec_format() {
+        let row = StaleOrphanRow {
+            project_slug: Some("my-project".to_string()),
+            path: "/home/u/.branchwork/worktrees/my-project/plan/0.1-abcd".to_string(),
+            first_detected: "2026-05-20 12:34:56".to_string(),
+            age_days: 13,
+        };
+        assert_eq!(
+            stale_orphan_warning_line(&row),
+            "[Branchwork] WARNING: orphan worktree /home/u/.branchwork/worktrees/my-project/plan/0.1-abcd on my-project has been leaked since 2026-05-20 12:34:56 (13 days). Visit the dashboard sidebar to clean up. No auto-delete."
+        );
+    }
+
+    #[test]
+    fn stale_orphan_warning_line_falls_back_when_slug_missing() {
+        let row = StaleOrphanRow {
+            project_slug: None,
+            path: "/x/0.1-z".to_string(),
+            first_detected: "2026-01-01 00:00:00".to_string(),
+            age_days: 99,
+        };
+        let line = stale_orphan_warning_line(&row);
+        assert!(line.contains("on <unknown>"), "slug fallback: {line}");
+        assert!(line.contains("(99 days)"), "age rendered: {line}");
+        assert!(
+            line.ends_with("No auto-delete."),
+            "no-auto-delete tail: {line}"
         );
     }
 }

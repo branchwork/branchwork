@@ -2596,6 +2596,51 @@ pub fn list_recorded_orphans(conn: &Connection) -> Vec<WorktreeOrphanRow> {
     .unwrap_or_default()
 }
 
+/// One stale orphan row plus its whole-day age, for the server-boot
+/// stale-orphan warning (Task 5.3). A leaked worktree recorded more than
+/// `STALE_ORPHAN_DAYS` ago warrants a loud warning on every boot until an
+/// operator reaps it from the dashboard sidebar — this query is what that
+/// warning iterates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleOrphanRow {
+    pub project_slug: Option<String>,
+    pub path: String,
+    pub first_detected: String,
+    /// Whole days elapsed since `first_detected` (floored), computed by
+    /// SQLite so we carry no Rust datetime-parsing dependency.
+    pub age_days: i64,
+}
+
+/// Recorded orphans whose `first_detected` is more than `min_days` days ago,
+/// oldest-leaked first. The date math runs in SQLite against the same UTC
+/// clock that stamped `first_detected` (`datetime('now')`), so there is no
+/// timezone skew and no Rust datetime dependency. `age_days` is the floored
+/// whole-day age (`CAST(... AS INTEGER)` truncates the positive difference).
+/// Recently-leaked orphans (≤ `min_days`) are excluded, so the caller can
+/// warn unconditionally over the returned set.
+pub fn list_stale_orphans(conn: &Connection, min_days: i64) -> Vec<StaleOrphanRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT project_slug, path, first_detected, \
+                CAST(julianday('now') - julianday(first_detected) AS INTEGER) AS age_days \
+           FROM worktree_orphans \
+          WHERE julianday('now') - julianday(first_detected) > ?1 \
+          ORDER BY first_detected ASC, path ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(params![min_days], |row| {
+        Ok(StaleOrphanRow {
+            project_slug: row.get(0)?,
+            path: row.get(1)?,
+            first_detected: row.get(2)?,
+            age_days: row.get(3)?,
+        })
+    })
+    .map(|it| it.flatten().collect())
+    .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2764,6 +2809,88 @@ mod tests {
         // concurrent cleanup / re-detect race must not panic).
         assert!(!delete_worktree_orphan(&conn, "/base/a/p/0.1-x"));
         assert!(!delete_worktree_orphan(&conn, "/never/recorded"));
+    }
+
+    // ── list_stale_orphans (Task 5.3) ────────────────────────────────────
+
+    /// Insert an orphan whose `first_detected` is `days_ago` days in the
+    /// past. `record_worktree_orphan` always stamps `datetime('now')`, so a
+    /// direct INSERT is the only way to forge an aged row.
+    fn insert_orphan_aged(conn: &Connection, slug: &str, path: &str, days_ago: i64) {
+        conn.execute(
+            "INSERT INTO worktree_orphans (project_slug, path, first_detected) \
+             VALUES (?1, ?2, datetime('now', ?3))",
+            params![slug, path, format!("-{days_ago} days")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_stale_orphans_returns_only_rows_older_than_threshold() {
+        // Acceptance: a worktree leaked >7 days ago is flagged; a recently
+        // leaked one is silent.
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        insert_orphan_aged(&conn, "old", "/base/old/p/0.1-aaaa", 10);
+        insert_orphan_aged(&conn, "fresh", "/base/fresh/p/0.1-bbbb", 1);
+
+        let stale = list_stale_orphans(&conn, 7);
+        assert_eq!(
+            stale.len(),
+            1,
+            "only the 10-day orphan is stale at min_days=7"
+        );
+        assert_eq!(stale[0].path, "/base/old/p/0.1-aaaa");
+        assert_eq!(stale[0].project_slug.as_deref(), Some("old"));
+        assert!(!stale[0].first_detected.is_empty());
+        assert_eq!(stale[0].age_days, 10, "floored whole-day age");
+    }
+
+    #[test]
+    fn list_stale_orphans_is_empty_when_all_recent() {
+        // Recently-leaked orphans (incl. exactly-at-boot, 0 days) stay silent.
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        insert_orphan_aged(&conn, "a", "/base/a/p/0.1-x", 0);
+        insert_orphan_aged(&conn, "b", "/base/b/p/0.1-y", 3);
+        insert_orphan_aged(&conn, "c", "/base/c/p/0.1-z", 6);
+        assert!(list_stale_orphans(&conn, 7).is_empty());
+    }
+
+    #[test]
+    fn list_stale_orphans_threshold_is_parameterised() {
+        // The 7-day constant is a *parameter*, not baked into the query — a
+        // 5-day orphan is stale at min_days=3 but not at min_days=7.
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        insert_orphan_aged(&conn, "p", "/base/p/q/0.1-x", 5);
+        assert!(
+            list_stale_orphans(&conn, 7).is_empty(),
+            "5 days < 7-day threshold"
+        );
+        assert_eq!(
+            list_stale_orphans(&conn, 3).len(),
+            1,
+            "5 days > 3-day threshold"
+        );
+    }
+
+    #[test]
+    fn list_stale_orphans_oldest_first() {
+        // Worst leak leads the warning block.
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        insert_orphan_aged(&conn, "p", "/base/p/q/0.1-younger", 8);
+        insert_orphan_aged(&conn, "p", "/base/p/q/0.1-older", 30);
+        let stale = list_stale_orphans(&conn, 7);
+        let paths: Vec<&str> = stale.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/base/p/q/0.1-older", "/base/p/q/0.1-younger"],
+            "oldest-leaked first"
+        );
+        assert_eq!(stale[0].age_days, 30);
+        assert_eq!(stale[1].age_days, 8);
     }
 
     /// Phase 1, Task 1.1: `ci_failure_events` schema round-trip plus
