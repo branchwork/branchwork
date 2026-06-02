@@ -96,6 +96,21 @@ pub mod actions {
     /// Branchwork re-runs the gate on completion. Diff carries
     /// `{plan, task, agent_id, check_name, recipe_cmd, fix_agent_id}`.
     pub const AUTO_MODE_GATE_FIX_SPAWNED: &str = "auto_mode.gate_fix_spawned";
+    /// A merge conflict handed the worktree to an at-merge resolver agent
+    /// (Phase 3 of the worktree-per-agent plan). One row per resolver
+    /// attempt so a post-mortem can see every retry. Diff carries
+    /// `{plan, task, attempt, resolver_agent_id}`. Resource is the plan.
+    pub const AUTO_MODE_RESOLVER_SPAWNED: &str = "auto_mode.resolver_spawned";
+    /// An at-merge resolver agent committed a resolution (exit 0 + no
+    /// unmerged paths + a new commit on the task branch). The loop is about
+    /// to re-attempt the merge. Diff carries
+    /// `{plan, task, attempt, resolver_agent_id}`.
+    pub const AUTO_MODE_RESOLVER_RESOLVED: &str = "auto_mode.resolver_resolved";
+    /// An at-merge resolver agent finished without resolving the conflict
+    /// (non-zero exit, lingering `UU` entries, or no new commit). The loop
+    /// recurses into another attempt (Task 3.2) until the cap. Diff carries
+    /// `{plan, task, attempt, resolver_agent_id}`.
+    pub const AUTO_MODE_RESOLVER_FAILED: &str = "auto_mode.resolver_failed";
 }
 
 // ── Per-branch push lock (Phase 2) ──────────────────────────────────────────
@@ -307,6 +322,10 @@ pub async fn on_task_agent_completed(
     let task_id = task_id.to_string();
 
     // Routing key on `task_id`:
+    //   - `<task>-resolve-<n>` -> at-merge conflict resolver completion
+    //     (Phase 3 of the worktree-per-agent plan). The resolver committed
+    //     (hopefully) a conflict resolution on the original task branch;
+    //     `on_resolver_agent_completed` re-attempts the merge.
     //   - `<task>-gate-fix-<n>` -> gate-fix completion (T2.2 of the
     //     pre-merge-gate plan). The agent committed (hopefully) the
     //     recipe's fix on the original task branch; we re-enter
@@ -322,11 +341,16 @@ pub async fn on_task_agent_completed(
     //
     // ORDER MATTERS: the gate-fix marker `-gate-fix-` contains the
     // substring `-fix-`, so the gate-fix detection MUST run before
-    // the CI-fix detection.
-    let is_gate_fix_agent = task_id.contains(GATE_FIX_MARKER);
-    let is_fix_agent = !is_gate_fix_agent && task_id.contains("-fix-");
+    // the CI-fix detection. The `-resolve-` marker is disjoint from both
+    // (`-resolve-` contains neither `-fix-` nor `-gate-fix-`), so its
+    // order relative to them is immaterial — checked first for clarity.
+    let is_resolver_agent = task_id.contains("-resolve-");
+    let is_gate_fix_agent = !is_resolver_agent && task_id.contains(GATE_FIX_MARKER);
+    let is_fix_agent = !is_resolver_agent && !is_gate_fix_agent && task_id.contains("-fix-");
     tokio::spawn(async move {
-        if is_gate_fix_agent {
+        if is_resolver_agent {
+            on_resolver_agent_completed(&state, &org_id, &agent_id, &plan_name, &task_id).await;
+        } else if is_gate_fix_agent {
             on_gate_fix_agent_completed(&state, &org_id, &agent_id, &plan_name, &task_id).await;
         } else if is_fix_agent {
             on_fix_agent_completed(&state, &org_id, &agent_id, &plan_name, &task_id).await;
@@ -404,6 +428,162 @@ async fn on_gate_fix_agent_completed(
     // fails, [`run_state_machine`]'s gate-fail path will see the
     // existing `-gate-fix-1` agent row, hit the cap (1 attempt per
     // cycle), fall through to the operator-visible pause from T1.3.
+    run_state_machine(state, org_id, &original_agent_id, plan_name, &original_task).await;
+}
+
+/// Called when an at-merge conflict resolver agent completes (`task_id`
+/// carries the `-resolve-<n>` marker that [`crate::agents::spawn_conflict_resolver`]
+/// stamps on). The resolver ran **in the original task agent's worktree**
+/// on the task branch (Phase 3.2: `branch = None`, `is_continue = true`),
+/// so its (hopeful) resolution commit lands on that branch. Phase 3.3:
+///
+///   1. Recover the `(original_task, attempt)` mapping from the
+///      `task_fix_attempts` row (`spawn_conflict_resolver` stores the
+///      original task as `task_number` + the resolver id as `agent_id`).
+///   2. Gate on whether the resolver actually resolved
+///      ([`crate::agents::resolver_resolution_succeeded`]: exit 0 + no
+///      lingering `UU` + a new commit on the task branch). Close the
+///      `task_fix_attempts` row `resolved` / `failed` and audit the outcome.
+///   3. Re-enter [`run_state_machine`] for the **original** task (its agent
+///      holds the task branch). That re-attempts the merge:
+///        - resolution worked → merge succeeds → CI gate → advance.
+///        - still conflicts → `run_merge_step`'s conflict arm spawns the
+///          next resolver (attempt + 1) and returns `Resolving` (no pause),
+///          OR hits the cap and pauses `merge_conflict_unresolved`. Both
+///          cases are driven entirely by the shared cap accounting, so this
+///          handler treats `resolved` and `failed` identically after the
+///          outcome label is recorded — the merge result is ground truth.
+///
+/// Bails (logs, no state change) on missing `task_fix_attempts` row or a
+/// missing original task agent — auto-mode never half-merges on incomplete
+/// metadata. The whole flow only runs while the plan is **not** paused —
+/// `on_task_agent_completed` gated on `auto_mode_enabled` at the entry edge,
+/// which is why Phase 3.3 made `run_merge_step` leave the plan running while
+/// a resolver works (Spawned → `Resolving`, not a pause).
+async fn on_resolver_agent_completed(
+    state: &AppState,
+    org_id: &str,
+    resolver_agent_id: &str,
+    plan_name: &str,
+    resolver_task_id: &str,
+) {
+    // 1. Recover (original_task, attempt). The resolver shares the CI-fix
+    //    `task_fix_attempts` table; the row stores the ORIGINAL task number
+    //    (not the `-resolve-<n>` task id) under `task_number`.
+    let (original_task, attempt) =
+        match db::fix_attempt_for_agent(&state.db, plan_name, resolver_agent_id) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "[auto_mode] resolver {resolver_agent_id} ({plan_name}/{resolver_task_id}) \
+                 has no task_fix_attempts row — skipping resolver completion"
+                );
+                return;
+            }
+        };
+
+    // 2. Find the original task agent — it holds the task branch + worktree
+    //    the merge re-runs against. Exact `task_id` match on the bare task
+    //    id; the NOT LIKE filters are belt-and-braces (a `-resolve-` /
+    //    `-fix-` / `-gate-fix-` row never equals the bare id anyway).
+    let original_agent_id: Option<String> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM agents \
+             WHERE plan_name = ?1 AND task_id = ?2 \
+               AND task_id NOT LIKE '%-fix-%' \
+               AND task_id NOT LIKE '%-gate-fix-%' \
+               AND task_id NOT LIKE '%-resolve-%' \
+             ORDER BY started_at DESC LIMIT 1",
+            params![plan_name, &original_task],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+    let Some(original_agent_id) = original_agent_id else {
+        eprintln!(
+            "[auto_mode] resolver {resolver_agent_id} ({plan_name}/{resolver_task_id}) \
+             has no surviving original task agent ({plan_name}/{original_task}) — skipping"
+        );
+        return;
+    };
+
+    // 3. Read the resolver row's exit status + worktree (`cwd`) + the
+    //    pre-resolution task-branch tip (`base_commit`, captured at spawn
+    //    time) so we can judge whether it committed a resolution.
+    let resolver_meta: Option<(String, Option<String>, Option<String>)> = {
+        let conn = state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT status, cwd, base_commit FROM agents WHERE id = ?1",
+            params![resolver_agent_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()
+    };
+    let Some((status, cwd, base_commit)) = resolver_meta else {
+        eprintln!(
+            "[auto_mode] resolver {resolver_agent_id} ({plan_name}/{resolver_task_id}) \
+             row vanished — skipping"
+        );
+        return;
+    };
+
+    // Exit 0 ⇒ the resolver agent row is `completed`; a non-zero CLI exit
+    // marks it `failed` (the agent-exit path still calls us in that case).
+    let exited_clean = status == "completed";
+    let resolved = match cwd.as_deref() {
+        Some(worktree) => crate::agents::resolver_resolution_succeeded(
+            std::path::Path::new(worktree),
+            base_commit.as_deref(),
+            exited_clean,
+        ),
+        // No worktree recorded — can't verify a resolution; treat as failed
+        // (the re-merge below will re-detect the conflict / hit the cap).
+        None => false,
+    };
+
+    // 4. Close the attempt row + audit the outcome. The merge re-attempt
+    //    below is identical for both — the merge result, not this label, is
+    //    ground truth — but the label + audit row let a post-mortem see
+    //    whether each resolver actually produced a commit.
+    let (outcome_label, action) = if resolved {
+        ("resolved", actions::AUTO_MODE_RESOLVER_RESOLVED)
+    } else {
+        ("failed", actions::AUTO_MODE_RESOLVER_FAILED)
+    };
+    db::close_fix_attempt(&state.db, plan_name, &original_task, attempt, outcome_label);
+
+    let payload = serde_json::json!({
+        "plan": plan_name,
+        "task": original_task,
+        "attempt": attempt,
+        "resolver_agent_id": resolver_agent_id,
+    });
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            action,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(&payload.to_string()),
+        );
+    }
+
+    eprintln!(
+        "[auto_mode] resolver {resolver_agent_id} ({plan_name}/{original_task}) attempt {attempt} \
+         → {outcome_label}; re-attempting merge"
+    );
+
+    // 5. Re-attempt the merge by re-entering the state machine for the
+    //    ORIGINAL task. Mirrors the gate-fix re-entry: the resolver's commit
+    //    is on the task branch, so re-merging the original task branch picks
+    //    it up. Success → merge + CI + advance; still-conflict → next
+    //    resolver (attempt + 1) or `merge_conflict_unresolved` pause once the
+    //    cap is spent — all handled inside `run_merge_step`.
     run_state_machine(state, org_id, &original_agent_id, plan_name, &original_task).await;
 }
 
@@ -1160,6 +1340,12 @@ enum MergeStepOutcome {
     /// (broadcast + audit'd by the merge step itself); the orchestrator
     /// just adds an `auto_mode_state(paused)` pill update on top.
     Paused,
+    /// Phase 3.3: the merge conflicted and an at-merge resolver agent was
+    /// spawned in the conflicted worktree. The plan was **not** paused —
+    /// the resolver's completion (`on_resolver_agent_completed`) re-attempts
+    /// the merge. The orchestrator stops here without advancing or pausing;
+    /// the pill stays at `merging` (a merge is effectively still in flight).
+    Resolving,
 }
 
 /// Body of the merge step: dispatch the merge and map its outcome to the
@@ -1220,6 +1406,64 @@ async fn run_merge_step(
         return MergeStepOutcome::Merged(sha);
     }
 
+    // Phase 3.3: the conflict arm may have handed the worktree to an
+    // at-merge resolver agent ([`crate::api::agents::maybe_spawn_conflict_resolver`]).
+    // Branch on the disposition before the generic pause below.
+    match outcome.resolver {
+        // A resolver agent is working in the conflicted worktree. Do NOT
+        // pause — its completion (`on_resolver_agent_completed`) re-attempts
+        // the merge. Audit the attempt (one row per resolver so a
+        // post-mortem sees every retry) and return `Resolving`.
+        Some(crate::agents::ResolverDisposition::Spawned {
+            resolver_agent_id,
+            attempt,
+        }) => {
+            let payload = serde_json::json!({
+                "plan": plan_name,
+                "task": task_id,
+                "attempt": attempt,
+                "resolver_agent_id": resolver_agent_id,
+            });
+            {
+                let conn = state.db.lock().unwrap();
+                audit::log(
+                    &conn,
+                    org_id,
+                    None,
+                    Some("branchwork-auto-mode"),
+                    actions::AUTO_MODE_RESOLVER_SPAWNED,
+                    audit::resources::PLAN,
+                    Some(plan_name),
+                    Some(&payload.to_string()),
+                );
+            }
+            return MergeStepOutcome::Resolving;
+        }
+        // The shared fix-attempt cap is spent — no resolver was spawned.
+        // Pause with the distinct `merge_conflict_unresolved` reason,
+        // carrying the conflicted paths so the dashboard can surface them.
+        // The conflicted worktree is left on disk (markers preserved) for
+        // human inspection — the conflict arm returned early in
+        // `merge_agent_branch_inner`, so nothing removed it.
+        Some(crate::agents::ResolverDisposition::CapHit {
+            attempt,
+            conflicted_paths,
+        }) => {
+            return pause_for_unresolved_conflict(
+                state,
+                org_id,
+                plan_name,
+                task_id,
+                &outcome.target_branch,
+                attempt,
+                &conflicted_paths,
+            );
+        }
+        // No resolver path applied (manual / SaaS / non-auto-mode /
+        // NoParentAgent) — fall through to the pre-3.3 pause below.
+        None => {}
+    }
+
     // Failure path: pause auto-mode for this plan. `had_conflict` and the
     // generic error case both block the loop until a human resumes — the
     // distinction shows up in the recorded reason so the dashboard can
@@ -1254,6 +1498,68 @@ async fn run_merge_step(
         Some(plan_name),
         Some(&payload.to_string()),
     );
+    MergeStepOutcome::Paused
+}
+
+/// Number of conflicted paths carried on the wire / stored in
+/// `paused_files` for a `merge_conflict_unresolved` pause. A pathological
+/// N-file conflict shouldn't blow the WS frame; the audit row carries the
+/// full list and `file_count` exposes the real total (mirrors the
+/// `auto_push_rebase_conflict` convention).
+const UNRESOLVED_CONFLICT_FILE_CAP: usize = 10;
+
+/// Phase 3.3: pause a plan whose merge conflict the at-merge resolver
+/// could not resolve within the shared fix-attempt cap. Sets
+/// `paused_reason = 'merge_conflict_unresolved'`, broadcasts
+/// `auto_mode_paused` with the conflicted paths, and audit-logs the pause.
+/// Reached on `SpawnError::CapHit` whether on the original merge or on a
+/// resolver completion's re-merge. The conflicted worktree is **left on
+/// disk** (the caller's conflict arm returned early before any cleanup) so
+/// a human can inspect the preserved markers. Returns
+/// [`MergeStepOutcome::Paused`].
+fn pause_for_unresolved_conflict(
+    state: &AppState,
+    org_id: &str,
+    plan_name: &str,
+    task_id: &str,
+    target_branch: &str,
+    attempt: u32,
+    conflicted_paths: &[String],
+) -> MergeStepOutcome {
+    let reason = "merge_conflict_unresolved";
+    let capped: Vec<String> = conflicted_paths
+        .iter()
+        .take(UNRESOLVED_CONFLICT_FILE_CAP)
+        .cloned()
+        .collect();
+
+    // Persist the (capped) file list alongside the pause so the dashboard
+    // banner can render it after a reload (read from `paused_files`).
+    db::auto_mode_pause(&state.db, plan_name, reason, Some(&capped));
+
+    let payload = serde_json::json!({
+        "plan": plan_name,
+        "task": task_id,
+        "reason": reason,
+        "target": target_branch,
+        "attempt": attempt,
+        "files": capped,
+        "file_count": conflicted_paths.len(),
+    });
+    broadcast_event(&state.broadcast_tx, "auto_mode_paused", payload.clone());
+    {
+        let conn = state.db.lock().unwrap();
+        audit::log(
+            &conn,
+            org_id,
+            None,
+            Some("branchwork-auto-mode"),
+            actions::AUTO_MODE_PAUSED,
+            audit::resources::PLAN,
+            Some(plan_name),
+            Some(&payload.to_string()),
+        );
+    }
     MergeStepOutcome::Paused
 }
 
@@ -1473,6 +1779,14 @@ async fn drain_deferred_for_cadence(
                 // caller flips the pill out of `merging` to `paused`.
                 return None;
             }
+            // Phase 3.3 edge: a drained sibling conflicted and spawned an
+            // at-merge resolver. The drain can't continue until that branch
+            // resolves, so stop the batch (treated like a stop). The plan is
+            // NOT paused; the resolver's completion re-drives that sibling's
+            // merge, and any still-deferred siblings drain on the next
+            // boundary. The caller's `auto_mode_state(paused)` pill is a
+            // minor inaccuracy here, accepted for this rare edge.
+            MergeStepOutcome::Resolving => return None,
         }
     }
     Some(())
@@ -1605,6 +1919,15 @@ pub async fn flush_deferred_merges(
             }
             MergeStepOutcome::Paused => {
                 // run_merge_step has already paused + audit-logged.
+                paused = true;
+                break;
+            }
+            // Phase 3.3 edge: a flushed branch conflicted and spawned an
+            // at-merge resolver. Stop the batch (the resolver re-drives that
+            // branch on completion). Reported as `paused` to the operator so
+            // the flush surfaces that it stopped early — the plan itself
+            // stays running while the resolver works.
+            MergeStepOutcome::Resolving => {
                 paused = true;
                 break;
             }
@@ -1901,6 +2224,14 @@ pub(crate) async fn run_state_machine(
             // run_merge_step has already paused + audit-logged; emit only
             // the pill update so the UI flips out of `merging`.
             broadcast_state(state, plan_name, task_id, state_labels::PAUSED, None, None);
+            return;
+        }
+        MergeStepOutcome::Resolving => {
+            // Phase 3.3: the merge conflicted and an at-merge resolver agent
+            // is now working in the conflicted worktree. Do NOT pause and do
+            // NOT advance — the resolver's completion re-enters this state
+            // machine (via `on_resolver_agent_completed`). Leave the pill at
+            // `merging`; a merge is effectively still in progress.
             return;
         }
     };
@@ -3739,7 +4070,7 @@ mod tests {
         let outcome = run_merge_step(&state, "default-org", "agent-1", "p", "1.1", true).await;
         let merged_sha = match &outcome {
             MergeStepOutcome::Merged(sha) => sha.clone(),
-            MergeStepOutcome::Paused => panic!("expected Merged, got Paused"),
+            other => panic!("expected Merged, got {other:?}"),
         };
 
         // Trunk SHA advanced — branch was actually merged.
@@ -4245,6 +4576,568 @@ mod tests {
             actions.iter().any(|a| a == actions::AUTO_MODE_PAUSED),
             "expected {} in {actions:?}",
             actions::AUTO_MODE_PAUSED
+        );
+    }
+
+    // ── At-merge conflict resolver completion (Task 3.3) ─────────────────────
+
+    /// Initialise `repo` with master diverged from a `branchwork/p/1.1`
+    /// task branch on `file.txt`, and attach `wt` as a linked worktree on
+    /// the task branch (so `wt/.git` is a `gitdir:` pointer file — a real
+    /// per-agent worktree). Merging master into the task branch conflicts.
+    /// Mirrors `crate::agents::tests::setup_conflicting_worktree`.
+    fn setup_conflicting_worktree(repo: &Path, wt: &Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        run_git(repo, &["init", "-q", "-b", "master"]);
+        run_git(repo, &["config", "user.email", "t@t.test"]);
+        run_git(repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-q", "-m", "base"]);
+        run_git(repo, &["branch", "branchwork/p/1.1"]);
+        std::fs::write(repo.join("file.txt"), "target side\n").unwrap();
+        run_git(repo, &["commit", "-qam", "target change"]);
+        run_git(
+            repo,
+            &["worktree", "add", wt.to_str().unwrap(), "branchwork/p/1.1"],
+        );
+        std::fs::write(wt.join("file.txt"), "task side\n").unwrap();
+        run_git(wt, &["commit", "-qam", "task change"]);
+    }
+
+    /// `git merge <branch>` tolerating a non-zero (conflict) exit — used to
+    /// reproduce the in-worktree conflict the resolver works on.
+    fn git_merge_allow_conflict(cwd: &Path, branch: &str) {
+        let _ = Command::new("git")
+            .args(["merge", branch, "--no-edit"])
+            .current_dir(cwd)
+            .output();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_agent_full(
+        db: &Db,
+        id: &str,
+        cwd: &Path,
+        status: &str,
+        mode: &str,
+        task: &str,
+        branch: Option<&str>,
+        base_commit: Option<&str>,
+        merge_status: Option<&str>,
+        parent: Option<&str>,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents \
+                (id, session_id, cwd, status, mode, plan_name, task_id, branch, \
+                 base_commit, merge_status, parent_agent_id, source_branch, org_id) \
+             VALUES (?1, ?1, ?2, ?3, ?4, 'p', ?5, ?6, ?7, ?8, ?9, 'master', 'default-org')",
+            params![
+                id,
+                cwd.to_string_lossy(),
+                status,
+                mode,
+                task,
+                branch,
+                base_commit,
+                merge_status,
+                parent
+            ],
+        )
+        .unwrap();
+    }
+
+    fn record_attempt(db: &Db, task: &str, attempt: u32, agent_id: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_fix_attempts \
+                (plan_name, task_number, attempt, agent_id, started_at) \
+             VALUES ('p', ?1, ?2, ?3, datetime('now'))",
+            params![task, attempt as i64, agent_id],
+        )
+        .unwrap();
+    }
+
+    fn attempt_outcome(db: &Db, task: &str, attempt: u32) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT outcome FROM task_fix_attempts \
+             WHERE plan_name='p' AND task_number=?1 AND attempt=?2",
+            params![task, attempt as i64],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn set_cap_and_task_cadence(db: &Db, max_fix_attempts: u32) {
+        let conn = db.lock().unwrap();
+        // `merge_cadence='task'` makes `should_merge_now` short-circuit true
+        // without a plan YAML; the cap drives the resolver budget.
+        conn.execute(
+            "UPDATE plan_auto_mode SET max_fix_attempts = ?1, merge_cadence = 'task' \
+             WHERE plan_name = 'p'",
+            params![max_fix_attempts as i64],
+        )
+        .unwrap();
+    }
+
+    fn resolver_row_count(db: &Db) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM agents WHERE mode = 'resolver'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn merge_status_of(db: &Db, id: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT merge_status FROM agents WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// `run_merge_step` on a conflict with cap budget left spawns a resolver
+    /// and returns `Resolving` — the plan stays running (NOT paused) so the
+    /// resolver's completion can re-attempt the merge.
+    #[tokio::test]
+    async fn run_merge_step_on_conflict_spawns_resolver_and_does_not_pause() {
+        let (db, dir) = fresh_db();
+        let repo = dir.path().join("project");
+        let wt = dir.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        // Original task agent lives in the linked worktree on the task branch.
+        insert_agent_full(
+            &db,
+            "agent-1",
+            &wt,
+            "completed",
+            "pty",
+            "1.1",
+            Some("branchwork/p/1.1"),
+            None,
+            None,
+            None,
+        );
+        enable_auto_mode(&db, "p"); // default cap = 3, room for a resolver
+
+        let outcome = run_merge_step(&state, "default-org", "agent-1", "p", "1.1", true).await;
+        assert_eq!(
+            outcome,
+            MergeStepOutcome::Resolving,
+            "a conflict with cap budget left must spawn a resolver, not pause"
+        );
+
+        // Plan is NOT paused — the resolver is working.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "plan must stay running while the resolver works"
+        );
+
+        // A resolver agent row was created, threaded under the original.
+        assert_eq!(resolver_row_count(&db), 1, "exactly one resolver spawned");
+
+        // Original agent held for the resolver (Task 2.4 hand-off).
+        assert_eq!(
+            merge_status_of(&db, "agent-1").as_deref(),
+            Some(crate::agents::MERGE_STATUS_HELD_FOR_RESOLVER),
+            "original agent must be marked held_for_resolver"
+        );
+
+        // Audit log records the resolver spawn (one row per attempt).
+        let actions = audit_actions_for(&db, "p");
+        assert!(
+            actions
+                .iter()
+                .any(|a| a == actions::AUTO_MODE_RESOLVER_SPAWNED),
+            "expected {} in {actions:?}",
+            actions::AUTO_MODE_RESOLVER_SPAWNED
+        );
+
+        // No `auto_mode_paused` broadcast on the spawn path.
+        let events = drain_event_types(&mut rx);
+        assert!(
+            !events.contains(&"auto_mode_paused".to_string()),
+            "resolver-spawned path must not broadcast auto_mode_paused: {events:?}"
+        );
+    }
+
+    /// `run_merge_step` on a conflict with the fix-attempt cap already spent
+    /// pauses the plan with reason `merge_conflict_unresolved`, broadcasts
+    /// `auto_mode_paused` with the conflicted paths, and leaves the worktree
+    /// on disk.
+    #[tokio::test]
+    async fn run_merge_step_on_conflict_cap_hit_pauses_merge_conflict_unresolved() {
+        let (db, dir) = fresh_db();
+        let repo = dir.path().join("project");
+        let wt = dir.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        insert_agent_full(
+            &db,
+            "agent-1",
+            &wt,
+            "completed",
+            "pty",
+            "1.1",
+            Some("branchwork/p/1.1"),
+            None,
+            None,
+            None,
+        );
+        enable_auto_mode(&db, "p");
+        // Cap of 1 with one attempt already recorded → count(1) >= max(1):
+        // the original merge's resolver spawn hits the cap immediately.
+        set_cap_and_task_cadence(&db, 1);
+        record_attempt(&db, "1.1", 1, "prior-resolver");
+
+        let outcome = run_merge_step(&state, "default-org", "agent-1", "p", "1.1", true).await;
+        assert_eq!(
+            outcome,
+            MergeStepOutcome::Paused,
+            "cap-hit conflict must pause"
+        );
+
+        // Pause reason is the distinct unresolved-conflict reason.
+        assert_eq!(
+            paused_reason(&db, "p").as_deref(),
+            Some("merge_conflict_unresolved"),
+            "cap-hit must pause with merge_conflict_unresolved"
+        );
+
+        // Broadcast carries the reason + conflicted file list.
+        let mut saw_paused_with_files = false;
+        while let Ok(msg) = rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+            if v.get("type").and_then(|t| t.as_str()) == Some("auto_mode_paused") {
+                let data = &v["data"];
+                if data["reason"] == "merge_conflict_unresolved" {
+                    let files = data["files"].as_array().expect("files array");
+                    assert!(
+                        files.iter().any(|f| f.as_str() == Some("file.txt")),
+                        "broadcast must carry the conflicted path: {data}"
+                    );
+                    saw_paused_with_files = true;
+                }
+            }
+        }
+        assert!(
+            saw_paused_with_files,
+            "expected an auto_mode_paused broadcast with conflicted files"
+        );
+
+        // The conflicted worktree is left on disk for inspection.
+        assert!(
+            wt.exists(),
+            "worktree must stay on disk after a cap-hit pause"
+        );
+
+        // Audit log carries the pause.
+        let actions = audit_actions_for(&db, "p");
+        assert!(
+            actions.iter().any(|a| a == actions::AUTO_MODE_PAUSED),
+            "expected {} in {actions:?}",
+            actions::AUTO_MODE_PAUSED
+        );
+    }
+
+    /// A resolvable conflict: the resolver committed a resolution merge on
+    /// the task branch. `on_resolver_agent_completed` marks the attempt
+    /// `resolved`, re-merges (cleanly this time), and lets auto-advance
+    /// proceed. Master advances; the plan stays unpaused.
+    #[tokio::test]
+    async fn on_resolver_agent_completed_resolved_re_merges_cleanly() {
+        let (db, dir) = fresh_db();
+        let repo = dir.path().join("project");
+        let wt = dir.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+
+        // Pre-resolution task-branch tip (= the resolver's base_commit).
+        let base = git_head_sha(&wt);
+        // Simulate a successful resolver: merge master in, resolve, commit a
+        // merge commit on the task branch.
+        git_merge_allow_conflict(&wt, "master");
+        std::fs::write(wt.join("file.txt"), "resolved\n").unwrap();
+        run_git(&wt, &["add", "file.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "resolve conflict"]);
+        let resolved_tip = git_head_sha(&wt);
+        assert_ne!(base, resolved_tip, "resolution must create a new commit");
+
+        let master_before = git_head_sha(&repo);
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        insert_agent_full(
+            &db,
+            "agent-1",
+            &wt,
+            "completed",
+            "pty",
+            "1.1",
+            Some("branchwork/p/1.1"),
+            None,
+            Some(crate::agents::MERGE_STATUS_HELD_FOR_RESOLVER),
+            None,
+        );
+        insert_agent_full(
+            &db,
+            "resolver-1",
+            &wt,
+            "completed",
+            "resolver",
+            "1.1-resolve-1",
+            None,
+            Some(&base),
+            None,
+            Some("agent-1"),
+        );
+        enable_auto_mode(&db, "p");
+        set_cap_and_task_cadence(&db, 3);
+        record_attempt(&db, "1.1", 1, "resolver-1");
+
+        on_resolver_agent_completed(&state, "default-org", "resolver-1", "p", "1.1-resolve-1")
+            .await;
+
+        // Attempt row closed `resolved`.
+        assert_eq!(
+            attempt_outcome(&db, "1.1", 1).as_deref(),
+            Some("resolved"),
+            "attempt must be closed 'resolved' on a successful resolution"
+        );
+
+        // Master advanced — the re-merge landed the resolved branch.
+        assert_ne!(
+            git_head_sha(&repo),
+            master_before,
+            "master must advance after the resolved re-merge"
+        );
+
+        // Plan stays unpaused.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "a resolved conflict must not leave the plan paused"
+        );
+
+        // Audit + broadcast: resolver_resolved + auto_mode_merged.
+        let actions = audit_actions_for(&db, "p");
+        assert!(
+            actions
+                .iter()
+                .any(|a| a == actions::AUTO_MODE_RESOLVER_RESOLVED),
+            "expected {} in {actions:?}",
+            actions::AUTO_MODE_RESOLVER_RESOLVED
+        );
+        let events = drain_event_types(&mut rx);
+        assert!(
+            events.contains(&"auto_mode_merged".to_string()),
+            "expected auto_mode_merged in {events:?}"
+        );
+    }
+
+    /// An unresolvable conflict driven by a no-op resolver (no commit). The
+    /// resolver completion marks the attempt `failed`, re-attempts the
+    /// merge, hits the (cap=1) budget, and pauses the plan with reason
+    /// `merge_conflict_unresolved`. The worktree is left on disk with its
+    /// conflict markers.
+    #[tokio::test]
+    async fn on_resolver_agent_completed_failed_hits_cap_and_pauses() {
+        let (db, dir) = fresh_db();
+        let repo = dir.path().join("project");
+        let wt = dir.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+
+        // Reproduce the conflict in the worktree (as reconstruct_merge_conflict
+        // does) but DON'T resolve it — the no-op resolver leaves UU entries
+        // and HEAD unchanged.
+        let base = git_head_sha(&wt);
+        git_merge_allow_conflict(&wt, "master");
+        assert_eq!(
+            git_head_sha(&wt),
+            base,
+            "an unresolved merge leaves HEAD at the task-branch tip"
+        );
+
+        let master_before = git_head_sha(&repo);
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, mut rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        insert_agent_full(
+            &db,
+            "agent-1",
+            &wt,
+            "completed",
+            "pty",
+            "1.1",
+            Some("branchwork/p/1.1"),
+            None,
+            Some(crate::agents::MERGE_STATUS_HELD_FOR_RESOLVER),
+            None,
+        );
+        insert_agent_full(
+            &db,
+            "resolver-1",
+            &wt,
+            "completed",
+            "resolver",
+            "1.1-resolve-1",
+            None,
+            Some(&base),
+            None,
+            Some("agent-1"),
+        );
+        enable_auto_mode(&db, "p");
+        // Cap of 1: the re-merge's resolver spawn (attempt 2) hits the cap.
+        set_cap_and_task_cadence(&db, 1);
+        record_attempt(&db, "1.1", 1, "resolver-1");
+
+        on_resolver_agent_completed(&state, "default-org", "resolver-1", "p", "1.1-resolve-1")
+            .await;
+
+        // Attempt 1 closed `failed`.
+        assert_eq!(
+            attempt_outcome(&db, "1.1", 1).as_deref(),
+            Some("failed"),
+            "no-op resolver must close its attempt 'failed'"
+        );
+
+        // Master did not move (the re-merge conflicted).
+        assert_eq!(
+            git_head_sha(&repo),
+            master_before,
+            "master must not advance on an unresolved conflict"
+        );
+
+        // Plan paused with the unresolved-conflict reason.
+        assert_eq!(
+            paused_reason(&db, "p").as_deref(),
+            Some("merge_conflict_unresolved"),
+            "hitting the cap must pause with merge_conflict_unresolved"
+        );
+
+        // Worktree left on disk (markers preserved for inspection).
+        assert!(
+            wt.exists(),
+            "worktree must stay on disk for human inspection"
+        );
+
+        // Audit: resolver_failed + the pause.
+        let actions = audit_actions_for(&db, "p");
+        assert!(
+            actions
+                .iter()
+                .any(|a| a == actions::AUTO_MODE_RESOLVER_FAILED),
+            "expected {} in {actions:?}",
+            actions::AUTO_MODE_RESOLVER_FAILED
+        );
+        assert!(
+            actions.iter().any(|a| a == actions::AUTO_MODE_PAUSED),
+            "expected {} in {actions:?}",
+            actions::AUTO_MODE_PAUSED
+        );
+
+        // Broadcast carries the pause.
+        let events = drain_event_types(&mut rx);
+        assert!(
+            events.contains(&"auto_mode_paused".to_string()),
+            "expected auto_mode_paused in {events:?}"
+        );
+    }
+
+    /// A failed resolver with cap budget still left recurses into Task 3.2:
+    /// the re-attempted merge spawns the NEXT resolver (attempt + 1) and the
+    /// plan stays running (NOT paused) — only the cap turns the cycle into a
+    /// pause (covered by the cap-hit test above).
+    #[tokio::test]
+    async fn on_resolver_agent_completed_failed_spawns_next_resolver_under_cap() {
+        let (db, dir) = fresh_db();
+        let repo = dir.path().join("project");
+        let wt = dir.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+
+        let base = git_head_sha(&wt);
+        git_merge_allow_conflict(&wt, "master"); // unresolved conflict, no commit
+
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (state, _rx) = test_app_state(db.clone(), new_runner_registry(), plans_dir);
+
+        insert_agent_full(
+            &db,
+            "agent-1",
+            &wt,
+            "completed",
+            "pty",
+            "1.1",
+            Some("branchwork/p/1.1"),
+            None,
+            Some(crate::agents::MERGE_STATUS_HELD_FOR_RESOLVER),
+            None,
+        );
+        insert_agent_full(
+            &db,
+            "resolver-1",
+            &wt,
+            "completed",
+            "resolver",
+            "1.1-resolve-1",
+            None,
+            Some(&base),
+            None,
+            Some("agent-1"),
+        );
+        enable_auto_mode(&db, "p");
+        // Cap of 3 → attempt 2 is below the cap and spawns.
+        set_cap_and_task_cadence(&db, 3);
+        record_attempt(&db, "1.1", 1, "resolver-1");
+
+        on_resolver_agent_completed(&state, "default-org", "resolver-1", "p", "1.1-resolve-1")
+            .await;
+
+        // Attempt 1 closed `failed`.
+        assert_eq!(attempt_outcome(&db, "1.1", 1).as_deref(), Some("failed"));
+
+        // A SECOND resolver was spawned (attempt 2) — recursion into 3.2.
+        assert_eq!(
+            resolver_row_count(&db),
+            2,
+            "a failed resolver under cap must spawn the next resolver"
+        );
+        let attempt2_recorded: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM task_fix_attempts \
+                 WHERE plan_name='p' AND task_number='1.1' AND attempt=2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(attempt2_recorded, 1, "attempt 2 must be recorded");
+
+        // Plan stays running — the new resolver is working.
+        assert!(
+            paused_reason(&db, "p").is_none(),
+            "recursion under cap must not pause the plan"
         );
     }
 
@@ -5332,7 +6225,7 @@ mod tests {
         let merge_outcome = run_merge_step(&state, org_id, "agent-1", "p", "0.1", true).await;
         let merged_sha = match merge_outcome {
             MergeStepOutcome::Merged(sha) => sha,
-            MergeStepOutcome::Paused => panic!("merge should succeed in stub"),
+            other => panic!("merge should succeed in stub, got {other:?}"),
         };
         on_ci_stalled(&state, org_id, "p", "0.1", &merged_sha).await;
 

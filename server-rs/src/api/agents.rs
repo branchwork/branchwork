@@ -726,6 +726,16 @@ pub struct MergeOutcome {
     /// - `"runner_request_failed"` → 500
     /// - other (checkout/merge failures) → 500
     pub error: Option<String>,
+    /// Phase 3.3: what the conflict arm did with an at-merge resolver.
+    /// Only ever `Some` together with `had_conflict: true`, and only when
+    /// the resolver path applied (standalone + worktrees + auto-mode). The
+    /// auto-mode loop ([`crate::auto_mode::run_merge_step`]) reads this to
+    /// decide whether to leave the plan running (a resolver was spawned)
+    /// or pause it with `merge_conflict_unresolved` (the cap is spent).
+    /// `None` for every non-conflict outcome and for conflicts where no
+    /// resolver applies (manual merge / SaaS / no worktree / non-auto-mode)
+    /// — there the loop keeps its pre-3.3 `merge_conflict` pause.
+    pub resolver: Option<crate::agents::ResolverDisposition>,
 }
 
 /// Run the merge flow for an agent's task branch — the body of
@@ -795,6 +805,7 @@ pub async fn merge_agent_branch_inner(
                     task_branch: String::new(),
                     had_conflict: false,
                     error: Some("Agent not found".to_string()),
+                    resolver: None,
                 };
             }
         }
@@ -809,6 +820,7 @@ pub async fn merge_agent_branch_inner(
                 task_branch: String::new(),
                 had_conflict: false,
                 error: Some("Agent has no task branch".to_string()),
+                resolver: None,
             };
         }
     };
@@ -827,6 +839,7 @@ pub async fn merge_agent_branch_inner(
                 task_branch,
                 had_conflict: false,
                 error: Some(rpc_error_string(e)),
+                resolver: None,
             };
         }
     };
@@ -849,6 +862,7 @@ pub async fn merge_agent_branch_inner(
                     task_branch,
                     had_conflict: false,
                     error: Some(rpc_error_string(e)),
+                    resolver: None,
                 };
             }
         }
@@ -877,6 +891,7 @@ pub async fn merge_agent_branch_inner(
                 task_branch,
                 had_conflict: false,
                 error: Some(rpc_error_string(e)),
+                resolver: None,
             };
         }
     };
@@ -892,6 +907,7 @@ pub async fn merge_agent_branch_inner(
                 error: Some(
                     "task branch has no commits — agent exited without committing".to_string(),
                 ),
+                resolver: None,
             };
         }
         WireMergeOutcome::CheckoutFailed { stderr } => {
@@ -901,6 +917,7 @@ pub async fn merge_agent_branch_inner(
                 task_branch,
                 had_conflict: false,
                 error: Some(format!("Failed to checkout {target}: {stderr}")),
+                resolver: None,
             };
         }
         WireMergeOutcome::Conflict {
@@ -911,19 +928,20 @@ pub async fn merge_agent_branch_inner(
             // Phase 3.2: hand the conflicted worktree off to an at-merge
             // resolver agent instead of just surfacing the conflict. The
             // helper gates on standalone + worktrees + auto-mode (and the
-            // fix-attempt cap), so a SaaS / shared-tree / non-auto-mode /
-            // cap-hit merge is a no-op and the conflict falls through to the
-            // existing pause path unchanged (Task 3.3 turns a cap-hit into a
-            // distinct permanent pause). `had_conflict: true` is returned
-            // either way — the resolver runs in the background while the loop
-            // still pauses, and Task 3.3 wires the don't-pause-while-resolving
-            // refinement.
+            // fix-attempt cap), so a SaaS / shared-tree / non-auto-mode
+            // merge returns `None` and the conflict falls through to the
+            // pre-3.3 `merge_conflict` pause unchanged. Phase 3.3: the
+            // returned [`ResolverDisposition`] is surfaced on the outcome so
+            // `run_merge_step` can leave the plan running while the resolver
+            // works (`Spawned`) or pause it with `merge_conflict_unresolved`
+            // when the cap is spent (`CapHit`). `had_conflict: true` either
+            // way.
             let conflict = crate::agents::ConflictPayload {
                 conflicted_paths: conflicted_paths.clone(),
                 our_diff,
                 their_diff,
             };
-            maybe_spawn_conflict_resolver(
+            let resolver = maybe_spawn_conflict_resolver(
                 state,
                 agent_id,
                 plan_name.as_deref(),
@@ -943,6 +961,7 @@ pub async fn merge_agent_branch_inner(
                     "Merge conflict in: {}",
                     conflicted_paths.join(", ")
                 )),
+                resolver,
             };
         }
         WireMergeOutcome::Other { stderr } => {
@@ -952,6 +971,7 @@ pub async fn merge_agent_branch_inner(
                 task_branch,
                 had_conflict: false,
                 error: Some(format!("Failed to run git merge: {stderr}")),
+                resolver: None,
             };
         }
     };
@@ -1037,23 +1057,30 @@ pub async fn merge_agent_branch_inner(
         task_branch,
         had_conflict: false,
         error: None,
+        resolver: None,
     }
 }
 
-/// Phase 3.2 at-merge conflict resolver hand-off, called from
-/// [`merge_agent_branch_inner`]'s conflict arm. Spawns a resolver agent in
-/// the conflicted worktree and marks the original agent
-/// [`crate::agents::MERGE_STATUS_HELD_FOR_RESOLVER`] so termination cleanup
-/// leaves the tree in place for it. No-op (the conflict falls through to the
-/// existing pause path unchanged) when any precondition fails:
-/// - the agent has no plan/task (can't scope a resolver to a task),
-/// - worktrees are disabled (no isolated tree to resolve in safely),
-/// - SaaS mode (the worktree lives on the runner; resolver dispatch there is a
-///   follow-up — `start_pty_agent` is the standalone spawn path),
-/// - auto-mode isn't enabled for the plan (the resolver is an auto-mode
-///   feature; manual merges of non-auto-mode plans keep their old behaviour),
-/// - the fix-attempt cap is already spent ([`crate::agents::SpawnError::CapHit`]
-///   — Task 3.3 turns this into a distinct permanent pause).
+/// Phase 3.2/3.3 at-merge conflict resolver hand-off, called from
+/// [`merge_agent_branch_inner`]'s conflict arm. Returns the
+/// [`ResolverDisposition`] for the auto-mode caller (`run_merge_step`) to
+/// react to:
+/// - `Some(Spawned{..})` — a resolver agent was spawned in the conflicted
+///   worktree and the original agent was marked
+///   [`crate::agents::MERGE_STATUS_HELD_FOR_RESOLVER`] (so termination
+///   cleanup leaves the tree in place). The loop must **not** pause.
+/// - `Some(CapHit{..})` — the shared fix-attempt cap is spent; the loop
+///   pauses with `merge_conflict_unresolved`, leaving the worktree on disk.
+/// - `None` — no resolver path applied; the loop keeps its pre-3.3
+///   `merge_conflict` pause. Returned when any precondition fails:
+///   - the agent has no plan/task (can't scope a resolver to a task),
+///   - worktrees are disabled (no isolated tree to resolve in safely),
+///   - SaaS mode (the worktree lives on the runner; resolver dispatch
+///     there is a follow-up — `start_pty_agent` is the standalone path),
+///   - auto-mode isn't enabled for the plan (manual merges of non-auto-mode
+///     plans keep their old behaviour),
+///   - no parent task agent row could be found
+///     ([`crate::agents::SpawnError::NoParentAgent`] — defensive).
 #[allow(clippy::too_many_arguments)]
 async fn maybe_spawn_conflict_resolver(
     state: &AppState,
@@ -1064,18 +1091,29 @@ async fn maybe_spawn_conflict_resolver(
     target: &str,
     worktree_path: &std::path::Path,
     conflict: crate::agents::ConflictPayload,
-) {
+) -> Option<crate::agents::ResolverDisposition> {
     let (Some(plan), Some(task)) = (plan_name, task_id) else {
-        return;
+        return None;
     };
+    // Only the ORIGINAL task merge gets a resolver. A CI-fix / gate-fix
+    // merge (`<task>-fix-<n>`) lands its own branch on trunk and is paused
+    // independently by `on_fix_agent_completed` (`fix_merge_failed`); a
+    // resolver merge never reaches here (the re-merge runs on the original
+    // task agent, whose `task_id` is the bare number). Spawning a resolver
+    // for a suffixed task id would burn budget on a branch whose completion
+    // handler ignores the resolution. The resolver re-merge path itself uses
+    // the bare original task id, so this guard does not block the recursion.
+    if task.contains("-fix-") || task.contains("-resolve-") {
+        return None;
+    }
     if !crate::agents::pty_agent::worktrees_enabled() {
-        return;
+        return None;
     }
     if crate::saas::dispatch::org_has_runner(&state.db, org_id) {
-        return; // SaaS: the worktree lives on the runner — follow-up.
+        return None; // SaaS: the worktree lives on the runner — follow-up.
     }
     if !crate::db::auto_mode_enabled(&state.db, plan) {
-        return;
+        return None;
     }
 
     let attempt = crate::db::task_fix_attempt_count(&state.db, plan, task) + 1;
@@ -1109,14 +1147,28 @@ async fn maybe_spawn_conflict_resolver(
             eprintln!(
                 "[merge] conflict on {plan}/{task} → spawned resolver {resolver_id} (attempt {attempt})"
             );
+            Some(crate::agents::ResolverDisposition::Spawned {
+                resolver_agent_id: resolver_id,
+                attempt,
+            })
         }
-        Err(crate::agents::SpawnError::CapHit) => eprintln!(
-            "[merge] conflict on {plan}/{task} → resolver cap hit (attempt {attempt}); \
-             falling through to pause"
-        ),
-        Err(e) => eprintln!(
-            "[merge] conflict on {plan}/{task} → resolver not spawned: {e}; falling through to pause"
-        ),
+        Err(crate::agents::SpawnError::CapHit) => {
+            eprintln!(
+                "[merge] conflict on {plan}/{task} → resolver cap hit (attempt {attempt}); \
+                 pausing with merge_conflict_unresolved"
+            );
+            Some(crate::agents::ResolverDisposition::CapHit {
+                attempt,
+                conflicted_paths: conflict.conflicted_paths,
+            })
+        }
+        Err(e) => {
+            eprintln!(
+                "[merge] conflict on {plan}/{task} → resolver not spawned: {e}; \
+                 falling through to merge_conflict pause"
+            );
+            None
+        }
     }
 }
 

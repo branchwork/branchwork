@@ -515,6 +515,39 @@ impl std::fmt::Display for SpawnError {
     }
 }
 
+/// What the merge-conflict arm did with a conflict, surfaced on
+/// [`crate::api::agents::MergeOutcome::resolver`] so the auto-mode loop
+/// (`run_merge_step`) can decide whether to pause (Task 3.3). `None` on
+/// the outcome means no resolver path applied at all — manual merge,
+/// SaaS, worktrees disabled, non-auto-mode plan, or no plan/task — in
+/// which case the loop keeps its pre-3.3 `merge_conflict` pause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolverDisposition {
+    /// A resolver agent was spawned in the conflicted worktree. The
+    /// auto-mode loop must **not** pause — leave the plan running so the
+    /// resolver's completion (`on_resolver_agent_completed`) can re-attempt
+    /// the merge.
+    Spawned {
+        /// The spawned resolver agent id — carried so the loop can audit
+        /// / thread the attempt.
+        resolver_agent_id: AgentId,
+        /// 1-based attempt number (shared `task_fix_attempts` budget).
+        attempt: u32,
+    },
+    /// The shared `task_fix_attempts` cap is spent; no resolver was spawned.
+    /// The auto-mode loop pauses the plan with reason
+    /// `merge_conflict_unresolved`, carrying the conflicted paths so the
+    /// dashboard can surface them. The conflicted worktree is left on disk
+    /// (markers preserved) for human inspection.
+    CapHit {
+        /// The attempt number that would have been spawned (= count + 1) —
+        /// for the pause audit/broadcast.
+        attempt: u32,
+        /// Files git left unmerged — surfaced in the pause broadcast.
+        conflicted_paths: Vec<String>,
+    },
+}
+
 /// Substitute the resolver prompt template's placeholders. Pure (no I/O) so
 /// the prompt shape is unit-testable without spawning anything.
 pub fn build_resolver_prompt(
@@ -589,6 +622,77 @@ fn reconstruct_merge_conflict(worktree_path: &Path, target_branch: &str) {
             "[resolver] reconstruct: failed to run `git merge {target_branch}` in {}: {e}",
             worktree_path.display()
         ),
+    }
+}
+
+/// `git rev-parse HEAD` in `worktree_path`. `None` when the command fails
+/// (not a repo, detached/unborn HEAD).
+fn worktree_head_sha(worktree_path: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(worktree_path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// Whether `worktree_path` still carries unmerged (conflicted) index
+/// entries — i.e. the resolver left a `UU`-style conflict unresolved.
+/// Uses `git diff --name-only --diff-filter=U`, which lists exactly the
+/// paths git considers unmerged (the same probe the rebase-conflict path
+/// uses). A non-empty result means the resolution is incomplete. Any git
+/// error is treated as "not unmerged" so a transient failure doesn't
+/// masquerade as a conflict (the new-commit check below is the other,
+/// independent gate).
+fn worktree_has_unmerged_paths(worktree_path: &Path) -> bool {
+    let out = std::process::Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(worktree_path)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// Decide whether an at-merge resolver agent actually resolved its
+/// conflict — the gate Task 3.3 runs before re-attempting the merge.
+///
+/// Success requires **all three** to hold:
+/// - `exited_clean` — the resolver process exited 0 (its agent row is
+///   `completed`, not `failed`).
+/// - no unmerged paths in the worktree ([`worktree_has_unmerged_paths`]) —
+///   the resolver left no `UU` conflict behind.
+/// - `git rev-parse HEAD` differs from `base_commit` — the resolver
+///   committed a new resolution on top of the task branch (`base_commit`
+///   is the resolver agent's `base_commit` column, captured at spawn time
+///   *before* the resolution while the worktree was still on the
+///   pre-resolution task-branch tip).
+///
+/// Any of: non-zero exit, lingering conflict, missing `base_commit`, or
+/// HEAD unchanged ⇒ `false` (the failure path, which recurses into Task 3.2
+/// until the cap).
+pub fn resolver_resolution_succeeded(
+    worktree_path: &Path,
+    base_commit: Option<&str>,
+    exited_clean: bool,
+) -> bool {
+    if !exited_clean {
+        return false;
+    }
+    if worktree_has_unmerged_paths(worktree_path) {
+        return false;
+    }
+    let Some(base) = base_commit else {
+        return false;
+    };
+    match worktree_head_sha(worktree_path) {
+        Some(head) => head != base,
+        None => false,
     }
 }
 
@@ -703,12 +807,21 @@ pub async fn spawn_conflict_resolver(
     )
     .await;
 
-    // 7. Badge the row as a resolver threaded under its parent.
+    // 7. Badge the row as a resolver threaded under its parent. Mark it
+    //    `held_for_resolver` too: the resolver shares the conflicted
+    //    worktree with the original agent, so if the resolver's own
+    //    supervisor crashes (`cleanup_worktree_for_terminated_agent` keys on
+    //    the resolver's own `merge_status`, not the parent's), the marker
+    //    keeps that path from yanking the shared tree out from under the
+    //    pending resolution. The merge-success cleanup
+    //    (`remove_agent_worktree`, keyed on `cwd`) still removes it once the
+    //    re-merge lands.
     {
         let conn = registry.db.lock().unwrap();
         conn.execute(
-            "UPDATE agents SET mode = 'resolver', parent_agent_id = ?2 WHERE id = ?1",
-            rusqlite::params![resolver_id, parent_agent_id],
+            "UPDATE agents SET mode = 'resolver', parent_agent_id = ?2, merge_status = ?3 \
+             WHERE id = ?1",
+            rusqlite::params![resolver_id, parent_agent_id, MERGE_STATUS_HELD_FOR_RESOLVER],
         )
         .ok();
     }
@@ -4136,6 +4249,111 @@ mod tests {
             .unwrap()
         };
         assert_eq!(resolver_count, 0, "cap hit must not spawn a resolver");
+    }
+
+    // ── resolver_resolution_succeeded gate (Task 3.3) ─────────────────────
+
+    /// A resolver that committed a merge resolution on the task branch
+    /// (exit 0, no unmerged paths, HEAD moved past `base_commit`) ⇒ resolved.
+    #[test]
+    fn resolver_resolution_succeeded_true_on_clean_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+
+        let base = git_head_sha_in(&wt);
+        // Resolve the conflict + commit a merge commit.
+        let _ = std::process::Command::new("git")
+            .args(["merge", "master", "--no-edit"])
+            .current_dir(&wt)
+            .output();
+        std::fs::write(wt.join("file.txt"), "resolved\n").unwrap();
+        run_git_in(&wt, &["add", "file.txt"]);
+        run_git_in(&wt, &["commit", "-q", "-m", "resolve"]);
+
+        assert!(
+            resolver_resolution_succeeded(&wt, Some(&base), true),
+            "clean exit + no unmerged + new commit ⇒ resolved"
+        );
+    }
+
+    /// Non-zero exit ⇒ not resolved, regardless of tree state.
+    #[test]
+    fn resolver_resolution_succeeded_false_on_non_zero_exit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+        let base = git_head_sha_in(&wt);
+        // Even with a real commit on top, a non-zero exit fails the gate.
+        std::fs::write(wt.join("file.txt"), "more work\n").unwrap();
+        run_git_in(&wt, &["commit", "-qam", "more"]);
+        assert!(
+            !resolver_resolution_succeeded(&wt, Some(&base), false),
+            "non-zero exit must fail the resolution gate"
+        );
+    }
+
+    /// Lingering unmerged (`UU`) paths ⇒ not resolved.
+    #[test]
+    fn resolver_resolution_succeeded_false_on_unmerged_paths() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+        let base = git_head_sha_in(&wt);
+        // Reproduce the conflict and leave it unresolved (no commit).
+        let _ = std::process::Command::new("git")
+            .args(["merge", "master", "--no-edit"])
+            .current_dir(&wt)
+            .output();
+        assert!(
+            !resolver_resolution_succeeded(&wt, Some(&base), true),
+            "a worktree with UU entries must fail the gate"
+        );
+    }
+
+    /// No new commit (HEAD == base_commit) ⇒ not resolved.
+    #[test]
+    fn resolver_resolution_succeeded_false_on_no_new_commit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+        let base = git_head_sha_in(&wt);
+        // Clean tree, but HEAD never moved past base — the resolver did
+        // nothing useful (e.g. a no-op driver that just aborted).
+        assert!(
+            !resolver_resolution_succeeded(&wt, Some(&base), true),
+            "HEAD unchanged ⇒ no resolution"
+        );
+        // Missing base_commit also fails (can't verify a new commit).
+        assert!(
+            !resolver_resolution_succeeded(&wt, None, true),
+            "missing base_commit ⇒ can't confirm a resolution"
+        );
+    }
+
+    /// Local helpers for the resolution-gate tests — small wrappers so the
+    /// tests stay self-contained (the auto_mode tests have their own copies).
+    fn run_git_in(cwd: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?} failed in {}", cwd.display());
+    }
+
+    fn git_head_sha_in(cwd: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     // ── try_auto_advance tests (Task 3.4) ─────────────────────────────
