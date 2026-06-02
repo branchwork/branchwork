@@ -530,6 +530,109 @@ pub(crate) fn cargo_target_dir_in(base: &Path, project_slug: &str) -> PathBuf {
     cache_root.join(project_slug).join("cargo-target")
 }
 
+// ── Per-project disk usage ───────────────────────────────────────────
+//
+// The worktree base holds one `<base>/<project-slug>/` subtree per project
+// (the cargo cache lives OUTSIDE the base — a sibling — so the base's
+// immediate children are exactly the project slugs). Running `du` over each
+// child gives that project's total worktree footprint, surfaced in the
+// dashboard sidebar so an operator can see which projects accrete disk
+// before it becomes a problem.
+
+/// One project's worktree-tree disk usage. Local compute shape; the wire /
+/// API form is [`crate::saas::runner_protocol::ProjectDiskUsage`] (identical
+/// fields) which both the standalone endpoint and the SaaS relay convert into.
+/// Kept wire-free here so this low-level git primitive stays decoupled from the
+/// runner protocol — mirrors the [`OrphanWorktree`] / `WorktreeOrphan` split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskUsageEntry {
+    /// Project slug — the immediate child directory name under the base.
+    pub slug: String,
+    /// Total size in bytes (from `du`, rounded up to whole 1 KiB blocks).
+    pub size_bytes: u64,
+    /// Human-readable size (e.g. `1.2G`), formatted by [`format_size_human`].
+    pub size_human: String,
+}
+
+/// Compute per-project worktree disk usage by running `du` over every
+/// immediate child directory of `base`. Each child is a project slug (the
+/// base layout is `<base>/<slug>/<plan>/<task>-<agent-id>/`). Returns an empty
+/// vec when the base does not exist yet (no worktrees created) and skips any
+/// child whose `du` shell-out fails. Sorted by slug for stable output.
+///
+/// Shelling out to `du` (rather than walking the tree in-process) matches the
+/// task brief and offloads the recursive `stat` to the system tool, which is
+/// fast and battle-tested for exactly this job.
+pub fn disk_usage_for_base(base: &Path) -> Vec<DiskUsageEntry> {
+    let read = match std::fs::read_dir(base) {
+        Ok(r) => r,
+        // Base absent (no worktrees yet) or unreadable → nothing to report.
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in read.flatten() {
+        // Only project-slug directories live directly under the base.
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {}
+            _ => continue,
+        }
+        let slug = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue, // non-UTF-8 dir name; skip rather than guess.
+        };
+        if let Some(size_bytes) = du_size_bytes(&entry.path()) {
+            out.push(DiskUsageEntry {
+                size_human: format_size_human(size_bytes),
+                slug,
+                size_bytes,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.slug.cmp(&b.slug));
+    out
+}
+
+/// Run `du` over `path` and return its total size in bytes, or `None` on a
+/// shell-out / parse failure.
+///
+/// Uses `du -sk` (summary, 1 KiB blocks) rather than the brief's literal
+/// `du -sh`: `-k` is portable across GNU and BSD `du`, yields a single
+/// machine-parsable integer, and lets us derive BOTH the byte count and the
+/// human string from ONE traversal (we format the human form ourselves via
+/// [`format_size_human`]). `du -sh` would only give the human string and need
+/// a second call for bytes.
+fn du_size_bytes(path: &Path) -> Option<u64> {
+    let out = Command::new("du").arg("-sk").arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Output is `<kib-blocks>\t<path>`; take the leading integer.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kib: u64 = text.split_whitespace().next()?.parse().ok()?;
+    Some(kib.saturating_mul(1024))
+}
+
+/// Format a byte count the way `du -h` would: powers of 1024 with a single
+/// suffix (`B`/`K`/`M`/`G`/`T`), one decimal place below 10 and none at or
+/// above it (`512B`, `1.0K`, `1.2M`, `12M`, `1.5G`).
+pub fn format_size_human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if size >= 10.0 {
+        format!("{:.0}{}", size, UNITS[unit])
+    } else {
+        format!("{:.1}{}", size, UNITS[unit])
+    }
+}
+
 /// Does a *local* branch named `branch` exist in `project_dir`?
 #[allow(dead_code)] // call sites land in Phase 2
 fn branch_exists(project_dir: &Path, branch: &str) -> bool {
@@ -1269,6 +1372,51 @@ detached
         let other = cargo_target_dir_in(base, "otherproj");
         assert_ne!(a, other);
         assert_eq!(a, PathBuf::from("/srv/cache/myproj/cargo-target"));
+    }
+
+    #[test]
+    fn format_size_human_matches_du_h_conventions() {
+        assert_eq!(format_size_human(0), "0B");
+        assert_eq!(format_size_human(512), "512B");
+        assert_eq!(format_size_human(1024), "1.0K");
+        assert_eq!(format_size_human(1536), "1.5K");
+        assert_eq!(format_size_human(10 * 1024), "10K");
+        assert_eq!(format_size_human(1024 * 1024), "1.0M");
+        assert_eq!(format_size_human(1024 * 1024 * 3 / 2), "1.5M");
+        assert_eq!(format_size_human(12 * 1024 * 1024), "12M");
+        assert_eq!(format_size_human(1024 * 1024 * 1024 * 3 / 2), "1.5G");
+    }
+
+    #[test]
+    fn disk_usage_for_base_reports_each_project_subdir() {
+        let base = TempDir::new().unwrap();
+        // Two project subtrees with a file each so `du` sees nonzero size.
+        for slug in ["proj-a", "proj-b"] {
+            let p = base.path().join(slug).join("plan").join("0.1-abc");
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("file.txt"), vec![0u8; 4096]).unwrap();
+        }
+        // A non-directory entry under the base must be ignored.
+        std::fs::write(base.path().join("stray.txt"), b"x").unwrap();
+
+        let usage = disk_usage_for_base(base.path());
+        let slugs: Vec<&str> = usage.iter().map(|e| e.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["proj-a", "proj-b"], "sorted, dirs only");
+        for e in &usage {
+            assert!(e.size_bytes > 0, "du reports nonzero for {}", e.slug);
+            assert_eq!(
+                e.size_human,
+                format_size_human(e.size_bytes),
+                "human matches bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn disk_usage_for_base_missing_base_is_empty() {
+        let base = TempDir::new().unwrap();
+        let missing = base.path().join("does-not-exist");
+        assert!(disk_usage_for_base(&missing).is_empty());
     }
 
     /// Test helper: `git status --porcelain` output for `cwd`, trimmed.

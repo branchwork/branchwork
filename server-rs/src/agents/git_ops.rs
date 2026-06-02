@@ -28,7 +28,7 @@ use crate::agents::worktree::{OrphanWorktree, RemoveOutcome};
 use crate::db::Db;
 use crate::git_helpers::{PushError, PushReport};
 use crate::saas::dispatch::org_has_runner;
-use crate::saas::runner_protocol::{MergeOutcome, WireMessage, WorktreeOrphan};
+use crate::saas::runner_protocol::{MergeOutcome, ProjectDiskUsage, WireMessage, WorktreeOrphan};
 use crate::saas::runner_rpc::{RunnerRpcError, runner_request_with_registry};
 use crate::saas::runner_ws::{RunnerRegistry, RunnerResponse};
 
@@ -349,6 +349,51 @@ pub async fn list_worktree_orphans(
     }
 }
 
+// ── disk_usage ────────────────────────────────────────────────────────────────
+
+/// Per-project worktree disk usage for the dashboard sidebar.
+/// - SaaS path: dispatch [`WireMessage::DiskUsage`] to the runner, which runs
+///   `du` over its own worktree base and replies with `DiskUsageReported`.
+/// - Standalone: resolve the local worktree base and run
+///   [`crate::agents::worktree::disk_usage_for_base`] on a blocking thread (a
+///   slow `du` must not stall the async runtime).
+///
+/// Consumed by the cached, stale-while-revalidate `api::worktree_disk_usage`
+/// endpoint, which only ever calls this from a background task — never inline
+/// on the HTTP request — so a slow `du` never blocks the dashboard.
+pub async fn disk_usage(
+    db: &Db,
+    runners: &RunnerRegistry,
+    org_id: &str,
+) -> Result<Vec<ProjectDiskUsage>, RunnerRpcError> {
+    if org_has_runner(db, org_id) {
+        let req_id = Uuid::new_v4().to_string();
+        let msg = WireMessage::DiskUsage { req_id };
+        match runner_request_with_registry(db, runners, org_id, msg, WORKTREE_TIMEOUT).await? {
+            RunnerResponse::DiskUsageReported(projects) => Ok(projects),
+            other => unexpected_response("disk_usage_reported", &other),
+        }
+    } else {
+        // The `du` shell-out is blocking — run it off the async runtime. Base
+        // resolution failure (no home dir) → empty (no worktrees to locate).
+        let projects =
+            tokio::task::spawn_blocking(|| match crate::agents::worktree::worktree_base() {
+                Ok(base) => crate::agents::worktree::disk_usage_for_base(&base)
+                    .into_iter()
+                    .map(|e| ProjectDiskUsage {
+                        slug: e.slug,
+                        size_bytes: e.size_bytes,
+                        size_human: e.size_human,
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            })
+            .await
+            .unwrap_or_default();
+        Ok(projects)
+    }
+}
+
 /// Parse the runner's `WorktreeRemoved.outcome` label back into a
 /// [`RemoveOutcome`]. Unknown / `error: …` labels collapse to `Err(msg)` so
 /// the SaaS path mirrors the local `Result<RemoveOutcome, WorktreeError>`.
@@ -409,7 +454,8 @@ mod worktree_dispatch_tests {
         match msg {
             WireMessage::SetupWorktree { req_id, .. }
             | WireMessage::RemoveWorktree { req_id, .. }
-            | WireMessage::ListWorktreeOrphans { req_id, .. } => Some(req_id),
+            | WireMessage::ListWorktreeOrphans { req_id, .. }
+            | WireMessage::DiskUsage { req_id } => Some(req_id),
             _ => None,
         }
     }
@@ -673,6 +719,43 @@ mod worktree_dispatch_tests {
                 .map(|d| d.as_secs()),
             Some(1_700_000_000)
         );
+    }
+
+    #[tokio::test]
+    async fn disk_usage_saas_relays_runner_report() {
+        let db = db_with_online_runner("runner-1", "org-1");
+        let registry = new_runner_registry();
+        install_echo_runner(&registry, "runner-1", |msg| match msg {
+            WireMessage::DiskUsage { .. } => {
+                Some(RunnerResponse::DiskUsageReported(vec![ProjectDiskUsage {
+                    slug: "proj-a".into(),
+                    size_bytes: 1_572_864,
+                    size_human: "1.5M".into(),
+                }]))
+            }
+            _ => None,
+        })
+        .await;
+
+        let projects = disk_usage(&db, &registry, "org-1")
+            .await
+            .expect("dispatch should reach the runner");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].slug, "proj-a");
+        assert_eq!(projects[0].size_bytes, 1_572_864);
+        assert_eq!(projects[0].size_human, "1.5M");
+    }
+
+    #[tokio::test]
+    async fn disk_usage_no_runner_is_rpc_err() {
+        // SaaS routing requested (db has a runner row) but the registry is
+        // empty (post-restart) → NoConnectedRunner.
+        let db = db_with_online_runner("runner-1", "org-1");
+        let registry = new_runner_registry();
+        let err = disk_usage(&db, &registry, "org-1")
+            .await
+            .expect_err("no connected runner");
+        assert!(matches!(err, RunnerRpcError::NoConnectedRunner));
     }
 
     fn init_repo(dir: &Path) {

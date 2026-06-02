@@ -9,6 +9,8 @@ import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
 import { useWsStore } from "../stores/ws-store.js";
+import { useOrgStore } from "../stores/org-store.js";
+import { useAuthStore } from "../stores/auth-store.js";
 
 beforeEach(() => {
   useUiStore.setState({ sidebarOpen: false });
@@ -225,5 +227,91 @@ describe("Sidebar", () => {
     // The single menu item is "Export".
     const exportItem = screen.getByRole("menuitem", { name: /Export/ });
     expect(exportItem).toBeTruthy();
+  });
+});
+
+describe("Sidebar worktree disk usage", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    useOrgStore.setState({ memberships: [] });
+    useAuthStore.setState({ user: null });
+  });
+
+  function planFor(project: string) {
+    return {
+      name: project.toLowerCase().replace(/[^a-z0-9]/g, "-"),
+      title: `${project} plan`,
+      project,
+      phaseCount: 1,
+      taskCount: 2,
+      doneCount: 1,
+      createdAt: new Date().toISOString(),
+      modifiedAt: new Date().toISOString(),
+    };
+  }
+
+  function seedMember(projects: string[]) {
+    useOrgStore.setState({
+      memberships: [
+        { id: "org-1", name: "Org One", slug: "org-1", role: "member", memberCount: 1 },
+      ],
+    });
+    useAuthStore.setState({ user: { id: "u1", email: "u@x.test", orgId: "org-1" } });
+    usePlanStore.setState({ plans: projects.map(planFor) });
+  }
+
+  /// Stub `fetch` so only the disk-usage endpoint returns `projects`; every
+  /// other Sidebar fetch (/api/health, /api/health/state) rejects — the same
+  /// "network disabled" behaviour the other Sidebar tests rely on (those
+  /// components catch the rejection and render a safe fallback). Returns the
+  /// spy so callers can assert which URLs were hit.
+  function stubFetch(projects: { slug: string; size_bytes: number; size_human: string }[]) {
+    const spy = vi.fn(async (input: RequestInfo | URL) => {
+      const path = typeof input === "string" ? input : input.toString();
+      if (path.includes("/worktree-disk-usage")) {
+        return new Response(JSON.stringify({ projects }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error("network disabled in test");
+    });
+    vi.stubGlobal("fetch", spy);
+    return spy;
+  }
+
+  it("renders the du-measured size next to a project group when the slug matches", async () => {
+    // `MyProj` slugifies to `myproj` (same rule as project_slug_for_worktree).
+    seedMember(["MyProj"]);
+    stubFetch([{ slug: "myproj", size_bytes: 1572864, size_human: "1.5M" }]);
+
+    renderSidebar();
+    const size = await screen.findByTestId("disk-usage-myproj");
+    expect(size.textContent).toBe("1.5M");
+  });
+
+  it("shows a size only for groups whose slug has a worktree entry", async () => {
+    seedMember(["MyProj", "Other Thing"]);
+    // Response carries only `myproj`; `other-thing` has no worktree tree.
+    stubFetch([{ slug: "myproj", size_bytes: 1048576, size_human: "1.0M" }]);
+
+    renderSidebar();
+    // Wait for the matching chip to confirm the fetch resolved.
+    expect((await screen.findByTestId("disk-usage-myproj")).textContent).toBe("1.0M");
+    expect(screen.queryByTestId("disk-usage-other-thing")).toBeNull();
+  });
+
+  it("does not fetch disk usage when the user has no org membership", async () => {
+    // Default state (afterEach reset): no memberships → diskUsageSlug is null →
+    // no disk-usage fetch ever fires.
+    usePlanStore.setState({ plans: [planFor("MyProj")] });
+    const spy = stubFetch([]);
+    renderSidebar();
+    // Give effects a tick to run; the disk-usage URL must never be requested.
+    await Promise.resolve();
+    const diskUsageCalls = spy.mock.calls.filter((c) =>
+      String(c[0]).includes("/worktree-disk-usage"),
+    );
+    expect(diskUsageCalls).toHaveLength(0);
   });
 });

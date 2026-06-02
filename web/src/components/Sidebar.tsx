@@ -1,9 +1,11 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { Link, NavLink, useLocation } from "react-router-dom";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
+import { useOrgStore } from "../stores/org-store.js";
+import { useAuthStore } from "../stores/auth-store.js";
 import { useUiStore } from "../stores/ui-store.js";
 import { fetchJson, postJson } from "../api.js";
 import { formatRelative } from "../lib/time.js";
@@ -15,6 +17,27 @@ import { StaleDataChip } from "./StaleDataChip.js";
 import { HealthStateIndicator } from "./HealthStateIndicator.js";
 import { OrphanWorktrees } from "./OrphanWorktrees.js";
 import { TouchTarget } from "./ui/TouchTarget.js";
+
+/// One project's worktree disk usage from `GET
+/// /api/orgs/:slug/worktree-disk-usage`. snake_case to match the server JSON
+/// (no camelCase mapping on the wire).
+interface WorktreeDiskUsage {
+  slug: string;
+  size_bytes: number;
+  size_human: string;
+}
+
+/// Slugify a project name to its worktree-base child directory name — the SAME
+/// rule as the server's `project_slug_for_worktree` (lowercased, every
+/// non-ASCII-alphanumeric char → `-`). Used to match a sidebar project group to
+/// its `du`-measured worktree size, since the disk-usage endpoint is keyed by
+/// slug while the sidebar groups by project name.
+function worktreeSlug(name: string): string {
+  const slug = Array.from(name)
+    .map((c) => (/[a-zA-Z0-9]/.test(c) ? c.toLowerCase() : "-"))
+    .join("");
+  return slug.length > 0 ? slug : "project";
+}
 
 export function Sidebar() {
   const plans = usePlanStore((s) => s.plans);
@@ -38,6 +61,52 @@ export function Sidebar() {
   const [convertingAll, setConvertingAll] = useState(false);
   const [showDone, setShowDone] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState("");
+
+  // Per-project worktree disk usage (Phase 6, Task 6.2). Fetched once per org
+  // on dashboard load and matched to each project group by slug. The endpoint
+  // is cached + stale-while-revalidate server-side, so a slow `du` never
+  // blocks this fetch; a cold cache returns an empty list and we re-poll once
+  // after the background `du` should have settled.
+  const memberships = useOrgStore((s) => s.memberships);
+  const authUser = useAuthStore((s) => s.user);
+  const diskUsageSlug = useMemo(() => {
+    const active = memberships.find((m) => m.id === (authUser?.orgId ?? null));
+    return active?.slug ?? memberships[0]?.slug ?? null;
+  }, [memberships, authUser]);
+  const [diskUsage, setDiskUsage] = useState<Map<string, WorktreeDiskUsage>>(new Map());
+
+  const loadDiskUsage = useCallback(async (): Promise<number | undefined> => {
+    if (!diskUsageSlug) return undefined;
+    try {
+      const data = await fetchJson<{ projects: WorktreeDiskUsage[] }>(
+        `/api/orgs/${diskUsageSlug}/worktree-disk-usage`,
+      );
+      setDiskUsage(new Map(data.projects.map((p) => [p.slug, p])));
+      return data.projects.length;
+    } catch {
+      // Best-effort: a failed fetch leaves any prior sizes in place.
+      return undefined;
+    }
+  }, [diskUsageSlug]);
+
+  useEffect(() => {
+    if (!diskUsageSlug) return;
+    let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    void loadDiskUsage().then((count) => {
+      // Cold cache → empty list + background `du`; re-poll once so the first
+      // dashboard load fills in the sizes without a manual refresh.
+      if (!cancelled && count === 0) {
+        retry = setTimeout(() => {
+          if (!cancelled) void loadDiskUsage();
+        }, 4000);
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (retry) clearTimeout(retry);
+    };
+  }, [diskUsageSlug, loadDiskUsage]);
 
   const sidebarOpen = useUiStore((s) => s.sidebarOpen);
   const closeSidebar = useUiStore((s) => s.closeSidebar);
@@ -300,44 +369,58 @@ export function Sidebar() {
               ))}
             </div>
           )}
-          {grouped.map(([project, { active, done }]) => (
-            <div key={project} className="mb-3">
-              <h3 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider px-2 mb-1 flex items-center gap-1.5">
-                <span
-                  aria-hidden="true"
-                  className={`w-1.5 h-1.5 rounded-full ${
-                    project === "Unassigned" ? "bg-gray-600" : "bg-indigo-500"
-                  }`}
-                />
-                {project}
-                <span className="text-gray-600 font-normal">({active.length + done.length})</span>
-              </h3>
-
-              {/* Active plans */}
-              <ul className="space-y-0.5">{active.map((p) => renderPlanItem(p))}</ul>
-
-              {/* Completed plans — folded */}
-              {done.length > 0 && (
-                <div className="mt-1">
-                  <button
-                    onClick={() => setShowDone((prev) => ({ ...prev, [project]: !prev[project] }))}
-                    className="w-full text-left px-2 py-1 text-[10px] text-gray-600 hover:text-gray-400 transition flex items-center gap-1"
-                  >
-                    <span aria-hidden="true" className="text-[8px]">
-                      {showDone[project] ? "▼" : "▶"}
+          {grouped.map(([project, { active, done }]) => {
+            const du = diskUsage.get(worktreeSlug(project));
+            return (
+              <div key={project} className="mb-3">
+                <h3 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider px-2 mb-1 flex items-center gap-1.5">
+                  <span
+                    aria-hidden="true"
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      project === "Unassigned" ? "bg-gray-600" : "bg-indigo-500"
+                    }`}
+                  />
+                  {project}
+                  <span className="text-gray-600 font-normal">({active.length + done.length})</span>
+                  {du && (
+                    <span
+                      className="ml-auto font-normal normal-case tracking-normal text-gray-600"
+                      title={`Worktree disk usage: ${du.size_human} (${du.size_bytes.toLocaleString()} bytes)`}
+                      data-testid={`disk-usage-${worktreeSlug(project)}`}
+                    >
+                      {du.size_human}
                     </span>
-                    <span aria-hidden="true" className="text-emerald-700">
-                      &#10003;
-                    </span>
-                    {done.length} completed plan{done.length !== 1 ? "s" : ""}
-                  </button>
-                  {showDone[project] && (
-                    <ul className="space-y-0.5">{done.map((p) => renderPlanItem(p, true))}</ul>
                   )}
-                </div>
-              )}
-            </div>
-          ))}
+                </h3>
+
+                {/* Active plans */}
+                <ul className="space-y-0.5">{active.map((p) => renderPlanItem(p))}</ul>
+
+                {/* Completed plans — folded */}
+                {done.length > 0 && (
+                  <div className="mt-1">
+                    <button
+                      onClick={() =>
+                        setShowDone((prev) => ({ ...prev, [project]: !prev[project] }))
+                      }
+                      className="w-full text-left px-2 py-1 text-[10px] text-gray-600 hover:text-gray-400 transition flex items-center gap-1"
+                    >
+                      <span aria-hidden="true" className="text-[8px]">
+                        {showDone[project] ? "▼" : "▶"}
+                      </span>
+                      <span aria-hidden="true" className="text-emerald-700">
+                        &#10003;
+                      </span>
+                      {done.length} completed plan{done.length !== 1 ? "s" : ""}
+                    </button>
+                    {showDone[project] && (
+                      <ul className="space-y-0.5">{done.map((p) => renderPlanItem(p, true))}</ul>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </aside>
     </>

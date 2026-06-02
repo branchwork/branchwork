@@ -23,8 +23,8 @@ use crate::ws::broadcast_event;
 
 use super::outbox;
 use super::runner_protocol::{
-    CiAggregate, DriverAuthInfo, Envelope, FolderEntry, GhRun, MergeOutcome, WireMessage,
-    WorktreeOrphan,
+    CiAggregate, DriverAuthInfo, Envelope, FolderEntry, GhRun, MergeOutcome, ProjectDiskUsage,
+    WireMessage, WorktreeOrphan,
 };
 
 // ── Runner registry (in-memory, lives in AppState) ──────────────────────────
@@ -122,6 +122,9 @@ pub enum RunnerResponse {
     /// Reply to `ListWorktreeOrphans`. The orphan worktrees the runner found
     /// under the project's scope; empty when none (or on a listing failure).
     WorktreeOrphansListed(Vec<WorktreeOrphan>),
+    /// Reply to `DiskUsage`. Per-project worktree disk usage the runner
+    /// measured under its own base; empty when none (or on a listing failure).
+    DiskUsageReported(Vec<ProjectDiskUsage>),
 }
 
 /// A connected runner's server-side handle.
@@ -1506,6 +1509,17 @@ async fn handle_runner_message(
             .await;
         }
 
+        WireMessage::DiskUsageReported { req_id, projects } => {
+            resolve_pending(
+                state,
+                runner_id,
+                req_id,
+                "disk_usage_reported",
+                RunnerResponse::DiskUsageReported(projects.clone()),
+            )
+            .await;
+        }
+
         WireMessage::RunnerHealth {
             outbox_depth,
             ws_reconnects_24h,
@@ -1632,7 +1646,9 @@ async fn handle_runner_message(
         // Worktree request variants (Task 2.7) are saas→runner only.
         | WireMessage::SetupWorktree { .. }
         | WireMessage::RemoveWorktree { .. }
-        | WireMessage::ListWorktreeOrphans { .. } => {}
+        | WireMessage::ListWorktreeOrphans { .. }
+        // Disk-usage request is saas→runner only (the server sends it).
+        | WireMessage::DiskUsage { .. } => {}
     }
 }
 

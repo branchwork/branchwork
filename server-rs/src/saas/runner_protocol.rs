@@ -853,6 +853,20 @@ pub enum WireMessage {
         orphans: Vec<WorktreeOrphan>,
     },
 
+    /// Dashboard requested per-project worktree disk usage. The runner resolves
+    /// its own worktree base, runs `du` over each `<base>/<slug>` child
+    /// directory, and replies with `DiskUsageReported`. Best-effort: tied to a
+    /// live HTTP caller, so outbox replay would land after the caller has
+    /// already timed out.
+    DiskUsage { req_id: String },
+    /// Runner reply with per-project worktree disk usage (empty when the base
+    /// holds no worktrees, or on a listing failure — same best-effort posture
+    /// as the standalone `disk_usage_for_base`).
+    DiskUsageReported {
+        req_id: String,
+        projects: Vec<ProjectDiskUsage>,
+    },
+
     // ── Bidirectional ───────────────────────────────────────────────────
     /// Acknowledge receipt of a sequenced message. The receiver sends this
     /// after persisting the event so the sender can prune its outbox.
@@ -911,6 +925,20 @@ pub struct WorktreeOrphan {
     /// Filesystem mtime as Unix epoch seconds, if it could be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_modified_secs: Option<u64>,
+}
+
+// ── Project disk usage ────────────────────────────────────────────────────────
+
+/// Per-project worktree disk usage for `DiskUsageReported`. Same fields as the
+/// local `agents::worktree::DiskUsageEntry`; lives here so the SaaS wire form
+/// and the standalone endpoint's JSON response share one shape. `slug` is the
+/// project's worktree-base child directory name; `size_human` is `du`-style
+/// (e.g. `1.2G`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectDiskUsage {
+    pub slug: String,
+    pub size_bytes: u64,
+    pub size_human: String,
 }
 
 // ── Credential envelope (Phase 3.3 of runner-daemon-workspace) ──────────────
@@ -1232,6 +1260,8 @@ impl WireMessage {
                 | WireMessage::WorktreeRemoved { .. }
                 | WireMessage::ListWorktreeOrphans { .. }
                 | WireMessage::WorktreeOrphansListed { .. }
+                | WireMessage::DiskUsage { .. }
+                | WireMessage::DiskUsageReported { .. }
                 | WireMessage::RunnerLogLine { .. }
                 | WireMessage::RunnerHealth { .. }
         )
@@ -1295,6 +1325,8 @@ impl WireMessage {
             WireMessage::WorktreeRemoved { .. } => "worktree_removed",
             WireMessage::ListWorktreeOrphans { .. } => "list_worktree_orphans",
             WireMessage::WorktreeOrphansListed { .. } => "worktree_orphans_listed",
+            WireMessage::DiskUsage { .. } => "disk_usage",
+            WireMessage::DiskUsageReported { .. } => "disk_usage_reported",
             WireMessage::Ack { .. } => "ack",
             WireMessage::Ping {} => "ping",
             WireMessage::Pong {} => "pong",
@@ -3535,6 +3567,52 @@ mod tests {
                 assert_eq!(orphans[0].last_modified_secs, Some(1_700_000_000));
                 assert_eq!(orphans[1].branch, None);
                 assert_eq!(orphans[1].last_modified_secs, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disk_usage_round_trip() {
+        let msg = WireMessage::DiskUsage {
+            req_id: "req-du-1".into(),
+        };
+        assert!(msg.is_best_effort());
+        assert_eq!(msg.event_type(), "disk_usage");
+        let json = serde_json::to_string(&Envelope::best_effort("server".into(), msg)).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::DiskUsage { req_id } => assert_eq!(req_id, "req-du-1"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let reply = WireMessage::DiskUsageReported {
+            req_id: "req-du-1".into(),
+            projects: vec![
+                ProjectDiskUsage {
+                    slug: "proj-a".into(),
+                    size_bytes: 1_572_864,
+                    size_human: "1.5M".into(),
+                },
+                ProjectDiskUsage {
+                    slug: "proj-b".into(),
+                    size_bytes: 1024,
+                    size_human: "1.0K".into(),
+                },
+            ],
+        };
+        assert!(reply.is_best_effort());
+        assert_eq!(reply.event_type(), "disk_usage_reported");
+        let json = serde_json::to_string(&Envelope::best_effort("r1".into(), reply)).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.message {
+            WireMessage::DiskUsageReported { req_id, projects } => {
+                assert_eq!(req_id, "req-du-1");
+                assert_eq!(projects.len(), 2);
+                assert_eq!(projects[0].slug, "proj-a");
+                assert_eq!(projects[0].size_bytes, 1_572_864);
+                assert_eq!(projects[0].size_human, "1.5M");
+                assert_eq!(projects[1].size_bytes, 1024);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

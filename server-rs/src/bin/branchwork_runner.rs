@@ -2734,6 +2734,23 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
             );
         }
 
+        WireMessage::DiskUsage { req_id } => {
+            let req_id = req_id.clone();
+            // Measure under the startup-resolved base — the same path
+            // worktrees are actually created under (and that `validated_cwd`
+            // sandboxes against).
+            let base = state.worktree_base.clone();
+            let projects = run_blocking_with_timeout(WORKTREE_TIMEOUT, move || {
+                worktree::disk_usage_for_base(&base)
+            })
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(local_disk_usage_to_wire)
+            .collect();
+            send_best_effort(state, WireMessage::DiskUsageReported { req_id, projects });
+        }
+
         // Runner doesn't receive these from server (runner→saas direction
         // only; the server sending them would be a protocol violation).
         WireMessage::RunnerHello { .. }
@@ -2766,6 +2783,8 @@ async fn handle_server_message(state: &Arc<RunnerState>, envelope: &Envelope) {
         | WireMessage::WorktreeSetupFailed { .. }
         | WireMessage::WorktreeRemoved { .. }
         | WireMessage::WorktreeOrphansListed { .. }
+        // Disk-usage reply is runner→saas; receiving one back is a violation.
+        | WireMessage::DiskUsageReported { .. }
         // The runner is the producer of `RunnerLogLine` and
         // `RunnerHealth`; receiving either back from the server is a
         // protocol violation we silently drop.
@@ -2899,6 +2918,16 @@ fn local_orphan_to_wire(o: worktree::OrphanWorktree) -> runner_protocol::Worktre
                 .ok()
                 .map(|d| d.as_secs())
         }),
+    }
+}
+
+/// Convert a runner-side [`worktree::DiskUsageEntry`] to the wire
+/// [`runner_protocol::ProjectDiskUsage`] (identical fields).
+fn local_disk_usage_to_wire(e: worktree::DiskUsageEntry) -> runner_protocol::ProjectDiskUsage {
+    runner_protocol::ProjectDiskUsage {
+        slug: e.slug,
+        size_bytes: e.size_bytes,
+        size_human: e.size_human,
     }
 }
 

@@ -643,6 +643,11 @@ async fn run_server(cli: Cli) {
             "/api/orgs/{slug}/orphan-worktrees/cleanup",
             post(api::orphan_worktrees::cleanup_orphan_worktrees),
         )
+        // Per-project worktree disk usage (member-readable; cached + bg refresh)
+        .route(
+            "/api/orgs/{slug}/worktree-disk-usage",
+            get(api::worktree_disk_usage::worktree_disk_usage),
+        )
         // Remote runners (SaaS)
         .route("/ws/runner", get(saas::runner_ws::runner_ws_handler))
         .route(

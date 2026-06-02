@@ -206,7 +206,9 @@ fn req_id_for(msg: &WireMessage) -> Option<&str> {
         | WireMessage::RemoveWorktree { req_id, .. }
         | WireMessage::WorktreeRemoved { req_id, .. }
         | WireMessage::ListWorktreeOrphans { req_id, .. }
-        | WireMessage::WorktreeOrphansListed { req_id, .. } => Some(req_id),
+        | WireMessage::WorktreeOrphansListed { req_id, .. }
+        | WireMessage::DiskUsage { req_id }
+        | WireMessage::DiskUsageReported { req_id, .. } => Some(req_id),
         _ => None,
     }
 }

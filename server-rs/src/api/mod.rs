@@ -12,3 +12,4 @@ pub mod plans;
 pub mod projects;
 pub mod runners;
 pub mod settings;
+pub mod worktree_disk_usage;
