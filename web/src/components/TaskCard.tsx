@@ -161,6 +161,26 @@ interface RunnerVersionBlock {
   runnerVersion: string | null;
 }
 
+/// Is this agent's `cwd` a per-agent git worktree (ADR 0002), or the
+/// shared project root (legacy mode)? The worktree manager
+/// (`agents::worktree::setup_worktree_in`) always builds the path as
+/// `<base>/<project-slug>/<plan>/<task>-<agent_id_short>`, where
+/// `agent_id_short` is the first 8 chars of the agent id. We key off that
+/// trailing `-<agent_id_short>` suffix rather than the configured worktree
+/// base because the base is a server/runner-side value
+/// (`BRANCHWORK_WORKTREE_BASE`, default `~/.branchwork/worktrees`) the
+/// dashboard never sees — and the suffix check survives a base override
+/// and works identically in SaaS mode (the cwd is then the runner-side
+/// path, but the shape is the same). Legacy-mode cwds (the bare project
+/// root) don't carry the suffix, so the "running in:" row stays hidden.
+export function isWorktreeCwd(cwd: string | null | undefined, agentId: string): boolean {
+  if (!cwd) return false;
+  const shortId = agentId.slice(0, 8);
+  if (shortId.length === 0) return false;
+  const lastSegment = cwd.replace(/\/+$/, "").split("/").pop() ?? "";
+  return lastSegment.endsWith(`-${shortId}`);
+}
+
 function TaskCardInner({ task, planName, phaseNumber }: Props) {
   const [starting, setStarting] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -835,6 +855,18 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
         </div>
       </div>
 
+      {/* Worktree path indicator (Task 6.1, worktree-per-agent-isolation
+          plan). Shown beneath the status when a running agent is working
+          inside its own per-agent worktree (ADR 0002), so the operator can
+          see — and copy — the on-disk checkout the agent is mutating. Hidden
+          in legacy shared-cwd mode (the cwd is the bare project root, which
+          carries no per-agent suffix) and for SaaS rows when the path
+          doesn't match the worktree shape. `agents.cwd` is already on the
+          wire — no backend change. */}
+      {runningAgent && isWorktreeCwd(runningAgent.cwd, runningAgent.id) && (
+        <WorktreePathRow cwd={runningAgent.cwd} />
+      )}
+
       {/* Spawn-failure banner — Task 1.1, runner-install-and-spawn-
           reliability plan. Shows when the runner failed to spawn the
           session daemon (typically the `branchwork-server session`
@@ -1019,6 +1051,67 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
           without scraping logs. Same lazy-on-expand pattern as
           TaskLearnings to keep the dashboard cheap on large plans. */}
       <RelevantLearnings planName={planName} taskNumber={task.number} />
+    </div>
+  );
+}
+
+interface WorktreePathRowProps {
+  cwd: string;
+}
+
+/// Small "running in: <worktree path>" row beneath the status pill (Task
+/// 6.1). The path is middle-truncated with the flex/`truncate` trick: the
+/// head (everything up to the final separator) shrinks with an
+/// end-ellipsis while the final `<task>-<agent_id>` segment stays pinned
+/// and readable — so on narrow viewports the most identifying part of the
+/// path survives instead of the leading base dirs. The full, untruncated
+/// path lives in the `title` attribute and is exactly what the copy button
+/// writes to the clipboard.
+function WorktreePathRow({ cwd }: WorktreePathRowProps) {
+  const [copied, setCopied] = useState(false);
+
+  // Split at the last separator so the meaningful final segment
+  // (`<task>-<agent_id_short>`) is the non-shrinking tail. The head keeps
+  // its trailing slash so the rejoined display reads as a real path.
+  const trimmed = cwd.replace(/\/+$/, "");
+  const lastSlash = trimmed.lastIndexOf("/");
+  const head = lastSlash >= 0 ? trimmed.slice(0, lastSlash + 1) : "";
+  const tail = lastSlash >= 0 ? trimmed.slice(lastSlash + 1) : trimmed;
+
+  async function handleCopy(e: React.MouseEvent) {
+    // The card's click-to-open-terminal handler already ignores clicks on
+    // buttons via `closest()`, but stop propagation defensively so the
+    // copy never doubles as "open agent terminal".
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(cwd);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Best-effort — insecure origins / file:// deny clipboard access.
+      // The full path is still in the `title` attribute for manual copy.
+    }
+  }
+
+  return (
+    <div
+      className="mt-1.5 flex items-center gap-1 text-[10px] text-gray-500"
+      data-testid="worktree-path-row"
+    >
+      <span className="flex-shrink-0">running in:</span>
+      <span className="flex min-w-0 flex-1 overflow-hidden font-mono text-gray-400" title={cwd}>
+        <span className="truncate min-w-0">{head}</span>
+        <span className="flex-shrink-0 whitespace-nowrap">{tail}</span>
+      </span>
+      <button
+        type="button"
+        onClick={handleCopy}
+        aria-label="Copy worktree path"
+        title={copied ? "Copied" : "Copy worktree path"}
+        className="flex-shrink-0 px-1 text-gray-500 hover:text-gray-300 transition"
+      >
+        <span aria-hidden="true">{copied ? "✓" : "⧉"}</span>
+      </button>
     </div>
   );
 }

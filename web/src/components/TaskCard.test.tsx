@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithRouter as render } from "../test-helpers/render.js";
-import { TaskCard } from "./TaskCard.js";
+import { TaskCard, isWorktreeCwd } from "./TaskCard.js";
 import {
   usePlanStore,
   type CiStatus,
@@ -968,5 +968,110 @@ describe("TaskCard runner-version dispatch gate (T1.3)", () => {
     render(<TaskCard task={t1} planName={PLAN} phaseNumber={1} />);
     const btn = screen.getByTestId("start-task-button") as HTMLButtonElement;
     expect(btn.disabled).toBe(false);
+  });
+});
+
+describe("TaskCard worktree path indicator (Task 6.1)", () => {
+  // Realistic UUID-shaped agent id; the worktree manager uses its first 8
+  // chars (`abcd1234`) as the trailing path segment suffix.
+  const WT_AGENT_ID = "abcd1234-0000-0000-0000-000000000000";
+  const WT_CWD = "/home/x/.branchwork/worktrees/branchwork/p1/1.1-abcd1234";
+
+  describe("isWorktreeCwd", () => {
+    it("returns true for a per-agent worktree path", () => {
+      expect(isWorktreeCwd(WT_CWD, WT_AGENT_ID)).toBe(true);
+    });
+
+    it("tolerates a trailing slash", () => {
+      expect(isWorktreeCwd(`${WT_CWD}/`, WT_AGENT_ID)).toBe(true);
+    });
+
+    it("returns false for a bare project-root cwd (legacy mode)", () => {
+      expect(isWorktreeCwd("/home/x/projects/myproj", WT_AGENT_ID)).toBe(false);
+    });
+
+    it("returns false for an override base that still ends with the agent suffix", () => {
+      // Survives a BRANCHWORK_WORKTREE_BASE override — only the trailing
+      // `-<short id>` matters, not the leading base dirs.
+      expect(isWorktreeCwd("/mnt/fast/wt/branchwork/p1/1.1-abcd1234", WT_AGENT_ID)).toBe(true);
+    });
+
+    it("returns false for null / empty cwd", () => {
+      expect(isWorktreeCwd(null, WT_AGENT_ID)).toBe(false);
+      expect(isWorktreeCwd(undefined, WT_AGENT_ID)).toBe(false);
+      expect(isWorktreeCwd("", WT_AGENT_ID)).toBe(false);
+    });
+
+    it("returns false for an empty agent id", () => {
+      expect(isWorktreeCwd(WT_CWD, "")).toBe(false);
+    });
+  });
+
+  it("renders the running-in row with the full path in the title", () => {
+    const t = task({ number: "1.1", status: "in_progress" });
+    seed(t, {
+      agents: [
+        agent({ id: WT_AGENT_ID, task_id: "1.1", status: "running", cwd: WT_CWD, branch: null }),
+      ],
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+
+    const row = screen.getByTestId("worktree-path-row");
+    expect(row.textContent).toMatch(/running in:/);
+    // The full, untruncated path lives in the title attribute (the
+    // visible text is middle-truncated via CSS, so we assert the title).
+    expect(row.querySelector(`[title="${WT_CWD}"]`)).not.toBeNull();
+  });
+
+  it("copy button writes the full cwd to the clipboard", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+
+    const t = task({ number: "1.1", status: "in_progress" });
+    seed(t, {
+      agents: [
+        agent({ id: WT_AGENT_ID, task_id: "1.1", status: "running", cwd: WT_CWD, branch: null }),
+      ],
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Copy worktree path/i }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(WT_CWD));
+  });
+
+  it("does NOT render in legacy shared-cwd mode (cwd is the project root)", () => {
+    const t = task({ number: "1.1", status: "in_progress" });
+    seed(t, {
+      agents: [
+        agent({
+          id: WT_AGENT_ID,
+          task_id: "1.1",
+          status: "running",
+          cwd: "/home/x/projects/myproj",
+          branch: null,
+        }),
+      ],
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    expect(screen.queryByTestId("worktree-path-row")).toBeNull();
+  });
+
+  it("does NOT render when no agent is running (only a completed branch agent)", () => {
+    const t = task({ number: "1.1", status: "completed" });
+    seed(t, {
+      // Completed agent whose cwd is worktree-shaped — must still NOT show
+      // "running in" because the gate is on a running/starting agent.
+      agents: [
+        agent({
+          id: WT_AGENT_ID,
+          task_id: "1.1",
+          status: "completed",
+          cwd: WT_CWD,
+          branch: "branchwork/p1/1.1",
+        }),
+      ],
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    expect(screen.queryByTestId("worktree-path-row")).toBeNull();
   });
 });
