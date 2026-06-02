@@ -27,7 +27,7 @@ for the per-OS detach mechanics and testing posture.
 - [Agents](#agents) — starting, attaching, types (PTY vs stream-JSON), stopping, check agents
 - [Drivers](#drivers) — Claude, Aider, Codex, Gemini — auth and how to pick
 - [Git flow](#git-flow) — branch naming, diff review, merge, stale branch cleanup
-- [Worktrees](#worktrees) — per-agent isolation, `BRANCHWORK_WORKTREE_BASE`, cross-filesystem warning
+- [Worktrees](#worktrees) — per-agent isolation, `BRANCHWORK_WORKTREE_BASE`, cross-filesystem warning, build-cache contention
 - [Project configuration](#project-configuration) — `branchwork.toml`, shared build-cache overrides
 - [Cost tracking & budgets](#cost-tracking--budgets)
 - [CI integration](#ci-integration)
@@ -549,6 +549,57 @@ Override it when:
 > the base is on a different filesystem from a project, so you can make
 > an informed call. (See ADR 0002, failure mode #3.)
 
+### Build cache contention
+
+Worktree-isolated agents share **one build cache per project** (see
+[Build-cache overrides (`[cache]`)](#build-cache-overrides-cache)), so
+parallel agents that run the same build tool can contend on it. That
+contention is **intended** — sharing the cache is what stops N agents
+from re-compiling the same dependencies N times — but it shapes the
+latency profile, and the behaviour differs by language:
+
+- **Rust (`cargo build`).** Every worktree agent on a project points at
+  the same `CARGO_TARGET_DIR`, and cargo takes a **per-target file lock**
+  while it writes. Two agents building at once therefore **serialise**:
+  the second agent's build starts when the first finishes touching its
+  cargo target, then proceeds (you'll see cargo's `Blocking waiting for
+  file lock on build directory` line in the meantime). This is correct —
+  the alternative is two identical compiles burning CPU and disk in
+  parallel. The wait is bounded by how long the lock holder takes: the
+  first cold build pays the full cost, but once the shared cache is warm
+  the incremental rebuilds that most agent edits trigger are short, so
+  the typical wait is small.
+- **JS / TS (`pnpm install`).** No contention. pnpm's global
+  content-addressable store is **safe for concurrent installs by
+  design** — every package is written under a content hash and pnpm
+  coordinates writers internally, so parallel `pnpm install`s across
+  agents do not block one another and need no special handling.
+- **Other languages.** Each build tool that runs under worktree
+  isolation gets an explicit cache-sharing decision, recorded in the
+  [build-cache contract](architecture/runner.md#build-cache-sharing-across-worktrees).
+  A runtime not yet listed there falls back to a per-worktree cache (no
+  sharing, no contention, but N cold builds) until it is wired.
+
+**If you would rather trade disk for parallelism.** The serialisation
+above is the recommended default. If you genuinely need fully concurrent,
+non-blocking cargo builds — and accept paying N× disk and N× CPU for N
+cold rebuilds — give each agent its own target directory by setting a
+**relative** `cargo_target_dir` in the project's `branchwork.toml`:
+
+```toml
+[cache]
+cargo_target_dir = "target"   # relative → resolves under each worktree
+```
+
+The value is used verbatim as `CARGO_TARGET_DIR`, and cargo resolves a
+relative target dir against the build's working directory — which is each
+agent's own worktree — so every agent compiles into its own
+`<worktree>/target` with no shared lock. This **negates the disk- and
+CPU-saving** the shared cache exists for and is **not recommended**;
+reach for it only if measured lock contention is actually hurting you.
+See [Build-cache overrides (`[cache]`)](#build-cache-overrides-cache) for
+the full `[cache]` schema.
+
 ### Disabling worktrees (deprecated)
 
 `BRANCHWORK_USE_WORKTREES` is a **deprecated** escape hatch that turns
@@ -609,6 +660,10 @@ Notes:
   cache path — the parse error is logged once and never crashes the spawn.
 - The cache directory is created on demand, so you don't need to `mkdir`
   it first.
+- Sharing one cache means parallel cargo builds **serialise** on cargo's
+  file lock (pnpm installs do not). That tradeoff — and the relative-path
+  escape hatch if you want concurrent isolated builds instead — is
+  covered in [Build cache contention](#build-cache-contention).
 
 ---
 
