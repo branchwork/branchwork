@@ -21,6 +21,14 @@
 //! # Shell command run by the phase-end Check agent.
 //! verification = "bash scripts/verify.sh"
 //!
+//! [cache]
+//! # Build-cache directory overrides. Only consulted for worktree-isolated
+//! # agents (an agent running directly in the project root shares the
+//! # project's own `target/`). Point the cache at a bigger / faster disk
+//! # than the default `<worktree-base>/../cache/<project>/…`.
+//! cargo_target_dir = "/mnt/big-disk/branchwork-cache/cargo"
+//! pnpm_store_dir   = "/mnt/big-disk/branchwork-cache/pnpm-store"
+//!
 //! [auto_mode]
 //! # When auto-mode should merge a task's branch into master:
 //! #   "task"  — every completed task (legacy, fastest feedback)
@@ -99,6 +107,40 @@ pub struct PhaseConfig {
     /// something like `"bash scripts/verify.sh"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification: Option<String>,
+}
+
+/// `[cache]` table — build-cache directory overrides for shared caching
+/// across worktrees (the `worktree-per-agent-isolation` plan, phase 4).
+///
+/// Branchwork gives each agent its own git worktree, so without a shared
+/// cache N parallel agents on one project would each rebuild from scratch.
+/// By default the cache lives beside the worktree base
+/// (`<worktree-base>/../cache/<project-slug>/…`); these fields let an
+/// operator point it somewhere else — typically a bigger or faster disk.
+///
+/// Only consulted for **worktree-isolated** agents: an agent running
+/// directly in the project root shares the project's own `target/` and
+/// never reads these. Paths are used verbatim (no project-slug suffix is
+/// appended), so a value set here is the literal directory the build tool
+/// will write into.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Override for the Rust build cache. When set, every worktree-isolated
+    /// agent's cargo build runs with `CARGO_TARGET_DIR` pointed here instead
+    /// of the default `<worktree-base>/../cache/<project-slug>/cargo-target`.
+    /// Consumed by [`crate::agents::pty_agent`] at spawn time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_target_dir: Option<PathBuf>,
+    /// Override for the pnpm content-addressable store directory.
+    ///
+    /// **Reserved.** pnpm already keeps one global store per host (shared
+    /// across every project and worktree), so Branchwork does not yet inject
+    /// a store-dir override at spawn time — there is no consumer for this
+    /// field today. It is parsed and round-tripped so the schema is stable
+    /// for a future task that wires it (e.g. via `.npmrc` or `--store-dir`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pnpm_store_dir: Option<PathBuf>,
 }
 
 /// When auto-mode should merge a task's branch into the canonical default
@@ -329,6 +371,7 @@ impl DirtyTreeConfig {
 pub struct RepoConfig {
     pub ci: CiConfig,
     pub phase: PhaseConfig,
+    pub cache: CacheConfig,
     pub auto_mode: AutoModeConfig,
 }
 
@@ -340,6 +383,8 @@ impl RepoConfig {
         self.ci.blocking_workflows.is_none()
             && self.ci.blocking_workflows_skip.is_none()
             && self.phase.verification.is_none()
+            && self.cache.cargo_target_dir.is_none()
+            && self.cache.pnpm_store_dir.is_none()
             && self.auto_mode.dirty_tree.ignore.is_none()
             && self.auto_mode.merge_cadence == MergeCadence::default()
             && self.auto_mode.pre_merge_checks.is_empty()
@@ -794,6 +839,88 @@ blocking_workflows = ["CI"]
             ..Default::default()
         };
         assert!(!with_recipe_only.is_empty());
+
+        // A `[cache]` override alone counts as non-empty.
+        let with_cache_only = RepoConfig {
+            cache: CacheConfig {
+                cargo_target_dir: Some(PathBuf::from("/srv/cache/cargo")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!with_cache_only.is_empty());
+    }
+
+    // ---- cache ---------------------------------------------------
+
+    #[test]
+    fn cache_section_parses_both_dirs() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            r#"
+[cache]
+cargo_target_dir = "/mnt/big-disk/branchwork-cache/cargo"
+pnpm_store_dir = "/mnt/big-disk/branchwork-cache/pnpm-store"
+"#,
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert_eq!(
+            cfg.cache.cargo_target_dir.as_deref(),
+            Some(Path::new("/mnt/big-disk/branchwork-cache/cargo"))
+        );
+        assert_eq!(
+            cfg.cache.pnpm_store_dir.as_deref(),
+            Some(Path::new("/mnt/big-disk/branchwork-cache/pnpm-store"))
+        );
+    }
+
+    #[test]
+    fn cache_section_absent_defaults_to_none() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        // A file with only an unrelated section → cache fields stay None.
+        write(
+            dir.path(),
+            "branchwork.toml",
+            "[phase]\nverification = \"make verify\"\n",
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert!(cfg.cache.cargo_target_dir.is_none());
+        assert!(cfg.cache.pnpm_store_dir.is_none());
+    }
+
+    #[test]
+    fn cache_partial_with_only_cargo_target_dir() {
+        clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "branchwork.toml",
+            "[cache]\ncargo_target_dir = \"/srv/cache/cargo\"\n",
+        );
+        let cfg = load_for_project_dir(dir.path()).expect("config should parse");
+        assert_eq!(
+            cfg.cache.cargo_target_dir.as_deref(),
+            Some(Path::new("/srv/cache/cargo"))
+        );
+        assert!(cfg.cache.pnpm_store_dir.is_none());
+    }
+
+    #[test]
+    fn cache_round_trips_via_toml() {
+        let cfg = RepoConfig {
+            cache: CacheConfig {
+                cargo_target_dir: Some(PathBuf::from("/srv/cache/cargo")),
+                pnpm_store_dir: Some(PathBuf::from("/srv/cache/pnpm")),
+            },
+            ..Default::default()
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        let reparsed: RepoConfig = toml::from_str(&text).unwrap();
+        assert_eq!(reparsed, cfg);
     }
 
     // ---- merge_cadence ------------------------------------------

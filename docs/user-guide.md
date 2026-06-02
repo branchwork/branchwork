@@ -28,6 +28,7 @@ for the per-OS detach mechanics and testing posture.
 - [Drivers](#drivers) — Claude, Aider, Codex, Gemini — auth and how to pick
 - [Git flow](#git-flow) — branch naming, diff review, merge, stale branch cleanup
 - [Worktrees](#worktrees) — per-agent isolation, `BRANCHWORK_WORKTREE_BASE`, cross-filesystem warning
+- [Project configuration](#project-configuration) — `branchwork.toml`, shared build-cache overrides
 - [Cost tracking & budgets](#cost-tracking--budgets)
 - [CI integration](#ci-integration)
 - [Auto-mode](#auto-mode) — auto-advance, auto-merge, the status pill, and the disabled Parallel toggle
@@ -565,6 +566,49 @@ The server reads the variable **once at startup** and prints a warning
 when legacy mode is active. Unset it (or set any other value) to keep
 worktrees on, which is the default. **This flag will be removed in the
 next minor version.**
+
+---
+
+## Project configuration
+
+Branchwork reads an optional **`branchwork.toml`** from each project root
+(`~/<project>/branchwork.toml` — the directory the plan's `project:` field
+points at). It tunes CI gating, phase verification, auto-mode cadence, the
+dirty-tree allowlist, and — covered here — shared build-cache locations.
+All sections are optional; a missing or empty file means "use the
+defaults". The full schema lives in
+[reference/branchwork-toml.md](reference/branchwork-toml.md).
+
+### Build-cache overrides (`[cache]`)
+
+Because each agent runs in [its own worktree](#worktrees), N parallel
+agents on one project would otherwise each rebuild from scratch. By
+default Branchwork shares one build cache across a project's worktrees,
+placed beside the worktree base
+(`<BRANCHWORK_WORKTREE_BASE>/../cache/<project>/…`). The `[cache]` table
+redirects that cache — typically onto a bigger or faster disk:
+
+```toml
+[cache]
+cargo_target_dir = "/mnt/big-disk/branchwork-cache/cargo"
+pnpm_store_dir = "/mnt/big-disk/branchwork-cache/pnpm-store"
+```
+
+| Key | Effect |
+|---|---|
+| `cargo_target_dir` | Sets `CARGO_TARGET_DIR` for every worktree-isolated agent's cargo builds. Used verbatim (no per-project suffix appended). When unset, Branchwork uses `<worktree-base>/../cache/<project-slug>/cargo-target`. |
+| `pnpm_store_dir` | Reserved. pnpm already keeps one global content-addressable store per host, so Branchwork does not yet inject a store-dir override; the key is parsed for forward compatibility. |
+
+Notes:
+
+- The override only applies to **worktree-isolated** agents. An agent
+  running directly in the project root (worktrees disabled, or a
+  freestanding agent with no task branch) shares the project's own
+  `target/` and ignores `[cache]`.
+- A missing or **malformed** `branchwork.toml` falls back to the default
+  cache path — the parse error is logged once and never crashes the spawn.
+- The cache directory is created on demand, so you don't need to `mkdir`
+  it first.
 
 ---
 

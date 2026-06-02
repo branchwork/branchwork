@@ -67,12 +67,19 @@ blocking_workflows = ["CI"]
 # project root. Any non-zero exit blocks the phase from being
 # marked done.
 verification = "bash scripts/verify.sh"
+
+[cache]
+# Build-cache directory overrides for worktree-isolated agents. Point
+# the shared cache at a bigger/faster disk than the default
+# `<worktree-base>/../cache/<project>/…`.
+cargo_target_dir = "/mnt/big-disk/branchwork-cache/cargo"
+pnpm_store_dir   = "/mnt/big-disk/branchwork-cache/pnpm-store"
 ```
 
-Both sections are optional. An empty file is valid (and is parsed to a
+All sections are optional. An empty file is valid (and is parsed to a
 fully-default config). Unknown top-level keys and unknown keys inside
-`[ci]` / `[phase]` are silently dropped, so typos won't crash the
-parser — but they also won't produce a warning, so double-check
+`[ci]` / `[phase]` / `[cache]` are silently dropped, so typos won't crash
+the parser — but they also won't produce a warning, so double-check
 spelling against this page.
 
 ### `[ci]`
@@ -106,6 +113,22 @@ expansion or `&&`-chained commands are at the agent's discretion. The
 canonical pattern is to keep the entrypoint trivial (`bash
 scripts/verify.sh`, `make verify`, `pnpm run ci`) and put the real
 logic in a checked-in script.
+
+### `[cache]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `cargo_target_dir` | path | unset | Override for `CARGO_TARGET_DIR`. When set, every worktree-isolated agent's cargo build writes here instead of the computed default. Used verbatim — no project-slug suffix is appended. |
+| `pnpm_store_dir` | path | unset | Reserved for a future pnpm store-dir override. Parsed and round-tripped, but not yet consumed (pnpm already shares one global store per host). |
+
+The `[cache]` table only affects **worktree-isolated** agents (the
+`worktree-per-agent-isolation` model). An agent running directly in the
+project root shares the project's own `target/` and ignores it. When
+unset, the cargo cache defaults to
+`<worktree-base>/../cache/<project-slug>/cargo-target` — a sibling of the
+worktree base so every agent on the project shares one build cache. See
+[user-guide.md → Project configuration](../user-guide.md#project-configuration)
+for the operator-facing walkthrough.
 
 ---
 

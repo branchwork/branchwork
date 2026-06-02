@@ -133,19 +133,23 @@ fn build_agent_extra_env<'a>(
 /// When `None`, the env-resolved [`crate::agents::worktree::worktree_base`]
 /// is used (production default).
 ///
-/// 4.2 will let `branchwork.toml` override the path; until that loader lands
-/// we always use the default sibling-of-base location.
+/// An explicit `branchwork.toml` `[cache] cargo_target_dir` overrides the
+/// computed default (see [`choose_cargo_target_dir`]); an absent or malformed
+/// config falls back to the default sibling-of-base location (task 4.2).
 fn resolve_cargo_target_dir(
     project_dir: &Path,
     base_override: Option<&Path>,
     agent_id: &str,
 ) -> Option<String> {
     let slug = project_slug_for_worktree(project_dir);
-    let resolved = match base_override {
-        Some(base) => Ok(crate::agents::worktree::cargo_target_dir_in(base, &slug)),
-        None => crate::agents::worktree::cargo_target_dir_for(&slug),
-    };
-    let dir = match resolved {
+
+    // `branchwork.toml` `[cache] cargo_target_dir` wins when set. A missing
+    // or malformed file yields `None` (repo_config logs a one-line warning
+    // and caches the negative result), so we fall back to the default.
+    let config_override = crate::repo_config::load_for_project_dir(project_dir)
+        .and_then(|c| c.cache.cargo_target_dir);
+
+    let dir = match choose_cargo_target_dir(config_override, base_override, &slug) {
         Ok(dir) => dir,
         Err(e) => {
             eprintln!(
@@ -166,6 +170,32 @@ fn resolve_cargo_target_dir(
         return None;
     }
     dir.to_str().map(str::to_string)
+}
+
+/// Decide the cargo target dir given an optional `branchwork.toml` override.
+///
+/// Precedence: an explicit `[cache] cargo_target_dir` is used verbatim;
+/// otherwise the default `<worktree-base>/../cache/<slug>/cargo-target` is
+/// computed (against `base_override` in tests, else the env-resolved
+/// [`crate::agents::worktree::worktree_base`]). Pure — no I/O — so the
+/// precedence is unit-testable without the repo_config cache or filesystem.
+/// `Err` only when there is no override *and* the default base can't be
+/// resolved.
+fn choose_cargo_target_dir(
+    config_override: Option<PathBuf>,
+    base_override: Option<&Path>,
+    project_slug: &str,
+) -> Result<PathBuf, crate::agents::worktree::WorktreeError> {
+    if let Some(dir) = config_override {
+        return Ok(dir);
+    }
+    match base_override {
+        Some(base) => Ok(crate::agents::worktree::cargo_target_dir_in(
+            base,
+            project_slug,
+        )),
+        None => crate::agents::worktree::cargo_target_dir_for(project_slug),
+    }
 }
 
 pub struct StartPtyOpts<'a> {
@@ -1853,6 +1883,97 @@ mod tests {
         );
         // The flag immediately before the value is `--env`.
         assert_eq!(args.get(cargo_pos - 1).map(String::as_str), Some("--env"));
+    }
+
+    // ── branchwork.toml [cache] override (Task 4.2) ──────────────────────
+
+    #[test]
+    fn choose_cargo_target_dir_prefers_branchwork_toml_override() {
+        // An explicit override is returned verbatim, ignoring base + slug.
+        let chosen = choose_cargo_target_dir(
+            Some(PathBuf::from("/mnt/big-disk/cargo")),
+            Some(Path::new("/srv/wt")),
+            "myproj",
+        )
+        .expect("override path is infallible");
+        assert_eq!(chosen, PathBuf::from("/mnt/big-disk/cargo"));
+    }
+
+    #[test]
+    fn choose_cargo_target_dir_falls_back_to_default_when_no_override() {
+        // No override → default sibling-of-base location for the slug.
+        let chosen = choose_cargo_target_dir(None, Some(Path::new("/srv/wt")), "myproj")
+            .expect("default path resolves against an explicit base");
+        assert_eq!(chosen, PathBuf::from("/srv/cache/myproj/cargo-target"));
+    }
+
+    /// Headline acceptance (Task 4.2): a `branchwork.toml` with
+    /// `[cache] cargo_target_dir` set overrides the default in the agent env,
+    /// and the override dir is pre-created so cargo finds it on first build.
+    #[test]
+    fn resolve_cargo_target_dir_honors_branchwork_toml_override() {
+        crate::repo_config::clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        let project_dir = dir.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let override_dir = dir.path().join("custom-cache");
+        std::fs::write(
+            project_dir.join("branchwork.toml"),
+            format!(
+                "[cache]\ncargo_target_dir = \"{}\"\n",
+                override_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let base = dir.path().join("wt-base");
+        let resolved = resolve_cargo_target_dir(&project_dir, Some(&base), "agent-cache-override")
+            .expect("override should resolve");
+        assert_eq!(resolved, override_dir.to_str().unwrap());
+        assert!(override_dir.is_dir(), "override cargo dir must be created");
+    }
+
+    /// Missing config falls back to the default sibling-of-base location.
+    #[test]
+    fn resolve_cargo_target_dir_falls_back_when_no_config() {
+        crate::repo_config::clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        let project_dir = dir.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        // No branchwork.toml at all → default path.
+        let base = dir.path().join("wt-base");
+        let resolved = resolve_cargo_target_dir(&project_dir, Some(&base), "agent-default")
+            .expect("default should resolve");
+        let expected = crate::agents::worktree::cargo_target_dir_in(
+            &base,
+            &project_slug_for_worktree(&project_dir),
+        );
+        assert_eq!(resolved, expected.to_str().unwrap());
+    }
+
+    /// Bad TOML logs a warning, falls back to the default, and never crashes.
+    #[test]
+    fn resolve_cargo_target_dir_falls_back_on_malformed_toml() {
+        crate::repo_config::clear_cache_for_tests();
+        let dir = TempDir::new().unwrap();
+        let project_dir = dir.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        // Unbalanced bracket → parse error → repo_config warns + returns None,
+        // so resolve falls back to the default sibling-of-base location.
+        std::fs::write(
+            project_dir.join("branchwork.toml"),
+            "[cache\ncargo_target_dir = \"/should/not/be/used\"",
+        )
+        .unwrap();
+        let base = dir.path().join("wt-base");
+        let resolved = resolve_cargo_target_dir(&project_dir, Some(&base), "agent-bad-toml")
+            .expect("malformed config must fall back, not crash");
+        let expected = crate::agents::worktree::cargo_target_dir_in(
+            &base,
+            &project_slug_for_worktree(&project_dir),
+        );
+        assert_eq!(resolved, expected.to_str().unwrap());
+        assert!(!resolved.contains("should/not/be/used"));
     }
 
     // ── Worktree-per-agent start path (Task 2.2) ─────────────────────────
