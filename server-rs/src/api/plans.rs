@@ -1250,6 +1250,14 @@ pub async fn put_plan_config(
         for (agent_id, org_id) in &fix_agents_to_kill {
             let _ = crate::agents::spawn_ops::kill_agent_dispatch(&state, org_id, agent_id).await;
         }
+        // Task 3.4: also cancel any in-flight at-merge conflict resolver for
+        // this plan. Unlike the fix agents above, the resolver's worktree is
+        // *preserved* (its row carries `merge_status = 'held_for_resolver'`,
+        // which the kill's worktree cleanup skips) so the human can inspect
+        // the conflicted tree; `resolver_cancelled` surfaces the leftover
+        // paths under the original task card. Re-enabling auto-mode does not
+        // re-spawn it.
+        state.registry.cancel_in_flight_resolvers(&name).await;
     }
 
     // Per-plan runner failover policy (T11.5). Validate first so a bad

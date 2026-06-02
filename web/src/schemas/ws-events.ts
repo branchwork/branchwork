@@ -222,6 +222,25 @@ const AutoModePreMergeCheckFailed = v.object({
   }),
 });
 
+/// The operator toggled auto-mode OFF while an at-merge conflict resolver
+/// was in flight (Task 3.4 of the worktree-per-agent plan). The resolver
+/// agent was killed, but its worktree is preserved on disk (conflict markers
+/// intact) so the human can resolve the conflict manually. `task` is the
+/// ORIGINAL task id (not the `-resolve-N` resolver task) so the dashboard can
+/// surface the conflict under the original task card; `conflicted_paths` is
+/// the still-unmerged file list. Re-enabling auto-mode does NOT re-spawn the
+/// resolver — the human must intervene.
+const ResolverCancelled = v.object({
+  type: v.literal("resolver_cancelled"),
+  data: v.object({
+    plan: v.string(),
+    task: v.string(),
+    agent_id: v.string(),
+    parent_agent_id: NullishStr,
+    conflicted_paths: v.array(v.string()),
+  }),
+});
+
 const PlanRunnerAffinityChanged = v.object({
   type: v.literal("plan_runner_affinity_changed"),
   data: v.object({
@@ -561,6 +580,7 @@ export const WsMessageSchema = v.variant("type", [
   AutoModePaused,
   AutoModeResumed,
   AutoModePreMergeCheckFailed,
+  ResolverCancelled,
   TaskAdvanced,
   TaskChecked,
   PlanChecked,

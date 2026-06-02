@@ -640,23 +640,34 @@ fn worktree_head_sha(worktree_path: &Path) -> Option<String> {
     if sha.is_empty() { None } else { Some(sha) }
 }
 
-/// Whether `worktree_path` still carries unmerged (conflicted) index
-/// entries — i.e. the resolver left a `UU`-style conflict unresolved.
-/// Uses `git diff --name-only --diff-filter=U`, which lists exactly the
-/// paths git considers unmerged (the same probe the rebase-conflict path
-/// uses). A non-empty result means the resolution is incomplete. Any git
-/// error is treated as "not unmerged" so a transient failure doesn't
-/// masquerade as a conflict (the new-commit check below is the other,
-/// independent gate).
-fn worktree_has_unmerged_paths(worktree_path: &Path) -> bool {
+/// The paths git currently considers unmerged (conflicted) in
+/// `worktree_path`, via `git diff --name-only --diff-filter=U` — exactly the
+/// files a human will find carrying `<<<<<<<` markers if they inspect the
+/// tree (the same probe the rebase-conflict path uses). Returned in git's
+/// order (sorted by path). Any git error yields an empty `Vec` so a transient
+/// failure never masquerades as a conflict; the new-commit check in
+/// [`resolver_resolution_succeeded`] is the independent second gate.
+fn worktree_unmerged_paths(worktree_path: &Path) -> Vec<String> {
     let out = std::process::Command::new("git")
         .args(["diff", "--name-only", "--diff-filter=U"])
         .current_dir(worktree_path)
         .output();
     match out {
-        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
-        _ => false,
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        _ => Vec::new(),
     }
+}
+
+/// Whether `worktree_path` still carries unmerged (conflicted) index
+/// entries — i.e. the resolver left a `UU`-style conflict unresolved. Thin
+/// wrapper over [`worktree_unmerged_paths`]: a non-empty result means the
+/// resolution is incomplete.
+fn worktree_has_unmerged_paths(worktree_path: &Path) -> bool {
+    !worktree_unmerged_paths(worktree_path).is_empty()
 }
 
 /// Decide whether an at-merge resolver agent actually resolved its
@@ -1637,6 +1648,103 @@ impl AgentRegistry {
         // write so the lock is released before this re-locks internally.
         cleanup_worktree_for_terminated_agent(&self.db, agent_id);
         true
+    }
+
+    /// Cancel every in-flight at-merge conflict resolver agent for
+    /// `plan_name` — the hook the `PUT /api/plans/:name/config` handler runs
+    /// when the operator toggles `auto_mode` **off** (Task 3.4).
+    ///
+    /// For each running/starting row badged `mode = 'resolver'`:
+    /// - kills it via [`Self::kill_agent`]. The resolver row carries
+    ///   `merge_status = 'held_for_resolver'`, so the kill's worktree-cleanup
+    ///   ([`cleanup_worktree_for_terminated_agent`]) **skips removal** — the
+    ///   conflicted tree is left on disk for the human to inspect, exactly as
+    ///   the brief requires.
+    /// - reads the still-unmerged paths out of the preserved worktree, and
+    /// - broadcasts a `resolver_cancelled` event carrying the **original**
+    ///   task id (so the dashboard can surface the conflict under the original
+    ///   task card, not the throwaway `-resolve-N` row) and those paths.
+    ///
+    /// Re-enabling auto-mode does **not** auto-resume the resolver: the killed
+    /// row stays `killed`, nothing watches it, and the conflict only re-enters
+    /// the resolver path if a merge is re-attempted. The human must intervene.
+    ///
+    /// Standalone-only in practice — resolvers are never spawned in SaaS mode
+    /// ([`crate::api::agents::merge_agent_branch_inner`] gates the spawn on
+    /// `!org_has_runner`), so the snapshot query simply returns empty there.
+    pub async fn cancel_in_flight_resolvers(&self, plan_name: &str) {
+        // 1. Snapshot the resolvers BEFORE killing. Collect everything we
+        //    need (cwd to read conflicts, the parent for the original task id)
+        //    inside the lock, then drop it: `kill_agent` re-locks `db`
+        //    internally, so holding the guard across the await would deadlock.
+        struct ResolverSnapshot {
+            id: String,
+            cwd: Option<String>,
+            resolver_task_id: String,
+            parent_agent_id: Option<String>,
+            parent_task_id: Option<String>,
+        }
+        let resolvers: Vec<ResolverSnapshot> = {
+            let conn = self.db.lock().unwrap();
+            let Ok(mut stmt) = conn.prepare(
+                "SELECT r.id, r.cwd, r.task_id, r.parent_agent_id, p.task_id \
+                 FROM agents r \
+                 LEFT JOIN agents p ON p.id = r.parent_agent_id \
+                 WHERE r.plan_name = ?1 \
+                   AND r.mode = 'resolver' \
+                   AND r.status IN ('running', 'starting')",
+            ) else {
+                return;
+            };
+            let Ok(rows) = stmt.query_map(rusqlite::params![plan_name], |row| {
+                Ok(ResolverSnapshot {
+                    id: row.get(0)?,
+                    cwd: row.get(1)?,
+                    resolver_task_id: row.get(2)?,
+                    parent_agent_id: row.get(3)?,
+                    parent_task_id: row.get(4)?,
+                })
+            }) else {
+                return;
+            };
+            rows.flatten().collect()
+        };
+
+        // 2. Kill each resolver (worktree preserved), then surface the
+        //    leftover conflict so the human can pick it up.
+        for r in resolvers {
+            self.kill_agent(&r.id).await;
+
+            // The conflicts a human will find in the preserved worktree. Empty
+            // when the tree is gone or the resolver had already resolved it.
+            let conflicted_paths = r
+                .cwd
+                .as_deref()
+                .map(|c| worktree_unmerged_paths(Path::new(c)))
+                .unwrap_or_default();
+
+            // Surface under the ORIGINAL task, not the `-resolve-N` row:
+            // prefer the parent agent's task id, falling back to stripping the
+            // `-resolve-<n>` suffix off the resolver's own task id.
+            let original_task = r.parent_task_id.clone().unwrap_or_else(|| {
+                r.resolver_task_id
+                    .rsplit_once("-resolve-")
+                    .map(|(orig, _)| orig.to_string())
+                    .unwrap_or_else(|| r.resolver_task_id.clone())
+            });
+
+            broadcast_event(
+                &self.broadcast_tx,
+                "resolver_cancelled",
+                serde_json::json!({
+                    "plan": plan_name,
+                    "task": original_task,
+                    "agent_id": r.id,
+                    "parent_agent_id": r.parent_agent_id,
+                    "conflicted_paths": conflicted_paths,
+                }),
+            );
+        }
     }
 }
 
@@ -4249,6 +4357,197 @@ mod tests {
             .unwrap()
         };
         assert_eq!(resolver_count, 0, "cap hit must not spawn a resolver");
+    }
+
+    // ── cancel_in_flight_resolvers (Task 3.4) ─────────────────────────────
+
+    /// Insert a fully-specified agent row for the cancellation tests.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_resolver_test_agent(
+        db: &Db,
+        id: &str,
+        plan_name: &str,
+        task_id: &str,
+        cwd: &std::path::Path,
+        status: &str,
+        mode: &str,
+        parent_agent_id: Option<&str>,
+        merge_status: Option<&str>,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents \
+                (id, plan_name, task_id, cwd, status, mode, parent_agent_id, merge_status, org_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'default-org')",
+            params![
+                id,
+                plan_name,
+                task_id,
+                cwd.to_str().unwrap(),
+                status,
+                mode,
+                parent_agent_id,
+                merge_status
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Pull the first `resolver_cancelled` event's `data` object out of a
+    /// drained broadcast stream (skipping the `agent_stopped` the kill emits).
+    fn first_resolver_cancelled(events: &[String]) -> Option<serde_json::Value> {
+        events.iter().find_map(|raw| {
+            let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+            if v.get("type")?.as_str()? == "resolver_cancelled" {
+                Some(v.get("data")?.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Acceptance: toggling auto-mode off kills the running resolver, leaves
+    /// its conflicted worktree on disk, and surfaces the conflicted paths
+    /// under the original task card.
+    #[tokio::test]
+    async fn cancel_in_flight_resolvers_kills_resolver_preserves_worktree_and_surfaces_paths() {
+        let (db, _dbdir) = fresh_db();
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("wt");
+        setup_conflicting_worktree(&repo, &wt);
+
+        // Reconstruct the conflict on disk (as `reconstruct_merge_conflict`
+        // does at resolver spawn) so the worktree carries a live `UU` entry.
+        let _ = std::process::Command::new("git")
+            .args(["merge", "master", "--no-edit"])
+            .current_dir(&wt)
+            .output();
+        assert!(
+            worktree_unmerged_paths(&wt).contains(&"file.txt".to_string()),
+            "fixture must leave file.txt unmerged"
+        );
+
+        // Original task agent (the parent) + the resolver threaded under it.
+        // Both hold the shared conflicted worktree (`held_for_resolver`).
+        insert_resolver_test_agent(
+            &db,
+            "parent-1",
+            "p",
+            "1.1",
+            &wt,
+            "completed",
+            "pty",
+            None,
+            Some(MERGE_STATUS_HELD_FOR_RESOLVER),
+        );
+        insert_resolver_test_agent(
+            &db,
+            "resolver-1",
+            "p",
+            "1.1-resolve-1",
+            &wt,
+            "running",
+            "resolver",
+            Some("parent-1"),
+            Some(MERGE_STATUS_HELD_FOR_RESOLVER),
+        );
+
+        let (registry, mut rx) = test_registry(db.clone());
+        registry.cancel_in_flight_resolvers("p").await;
+
+        // Resolver killed; parent untouched.
+        assert_eq!(agent_status(&db, "resolver-1").0, "killed");
+        assert_eq!(agent_status(&db, "parent-1").0, "completed");
+        // Worktree preserved on disk — `held_for_resolver` skips the cleanup
+        // that would otherwise `git worktree remove` this linked tree.
+        assert!(
+            wt.is_dir(),
+            "resolver worktree must be preserved for human inspection"
+        );
+
+        // `resolver_cancelled` surfaced the conflict under the ORIGINAL task.
+        let events = drain_events(&mut rx);
+        let data =
+            first_resolver_cancelled(&events).expect("a resolver_cancelled event must broadcast");
+        assert_eq!(data["plan"], "p");
+        assert_eq!(
+            data["task"], "1.1",
+            "must surface under the original task id, not 1.1-resolve-1"
+        );
+        assert_eq!(data["agent_id"], "resolver-1");
+        assert_eq!(data["parent_agent_id"], "parent-1");
+        let paths: Vec<String> = serde_json::from_value(data["conflicted_paths"].clone()).unwrap();
+        assert!(
+            paths.contains(&"file.txt".to_string()),
+            "conflicted paths must surface the unmerged file: {paths:?}"
+        );
+
+        // Re-enabling auto-mode never re-processes the now-killed resolver: a
+        // second pass finds nothing running and fires no event.
+        registry.cancel_in_flight_resolvers("p").await;
+        assert!(
+            first_resolver_cancelled(&drain_events(&mut rx)).is_none(),
+            "a killed resolver must not be re-cancelled (no auto-resume)"
+        );
+    }
+
+    /// Scoping: only running/starting `mode='resolver'` rows of *this* plan
+    /// are cancelled — finished resolvers, other plans' resolvers, and the
+    /// plan's normal task agents are all left alone.
+    #[tokio::test]
+    async fn cancel_in_flight_resolvers_scopes_to_running_resolvers_of_the_plan() {
+        let (db, _dbdir) = fresh_db();
+        let cwd = std::path::Path::new("/tmp");
+
+        // Already-finished resolver for plan p — must not be re-killed.
+        insert_resolver_test_agent(
+            &db,
+            "done-resolver",
+            "p",
+            "1.1-resolve-1",
+            cwd,
+            "completed",
+            "resolver",
+            None,
+            Some(MERGE_STATUS_HELD_FOR_RESOLVER),
+        );
+        // Running resolver for a DIFFERENT plan — out of scope.
+        insert_resolver_test_agent(
+            &db,
+            "other-plan-resolver",
+            "q",
+            "2.1-resolve-1",
+            cwd,
+            "running",
+            "resolver",
+            None,
+            Some(MERGE_STATUS_HELD_FOR_RESOLVER),
+        );
+        // Running NON-resolver task agent for plan p — must not be killed by
+        // the resolver-cancel path (the fix-agent path above owns those).
+        insert_resolver_test_agent(
+            &db,
+            "task-agent",
+            "p",
+            "1.2",
+            cwd,
+            "running",
+            "pty",
+            None,
+            None,
+        );
+
+        let (registry, mut rx) = test_registry(db.clone());
+        registry.cancel_in_flight_resolvers("p").await;
+
+        assert_eq!(agent_status(&db, "done-resolver").0, "completed");
+        assert_eq!(agent_status(&db, "other-plan-resolver").0, "running");
+        assert_eq!(agent_status(&db, "task-agent").0, "running");
+        assert!(
+            first_resolver_cancelled(&drain_events(&mut rx)).is_none(),
+            "no in-flight resolver for plan p ⇒ no resolver_cancelled event"
+        );
     }
 
     // ── resolver_resolution_succeeded gate (Task 3.3) ─────────────────────
