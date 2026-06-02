@@ -20,7 +20,7 @@ inline below; the canonical reference is `WireMessage` in
 ## What the runner does
 
 A SaaS runner exposes the customer machine's filesystem, git state,
-and AI CLIs to the hosted dashboard. It owns four kinds of work, each
+and AI CLIs to the hosted dashboard. It owns five kinds of work, each
 triggered by the dashboard sending a `WireMessage` frame on the
 shared WebSocket:
 
@@ -32,6 +32,12 @@ shared WebSocket:
   runner is the dashboard's window into the project parent directory
   (`~/projects`, `~/code`, …) on the customer machine. See
   [Folder operations](#folder-operations).
+- **Per-agent worktree setup, removal, and orphan listing** so each
+  agent gets its own isolated checkout on the customer machine. The
+  runner owns the project filesystem, so it — not the server —
+  resolves the worktree base and runs `git worktree add`, replying
+  with the absolute path it created. See
+  [Worktree dispatch](#worktree-dispatch).
 - **Branch resolution, merge, push, and `gh` queries** for everything
   the merge button and CI badge used to do directly on the SaaS
   filesystem. See
@@ -40,10 +46,10 @@ shared WebSocket:
   end-to-end for unattended plans, again via request/response frames
   correlated by `req_id`.
 
-All four families share the [request/response pattern documented in
+All five families share the [request/response pattern documented in
 protocols.md](protocols.md#requestresponse-frames): the SaaS server
 mints a `req_id`, parks on a `oneshot`, and times out cleanly if the
-runner never replies. Folder, branch, and `gh` requests are
+runner never replies. Folder, worktree, branch, and `gh` requests are
 classified best-effort — the dashboard's HTTP caller is the retry
 loop, not the runner outbox.
 
@@ -304,6 +310,131 @@ issues per-task absolute paths (e.g. for monorepo subpackages) the
 runner spawns the daemon with that exact path and the runner's own
 `--cwd` is irrelevant for that agent.
 
+## Worktree dispatch
+
+Worktree-per-agent isolation (ADR 0002) gives every agent its own git
+checkout. In self-hosted mode the server creates those worktrees
+directly; in SaaS mode it **can't** — the project filesystem lives on
+the customer machine, behind the runner. So the runner owns worktree
+creation, removal, and orphan listing, and the server drives it over
+three best-effort request/response pairs added in Phase 2.7.
+
+### The resolved-path principle
+
+The server does **not** pre-compute the absolute worktree path — it
+cannot, because only the runner knows its own `$HOME` and its
+`$BRANCHWORK_WORKTREE_BASE` override. Instead the server ships the
+*parts* (project dir, slug, plan/task segments, agent id, branch) and
+the runner resolves its base, builds
+`<base>/<slug>/<plan>/<task>-<agent-id-short>`, runs `git worktree
+add`, and replies with the **absolute path it actually created**. The
+server records that path verbatim in `agents.cwd` (write-once) and
+uses it as the agent's spawn cwd. This mirrors the resolved-path shape
+the folder and clone RPCs already use
+(`CreateFolder → FolderCreated { resolved_path }`,
+`CloneProject → CloneDone { resolved_path }`).
+
+The freestanding-agent placeholders (`_no-plan` / `_no-task`) are
+substituted **server-side** before the wire frame is built — the
+runner has no access to the `NO_PLAN_SEGMENT` / `NO_TASK_SEGMENT`
+constants — so both modes produce the same path shape.
+
+### Wire variants
+
+| Variant | What the runner does | Reply |
+|---|---|---|
+| `SetupWorktree { req_id, project_dir, project_slug, plan, task, agent_id, branch, base_branch?, is_continue }` | Resolve the startup base, then `worktree::setup_worktree_in` → `git worktree add` (`-b <branch>` for a fresh task; attach the existing branch on continue). | `WorktreeCreated { req_id, path }` (absolute, runner-resolved) **or** `WorktreeSetupFailed { req_id, error }` |
+| `RemoveWorktree { req_id, project_dir, path }` | `worktree::remove_worktree` from the project root: `git worktree remove` → `--force` → `rm -rf` + `git worktree prune`, escalating only as far as needed. | `WorktreeRemoved { req_id, outcome }` where `outcome` ∈ `removed` / `force_removed` / `manually_removed` / `error: <msg>` |
+| `ListWorktreeOrphans { req_id, project_dir, project_slug, live_cwds }` | Scan `<base>/<slug>/` for worktrees no live agent (`live_cwds`) claims — the candidates a startup sweep reaps. | `WorktreeOrphansListed { req_id, orphans: [{ path, branch?, last_modified_secs? }] }` |
+
+All three pairs are **best-effort** (no outbox): each is correlated to
+a live caller — an agent spawn, a kill/merge cleanup, or the admin
+orphan-cleanup endpoint — with its own timeout, so outbox replay would
+deliver an answer to a caller that has already given up. Each handler
+runs its git work inside `run_blocking_with_timeout` with a 30 s
+`WORKTREE_TIMEOUT`, keeping the WS reader loop responsive. The
+`WorktreeOrphan.last_modified` mtime travels as Unix epoch seconds
+(`last_modified_secs`) rather than serde's `SystemTime` struct so it
+round-trips cleanly through JSON.
+
+### Sandbox widening
+
+The runner refuses to operate outside a fixed allowlist of directory
+prefixes, so a buggy or hostile server can't pivot it into an
+arbitrary path. Before worktrees that allowlist was a single prefix:
+the canonical `--cwd`. Worktree paths live **outside** `--cwd` (under
+the base, default `~/.branchwork/worktrees`), so the sandbox widens to
+two prefixes:
+
+- **`validated_cwd`** now accepts a request path that canonicalises
+  under **either** `state.cwd` **or** `state.worktree_base`. Both are
+  resolved and canonicalised **once at startup** — the worktree base
+  comes from `worktree::worktree_base()` (honouring
+  `$BRANCHWORK_WORKTREE_BASE`), is created if missing, and is stored on
+  `RunnerState` next to `--cwd`. Resolving it once guarantees the base
+  the runner *creates* worktrees under is exactly the base the sandbox
+  *validates* against — they can't drift.
+- **`validated_worktree_path`** is a second, stricter check used only
+  for `RemoveWorktree`'s `rm -rf` fallback tier. The worktree leaf may
+  already be gone (deleted behind git's back), so it canonicalises the
+  nearest *existing ancestor* instead of the path itself, rejects any
+  `..` traversal outright, and requires the result under
+  `state.worktree_base`. Without it a buggy server could ask the runner
+  to `rm -rf` an arbitrary directory.
+
+### Agent start in SaaS mode (with worktree dispatch)
+
+```mermaid
+sequenceDiagram
+  participant Server as branchwork-server (hosted)
+  participant Runner as branchwork-runner
+  participant Git as git (customer FS)
+
+  Note over Server: resolve project dir, slug,<br/>plan/task segments, branch
+  Server->>Runner: SetupWorktree { req_id, project_dir, slug, plan, task, agent_id, branch, is_continue }
+  Note over Runner: validated_cwd(project_dir) OK<br/>base = state.worktree_base
+  Runner->>Git: git worktree add base/slug/plan/task-id -b branch
+  Git-->>Runner: worktree created
+  Runner-->>Server: WorktreeCreated { req_id, path }
+  Note over Server: agents.cwd = path (write-once)
+  Server->>Runner: StartAgent { agent_id, cwd=path, driver, prompt }
+  Note over Runner: spawn branchwork-server session --cwd path
+  Runner-->>Server: AgentStarted (reliable)
+```
+
+The kill / merge / finish cleanup path runs the same round-trip in
+reverse: `RemoveWorktree { path }` → `WorktreeRemoved { outcome }`. A
+server-boot sweep uses `ListWorktreeOrphans` to find worktrees a crash
+left behind and surfaces them in the admin **Cleanup orphans** UI,
+which dispatches `RemoveWorktree` per pick.
+
+### Server-side dispatchers and implementation status
+
+The mode switch lives in `agents/git_ops.rs`: `setup_worktree`,
+`remove_worktree`, and `list_worktree_orphans` each branch on
+`org_has_runner(db, org_id)`. SaaS dispatches the wire variant via
+`runner_request_with_registry` (30 s timeout) and resolves the reply
+through `RunnerResponse::{WorktreeSetup, WorktreeRemoved,
+WorktreeOrphansListed}`; standalone calls the local `worktree::*`
+functions directly. Either way the caller sees one nested
+`Result<Result<PathBuf, String>, RunnerRpcError>` — the outer `Err` is
+"couldn't reach the runner", the inner `Err` is "the git op itself
+failed".
+
+Wired end-to-end today: the runner handlers, the server dispatchers,
+the reply-resolution in `runner_ws.rs`, and the two-prefix sandbox. In
+SaaS mode the admin **Cleanup orphans** endpoint
+(`api::orphan_worktrees`) already dispatches `RemoveWorktree` /
+`ListWorktreeOrphans` over the wire. What remains is the **agent-spawn**
+path: `pty_agent::start_pty_agent` routes worktree setup through
+`git_ops::setup_worktree` on the standalone side, but the SaaS spawn
+path (`spawn_ops::start_agent_via_runner`) still sends `StartAgent`
+with the cwd it was handed and does not yet dispatch `SetupWorktree`
+ahead of it. Closing that gap is the sequence diagram above — wired
+standalone-first, exactly like the build-cache `CARGO_TARGET_DIR`
+injection (see the [SaaS note under Build-cache
+sharing](#build-cache-sharing-across-worktrees)).
+
 ## Build-cache sharing across worktrees
 
 Worktree-per-agent isolation (ADR 0002) gives every agent its own
@@ -439,23 +570,25 @@ Concretely:
 
 | Direction          | Reliable (outbox + ACK)                                         | Best-effort (no outbox, no ACK) |
 |--------------------|------------------------------------------------------------------|--------------------------------|
-| Runner → SaaS      | `RunnerHello`, `AgentStarted`, `AgentStopped`, `TaskStatusChanged`, `DriverAuthReport`, `Resume`, `Ack` | `AgentOutput`, `Ping`, `Pong`, `FoldersListed`, `FolderCreated`, `DefaultBranchResolved`, `BranchesListed`, `MergeResult`, `PushResult`, `GhRunListed`, `GhFailureLogFetched` |
-| SaaS → Runner      | `StartAgent`, `KillAgent`, `TerminalReplay`, `Resume`, `Ack`     | `AgentInput`, `Ping`, `Pong`, `ResizeTerminal`†, `ListFolders`, `CreateFolder`, `GetDefaultBranch`, `ListBranches`, `MergeBranch`, `PushBranch`, `GhRunList`, `GhFailureLog` |
+| Runner → SaaS      | `RunnerHello`, `AgentStarted`, `AgentStopped`, `TaskStatusChanged`, `DriverAuthReport`, `Resume`, `Ack` | `AgentOutput`, `Ping`, `Pong`, `FoldersListed`, `FolderCreated`, `WorktreeCreated`, `WorktreeSetupFailed`, `WorktreeRemoved`, `WorktreeOrphansListed`, `DefaultBranchResolved`, `BranchesListed`, `MergeResult`, `PushResult`, `GhRunListed`, `GhFailureLogFetched` |
+| SaaS → Runner      | `StartAgent`, `KillAgent`, `TerminalReplay`, `Resume`, `Ack`     | `AgentInput`, `Ping`, `Pong`, `ResizeTerminal`†, `ListFolders`, `CreateFolder`, `SetupWorktree`, `RemoveWorktree`, `ListWorktreeOrphans`, `GetDefaultBranch`, `ListBranches`, `MergeBranch`, `PushBranch`, `GhRunList`, `GhFailureLog` |
 
 > † `ResizeTerminal` is technically reliable per the wire protocol but
 > is sent through the same channel as `AgentInput` from the dashboard
 > side; small terminal resizes that get lost across a reconnect are
 > harmless because the dashboard re-emits them on the next render.
 
-The folder, branch/merge, and `gh` request/response pairs (`ListFolders`,
-`CreateFolder`, `GetDefaultBranch`, `ListBranches`, `MergeBranch`,
-`PushBranch`, `GhRunList`, `GhFailureLog` and their `…ed`/`…Result`
-replies) are state-changing on the runner host, but they are nonetheless
-classified best-effort: each is correlated to a *live HTTP caller* (or a
-~30 s polling tick, in the `GhRunList` case) whose retry loop is
-already the right backstop. Outbox replay would deliver an answer to a
-caller that has long since timed out. See [protocols.md — Request/response
-frames](protocols.md#requestresponse-frames) for the full rationale.
+The folder, worktree, branch/merge, and `gh` request/response pairs
+(`ListFolders`, `CreateFolder`, `SetupWorktree`, `RemoveWorktree`,
+`ListWorktreeOrphans`, `GetDefaultBranch`, `ListBranches`, `MergeBranch`,
+`PushBranch`, `GhRunList`, `GhFailureLog` and their `…ed`/`…Result`/
+`…Created` replies) are state-changing on the runner host, but they are
+nonetheless classified best-effort: each is correlated to a *live HTTP
+caller* (or a ~30 s polling tick, in the `GhRunList` case) whose retry
+loop is already the right backstop. Outbox replay would deliver an
+answer to a caller that has long since timed out. See [protocols.md —
+Request/response frames](protocols.md#requestresponse-frames) for the
+full rationale.
 
 ### Tables and seqs
 
@@ -686,7 +819,9 @@ A bestiary of how things break and what the dashboard sees:
 | [`server-rs/src/bin/branchwork_runner.rs`](../../server-rs/src/bin/branchwork_runner.rs)      | Binary entry, reconnect loop, agent spawning, I/O forwarding        |
 | [`server-rs/src/saas/runner_protocol.rs`](../../server-rs/src/saas/runner_protocol.rs)        | `Envelope`, `WireMessage`, `DriverAuthInfo`, best-effort classification |
 | [`server-rs/src/saas/outbox.rs`](../../server-rs/src/saas/outbox.rs)                          | `runner_outbox` / `inbox_pending` / `seq_tracker` schema + helpers  |
-| [`server-rs/src/saas/runner_ws.rs`](../../server-rs/src/saas/runner_ws.rs)                    | Server-side WS handler, token validation, `RunnerRegistry`          |
+| [`server-rs/src/saas/runner_ws.rs`](../../server-rs/src/saas/runner_ws.rs)                    | Server-side WS handler, token validation, `RunnerRegistry`, `RunnerResponse` reply resolution |
+| [`server-rs/src/agents/git_ops.rs`](../../server-rs/src/agents/git_ops.rs)                    | Mode-aware dispatchers (`setup_worktree` / `remove_worktree` / `list_worktree_orphans`, branch/merge/`gh`) — local vs runner RPC |
+| [`server-rs/src/agents/worktree.rs`](../../server-rs/src/agents/worktree.rs)                  | Per-agent worktree manager (`setup_worktree_in` / `remove_worktree` / `list_orphans_in`), base resolution, build-cache paths |
 | [`server-rs/src/agents/supervisor.rs`](../../server-rs/src/agents/supervisor.rs)              | The session daemon the runner shells out to (shared with self-hosted) |
 | [`server-rs/src/agents/session_protocol.rs`](../../server-rs/src/agents/session_protocol.rs)  | Length-prefixed `Message` frames runner ↔ session daemon            |
 

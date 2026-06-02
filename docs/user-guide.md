@@ -27,7 +27,7 @@ for the per-OS detach mechanics and testing posture.
 - [Agents](#agents) — starting, attaching, types (PTY vs stream-JSON), stopping, check agents
 - [Drivers](#drivers) — Claude, Aider, Codex, Gemini — auth and how to pick
 - [Git flow](#git-flow) — branch naming, diff review, merge, stale branch cleanup
-- [Worktrees](#worktrees) — per-agent isolation, `BRANCHWORK_WORKTREE_BASE`, cross-filesystem warning, build-cache contention
+- [Worktrees](#worktrees) — per-agent isolation, where your in-flight work lives, `BRANCHWORK_WORKTREE_BASE`, build-cache contention, at-merge conflict resolver, orphan cleanup
 - [Project configuration](#project-configuration) — `branchwork.toml`, shared build-cache overrides
 - [Cost tracking & budgets](#cost-tracking--budgets)
 - [CI integration](#ci-integration)
@@ -522,6 +522,74 @@ spawns an agent. Note this is a separate tree from `~/.claude/` (see
 [`~/.claude/` layout](#claude-layout)) — `~/.branchwork/` holds only
 per-agent worktree state.
 
+The full on-disk picture, with two agents running in parallel against
+one project:
+
+```
+  ~/code/myproject/                     the project — ONE shared .git
+  ├── .git/  ◄──────────────────────┐   object database for all worktrees
+  └── (main worktree: your editor,  │
+       on whatever branch you had)  │   git worktree: shares objects,
+                                    │   own working tree + own HEAD
+       ┌────────────────────────────┴───────────────────────────┐
+       │                                                         │
+  agent A → task 1.2                                  agent B → task 1.3
+  branch branchwork/myplan/1.2                        branch branchwork/myplan/1.3
+       │                                                         │
+       ▼                                                         ▼
+  ~/.branchwork/worktrees/                           ~/.branchwork/worktrees/
+    myproject/myplan/1.2-a1b2c3d4/                     myproject/myplan/1.3-e5f6a7b8/
+  (agent A's working tree)                           (agent B's working tree)
+       │                                                         │
+       └───────────────────────────┬─────────────────────────────┘
+                                    ▼
+            ~/.branchwork/cache/myproject/cargo-target/
+            shared CARGO_TARGET_DIR — compiled once, reused by both
+            (sibling of the worktree base, NOT inside any worktree)
+```
+
+Three distinct trees: the project (one `.git`, shared), the two
+per-agent worktrees (one working tree + HEAD each), and the single
+shared build cache that sits beside the worktree base — see
+[Build cache contention](#build-cache-contention) for the cache box.
+
+### Where my work lives
+
+When an agent is running, its edits are in **its own worktree** —
+*not* in the project directory you normally open in your editor. The
+main checkout stays on whatever branch you were on; the agent's
+in-flight changes won't show up there until you merge.
+
+To watch an agent work, or to take over by hand, open the agent's
+worktree directly:
+
+```bash
+# the path is on the task card while the agent runs —
+# click the copy icon next to "running in: …"
+code ~/.branchwork/worktrees/myproject/myplan/1.2-a1b2c3d4/
+```
+
+You can find the path three ways:
+
+- **Task card** — a "running in: `<path>`" row appears under the
+  status pill while the agent is live, with a one-click **copy** icon.
+- **Agents view** — the "current working directory" column on each
+  agent row (see [check-agents query](#check-agents-query)).
+- **Diff tab** — the agent panel's **Diff** tab renders the worktree's
+  changes against the base commit without you opening any path at all.
+  This is the read-only way to review in-flight work.
+
+After you **Merge**, the commits land on your source branch in the
+project root and the worktree is removed automatically — so the path
+above is transient. Open the project root again (not the worktree) to
+see the merged result.
+
+> **SaaS note.** In SaaS mode the worktree lives on the **runner
+> host**, not on the machine running your browser, so the path on the
+> task card is a path on that host — you can't `cd` into it locally.
+> Use the **Diff** tab (which streams over the runner connection) to
+> review the work, or open the path on the runner host itself.
+
 ### `BRANCHWORK_WORKTREE_BASE`
 
 Set the `BRANCHWORK_WORKTREE_BASE` environment variable to move the
@@ -599,6 +667,47 @@ CPU-saving** the shared cache exists for and is **not recommended**;
 reach for it only if measured lock contention is actually hurting you.
 See [Build-cache overrides (`[cache]`)](#build-cache-overrides-cache) for
 the full `[cache]` schema.
+
+### Conflict resolution at merge
+
+Because each agent's branch is built in isolation, two agents can
+still produce changes that **conflict when merged** — same file, same
+region. Under [auto-mode](#auto-mode) (standalone mode), a merge
+conflict doesn't just pause the plan: Branchwork spawns a **resolver
+agent** in the conflicting agent's own worktree, hands it the
+conflicted paths and both sides of the diff, and lets it resolve the
+conflict and re-merge. If the resolver can't — or the per-task retry
+cap is hit — the plan pauses with `merge_conflict_unresolved` and you
+take over by hand. Disabling auto-mode mid-resolution kills the
+resolver but leaves its worktree intact for inspection.
+
+Outside auto-mode, a conflicting **Merge** click surfaces the conflict
+as an inline error instead and you resolve it yourself. The
+conflict-detection and resolver design — and why per-agent worktrees
+are what make an in-place resolver possible at all — is in
+[ADR 0002](adrs/0002-worktree-per-agent-isolation.md).
+
+### Orphaned worktrees
+
+A worktree is normally removed automatically when its agent merges, is
+killed, or fails. A crash (host reboot, OOM) can leave one behind — a
+directory under the base with no live agent. Branchwork surfaces these
+two ways:
+
+- **Boot-time warning.** On every server start, a sweep records
+  orphaned worktrees and logs a warning for any that have lingered past
+  the stale threshold, so they don't pile up unnoticed.
+- **Cleanup orphans.** The sidebar shows a **Cleanup orphans** entry
+  (admin-only) when orphans exist. It lists each orphaned worktree and
+  removes the ones you pick — `git worktree remove`, escalating to
+  `rm -rf` + `git worktree prune` only if needed. In SaaS mode this
+  dispatches the removal to the runner (the worktree is on the runner
+  host); see
+  [runner.md — Worktree dispatch](architecture/runner.md#worktree-dispatch).
+
+Branchwork never **auto-deletes** an orphaned worktree — removal is
+always an explicit action, since an "orphan" might just be a worktree
+whose agent the server temporarily lost track of (ADR 0002).
 
 ### Disabling worktrees (deprecated)
 

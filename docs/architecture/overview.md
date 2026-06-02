@@ -272,6 +272,16 @@ a reconnect is fine; dropping an `AgentStopped` would leak a stuck
   (`branchwork/<plan>/<task>`), and the merge button is gated on the
   branch having commits — nothing is persisted through the dashboard
   alone.
+- **Each agent runs in its own worktree.** That task branch is checked
+  out into a per-agent git worktree under `~/.branchwork/worktrees/…`
+  (not the shared project tree), so parallel agents never clobber each
+  other's files. In SaaS mode the runner owns those worktrees and the
+  server drives their lifecycle (`SetupWorktree` / `RemoveWorktree` /
+  `ListWorktreeOrphans`) over the wire. See
+  [user-guide.md — Worktrees](../user-guide.md#worktrees) for where
+  they live and how to point a base elsewhere, and
+  [runner.md — Worktree dispatch](runner.md#worktree-dispatch) for the
+  SaaS round-trip and sandbox.
 - **SaaS adds a WebSocket hop, not a new protocol.** The
   `branchwork-runner` speaks a JSON
   [`WireMessage`](../../server-rs/src/saas/runner_protocol.rs) envelope
@@ -282,8 +292,12 @@ a reconnect is fine; dropping an `AgentStopped` would leak a stuck
 - [architecture/server.md](server.md) _(stub)_ — dashboard internals.
 - [architecture/session-daemon.md](session-daemon.md) _(stub)_ — PTY
   and reattach details.
-- [architecture/runner.md](runner.md) _(stub)_ — runner lifecycle,
-  outbox, reconnect.
+- [architecture/runner.md](runner.md) — runner lifecycle, outbox,
+  reconnect, and [worktree dispatch](runner.md#worktree-dispatch) in
+  SaaS mode.
+- [user-guide.md — Worktrees](../user-guide.md#worktrees) — per-agent
+  worktree isolation, where in-flight work lives, base override, and
+  orphan cleanup.
 - [architecture/protocols.md](protocols.md) _(stub)_ — frame formats
   and WS event vocabulary.
 - [architecture/persistence.md](persistence.md) — SQLite schema, the
