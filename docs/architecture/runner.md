@@ -304,6 +304,41 @@ issues per-task absolute paths (e.g. for monorepo subpackages) the
 runner spawns the daemon with that exact path and the runner's own
 `--cwd` is irrelevant for that agent.
 
+## Build-cache sharing across worktrees
+
+Worktree-per-agent isolation (ADR 0002) gives every agent its own
+checkout. By default that means every agent's build tool writes into
+its *own* per-worktree cache, so N agents on one project rebuild the
+same dependencies N times — for Rust that dominates build time. To keep
+parallel builds fast we point each build tool at a single **shared**
+cache directory that lives outside the worktrees, as a sibling of the
+worktree base: `<BRANCHWORK_WORKTREE_BASE>/../cache/<project-slug>/…`
+(default `~/.branchwork/cache/<slug>/…`). The build tool's own file
+lock then serialises concurrent writers — that contention is intended
+and far cheaper than N cold rebuilds.
+
+**Contract — every build tool whose agents run under worktree isolation
+needs an explicit cache-sharing decision.** Adding a new language
+runtime (Go `GOCACHE`, Gradle build cache, …) MUST record it here and,
+if it needs an env var, wire it the same way `CARGO_TARGET_DIR` is.
+Current decisions:
+
+| Runtime | Mechanism | Path |
+|---|---|---|
+| **Rust (cargo)** | `CARGO_TARGET_DIR` injected into the agent process env at spawn (`pty_agent::start_pty_agent` → `worktree::cargo_target_dir_for`), forwarded to the session daemon as a `--env CARGO_TARGET_DIR=…` flag. Cargo's per-target file lock serialises concurrent builds. | `<base>/../cache/<slug>/cargo-target` |
+| **JS / TS (pnpm)** | No env var. pnpm keeps a single content-addressed global store shared across every checkout on the machine; the operator sets it once with `pnpm config set store-dir <path>` (or accepts the default `~/.local/share/pnpm/store`). npm / yarn-classic would need the cargo-style treatment if ever supported. | global pnpm store |
+
+The canonical contract lives in the module docs of
+[`worktree.rs`](../../server-rs/src/agents/worktree.rs); update both
+places when adding a runtime.
+
+> **SaaS note:** `CARGO_TARGET_DIR` injection is wired on the
+> *self-hosted* spawn path (`pty_agent::start_pty_agent`) today. The
+> runner-side spawn (`branchwork_runner::spawn_agent`) does not yet
+> compute its own shared cache from its own `worktree_base`; until it
+> does, runner-spawned agents fall back to a per-worktree `target/`.
+> A follow-up should mirror the standalone logic on the runner.
+
 ## Folder operations
 
 The first runner-dispatched filesystem RPCs were `ListFolders` and

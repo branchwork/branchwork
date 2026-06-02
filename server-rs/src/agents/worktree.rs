@@ -22,6 +22,35 @@
 //! [`crate::agents::phase_check`] (the other worktree consumer); no async
 //! machinery is required — the operations are short and callers already
 //! run inside a tokio task.
+//!
+//! ## Build-cache sharing across worktrees (UPDATE THIS for new languages)
+//!
+//! Worktree-per-agent isolation gives every agent its own checkout. By
+//! default that means every agent's build tool writes into its *own*
+//! per-worktree cache, so N agents on one project rebuild the same
+//! dependencies N times — for Rust that's the dominant cost of a build. To
+//! keep parallel builds fast we point each build tool at a single *shared*
+//! cache directory that lives OUTSIDE the worktrees, as a sibling of the
+//! worktree base: `<BRANCHWORK_WORKTREE_BASE>/../cache/<project-slug>/…`.
+//! The build tool's own file lock then serialises concurrent writers —
+//! that contention is intended and far cheaper than N cold rebuilds.
+//!
+//! **Contract:** every build tool whose agents run under worktree isolation
+//! needs an explicit cache-sharing decision recorded here. Adding a new
+//! language runtime (Go `GOCACHE`, Gradle build cache, …) MUST add a bullet
+//! below and, if it needs an env var, wire it the same way
+//! `CARGO_TARGET_DIR` is wired in `pty_agent::start_pty_agent`. Current
+//! decisions:
+//!
+//! - **Rust (cargo)** — `CARGO_TARGET_DIR` is injected into the agent's
+//!   process env (see [`cargo_target_dir_for`] + `pty_agent`) pointing at
+//!   `<base>/../cache/<slug>/cargo-target`. Cargo's per-target file lock
+//!   serialises concurrent builds (the desired behaviour).
+//! - **JS / TS (pnpm)** — no env var needed. pnpm already keeps a single
+//!   content-addressed global store shared across every checkout on the
+//!   machine; the operator sets it once with `pnpm config set store-dir
+//!   <path>` (or accepts the default `~/.local/share/pnpm/store`). npm /
+//!   yarn-classic would need the cargo-style treatment if ever supported.
 
 use std::collections::HashSet;
 use std::io;
@@ -461,6 +490,44 @@ pub fn worktree_base() -> Result<PathBuf, WorktreeError> {
             .map(|cwd| cwd.join(&base))
             .map_err(|e| WorktreeError::BasePathInvalid(format!("cwd unavailable: {e}")))
     }
+}
+
+/// Resolve the shared `CARGO_TARGET_DIR` for a project's Rust builds, anchored
+/// at the env-resolved [`worktree_base`]. See [`cargo_target_dir_in`] for the
+/// path shape and the module-level "Build-cache sharing across worktrees"
+/// section for the rationale.
+///
+/// `pub` so the spawn path (and, later, the SaaS runner) can resolve the same
+/// directory that `worktree_base` anchors.
+// Server-only today (consumed by `pty_agent::start_pty_agent`); dead in the
+// runner `#[path]` include, which has no cache-sharing call site yet.
+#[allow(dead_code)]
+pub fn cargo_target_dir_for(project_slug: &str) -> Result<PathBuf, WorktreeError> {
+    Ok(cargo_target_dir_in(&worktree_base()?, project_slug))
+}
+
+/// Inner [`cargo_target_dir_for`] against an explicit worktree `base`: returns
+/// `<base>/../cache/<project-slug>/cargo-target`. The cache lives as a SIBLING
+/// of the worktrees (not inside any single worktree) so every agent's cargo
+/// writes into one shared directory. `base` is absolute (`worktree_base`
+/// guarantees it), so its parent is the `~/.branchwork` root in the default
+/// layout.
+///
+/// `pub(crate)` so the spawn path can pin a test base override the same way it
+/// does for [`setup_worktree_in`], and the unit tests below can assert the
+/// path shape without mutating `$BRANCHWORK_WORKTREE_BASE` (a process-wide env
+/// write would race parallel test binaries).
+// Server-only today; dead in the runner `#[path]` include (see above).
+#[allow(dead_code)]
+pub(crate) fn cargo_target_dir_in(base: &Path, project_slug: &str) -> PathBuf {
+    let cache_root = match base.parent() {
+        Some(parent) => parent.join("cache"),
+        // Degenerate: `base` is a filesystem root with no parent. Keep the
+        // path well-formed via a literal `..` so it still resolves to a
+        // sibling-of-base location.
+        None => base.join("..").join("cache"),
+    };
+    cache_root.join(project_slug).join("cargo-target")
 }
 
 /// Does a *local* branch named `branch` exist in `project_dir`?
@@ -1170,6 +1237,38 @@ detached
             worktree_base().unwrap().is_absolute(),
             "resolved base must be absolute"
         );
+    }
+
+    #[test]
+    fn cargo_target_dir_is_sibling_of_worktree_base() {
+        // The cache lives at `<base>/../cache/<slug>/cargo-target` — a sibling
+        // of the worktrees, NOT inside any single worktree. Default layout:
+        // base `~/.branchwork/worktrees` → cache `~/.branchwork/cache/...`.
+        let base = Path::new("/home/me/.branchwork/worktrees");
+        let dir = cargo_target_dir_in(base, "branchwork");
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/me/.branchwork/cache/branchwork/cargo-target"),
+        );
+        // And it is genuinely outside the worktree base.
+        assert!(!dir.starts_with(base), "cache must not live under {base:?}");
+    }
+
+    #[test]
+    fn cargo_target_dir_is_shared_per_project_not_per_agent() {
+        // Same project slug → same target dir regardless of which agent asks,
+        // which is what lets parallel worktrees share one build cache.
+        let base = Path::new("/srv/wt");
+        let a = cargo_target_dir_in(base, "myproj");
+        let b = cargo_target_dir_in(base, "myproj");
+        assert_eq!(
+            a, b,
+            "same project must resolve to the same cargo target dir"
+        );
+        // Distinct projects get distinct dirs (no cross-project cache mixing).
+        let other = cargo_target_dir_in(base, "otherproj");
+        assert_ne!(a, other);
+        assert_eq!(a, PathBuf::from("/srv/cache/myproj/cargo-target"));
     }
 
     /// Test helper: `git status --porcelain` output for `cwd`, trimmed.

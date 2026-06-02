@@ -62,9 +62,13 @@ pub struct SessionArgs {
     pub rows: u16,
 
     /// Extra environment variables, in `KEY=VALUE` form. Repeat the flag once
-    /// per variable. Drivers declare these via [`AgentDriver::extra_env`]; the
-    /// canonical case today is `CLAUDE_CODE_SANDBOXED=1` for the claude CLI,
-    /// which skips its first-run trust-workspace dialog.
+    /// per variable. Two sources feed this list (see
+    /// `pty_agent::build_agent_extra_env`): the driver's static
+    /// [`AgentDriver::extra_env`] (canonically `CLAUDE_CODE_SANDBOXED=1` for
+    /// the claude CLI, which skips its first-run trust-workspace dialog) and
+    /// the per-agent `CARGO_TARGET_DIR`, which points worktree-isolated agents
+    /// at a shared Rust build cache. The daemon applies each pair on top of
+    /// the inherited env (no `env_clear`).
     #[arg(long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 

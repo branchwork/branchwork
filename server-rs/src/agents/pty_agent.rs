@@ -102,6 +102,72 @@ fn project_slug_for_worktree(project_dir: &Path) -> String {
     }
 }
 
+/// Merge the driver's static env additions (e.g. `CLAUDE_CODE_SANDBOXED=1`)
+/// with the per-agent dynamic env — today just `CARGO_TARGET_DIR`, the shared
+/// Rust build cache that lets parallel worktrees avoid redundant rebuilds.
+/// Pure so the wiring can be unit-tested without a real spawn.
+///
+/// The session daemon applies every pair on top of the inherited environment
+/// (its `CommandBuilder` does **not** `env_clear`), so `CARGO_TARGET_DIR`
+/// overrides cargo's default `<cwd>/target` for every build the agent runs.
+/// If a future driver clears the env before spawning, it must re-add these.
+fn build_agent_extra_env<'a>(
+    driver_env: &[(&'static str, &'static str)],
+    cargo_target_dir: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut env: Vec<(&'a str, &'a str)> = driver_env.iter().map(|&(k, v)| (k, v)).collect();
+    if let Some(dir) = cargo_target_dir {
+        env.push(("CARGO_TARGET_DIR", dir));
+    }
+    env
+}
+
+/// Compute (and create) the shared `CARGO_TARGET_DIR` for an agent running in
+/// its own worktree, returning the path as an owned string ready to drop into
+/// the spawn env. Returns `None` (and logs) on any failure — the agent still
+/// runs, it just doesn't share the build cache.
+///
+/// `base_override` mirrors the worktree base the agent's own worktree was
+/// created under (the test seam → tempdir), so the cache lands beside the
+/// worktrees and tests never pollute the operator's real `~/.branchwork/cache`.
+/// When `None`, the env-resolved [`crate::agents::worktree::worktree_base`]
+/// is used (production default).
+///
+/// 4.2 will let `branchwork.toml` override the path; until that loader lands
+/// we always use the default sibling-of-base location.
+fn resolve_cargo_target_dir(
+    project_dir: &Path,
+    base_override: Option<&Path>,
+    agent_id: &str,
+) -> Option<String> {
+    let slug = project_slug_for_worktree(project_dir);
+    let resolved = match base_override {
+        Some(base) => Ok(crate::agents::worktree::cargo_target_dir_in(base, &slug)),
+        None => crate::agents::worktree::cargo_target_dir_for(&slug),
+    };
+    let dir = match resolved {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "[agent {}] could not resolve cargo target dir: {e} — not sharing build cache",
+                &agent_id[..8.min(agent_id.len())],
+            );
+            return None;
+        }
+    };
+    // Pre-create the dir so cargo finds it on first build; the parent must
+    // exist either way. Best-effort.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "[agent {}] failed to create cargo target dir {}: {e} — not sharing build cache",
+            &agent_id[..8.min(agent_id.len())],
+            dir.display(),
+        );
+        return None;
+    }
+    dir.to_str().map(str::to_string)
+}
+
 pub struct StartPtyOpts<'a> {
     pub prompt: String,
     pub cwd: &'a Path,
@@ -372,7 +438,27 @@ pub async fn start_pty_agent(registry: &AgentRegistry, opts: StartPtyOpts<'_>) -
         settings_path: settings_path.as_deref(),
         skip_permissions,
     });
-    let extra_env = driver.extra_env();
+
+    // Shared Rust build cache: when this agent runs in its own worktree, point
+    // its cargo at a single per-project target dir that lives OUTSIDE the
+    // worktree (a sibling of the worktree base) so parallel agents share one
+    // build cache instead of each rebuilding from scratch. Cargo's per-target
+    // file lock serialises concurrent builds — the desired behaviour. See
+    // `worktree.rs` ("Build-cache sharing across worktrees") for the contract.
+    //
+    // Only relevant when a worktree was actually created (`worktree_path`):
+    // a freestanding agent — or the legacy shared-cwd mode — already runs in
+    // the project root and shares its own `target/`, so no redirect is needed.
+    //
+    // `cargo_target_dir` (the owned String) is declared BEFORE `extra_env` so
+    // it outlives the borrow `extra_env` holds into it.
+    let cargo_target_dir: Option<String> = if worktree_path.is_some() {
+        resolve_cargo_target_dir(project_dir, registry.worktree_base_override.as_deref(), &id)
+    } else {
+        None
+    };
+    let driver_env = driver.extra_env();
+    let extra_env = build_agent_extra_env(&driver_env, cargo_target_dir.as_deref());
     let formatted_prompt = driver.format_prompt(&prompt);
 
     let daemon_pid = match supervisor::spawn_session_daemon(
@@ -1709,6 +1795,66 @@ mod tests {
         assert_eq!(post_sep, cmd, "post-'--' argv must equal cli cmd: {args:?}");
     }
 
+    // ── Shared build cache: CARGO_TARGET_DIR injection (Task 4.1) ─────────
+
+    #[test]
+    fn build_agent_extra_env_appends_cargo_target_dir() {
+        let driver_env: &[(&'static str, &'static str)] = &[("CLAUDE_CODE_SANDBOXED", "1")];
+        let target = "/srv/cache/proj/cargo-target".to_string();
+        let env = build_agent_extra_env(driver_env, Some(target.as_str()));
+        // Driver env is preserved...
+        assert!(env.contains(&("CLAUDE_CODE_SANDBOXED", "1")));
+        // ...and the cache dir is appended.
+        assert!(
+            env.contains(&("CARGO_TARGET_DIR", "/srv/cache/proj/cargo-target")),
+            "CARGO_TARGET_DIR must be appended: {env:?}",
+        );
+        assert_eq!(env.len(), 2);
+    }
+
+    #[test]
+    fn build_agent_extra_env_without_cache_is_driver_env_only() {
+        // No worktree → no cargo target dir → just the driver's static env,
+        // verbatim. (A freestanding agent / legacy shared-cwd mode.)
+        let driver_env: &[(&'static str, &'static str)] = &[("CLAUDE_CODE_SANDBOXED", "1")];
+        let env = build_agent_extra_env(driver_env, None);
+        assert_eq!(env, vec![("CLAUDE_CODE_SANDBOXED", "1")]);
+        assert!(!env.iter().any(|(k, _)| *k == "CARGO_TARGET_DIR"));
+
+        // An empty driver env (aider/codex/gemini) + no cache → empty list.
+        assert!(build_agent_extra_env(&[], None).is_empty());
+    }
+
+    #[test]
+    fn cargo_target_dir_threads_into_session_daemon_argv() {
+        use std::path::PathBuf;
+        use supervisor::build_session_daemon_args;
+
+        // Driver env + the computed cache dir both become `--env` flags before
+        // the `--` separator, so the daemon's clap parses them as SessionArgs.
+        let driver_env: &[(&'static str, &'static str)] = &[("CLAUDE_CODE_SANDBOXED", "1")];
+        let target = "/srv/cache/proj/cargo-target".to_string();
+        let extra_env = build_agent_extra_env(driver_env, Some(target.as_str()));
+
+        let socket = PathBuf::from("/tmp/agent-x.sock");
+        let cwd = PathBuf::from("/srv/wt/proj/1.1-abcd1234");
+        let cmd: Vec<String> = vec!["claude".into()];
+        let args = build_session_daemon_args(&socket, &cwd, 120, 40, &extra_env, &cmd);
+
+        let separator = args.iter().position(|a| a == "--").expect("'--'");
+        // Find the CARGO_TARGET_DIR=... value and assert it precedes `--`.
+        let cargo_pos = args
+            .iter()
+            .position(|a| a == "CARGO_TARGET_DIR=/srv/cache/proj/cargo-target")
+            .expect("CARGO_TARGET_DIR=... must appear in argv");
+        assert!(
+            cargo_pos < separator,
+            "--env pair must precede '--': {args:?}"
+        );
+        // The flag immediately before the value is `--env`.
+        assert_eq!(args.get(cargo_pos - 1).map(String::as_str), Some("--env"));
+    }
+
     // ── Worktree-per-agent start path (Task 2.2) ─────────────────────────
 
     fn git_init_with_commit(dir: &Path) {
@@ -1864,6 +2010,87 @@ mod tests {
             cwd.as_str(),
             project_dir.to_str().unwrap(),
             "cwd must not be the project root"
+        );
+    }
+
+    /// Task 4.1 headline: a worktree-isolated agent gets a shared
+    /// `CARGO_TARGET_DIR` created at `<base>/../cache/<slug>/cargo-target`,
+    /// OUTSIDE the worktree. The cache dir is created before the (here
+    /// failing) session-daemon spawn and is NOT swept by the worktree
+    /// cleanup, so it persists. Two agents on the same project resolve to the
+    /// SAME dir — that shared single target is the whole point.
+    #[tokio::test]
+    async fn worktree_agent_creates_shared_cargo_target_dir() {
+        if !worktrees_enabled() {
+            return;
+        }
+        let (db, dir) = fresh_db();
+        let sockets_dir = dir.path().join("sockets");
+        std::fs::create_dir_all(&sockets_dir).unwrap();
+        let (mut registry, _rx) = test_registry(db.clone(), sockets_dir);
+
+        let project_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        git_init_with_commit(&project_dir);
+
+        let base = dir.path().join("worktrees");
+        registry.worktree_base_override = Some(base.clone());
+
+        // The cache lives at `<base>/../cache/<slug>/cargo-target` =
+        // `<tempdir>/cache/repo/cargo-target` (slug == project dir name).
+        let expected_cache = dir.path().join("cache").join("repo").join("cargo-target");
+
+        // First agent: the shared cargo target dir is created.
+        let _ = start_pty_agent(
+            &registry,
+            StartPtyOpts {
+                prompt: "do it".to_string(),
+                cwd: &project_dir,
+                plan_name: Some("p"),
+                task_id: Some("1.1"),
+                effort: Effort::Medium,
+                branch: Some("branchwork/p/1.1"),
+                is_continue: false,
+                max_budget_usd: None,
+                driver: None,
+                user_id: None,
+                org_id: None,
+                runner_id: None,
+            },
+        )
+        .await;
+        assert!(
+            expected_cache.is_dir(),
+            "worktree agent must create the shared cargo target dir at {}",
+            expected_cache.display(),
+        );
+
+        // Second agent on the SAME project: same shared dir (idempotent), no
+        // per-agent fan-out under it — that single shared target is the point.
+        let _ = start_pty_agent(
+            &registry,
+            StartPtyOpts {
+                prompt: "do it".to_string(),
+                cwd: &project_dir,
+                plan_name: Some("p"),
+                task_id: Some("1.2"),
+                effort: Effort::Medium,
+                branch: Some("branchwork/p/1.2"),
+                is_continue: false,
+                max_budget_usd: None,
+                driver: None,
+                user_id: None,
+                org_id: None,
+                runner_id: None,
+            },
+        )
+        .await;
+        assert!(expected_cache.is_dir());
+        // The cache dir is a sibling of the worktree base, never inside it.
+        assert!(
+            !expected_cache.starts_with(&base),
+            "cache must live outside the worktree base {}",
+            base.display(),
         );
     }
 

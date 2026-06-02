@@ -210,6 +210,12 @@ pub trait AgentDriver: Send + Sync {
     /// launches (e.g. Claude Code's `CLAUDE_CODE_SANDBOXED=1`, which skips
     /// the interactive "Trust this workspace?" dialog the binary would
     /// otherwise block on when first run in a never-seen folder).
+    ///
+    /// These are *static*, driver-level vars. The spawn path
+    /// (`pty_agent::build_agent_extra_env`) merges them with per-agent dynamic
+    /// vars — currently `CARGO_TARGET_DIR` for worktree-isolated build-cache
+    /// sharing — before handing the combined list to the session daemon, so a
+    /// driver does not (and should not) try to compute those here.
     fn extra_env(&self) -> Vec<(&'static str, &'static str)> {
         Vec::new()
     }
