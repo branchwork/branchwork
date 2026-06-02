@@ -218,6 +218,16 @@ pub mod actions {
     /// pr_url}`. Written only on a successfully-opened PR — host-API
     /// failures and validation refusals do not audit.
     pub const LEARNING_PROMOTE: &str = "learning.promote";
+
+    /// `POST /api/orgs/:slug/orphan-worktrees/cleanup` — an org admin
+    /// reaped one or more leaked per-agent worktrees recorded by the boot
+    /// sweep (Phase 5, Task 5.2 of worktree-per-agent-isolation). Diff
+    /// carries `{removed: [paths], failed: [paths]}`. Written only when
+    /// at least one worktree was actually removed (a no-op cleanup over an
+    /// empty set does not audit). Resource is `WORKTREE`; the action is
+    /// destructive (each `git worktree remove` / `rm -rf` is irreversible)
+    /// so the row is the forensic record of which paths were reaped.
+    pub const WORKTREE_ORPHAN_CLEANUP: &str = "worktree.orphan_cleanup";
 }
 
 /// Resource types for audit entries.
@@ -234,6 +244,7 @@ pub mod resources {
     pub const PROJECT: &str = "project";
     pub const CREDENTIAL: &str = "credential";
     pub const LEARNING: &str = "learning";
+    pub const WORKTREE: &str = "worktree";
 }
 
 /// A single audit log entry as returned by the API.

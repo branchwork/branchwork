@@ -22,8 +22,8 @@
 //! deployment-host concern, not org-partitioned data), so the endpoint
 //! gates on an admin role for the named org but returns the full set.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path as StdPath, PathBuf};
 
 use axum::{
     Json,
@@ -32,6 +32,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use rusqlite::params;
+use serde::Deserialize;
 
 use crate::auth::AuthUser;
 use crate::auth::orgs::{ROLE_ADMIN, ROLE_OWNER};
@@ -104,6 +105,190 @@ pub async fn list_orphan_worktrees(
         crate::db::list_recorded_orphans(&conn)
     };
     Json(serde_json::json!({ "orphans": orphans })).into_response()
+}
+
+// ── POST /api/orgs/:slug/orphan-worktrees/cleanup ────────────────────────
+
+/// Body for the cleanup endpoint. `paths` absent (or `null`) ⇒ clean every
+/// recorded orphan; an explicit list ⇒ clean only that subset; an explicit
+/// empty list ⇒ no-op (clean nothing). An empty / missing request body is
+/// tolerated (treated as "clean all").
+#[derive(Deserialize, Default)]
+pub struct CleanupBody {
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+}
+
+/// One failed removal — surfaced so the dashboard can tell the operator
+/// which paths it could not reap and why (vs. silently dropping them).
+#[derive(serde::Serialize)]
+struct CleanupFailure {
+    path: String,
+    error: String,
+}
+
+/// Admin-only reaping of leaked worktrees recorded by the boot sweep.
+///
+/// For each target path it resolves the project's main-worktree root, runs
+/// the mode-aware [`git_ops::remove_worktree`] dispatcher (local `git
+/// worktree remove` standalone; `WireMessage::RemoveWorktree` to the runner
+/// in SaaS), and on success deletes the `worktree_orphans` row. Returns
+/// `{ "removed": [paths], "failed": [{path, error}] }`.
+///
+/// `project_dir` derivation: the `worktree_orphans` table stores only the
+/// orphan `path` + `project_slug`, not the project root. We resolve the
+/// root two ways (slug map first, then the orphan path itself) so a stale
+/// row whose worktree directory was already deleted can still be pruned /
+/// cleared.
+pub async fn cleanup_orphan_worktrees(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(slug): Path<String>,
+    body: Option<Json<CleanupBody>>,
+) -> Response {
+    let (org_id, role) = match resolve_org(&state, &user, &slug) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if let Err(r) = require_admin(&role) {
+        return *r;
+    }
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    // Snapshot the recorded set: validates requested paths against known
+    // orphans and supplies each path's `project_slug` for root resolution.
+    let recorded = {
+        let conn = state.db.lock().unwrap();
+        crate::db::list_recorded_orphans(&conn)
+    };
+
+    // Target set: explicit subset, or every recorded orphan when omitted.
+    let targets: Vec<String> = match body.paths {
+        Some(paths) => paths,
+        None => recorded.iter().map(|r| r.path.clone()).collect(),
+    };
+
+    // slug → main-worktree-root map (mirrors the boot sweep's derivation).
+    // Built once so we can resolve a `project_dir` for `git worktree
+    // remove` even when the orphan directory itself is already gone.
+    let slug_to_dir = slug_to_project_dir(&state);
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut failed: Vec<CleanupFailure> = Vec::new();
+
+    for path in targets {
+        let Some(row) = recorded.iter().find(|r| r.path == path) else {
+            // Requested a path the sweep never recorded — report rather
+            // than silently drop, so a stale dashboard surfaces the gap.
+            failed.push(CleanupFailure {
+                path,
+                error: "not_an_orphan".to_string(),
+            });
+            continue;
+        };
+
+        let path_buf = PathBuf::from(&path);
+        // slug map first (authoritative, survives the orphan dir being
+        // deleted), then derive from the orphan path itself (a linked
+        // worktree resolves to its main worktree root).
+        let project_dir = row
+            .project_slug
+            .as_deref()
+            .and_then(|s| slug_to_dir.get(s).cloned())
+            .or_else(|| crate::agents::main_worktree_root(&path_buf));
+
+        let outcome: Result<(), String> = match project_dir {
+            Some(dir) => match crate::agents::git_ops::remove_worktree(
+                &state.db,
+                &state.runners,
+                &org_id,
+                &dir,
+                &path_buf,
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(msg)) => Err(msg),
+                Err(e) => Err(e.to_string()),
+            },
+            None => {
+                // No resolvable root. If the directory is already gone the
+                // row is stale — clearing it IS the cleanup. If it still
+                // exists we can't safely remove it without a git root.
+                if path_buf.exists() {
+                    Err("could not resolve project directory".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        };
+
+        match outcome {
+            Ok(()) => {
+                {
+                    let conn = state.db.lock().unwrap();
+                    // Best-effort: a `false` (row already gone) is fine.
+                    crate::db::delete_worktree_orphan(&conn, &path);
+                }
+                removed.push(path);
+            }
+            Err(msg) => failed.push(CleanupFailure { path, error: msg }),
+        }
+    }
+
+    // Audit the destructive action — only when something was actually
+    // reaped (a no-op cleanup over an empty set is not worth a row).
+    if !removed.is_empty() {
+        let conn = state.db.lock().unwrap();
+        crate::audit::log(
+            &conn,
+            &org_id,
+            Some(&user.id),
+            Some(&user.email),
+            crate::audit::actions::WORKTREE_ORPHAN_CLEANUP,
+            crate::audit::resources::WORKTREE,
+            None,
+            Some(
+                &serde_json::json!({
+                    "removed": removed,
+                    "failed": failed.iter().map(|f| &f.path).collect::<Vec<_>>(),
+                })
+                .to_string(),
+            ),
+        );
+    }
+
+    Json(serde_json::json!({ "removed": removed, "failed": failed })).into_response()
+}
+
+/// Build a `project_slug → main-worktree-root` map by scanning distinct
+/// agent cwds, identical to the boot sweep's project derivation. Lets the
+/// cleanup endpoint resolve a `project_dir` for `git worktree remove` even
+/// when the leaked worktree directory was already deleted from disk (so the
+/// dangling git ref can still be pruned). In SaaS mode the cwds live on the
+/// runner host, so this resolves nothing on the server — mirrors the sweep,
+/// which already skips SaaS for the same reason.
+fn slug_to_project_dir(state: &AppState) -> HashMap<String, PathBuf> {
+    let cwds: Vec<String> = {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT DISTINCT cwd FROM agents WHERE cwd IS NOT NULL") {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0));
+        match rows {
+            Ok(it) => it.flatten().collect(),
+            Err(_) => return HashMap::new(),
+        }
+    };
+    let mut map = HashMap::new();
+    for cwd in cwds {
+        if let Some(root) = crate::agents::main_worktree_root(StdPath::new(&cwd)) {
+            let slug = crate::agents::pty_agent::project_slug_for_worktree(&root);
+            map.entry(slug).or_insert(root);
+        }
+    }
+    map
 }
 
 // ── server-boot sweep ────────────────────────────────────────────────────

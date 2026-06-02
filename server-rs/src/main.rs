@@ -635,6 +635,10 @@ async fn run_server(cli: Cli) {
             "/api/orgs/{slug}/orphan-worktrees",
             get(api::orphan_worktrees::list_orphan_worktrees),
         )
+        .route(
+            "/api/orgs/{slug}/orphan-worktrees/cleanup",
+            post(api::orphan_worktrees::cleanup_orphan_worktrees),
+        )
         // Remote runners (SaaS)
         .route("/ws/runner", get(saas::runner_ws::runner_ws_handler))
         .route(

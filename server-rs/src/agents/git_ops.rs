@@ -282,7 +282,10 @@ pub async fn setup_worktree(
 /// Inner `Result<RemoveOutcome, String>` mirrors the local function: `Ok` with
 /// the escalation tier that succeeded, or `Err(msg)` when even the `rm -rf`
 /// fallback failed.
-#[allow(dead_code)] // cleanup-path consumer (kill/fail/merge sweep) lands in a later phase
+///
+/// Consumed by the admin orphan-cleanup endpoint
+/// (`api::orphan_worktrees::cleanup_orphan_worktrees`, Task 5.2). The
+/// kill/fail/merge cleanup sweep is a separate later consumer.
 pub async fn remove_worktree(
     db: &Db,
     runners: &RunnerRegistry,

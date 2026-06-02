@@ -2555,6 +2555,22 @@ pub fn record_worktree_orphan(
     .unwrap_or(false)
 }
 
+/// Delete a recorded orphan row by its `path` (the PRIMARY KEY). Returns
+/// `true` when a row was actually removed. Called by the admin cleanup
+/// endpoint (`POST /api/orgs/:slug/orphan-worktrees/cleanup`, Task 5.2)
+/// after the on-disk worktree has been reaped via the mode-aware
+/// `git_ops::remove_worktree` dispatcher. A `false` return (row already
+/// gone) is non-fatal: a concurrent cleanup or a re-detect race may have
+/// removed it first.
+pub fn delete_worktree_orphan(conn: &Connection, path: &str) -> bool {
+    conn.execute(
+        "DELETE FROM worktree_orphans WHERE path = ?1",
+        params![path],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
 /// All recorded orphan worktrees, newest-first. The table carries no
 /// `org_id` (orphans are a deployment-host concern, not org-partitioned),
 /// so the org-scoped read endpoint applies an admin auth gate but returns
@@ -2726,6 +2742,28 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&"/base/a/p/0.1-x".to_string()));
         assert!(paths.contains(&"/base/b/p/0.1-y".to_string()));
+    }
+
+    #[test]
+    fn delete_worktree_orphan_removes_only_the_named_row() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        record_worktree_orphan(&conn, "a", "/base/a/p/0.1-x", None, None);
+        record_worktree_orphan(&conn, "b", "/base/b/p/0.1-y", None, None);
+
+        // First delete removes the row and reports true; the sibling
+        // survives so the cleanup endpoint can delete a strict subset.
+        assert!(delete_worktree_orphan(&conn, "/base/a/p/0.1-x"));
+        let remaining: Vec<String> = list_recorded_orphans(&conn)
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(remaining, vec!["/base/b/p/0.1-y".to_string()]);
+
+        // Re-deleting an already-gone path is a non-fatal `false` (a
+        // concurrent cleanup / re-detect race must not panic).
+        assert!(!delete_worktree_orphan(&conn, "/base/a/p/0.1-x"));
+        assert!(!delete_worktree_orphan(&conn, "/never/recorded"));
     }
 
     /// Phase 1, Task 1.1: `ci_failure_events` schema round-trip plus

@@ -13,6 +13,7 @@ import { useToastStore } from "../stores/toast-store.js";
 import { isPlanDone } from "../lib/predicates.js";
 import { StaleDataChip } from "./StaleDataChip.js";
 import { HealthStateIndicator } from "./HealthStateIndicator.js";
+import { OrphanWorktrees } from "./OrphanWorktrees.js";
 import { TouchTarget } from "./ui/TouchTarget.js";
 
 export function Sidebar() {
@@ -251,6 +252,11 @@ export function Sidebar() {
             <span aria-hidden="true">⚙ </span>Admin
           </NavLink>
         </div>
+
+        {/* Admin-only leaked-worktree reaper. Self-hides for non-admins
+            and when there are no recorded orphans, so it adds no chrome
+            in the common case. */}
+        <OrphanWorktrees />
 
         {/* Search */}
         <div className="px-2 pb-2">
