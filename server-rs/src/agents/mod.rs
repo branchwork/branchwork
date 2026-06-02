@@ -860,7 +860,11 @@ pub async fn spawn_conflict_resolver(
 /// positionally.
 ///
 /// Returns `None` when `from` is not a git worktree or the command fails.
-fn main_worktree_root(from: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)` so the server-boot orphan sweep (`api::orphan_worktrees`)
+/// can derive each project's stable root from a (possibly orphaned) agent
+/// worktree cwd, the same way merge / kill cleanup does.
+pub(crate) fn main_worktree_root(from: &Path) -> Option<PathBuf> {
     let out = std::process::Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(from)

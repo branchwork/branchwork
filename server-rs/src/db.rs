@@ -2071,6 +2071,28 @@ fn migrate(conn: &Connection) {
             FOREIGN KEY (learning_id) REFERENCES learnings(id) ON DELETE CASCADE,
             FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
         );
+
+        -- Leaked per-agent worktrees found by the server-boot orphan sweep
+        -- (Phase 5, Task 5.1 of worktree-per-agent-isolation). A worktree
+        -- under `<base>/<slug>/` that no live agent (`finished_at IS NULL`)
+        -- claims is a leak — typically from a server crash / SIGKILL that
+        -- skipped the normal per-agent cleanup on completion or kill.
+        -- `path` is the PRIMARY KEY, so re-detecting the same orphan on a
+        -- later boot is a no-op `INSERT OR IGNORE`: `first_detected` keeps
+        -- the timestamp from when it was first seen (the orphan is NOT
+        -- re-inserted with a fresh detection time across restarts).
+        -- `last_modified` is the worktree directory's filesystem mtime at
+        -- detection (NULL when it could not be read). The table carries no
+        -- `org_id`: orphan worktrees are a deployment-host concern, not
+        -- org-partitioned data, so the org-scoped read endpoint gates on an
+        -- admin role but returns the full set.
+        CREATE TABLE IF NOT EXISTS worktree_orphans (
+            project_slug   TEXT,
+            path           TEXT PRIMARY KEY,
+            branch         TEXT,
+            last_modified  TEXT,
+            first_detected TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )
     .expect("failed to run schema migration");
@@ -2492,6 +2514,72 @@ fn cleanup_stale_auto_completed(conn: &Connection) {
     }
 }
 
+// ── worktree_orphans: server-boot orphan-worktree sweep (Task 5.1) ────────
+
+/// One row of the `worktree_orphans` table. Field names are snake_case so
+/// they serialize verbatim into the `GET /api/orgs/:slug/orphan-worktrees`
+/// JSON shape (`project_slug`, `path`, `branch`, `last_modified`,
+/// `first_detected`).
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct WorktreeOrphanRow {
+    pub project_slug: Option<String>,
+    pub path: String,
+    pub branch: Option<String>,
+    pub last_modified: Option<String>,
+    pub first_detected: String,
+}
+
+/// Record a freshly-detected orphan worktree. `path` is the PRIMARY KEY, so
+/// a re-detected orphan is a no-op `INSERT OR IGNORE` — its original
+/// `first_detected` survives across server restarts (Task 5.1 acceptance:
+/// the same orphan is not re-inserted with a fresh detection time).
+/// `last_modified_secs` is the worktree directory's mtime as seconds since
+/// the Unix epoch, or `None` when it could not be read. Returns `true` when
+/// a NEW row was inserted.
+pub fn record_worktree_orphan(
+    conn: &Connection,
+    project_slug: &str,
+    path: &str,
+    branch: Option<&str>,
+    last_modified_secs: Option<i64>,
+) -> bool {
+    conn.execute(
+        "INSERT OR IGNORE INTO worktree_orphans \
+            (project_slug, path, branch, last_modified, first_detected) \
+         VALUES (?1, ?2, ?3, \
+             CASE WHEN ?4 IS NULL THEN NULL ELSE datetime(?4, 'unixepoch') END, \
+             datetime('now'))",
+        params![project_slug, path, branch, last_modified_secs],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// All recorded orphan worktrees, newest-first. The table carries no
+/// `org_id` (orphans are a deployment-host concern, not org-partitioned),
+/// so the org-scoped read endpoint applies an admin auth gate but returns
+/// the full set.
+pub fn list_recorded_orphans(conn: &Connection) -> Vec<WorktreeOrphanRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT project_slug, path, branch, last_modified, first_detected \
+           FROM worktree_orphans ORDER BY first_detected DESC, path ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map([], |row| {
+        Ok(WorktreeOrphanRow {
+            project_slug: row.get(0)?,
+            path: row.get(1)?,
+            branch: row.get(2)?,
+            last_modified: row.get(3)?,
+            first_detected: row.get(4)?,
+        })
+    })
+    .map(|it| it.flatten().collect())
+    .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2541,6 +2629,103 @@ mod tests {
         assert!(tables.contains(&"learnings".to_string()));
         assert!(tables.contains(&"learning_hits".to_string()));
         assert!(tables.contains(&"promotion_candidates".to_string()));
+        assert!(tables.contains(&"worktree_orphans".to_string()));
+    }
+
+    // ── worktree_orphans (Task 5.1) ──────────────────────────────────────
+
+    #[test]
+    fn record_worktree_orphan_round_trips_all_columns() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        let inserted = record_worktree_orphan(
+            &conn,
+            "myproj",
+            "/base/myproj/plan/0.1-abcd",
+            Some("branchwork/plan/0.1"),
+            Some(1_700_000_000), // 2023-11-14T22:13:20Z
+        );
+        assert!(inserted, "first insert reports a new row");
+
+        let rows = list_recorded_orphans(&conn);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.project_slug.as_deref(), Some("myproj"));
+        assert_eq!(r.path, "/base/myproj/plan/0.1-abcd");
+        assert_eq!(r.branch.as_deref(), Some("branchwork/plan/0.1"));
+        // `last_modified` is rendered from the unix-epoch seconds via SQLite.
+        assert_eq!(r.last_modified.as_deref(), Some("2023-11-14 22:13:20"));
+        assert!(!r.first_detected.is_empty(), "first_detected defaulted");
+    }
+
+    #[test]
+    fn record_worktree_orphan_null_mtime_stores_null() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        record_worktree_orphan(&conn, "p", "/base/p/x/0.1-z", None, None);
+        let rows = list_recorded_orphans(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].branch, None);
+        assert_eq!(rows[0].last_modified, None);
+    }
+
+    #[test]
+    fn record_worktree_orphan_is_idempotent_and_preserves_first_detected() {
+        // Acceptance: re-detecting the same orphan on a later boot must NOT
+        // re-insert it with fresh metadata. The `path` PK + INSERT OR IGNORE
+        // means the second call is a no-op; we prove that by re-inserting the
+        // SAME path with a DIFFERENT branch and asserting the original row is
+        // untouched.
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+
+        let first = record_worktree_orphan(
+            &conn,
+            "p",
+            "/base/p/plan/0.1-aaaa",
+            Some("branchwork/plan/0.1"),
+            Some(1_700_000_000),
+        );
+        assert!(first, "first insert is new");
+        let original_first_detected = list_recorded_orphans(&conn)[0].first_detected.clone();
+
+        // Re-detect the same path with different branch + mtime.
+        let second = record_worktree_orphan(
+            &conn,
+            "p",
+            "/base/p/plan/0.1-aaaa",
+            Some("some-other-branch"),
+            Some(1_800_000_000),
+        );
+        assert!(!second, "re-detecting the same path reports no new row");
+
+        let rows = list_recorded_orphans(&conn);
+        assert_eq!(rows.len(), 1, "still exactly one row");
+        assert_eq!(
+            rows[0].branch.as_deref(),
+            Some("branchwork/plan/0.1"),
+            "original branch preserved (second insert ignored)"
+        );
+        assert_eq!(
+            rows[0].first_detected, original_first_detected,
+            "first_detected is NOT refreshed across re-detection"
+        );
+    }
+
+    #[test]
+    fn list_recorded_orphans_returns_all_rows() {
+        let (db, _dir) = test_db();
+        let conn = db.lock().unwrap();
+        record_worktree_orphan(&conn, "a", "/base/a/p/0.1-x", None, None);
+        record_worktree_orphan(&conn, "b", "/base/b/p/0.1-y", None, None);
+        let paths: Vec<String> = list_recorded_orphans(&conn)
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"/base/a/p/0.1-x".to_string()));
+        assert!(paths.contains(&"/base/b/p/0.1-y".to_string()));
     }
 
     /// Phase 1, Task 1.1: `ci_failure_events` schema round-trip plus

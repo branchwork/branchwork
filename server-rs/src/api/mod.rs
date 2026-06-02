@@ -7,6 +7,7 @@ pub mod github;
 pub mod gitlab;
 pub mod health;
 pub mod learnings;
+pub mod orphan_worktrees;
 pub mod plans;
 pub mod projects;
 pub mod runners;

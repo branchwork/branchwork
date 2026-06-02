@@ -310,7 +310,8 @@ pub async fn remove_worktree(
 /// claims (`live_cwds`).
 /// - SaaS path: dispatch [`WireMessage::ListWorktreeOrphans`] to the runner.
 /// - Standalone: run [`crate::agents::worktree::list_orphans`] directly.
-#[allow(dead_code)] // startup orphan-sweep consumer lands in a later phase
+///
+/// Consumed by the server-boot orphan sweep in `api::orphan_worktrees`.
 pub async fn list_worktree_orphans(
     db: &Db,
     runners: &RunnerRegistry,

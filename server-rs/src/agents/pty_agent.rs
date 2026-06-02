@@ -80,7 +80,11 @@ fn worktrees_enabled_from(raw: Option<&str>) -> bool {
 /// directory: its last path component, lowercased, with every non-alphanumeric
 /// character replaced by `-`. Falls back to `project` when the directory has no
 /// usable final component (e.g. `/`) or slugifies to empty.
-fn project_slug_for_worktree(project_dir: &Path) -> String {
+///
+/// `pub(crate)` so the server-boot orphan sweep (`api::orphan_worktrees`)
+/// scopes its `list_orphans` call with the exact same slug used at worktree
+/// creation time — deriving the slug any other way would miss the scope.
+pub(crate) fn project_slug_for_worktree(project_dir: &Path) -> String {
     let name = project_dir
         .file_name()
         .and_then(|s| s.to_str())

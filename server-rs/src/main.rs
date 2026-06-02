@@ -278,6 +278,17 @@ async fn run_server(cli: Cli) {
     // gate needed.
     ci::spawn_backfill_missing_ci_runs(state.clone());
 
+    // One-shot startup orphan-worktree sweep (worktree-per-agent Phase 5.1).
+    // Runs AFTER `cleanup_and_reattach` (above) has flipped dead agents to
+    // terminal, so their `finished_at` is set and they no longer count as
+    // live. For each project that has agent rows, it records any worktree
+    // under `<base>/<slug>/` that no live agent claims into the
+    // `worktree_orphans` table (idempotent on the `path` PK, so a
+    // re-detected orphan keeps its original `first_detected`). Detached so
+    // the HTTP listener readiness probe is not blocked by the per-project
+    // `git worktree list` shell-outs.
+    api::orphan_worktrees::spawn_startup_sweep(state.clone());
+
     // One-shot YAML migration (CI-split Phase 3.1): rewrite
     // `ci_blocking_workflows: [..., Pipeline, ...]` to
     // `ci_blocking_workflows: [..., task-tests, ...]` across every plan
@@ -618,6 +629,11 @@ async fn run_server(cli: Cli) {
         .route(
             "/api/orgs/{slug}/audit-log/export",
             get(audit::export_audit_log),
+        )
+        // Orphan worktrees (admin-only; populated by the boot sweep)
+        .route(
+            "/api/orgs/{slug}/orphan-worktrees",
+            get(api::orphan_worktrees::list_orphan_worktrees),
         )
         // Remote runners (SaaS)
         .route("/ws/runner", get(saas::runner_ws::runner_ws_handler))
