@@ -2155,7 +2155,10 @@ pub fn auto_advance_enabled(db: &Db, plan_name: &str) -> bool {
 /// Compute the remaining budget for a plan, or `Err((spent, max))` if the
 /// budget is already exhausted. Mirrors `plan_remaining_budget` in the API
 /// module so we don't have to thread it through here.
-fn remaining_budget(db: &Db, plan_name: &str) -> Result<Option<f64>, (f64, f64)> {
+///
+/// `pub(crate)` so the DAG scheduler ([`crate::dag_scheduler`]) reuses the
+/// exact same budget logic rather than duplicating it.
+pub(crate) fn remaining_budget(db: &Db, plan_name: &str) -> Result<Option<f64>, (f64, f64)> {
     let conn = db.lock().unwrap();
     let max: Option<f64> = conn
         .query_row(

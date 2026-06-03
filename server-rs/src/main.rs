@@ -9,6 +9,8 @@ mod credential_material;
 mod crypto;
 #[allow(dead_code)] // Wired in by Phase 2 (DAG scheduler)
 mod dag;
+#[allow(dead_code)] // try_dag_advance is wired in by Phase 2.2 (version router)
+mod dag_scheduler;
 mod db;
 mod file_watcher;
 mod git_helpers;
