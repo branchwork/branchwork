@@ -366,7 +366,30 @@ fn run(cmd: &str, args: &[&str], cwd: &Path) {
 
 /// Minimal HTTP client: curl shelled out. Avoids pulling reqwest into
 /// dev-dependencies just for tests. Returns (status_code, parsed_body).
+///
+/// Retries on status 0 — curl's `000`, meaning no HTTP response was
+/// received at all (connection refused/reset before the server answered).
+/// `wait_healthy` already proved the server is up, so a 0 here is a
+/// transient connection blip under parallel-spawn + AV-scan load (the
+/// `s==0` flake class, e.g. `get_returns_404_for_unknown_phase` failing
+/// with `left: 0`). Because status 0 means the request never landed,
+/// retrying can't double-execute a mutation.
 fn http(method: &str, url: &str, body: Option<Value>) -> (u16, Value) {
+    let mut last = (0u16, Value::Null);
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(50 * attempt as u64));
+        }
+        let (s, body_val) = http_once(method, url, body.clone());
+        if s != 0 {
+            return (s, body_val);
+        }
+        last = (s, body_val);
+    }
+    last
+}
+
+fn http_once(method: &str, url: &str, body: Option<Value>) -> (u16, Value) {
     let mut cmd = Command::new("curl");
     cmd.args([
         "-sS",
