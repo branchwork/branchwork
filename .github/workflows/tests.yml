@@ -10,11 +10,14 @@ name: Tests
 # flaky) runs on a schedule via e2e-nightly.yml and on workflow_dispatch,
 # NOT on every commit.
 #
-# Speed: Rust jobs build in DEBUG (release compile was ~2-4x slower and
-# bought nothing for correctness tests — the shipped release binary is
-# built once by pipeline.yml's build-binary job). Caching is via
-# Swatinem/rust-cache (keyed robustly across the per-commit Cargo.lock
-# version bump, which churned the old hashFiles() key every release).
+# Speed: caching is via Swatinem/rust-cache (keyed robustly across the
+# per-commit Cargo.lock version bump, which churned the old hashFiles()
+# key every release) and cargo-audit ships as a prebuilt binary instead
+# of being recompiled from source every run. Tests stay in RELEASE: the
+# E2E-style integration tests spawn the real `CARGO_BIN_EXE_branchwork-
+# server`, and a slower DEBUG server boot widens the startup race
+# (curl `s==0` on the first request) into reliable flakes. The shipped
+# binary is still compiled exactly once, separately, by build-binary.
 
 on:
   workflow_call:
@@ -46,15 +49,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server-rs
-          # One shared cache across the fast Rust jobs; the build-binary
-          # job (release/musl) keys separately so its artifacts don't
-          # evict the debug cache.
-          shared-key: ci-debug
+          # Separate cache namespace from build-binary's release/musl
+          # cache so the two profiles/targets don't evict each other.
+          shared-key: ci-test
       - name: Create web/dist placeholder
         run: mkdir -p ../web/dist && touch ../web/dist/index.html
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
       # Prebuilt cargo-audit binary (the old `cargo install --locked`
       # recompiled it from source every run — minutes of pure waste).
       - uses: taiki-e/install-action@v2
@@ -118,4 +120,4 @@ jobs:
             echo "::warning::GH_PAT not set; gh-backed paths will skip via tests/support/gh.rs::maybe_create"
           fi
       - name: cargo test --features e2e
-        run: cargo test --features e2e
+        run: cargo test --release --features e2e
