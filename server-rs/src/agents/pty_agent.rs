@@ -811,7 +811,16 @@ fn branch_has_no_commits_ahead_of_trunk(cwd: &Path, branch: &str) -> Option<bool
 /// Shared exit handler for both "supervisor closed the socket on us" and
 /// explicit kill paths. Updates status, parses cost, emits WS events,
 /// optionally notifies a webhook, and enforces plan budgets.
-async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
+///
+/// Idempotent on the terminal flip: the status `UPDATE` is guarded on
+/// `status='running'`, so calling this concurrently from the reader-task
+/// EOF path AND the supervisor-liveness backstop (the 30 s poller in `main`
+/// / boot reconcile) is safe — exactly one caller wins the flip and fires
+/// the auto-mode completion hook. That idempotency is what lets the
+/// backstops funnel an *orderly* daemon shutdown (pidfile already gone)
+/// through here to recover the real `completed`/`failed` status instead of
+/// mis-marking it `killed/supervisor_died`.
+pub(crate) async fn on_agent_exit(registry: &AgentRegistry, agent_id: &str) {
     // Look up which driver spawned this agent so we parse cost using the
     // right regex / summary format. NULL rows (pre-driver-column) fall back
     // to the default driver via `get_or_default`.

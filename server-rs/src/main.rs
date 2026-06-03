@@ -252,10 +252,25 @@ async fn run_server(cli: Cli) {
             };
             for (id, pid) in agents {
                 if !agents::process_alive(pid) {
-                    registry_monitor.mark_supervisor_died(
-                        &id,
-                        &format!("supervisor PID {pid} no longer alive"),
-                    );
+                    // PID gone. Only a genuine crash (pidfile still on disk —
+                    // SIGKILL/OOM skipped the daemon's orderly shutdown) is a
+                    // `supervisor_died`. A pidfile that's already gone means
+                    // the daemon shut down cleanly and we just didn't observe
+                    // the socket EOF (lost to a wedge / our own restart) — that
+                    // MUST be finalized through `on_agent_exit` so a clean
+                    // completion lands as `completed` and fires the auto-mode
+                    // merge/advance hook, rather than being stolen as
+                    // `killed/supervisor_died`. `on_agent_exit` is idempotent
+                    // with the reader-task EOF path, so racing it is safe.
+                    let socket = registry_monitor.socket_for(&id);
+                    if agents::supervisor::pidfile_path(&socket).exists() {
+                        registry_monitor.mark_supervisor_died(
+                            &id,
+                            &format!("supervisor PID {pid} no longer alive"),
+                        );
+                    } else {
+                        agents::pty_agent::on_agent_exit(&registry_monitor, &id).await;
+                    }
                 }
             }
         }

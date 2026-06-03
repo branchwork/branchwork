@@ -1078,10 +1078,33 @@ impl AgentRegistry {
 
             let alive = pid.map(process_alive).unwrap_or(false);
             if !alive {
-                self.mark_supervisor_died(
-                    &id,
-                    &format!("supervisor PID {pid:?} not alive on boot"),
-                );
+                // The daemon PID is gone. Two very different causes look
+                // identical to `process_alive`, and conflating them was the
+                // long-standing "agent killed instead of completed, plan
+                // won't advance" bug: an agent that finished cleanly while
+                // the server was down (every dev rebuild+restart) was
+                // retroactively marked `killed/supervisor_died`, so the
+                // auto-mode merge/advance hook in `on_agent_exit` never
+                // fired.
+                //
+                // The discriminator is the pidfile — the same signal
+                // `on_agent_exit` uses (supervisor.rs writes the exitcode
+                // sibling and THEN unlinks the pidfile as the final step of
+                // orderly shutdown; a SIGKILL/OOM skips that and leaves the
+                // pidfile behind):
+                //   - pidfile present → genuine crash → supervisor_died.
+                //   - pidfile absent  → orderly exit we simply didn't
+                //     observe → funnel through `on_agent_exit` to recover
+                //     the real `completed`/`failed` status from the exitcode
+                //     sibling and fire the advance hook.
+                if supervisor::pidfile_path(&socket_path).exists() {
+                    self.mark_supervisor_died(
+                        &id,
+                        &format!("supervisor PID {pid:?} not alive on boot"),
+                    );
+                } else {
+                    pty_agent::on_agent_exit(self, &id).await;
+                }
                 continue;
             }
 
@@ -3419,19 +3442,23 @@ mod tests {
         let (db, _dir) = fresh_db();
         let (registry, mut rx) = test_registry(db.clone());
 
-        // Socket present but PID very unlikely to be alive. i32::MAX is above
-        // the typical pid_max; kill(0) will return ESRCH. The named-wart
-        // (Task 11.6) classification: the supervisor specifically went
-        // away (kill -9, OOM killer) — the row's history isn't lost, so
-        // `killed`/`supervisor_died` is the right label, not the more
-        // generic `failed`/`orphaned`.
+        // Dead PID *and* the pidfile is still on disk — the daemon was
+        // SIGKILL'd / OOM-killed before it could run its orderly shutdown
+        // (which writes the exitcode sibling and unlinks the pidfile). That
+        // leftover pidfile is the crash signal: the supervisor specifically
+        // went away, so `killed`/`supervisor_died` is the right label, not
+        // the more generic `failed`/`orphaned`. i32::MAX is above the typical
+        // pid_max; kill(0) returns ESRCH.
+        let sock_dir = TempDir::new().unwrap();
+        let socket = sock_dir.path().join("pty-dead.sock");
+        std::fs::write(supervisor::pidfile_path(&socket), "2147483647").unwrap();
         insert_agent(
             &db,
             "pty-dead",
             "pty",
             "running",
             Some(i32::MAX as i64),
-            Some("/tmp/branchwork-test-sockets/does-not-exist.sock"),
+            Some(socket.to_str().unwrap()),
         );
 
         registry.cleanup_and_reattach().await;
@@ -3446,6 +3473,47 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("pty-dead") && e.contains("supervisor_died")),
             "missing supervisor_died broadcast: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_recovers_clean_exit_as_completed_when_pidfile_absent() {
+        // Regression for the long-standing "agent killed instead of completed,
+        // plan won't advance" bug. A dead PID with NO pidfile means the daemon
+        // shut down in an orderly way (it unlinks the pidfile as the last step)
+        // — the agent finished while the server wasn't watching the socket
+        // (a restart / wedge ate the EOF). cleanup_and_reattach must funnel
+        // this through `on_agent_exit` and recover `completed` (no exitcode
+        // sibling => clean-exit default), NOT mis-mark it `killed/
+        // supervisor_died`. Recovering `completed` is what lets on_agent_exit
+        // fire the auto-mode merge/advance hook so the plan moves on.
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let sock_dir = TempDir::new().unwrap();
+        let socket = sock_dir.path().join("pty-clean.sock");
+        // No pidfile, no exitcode sibling on disk → orderly clean exit.
+        insert_agent(
+            &db,
+            "pty-clean",
+            "pty",
+            "running",
+            Some(i32::MAX as i64),
+            Some(socket.to_str().unwrap()),
+        );
+
+        registry.cleanup_and_reattach().await;
+
+        let (status, reason) = agent_status(&db, "pty-clean");
+        assert_eq!(status, "completed", "clean exit must recover as completed");
+        assert_eq!(reason, None);
+
+        let events = drain_events(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.contains("pty-clean") && e.contains("supervisor_died")),
+            "must NOT broadcast supervisor_died for a clean exit: {events:?}"
         );
     }
 
