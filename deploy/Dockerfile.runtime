@@ -1,0 +1,36 @@
+# ── Fast master-deploy runtime image ────────────────────────────────
+# Copies prebuilt `branchwork-server` / `branchwork-runner` musl binaries
+# (staged into ./dist-bin/ by pipeline.yml's `build-binary` job) instead
+# of compiling Rust in-container. The in-container cross-compile path
+# lives in `deploy/Dockerfile` and is still used by `tag-build.yml` for
+# multi-arch RELEASE images; this file is the amd64-only fast path the
+# per-commit master pipeline uses, where the ~15 min in-container compile
+# was the dominant cost.
+#
+# The binaries are static musl builds (no libc dependency); alpine here is
+# purely for the runtime utilities the binaries shell out to (git/gh) plus
+# ca-certificates + tini for signal handling — identical to stage 3 of
+# deploy/Dockerfile.
+FROM alpine:3.21 AS runtime
+RUN apk add --no-cache git ca-certificates tini && \
+    addgroup -g 1000 branchwork && \
+    adduser -u 1000 -G branchwork -D branchwork
+
+# Staged by the CI build-binary job: dist-bin/{branchwork-server,branchwork-runner}.
+# chmod +x because artifact upload/download does not preserve the exec bit.
+COPY dist-bin/branchwork-server /usr/local/bin/branchwork-server
+COPY dist-bin/branchwork-runner /usr/local/bin/branchwork-runner
+RUN chmod +x /usr/local/bin/branchwork-server /usr/local/bin/branchwork-runner
+
+# Data dir for the server (plans, DB, sockets) and home dir for the runner.
+RUN mkdir -p /data /home/runneruser && \
+    chown branchwork:branchwork /data /home/runneruser
+VOLUME ["/data"]
+
+USER branchwork
+EXPOSE 3100
+
+ENV BRANCHWORK_DATA_DIR=/data
+
+ENTRYPOINT ["tini", "--"]
+CMD ["branchwork-server", "--port", "3100", "--claude-dir", "/data"]

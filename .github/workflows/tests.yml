@@ -1,19 +1,28 @@
 name: Tests
 
-# Reusable workflow that runs the three test jobs (server, web, e2e)
-# extracted from pipeline.yml. The caller decides whether to invoke
-# this workflow — there is no `classify` job here; the per-event
-# logic lives in the parent workflow.
+# Reusable workflow that runs the test jobs (server, web) plus an
+# opt-in e2e job. Callers decide whether to invoke it and whether to
+# run the slow real-Claude/gh e2e suite (via the `run_e2e` input).
 #
-# Phase 1.1 of the CI split (plan
-# `ci-split-task-tests-from-master-pipeline`). Job bodies are
-# byte-for-byte copies of pipeline.yml::server / web / e2e minus
-# their `needs:` / `if:` lines. Update the source job in pipeline.yml
-# AND this file together until pipeline.yml is collapsed onto this
-# workflow in a later phase.
+# Per-commit callers (pipeline.yml master pushes, task-tests.yml PRs)
+# run server + web only — fast, hermetic, no network/API. The e2e suite
+# (real `gh` repos + real Claude API: ~5 min, network-bound, occasionally
+# flaky) runs on a schedule via e2e-nightly.yml and on workflow_dispatch,
+# NOT on every commit.
+#
+# Speed: Rust jobs build in DEBUG (release compile was ~2-4x slower and
+# bought nothing for correctness tests — the shipped release binary is
+# built once by pipeline.yml's build-binary job). Caching is via
+# Swatinem/rust-cache (keyed robustly across the per-commit Cargo.lock
+# version bump, which churned the old hashFiles() key every release).
 
 on:
   workflow_call:
+    inputs:
+      run_e2e:
+        description: "Run the real-Claude/gh e2e suite (slow; nightly/dispatch only)."
+        type: boolean
+        default: false
     secrets:
       GH_PAT: { required: false }
       ANTHROPIC_API_KEY: { required: false }
@@ -23,11 +32,6 @@ env:
 
 jobs:
   # ── server (Rust) ────────────────────────────────────────────────
-  # ubuntu-latest only. Branchwork's binaries ship as Linux containers
-  # via deploy/Dockerfile (musl/linux/amd64). There are no Windows
-  # operators in the actual deployment model, so the windows-latest
-  # half of the old matrix was paying CI minutes for surface area
-  # nobody uses.
   server:
     name: Rust
     runs-on: ubuntu-latest
@@ -39,20 +43,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            server-rs/target
-          key: ci-ubuntu-${{ hashFiles('server-rs/Cargo.lock') }}
-          restore-keys: ci-ubuntu-
+          workspaces: server-rs
+          # One shared cache across the fast Rust jobs; the build-binary
+          # job (release/musl) keys separately so its artifacts don't
+          # evict the debug cache.
+          shared-key: ci-debug
       - name: Create web/dist placeholder
         run: mkdir -p ../web/dist && touch ../web/dist/index.html
       - run: cargo fmt --check
-      - run: cargo clippy --release --all-targets -- -D warnings
-      - run: cargo test --release
-      - run: cargo install cargo-audit --locked
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # Prebuilt cargo-audit binary (the old `cargo install --locked`
+      # recompiled it from source every run — minutes of pure waste).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       - run: cargo audit
 
   # ── web ──────────────────────────────────────────────────────────
@@ -78,9 +85,14 @@ jobs:
       - name: Bundle-size budget
         run: pnpm --filter @branchwork/web bundle:check
 
-  # ── e2e ──────────────────────────────────────────────────────────
+  # ── e2e (opt-in: real gh + Claude) ───────────────────────────────
+  # Skipped unless the caller passes run_e2e=true (e2e-nightly.yml /
+  # workflow_dispatch). Kept OFF the per-commit path so a flaky
+  # network/API hiccup can't redden a merge and so the merge gate stays
+  # fast.
   e2e:
     name: E2E tests (gh + Claude)
+    if: ${{ inputs.run_e2e }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -92,16 +104,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            server-rs/target
-          key: ci-e2e-${{ hashFiles('server-rs/Cargo.lock') }}
-          restore-keys: |
-            ci-e2e-
-            ci-ubuntu-latest-
+          workspaces: server-rs
+          shared-key: ci-e2e
       - run: mkdir -p ../web/dist && touch ../web/dist/index.html
       - name: Verify gh CLI + auth
         run: |
@@ -112,4 +118,4 @@ jobs:
             echo "::warning::GH_PAT not set; gh-backed paths will skip via tests/support/gh.rs::maybe_create"
           fi
       - name: cargo test --features e2e
-        run: cargo test --release --features e2e
+        run: cargo test --features e2e

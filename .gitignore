@@ -23,3 +23,9 @@ web-dev.log
 # Operator scratch dirs — per-host CLI tooling state, never committed.
 .bob/
 .codex/
+
+# CI-only: prebuilt binaries staged for deploy/Dockerfile.runtime
+dist-bin/
+
+# Local redeploy server log
+branchwork-server.log

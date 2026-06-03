@@ -1,0 +1,25 @@
+name: e2e-nightly
+
+# The real-Claude/gh e2e suite, moved OFF the per-commit path (it was
+# ~5 min, network-bound, and the source of the recurring `s==0`
+# startup-race flake that reddened unrelated merges). Runs nightly and
+# on demand instead. A red run here is a real signal to investigate —
+# it just no longer blocks every master push / PR.
+#
+# Reuses tests.yml with run_e2e=true (so it also re-runs the fast
+# server+web jobs as a nightly full-suite check). `secrets: inherit`
+# forwards GH_PAT + ANTHROPIC_API_KEY through to the e2e job.
+
+on:
+  schedule:
+    # 07:00 UTC daily (~midnight US Pacific / morning CET).
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Tests
+    uses: ./.github/workflows/tests.yml
+    with:
+      run_e2e: true
+    secrets: inherit

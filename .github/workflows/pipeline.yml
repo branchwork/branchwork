@@ -1,43 +1,34 @@
 name: Pipeline
 
-# Single workflow for the master build pipeline. Replaces the
-# Bump → CI → Docker → Deploy chain of separate workflows that fired
-# off each other via `workflow_run`. The chained model produced 4
-# top-level runs per master push with 3+ Skipped/Cancelled rows in
-# the Actions tab — visual noise that made it impossible to answer
-# "is master green?" with a single API call.
+# Single workflow for the master build pipeline. ONE run per human push
+# does everything, in order, gated so master never advances on red:
 #
-# This file collapses that into ONE run per push. All jobs live here,
-# wired by `needs:` and gated by a `classify` job that decides which
-# parts of the pipeline apply to the current event. Skipped jobs stay
-# scoped to this run rather than spawning sibling runs.
+#   classify → tests → bump → build-binary → docker → deploy
 #
-# PR-side tests are handled by `task-tests.yml`, NOT this file (Phase
-# 4.3 of the CI split). `pipeline.yml` listens on master pushes and
-# `workflow_dispatch` only — opening or pushing to a PR fires
-# `task-tests.yml` and nothing else, so the PR Checks tab shows a
-# single check.
+# Test-before-bump (changed 2026-06-03): the fast test suite runs on the
+# HUMAN commit and MUST pass before the version is bumped. Previously
+# tests ran on the auto-bump commit AFTER it landed — so a human push
+# showed a misleading green (tests skipped), feedback took two sequential
+# runs, and master could carry an untested commit + a red bump on top.
 #
-# Per-event behaviour:
-#   - Master push, *non*-bump commit (i.e. a human push):
-#       classify → bump
-#       (bump pushes a `chore: auto-bump to vX.Y.Z` commit using a PAT,
-#        which fires this workflow again on that commit.)
-#   - Master push, bump commit:
-#       classify → tests → docker → deploy
-#   - workflow_dispatch:
-#       classify → tests → docker → deploy
-#       (manual full-pipeline override; deploys whatever HEAD is on master.)
+# The version bump still produces the deploy artifact (the binary embeds
+# CARGO_PKG_VERSION), so the order is test → bump → build the release
+# binary from the bumped tree → image → deploy. The bump is pushed via
+# PAT, which fires this workflow again on the bump commit; that run is a
+# classify-only no-op (is_bump ⇒ every gate false) because the human-push
+# run already tested, built, and deployed it.
 #
-# The server / web / e2e jobs live in `.github/workflows/tests.yml`
-# (Phase 1.1 of the CI split). Calling that workflow via `uses:` keeps
-# the per-job rows nested under this Pipeline run in the Actions tab
-# instead of spawning a sibling top-level run.
+# Build-once (changed 2026-06-03): the release binary is compiled exactly
+# ONCE, in `build-binary` (amd64/musl, cached), and `docker` COPYs it via
+# deploy/Dockerfile.runtime. Previously the Tests/Rust job compiled
+# release AND the Docker job recompiled the whole project in-container
+# (two arches, one discarded) — ~23 of ~24 wall-clock minutes.
 #
-# Tag pushes (`v*`) are handled by `tag-build.yml`, which is a
-# separate workflow because its trigger surface and image tagging
-# scheme are different from the master path. Releases are explicit
-# human action and don't share this file's automation.
+# e2e (real gh + Claude) moved OFF this path to e2e-nightly.yml.
+#
+# PR-side tests are handled by `task-tests.yml`. Tag pushes (`v*`) are
+# handled by `tag-build.yml`, which still uses the multi-arch
+# deploy/Dockerfile for release images.
 
 on:
   push:
@@ -46,25 +37,19 @@ on:
 
 permissions:
   contents: write   # the `bump` job pushes a commit back to master
-  packages: write   # the `docker-*` jobs push images to GHCR
+  packages: write   # the `docker` job pushes images to GHCR
 
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
-# A second master push that arrives while a deploy is in flight
-# queues behind it rather than cancelling — same semantics as the
-# old standalone deploy.yml.
 concurrency:
   group: pipeline-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   # ── classify ─────────────────────────────────────────────────────
-  # 30-second job that figures out what the current event implies.
-  # Output booleans drive every downstream `if:` gate so the
-  # decision logic lives in exactly one place.
   classify:
     name: Classify event
     runs-on: ubuntu-latest
@@ -88,32 +73,29 @@ jobs:
           is_master_push=false
           is_dispatch=false
           is_bump=false
-          if [[ "$event" == "push" ]]; then
-            if [[ "$ref" == "refs/heads/master" ]]; then
-              is_master_push=true
-            fi
+          if [[ "$event" == "push" && "$ref" == "refs/heads/master" ]]; then
+            is_master_push=true
           fi
-          [[ "$event" == "workflow_dispatch" ]]                                && is_dispatch=true
-          [[ "$msg"   == "chore: auto-bump to v"* ]]                           && is_bump=true
+          [[ "$event" == "workflow_dispatch" ]]      && is_dispatch=true
+          [[ "$msg"   == "chore: auto-bump to v"* ]] && is_bump=true
 
-          # Bump only on a human master push.
+          # A *human* master push (or a dispatch) drives the whole pipeline
+          # in one run: test → bump → build → deploy. The bump commit that
+          # the bump job pushes re-fires this workflow, but that run is a
+          # classify-only no-op — the human-push run already did everything.
+          human_push=false
+          [[ "$is_master_push" == "true" && "$is_bump" != "true" ]] && human_push=true
+
           should_bump=false
-          [[ "$is_master_push" == "true" && "$is_bump" != "true" ]] && should_bump=true
+          [[ "$human_push" == "true" ]] && should_bump=true
 
-          # Run server/web/e2e on the bump commit on master and on
-          # explicit dispatch. PRs and task-branch pushes are handled
-          # by `task-tests.yml`, which calls the same `tests.yml`.
+          # Test/build/deploy on the HUMAN commit now (NOT the bump commit)
+          # and on explicit dispatch. PRs/task branches use task-tests.yml.
           should_test=false
-          [[ "$is_master_push" == "true" && "$is_bump" == "true" ]] && should_test=true
-          [[ "$is_dispatch" == "true" ]] && should_test=true
+          { [[ "$human_push" == "true" ]] || [[ "$is_dispatch" == "true" ]]; } && should_test=true
 
-          # Build + deploy only on bump-commit master pushes (or
-          # explicit dispatch). Task branches don't ship images.
-          should_build=false
-          [[ "$is_master_push" == "true" && "$is_bump" == "true" ]] && should_build=true
-          [[ "$is_dispatch" == "true" ]] && should_build=true
-
-          should_deploy=$should_build
+          should_build=$should_test
+          should_deploy=$should_test
 
           {
             echo "is_bump_commit=$is_bump"
@@ -125,24 +107,33 @@ jobs:
 
           cat <<SUMMARY
           event=$event ref=$ref msg='$msg'
-            is_master_push=$is_master_push is_dispatch=$is_dispatch is_bump=$is_bump
+            human_push=$human_push is_dispatch=$is_dispatch is_bump=$is_bump
             should_bump=$should_bump should_test=$should_test should_build=$should_build should_deploy=$should_deploy
           SUMMARY
 
-  # ── bump ─────────────────────────────────────────────────────────
-  # Runs for human master pushes only. Bumps `server-rs/Cargo.toml`
-  # patch + the matching `Cargo.lock` entry, commits, pushes via PAT
-  # so the resulting commit fires this workflow again (a follow-up
-  # GITHUB_TOKEN push would NOT trigger downstream).
-  #
-  # Push-lock coordination: best-effort POST to
-  # `<saas-url>/api/git/push-lock` so an in-process auto-mode merge
-  # doesn't race us. Falls through to rebase-on-non-FF on any miss.
-  bump:
+  # ── tests (fast: server + web, NO e2e) ───────────────────────────
+  # Runs on the human commit, BEFORE the bump. The gate the rest of the
+  # pipeline hangs off — bump/build/deploy only proceed if this is green.
+  tests:
     needs: classify
-    if: needs.classify.outputs.should_bump == 'true'
+    if: needs.classify.outputs.should_test == 'true'
+    name: Tests
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit
+
+  # ── bump ─────────────────────────────────────────────────────────
+  # Only after tests pass. Bumps the patch version, commits, pushes via
+  # PAT (which re-fires this workflow on the bump commit as a no-op), and
+  # outputs the pushed commit SHA so build/docker/deploy operate on the
+  # bumped tree.
+  bump:
+    needs: [classify, tests]
+    if: ${{ needs.classify.outputs.should_bump == 'true' && needs.tests.result == 'success' }}
     name: Auto-bump patch version
     runs-on: ubuntu-latest
+    outputs:
+      new_sha: ${{ steps.pushed.outputs.sha }}
+      new_version: ${{ steps.bump.outputs.new_version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -264,6 +255,11 @@ jobs:
           done
           exit 1
 
+      - name: Record pushed SHA
+        id: pushed
+        if: ${{ !cancelled() && steps.bump.outcome == 'success' }}
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Release push lock
         if: ${{ always() && env.BUMP_LOCK_TOKEN != '' }}
         env:
@@ -292,76 +288,123 @@ jobs:
           fi
           echo "::notice::Push lock released."
 
-  # ── tests ────────────────────────────────────────────────────────
-  # Delegates to the reusable `tests.yml` workflow which carries the
-  # server / web / e2e jobs (Phase 1.1 of the CI split). Calling it
-  # via `uses:` keeps the per-job rows nested under this Pipeline run
-  # in the Actions tab — they do NOT spawn a sibling top-level run.
+  # ── build-binary (the ONE release compile) ───────────────────────
+  # Builds branchwork-server + branchwork-runner for x86_64-musl from the
+  # bumped tree (so CARGO_PKG_VERSION matches) and uploads them. Docker
+  # COPYs these — nothing compiles Rust in-container anymore.
   #
-  # `secrets: inherit` forwards GH_PAT + ANTHROPIC_API_KEY from this
-  # workflow's environment to `tests.yml`, matching the previous
-  # `${{ secrets.X }}` references in the inline e2e job.
-  #
-  # When `should_test=false`, this job is skipped; `docker` is also
-  # skipped by its own `if: should_build == 'true'`, so the `needs:`
-  # graph stays consistent without `always()` / `success()` gymnastics.
-  tests:
-    needs: classify
-    if: needs.classify.outputs.should_test == 'true'
-    name: Tests
-    uses: ./.github/workflows/tests.yml
-    secrets: inherit
+  # `target_sha` is the bump commit on a human push, or github.sha on
+  # workflow_dispatch (no bump). The `if` uses !cancelled() so a SKIPPED
+  # bump (dispatch path) doesn't skip this job.
+  build-binary:
+    needs: [classify, tests, bump]
+    if: ${{ !cancelled() && needs.classify.outputs.should_build == 'true' && needs.tests.result == 'success' && (needs.bump.result == 'success' || needs.bump.result == 'skipped') }}
+    name: Build release binary
+    runs-on: ubuntu-latest
+    outputs:
+      target_sha: ${{ steps.ref.outputs.sha }}
+    steps:
+      - id: ref
+        run: echo "sha=${{ needs.bump.outputs.new_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.new_sha || github.sha }}
+      # Frontend first — the server binary embeds web/dist at compile time.
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @branchwork/web build
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-rs
+          shared-key: ci-release-musl
+      # zig + cargo-zigbuild: cross-link musl cleanly (matches the proven
+      # deploy/Dockerfile toolchain). Pinned to the same zig 0.13.0.
+      - name: Install zig
+        run: |
+          set -euo pipefail
+          curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | sudo tar -xJ -C /usr/local
+          sudo ln -sf /usr/local/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig
+          zig version
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build release binaries (amd64/musl)
+        working-directory: server-rs
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --target x86_64-unknown-linux-musl \
+            --bin branchwork-server --bin branchwork-runner
+          mkdir -p ../dist-bin
+          cp target/x86_64-unknown-linux-musl/release/branchwork-server ../dist-bin/
+          cp target/x86_64-unknown-linux-musl/release/branchwork-runner ../dist-bin/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: branchwork-binaries
+          path: dist-bin/
+          retention-days: 3
+          if-no-files-found: error
 
-  # ── docker (amd64 only, single job) ──────────────────────────────
-  # Single arch, single job: builds the image and pushes all the
-  # human-readable tags (`:edge`, `:latest`, `:<sha7>`, `:sha-<long>`)
-  # in one go via docker/metadata-action + docker/build-push-action.
-  # No separate digest-upload + manifest dance — that pattern was
-  # only justified when we needed to fan-in two arch builds.
-  #
-  # Prod runs amd64 (Hetzner box is x86_64); deploy/Dockerfile's
-  # CMD is the linux/amd64 binary. arm64 was a future-proofing bet
-  # that hasn't paid out in actual deployment.
+  # ── docker (copy prebuilt binary; no in-container compile) ────────
   docker:
-    needs: [classify, tests]
-    if: needs.classify.outputs.should_build == 'true'
+    needs: [classify, build-binary]
+    if: ${{ !cancelled() && needs.classify.outputs.should_build == 'true' && needs.build-binary.result == 'success' }}
     name: Docker
     runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.tags.outputs.short }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-binary.outputs.target_sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: branchwork-binaries
+          path: dist-bin
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=raw,value=edge,enable={{is_default_branch}}
-            type=sha,prefix=,format=short
+      - name: Compute tags from target SHA
+        id: tags
+        run: |
+          set -euo pipefail
+          full="${{ needs.build-binary.outputs.target_sha }}"
+          short="${full:0:7}"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "${REGISTRY}/${IMAGE_NAME}:${short}"
+            echo "${REGISTRY}/${IMAGE_NAME}:sha-${full}"
+            echo "${REGISTRY}/${IMAGE_NAME}:edge"
+            echo "${REGISTRY}/${IMAGE_NAME}:latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: deploy/Dockerfile
+          file: deploy/Dockerfile.runtime
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=amd64
-          cache-to: type=gha,mode=max,scope=amd64
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime
 
   # ── deploy ───────────────────────────────────────────────────────
   deploy:
-    needs: [classify, docker]
-    if: needs.classify.outputs.should_deploy == 'true'
+    needs: [classify, build-binary, docker]
+    if: ${{ !cancelled() && needs.classify.outputs.should_deploy == 'true' && needs.docker.result == 'success' }}
     name: Deploy to Hetzner
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -374,11 +417,13 @@ jobs:
       PROD_DIR: /opt/branchwork/src
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-binary.outputs.target_sha }}
       - name: Resolve target SHA
         id: target
         run: |
           set -euo pipefail
-          full="${{ github.sha }}"
+          full="${{ needs.build-binary.outputs.target_sha }}"
           short="${full:0:7}"
           echo "full=$full" >> "$GITHUB_OUTPUT"
           echo "short=$short" >> "$GITHUB_OUTPUT"
