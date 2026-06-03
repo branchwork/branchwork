@@ -34,6 +34,11 @@ pub mod actions {
     /// request returns 412 and this row records the attempt. Diff carries
     /// `{requested: true, reason: "worktrees_not_ready"}`.
     pub const CONFIG_PARALLEL_REFUSED: &str = "config.parallel_refused";
+    /// PUT /api/plans/:name/config toggled the per-project worktree-per-agent
+    /// isolation opt-in (`plan_project.worktree_isolation_opt_in`). Diff
+    /// carries `{worktreeIsolation: <bool>}`. Opting out also force-clears
+    /// `parallel`, recorded as `{worktreeIsolation: false, clearedParallel: true}`.
+    pub const CONFIG_WORKTREE_ISOLATION: &str = "config.worktree_isolation";
     /// PUT /api/plans/:name/settings wrote new values for
     /// `ci_blocking_workflows` and/or `phase_verification` to the plan
     /// YAML. Diff carries the post-update fields (camelCase) — explicit

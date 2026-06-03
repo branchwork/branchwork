@@ -464,6 +464,125 @@ fn put_parallel_false_is_never_gated() {
     assert_eq!(body["parallel"], false);
 }
 
+// ── worktree-isolation opt-in toggle ────────────────────────────────────
+
+#[test]
+fn get_config_surfaces_worktree_isolation_default_false() {
+    let d = TestDashboard::new();
+    d.create_plan(
+        "cfg-wt-default",
+        &minimal_plan("cfg-wt-default", &d.project),
+    );
+
+    let (s, body) = d.get("/api/plans/cfg-wt-default/config");
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["worktreeIsolation"], false, "body: {body}");
+}
+
+#[test]
+fn put_worktree_isolation_opt_in_then_parallel_succeeds_via_api() {
+    // The end-to-end UI flow: opt the project into worktree isolation, then
+    // enable parallel — both via the public config PUT, no direct SQL.
+    let d = TestDashboard::new();
+    d.create_plan("cfg-wt-flow", &minimal_plan("cfg-wt-flow", &d.project));
+
+    // 1) Opt in. GET reflects it; the plan_project row is created/updated.
+    let (s, body) = d.put(
+        "/api/plans/cfg-wt-flow/config",
+        json!({"worktreeIsolation": true}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["worktreeIsolation"], true, "body: {body}");
+
+    // 2) Now parallel=true is accepted (gate: WORKTREES_SHIPPED && opted_in).
+    let (s, body) = d.put("/api/plans/cfg-wt-flow/config", json!({"parallel": true}));
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], true, "body: {body}");
+    assert_eq!(body["worktreeIsolation"], true, "body: {body}");
+}
+
+#[test]
+fn put_worktree_isolation_true_and_parallel_true_in_one_request() {
+    // Combined request must work: the opt-in is applied before the parallel
+    // gate reads it, so the gate sees the fresh value.
+    let d = TestDashboard::new();
+    d.create_plan("cfg-wt-combo", &minimal_plan("cfg-wt-combo", &d.project));
+
+    let (s, body) = d.put(
+        "/api/plans/cfg-wt-combo/config",
+        json!({"worktreeIsolation": true, "parallel": true}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], true, "body: {body}");
+    assert_eq!(body["worktreeIsolation"], true, "body: {body}");
+}
+
+#[test]
+fn put_worktree_isolation_false_force_clears_parallel() {
+    // Revoking the opt-in must drop parallel too — opt-in=false ⟹ parallel=false.
+    let d = TestDashboard::new();
+    d.create_plan("cfg-wt-revoke", &minimal_plan("cfg-wt-revoke", &d.project));
+
+    // Opt in + enable parallel.
+    let (s, _) = d.put(
+        "/api/plans/cfg-wt-revoke/config",
+        json!({"worktreeIsolation": true}),
+    );
+    assert_eq!(s, 200);
+    let (s, body) = d.put("/api/plans/cfg-wt-revoke/config", json!({"parallel": true}));
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], true);
+
+    // Revoke isolation.
+    let (s, body) = d.put(
+        "/api/plans/cfg-wt-revoke/config",
+        json!({"worktreeIsolation": false}),
+    );
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["worktreeIsolation"], false, "body: {body}");
+    assert_eq!(
+        body["parallel"], false,
+        "parallel must be force-cleared: {body}"
+    );
+
+    // Persisted on both tables.
+    let db_path = d.dir.path().join(".claude").join("branchwork.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    for table in ["plan_auto_mode", "plan_auto_advance"] {
+        let p: Option<i64> = conn
+            .query_row(
+                &format!("SELECT parallel FROM {table} WHERE plan_name = ?1"),
+                params!["cfg-wt-revoke"],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(
+            p.is_none() || p == Some(0),
+            "{table}.parallel must be 0: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn put_worktree_isolation_rejects_plan_without_project() {
+    // A plan with no `project:` in YAML and no plan_project row can't isolate
+    // — the opt-in needs a project to anchor the worktree. Expect 409.
+    let d = TestDashboard::new();
+    let path = d.plans_dir.join("cfg-wt-noproj.yaml");
+    std::fs::write(
+        &path,
+        "title: cfg-wt-noproj\ncontext: ''\nphases:\n  - number: 1\n    title: P1\n    description: ''\n    tasks:\n      - number: '1.1'\n        title: T\n        description: ''\n        acceptance: ''\n",
+    )
+    .unwrap();
+
+    let (s, body) = d.put(
+        "/api/plans/cfg-wt-noproj/config",
+        json!({"worktreeIsolation": true}),
+    );
+    assert_eq!(s, 409, "body: {body}");
+    assert_eq!(body["error"], "project_required", "body: {body}");
+}
+
 #[test]
 fn get_surfaces_paused_reason_when_set() {
     let d = TestDashboard::new();

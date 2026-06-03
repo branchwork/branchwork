@@ -948,8 +948,14 @@ struct PlanConfig {
     /// Per-plan opt-in for fan-out spawn (3.5.2). Stored on both
     /// `plan_auto_mode` and `plan_auto_advance` and kept in lockstep by
     /// the unified PUT. Toggling to true is rejected at the API layer
-    /// until worktrees ship (3.5.3).
+    /// unless `worktree_isolation` is also on (the AND gate).
     parallel: bool,
+    /// Per-project opt-in for worktree-per-agent isolation (ADR 0002),
+    /// stored on `plan_project.worktree_isolation_opt_in`. The prerequisite
+    /// for `parallel`: the unified PUT rejects `parallel = true` unless this
+    /// is on (AND `WORKTREES_SHIPPED`). Surfaced so the UI can render the
+    /// opt-in switch and gate the Parallel switch on it.
+    worktree_isolation: bool,
     /// Per-plan runner affinity (T11.4). `None` = "any online runner";
     /// `Some(id)` pins every spawn to that runner. The dispatcher pauses
     /// the plan with `paused_reason='runner_offline'` if the pinned
@@ -971,6 +977,11 @@ pub struct PlanConfigBody {
     auto_mode: Option<bool>,
     max_fix_attempts: Option<u32>,
     parallel: Option<bool>,
+    /// Per-project worktree-isolation opt-in (the `parallel` prerequisite).
+    /// `Some(true)` opts in, `Some(false)` opts out (and force-clears
+    /// `parallel` to keep the invariant opt-in=false ⟹ parallel=false),
+    /// `None` leaves it untouched.
+    worktree_isolation: Option<bool>,
     /// Three-state field: `Absent` (None), `ExplicitNull` (Some(None) — the
     /// only value we honour: clear the pause + re-evaluate), or
     /// `ExplicitValue` (Some(Some(_)) — ignored, paused reasons are only
@@ -1067,6 +1078,7 @@ fn read_plan_config(db: &rusqlite::Connection, name: &str) -> PlanConfig {
         paused_reason,
         paused_files,
         parallel: mode_parallel || advance_parallel,
+        worktree_isolation: project_worktree_opt_in(db, name),
         runner_id,
         runner_failover,
     }
@@ -1087,6 +1099,85 @@ pub async fn put_plan_config(
     Path(name): Path<String>,
     Json(body): Json<PlanConfigBody>,
 ) -> axum::response::Response {
+    // Worktree-isolation opt-in (per-project, ADR 0002). Applied BEFORE the
+    // parallel gate below so a combined `{worktreeIsolation:true,
+    // parallel:true}` request sees the fresh opt-in. The flag lives on
+    // `plan_project`, whose `project` column is NOT NULL — so when no row
+    // exists yet we seed it from the plan's YAML `project:` field (stored as
+    // the relative name `project_dir_for` joins onto $HOME, never an absolute
+    // path). A plan with no project anywhere can't isolate, so reject with a
+    // clear error rather than fabricate one.
+    if let Some(opt_in) = body.worktree_isolation {
+        let existing_project: Option<String> = {
+            let db = state.db.lock().unwrap();
+            db.query_row(
+                "SELECT project FROM plan_project WHERE plan_name = ?1",
+                params![name],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        };
+        let project = existing_project.or_else(|| {
+            crate::plan_parser::list_plans(&state.plans_dir)
+                .into_iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.project)
+        });
+        let Some(project) = project else {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "project_required",
+                    "message": "Set a project for this plan before enabling worktree isolation.",
+                })),
+            )
+                .into_response();
+        };
+        {
+            let db = state.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO plan_project (plan_name, project, worktree_isolation_opt_in, updated_at) \
+                 VALUES (?1, ?2, ?3, datetime('now')) \
+                 ON CONFLICT(plan_name) DO UPDATE SET \
+                     worktree_isolation_opt_in = excluded.worktree_isolation_opt_in, \
+                     updated_at = excluded.updated_at",
+                params![name, project, opt_in as i64],
+            )
+            .ok();
+            // Invariant: opt-in=false ⟹ parallel=false. Force-clear the
+            // parallel flag on both tables so a stale `parallel=1` can't keep
+            // fanning out spawns after isolation is revoked.
+            if !opt_in {
+                db.execute(
+                    "UPDATE plan_auto_mode SET parallel = 0 WHERE plan_name = ?1",
+                    params![name],
+                )
+                .ok();
+                db.execute(
+                    "UPDATE plan_auto_advance SET parallel = 0, updated_at = datetime('now') \
+                     WHERE plan_name = ?1",
+                    params![name],
+                )
+                .ok();
+            }
+            let mut diff = serde_json::Map::new();
+            diff.insert("worktreeIsolation".to_string(), serde_json::json!(opt_in));
+            if !opt_in {
+                diff.insert("clearedParallel".to_string(), serde_json::json!(true));
+            }
+            crate::audit::log(
+                &db,
+                auth.org_id(),
+                auth.0.as_ref().map(|u| u.id.as_str()),
+                auth.0.as_ref().map(|u| u.email.as_str()),
+                crate::audit::actions::CONFIG_WORKTREE_ISOLATION,
+                crate::audit::resources::PLAN,
+                Some(&name),
+                Some(&serde_json::Value::Object(diff).to_string()),
+            );
+        }
+    }
+
     // Worktree gate (Task 3.5.3): reject `parallel = true` until both
     //   (1) worktree-per-agent isolation has shipped (compile-time const), and
     //   (2) the project has opted in via `plan_project.worktree_isolation_opt_in`.
