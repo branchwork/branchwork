@@ -297,7 +297,9 @@ fn put_partial_preserves_parallel() {
 #[test]
 fn put_parallel_true_returns_412_when_worktrees_not_shipped() {
     // Acceptance: PUT with `parallel=true` returns 412 with the documented
-    // body when `WORKTREES_SHIPPED = false` (the build's default).
+    // body when the project has NOT opted in. (Worktrees have shipped, so the
+    // per-project `worktree_isolation_opt_in` flag is the gate that's unmet
+    // here — this plan never set it.)
     let d = TestDashboard::new();
     d.create_plan("cfg-par-gate", &minimal_plan("cfg-par-gate", &d.project));
 
@@ -346,10 +348,12 @@ fn put_parallel_true_returns_412_when_worktrees_not_shipped() {
 }
 
 #[test]
-fn put_parallel_true_with_opt_in_still_412_when_const_false() {
-    // Both gates must agree before parallel=true is allowed. Seed the
-    // per-project opt-in to 1 to confirm WORKTREES_SHIPPED=false alone
-    // is enough to refuse the toggle (defence-in-depth, AND semantics).
+fn put_parallel_true_succeeds_with_opt_in_now_that_worktrees_shipped() {
+    // Both gates must agree before parallel=true is allowed. Worktrees have
+    // shipped (`WORKTREES_SHIPPED = true`), so an opted-in project is the
+    // one remaining gate — once it's set, the enable side of the toggle
+    // succeeds and the flag persists across both tables. (The not-opted-in
+    // case is still refused; see `put_parallel_true_returns_412_*`.)
     let d = TestDashboard::new();
     d.create_plan(
         "cfg-par-optedin",
@@ -371,8 +375,32 @@ fn put_parallel_true_with_opt_in_still_412_when_const_false() {
         "/api/plans/cfg-par-optedin/config",
         json!({"parallel": true}),
     );
-    assert_eq!(s, 412, "body: {body}");
-    assert_eq!(body["error"], "worktrees_required", "body: {body}");
+    assert_eq!(s, 200, "body: {body}");
+    assert_eq!(body["parallel"], true, "body: {body}");
+
+    // Persisted on both tables (kept in lockstep by the unified PUT).
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let am: i64 = conn
+        .query_row(
+            "SELECT parallel FROM plan_auto_mode WHERE plan_name = ?1",
+            params!["cfg-par-optedin"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(am, 1, "plan_auto_mode.parallel must be set");
+    let aa: i64 = conn
+        .query_row(
+            "SELECT parallel FROM plan_auto_advance WHERE plan_name = ?1",
+            params!["cfg-par-optedin"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(aa, 1, "plan_auto_advance.parallel must be set");
+
+    // GET round-trips the enabled flag.
+    let (s, body) = d.get("/api/plans/cfg-par-optedin/config");
+    assert_eq!(s, 200);
+    assert_eq!(body["parallel"], true);
 }
 
 #[test]

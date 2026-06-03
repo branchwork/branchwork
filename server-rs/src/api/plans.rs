@@ -906,12 +906,15 @@ pub async fn set_auto_advance(
 // surfaces `paused_reason` so the UI can show a banner explaining why the
 // loop self-paused. The dedicated `/auto-advance` route stays unchanged.
 
-/// Compile-time gate for fan-out spawn: until worktree-per-agent isolation
-/// (ADR 0002) ships, all `parallel = true` PUTs are rejected. Flip this to
-/// `true` once `pty_agent.rs` carries a `git worktree`-based spawn path so
-/// the enable side of the toggle becomes available again. Kept as a `pub`
-/// const so the grep target is stable for the worktree implementer.
-pub const WORKTREES_SHIPPED: bool = false;
+/// Compile-time gate for fan-out spawn: `parallel = true` PUTs are rejected
+/// while this is `false`. Flipped to `true` now that worktree-per-agent
+/// isolation (ADR 0002) has shipped — the worktree-per-agent-isolation plan
+/// (T1–T6) landed the `git worktree`-based spawn path, per-agent worktree
+/// setup/teardown, shared build cache, orphan sweep, and merge handling.
+/// The enable side of the toggle is still gated per-project on
+/// `plan_project.worktree_isolation_opt_in` (see `project_worktree_opt_in`),
+/// so flipping this const does not turn parallel on anywhere by itself.
+pub const WORKTREES_SHIPPED: bool = true;
 
 /// Read the per-project worktree opt-in flag. Returns `false` when no
 /// `plan_project` row exists for the plan or the column is 0. The toggling
