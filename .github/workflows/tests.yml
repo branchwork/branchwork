@@ -56,14 +56,12 @@ jobs:
         run: mkdir -p ../web/dist && touch ../web/dist/index.html
       - run: cargo fmt --check
       - run: cargo clippy --release --all-targets -- -D warnings
-      # Cap test parallelism. Each integration test spins up a real
-      # `branchwork-server` and polls /api/health; at cargo's default
-      # (= core count) too many boot at once on the 4-vCPU runner and one
-      # randomly loses the startup race (curl s==0 / wait_healthy 60s
-      # timeout) — a ~50% per-run flake that reddened the gate regardless
-      # of which test drew the short straw. Two-at-a-time keeps the boots
-      # uncontended without serializing the whole suite.
-      - run: cargo test --release -- --test-threads=2
+      # Full parallelism: the server-spawn startup flake is bounded in the
+      # harness itself now (tests/support/mod.rs caps live `branchwork-
+      # server` instances to ~cores/2 via a process-wide semaphore), so the
+      # cheap unit tests run unthrottled while server boots stay
+      # uncontended. No blanket `--test-threads` cap needed.
+      - run: cargo test --release
       # Prebuilt cargo-audit binary (the old `cargo install --locked`
       # recompiled it from source every run — minutes of pure waste).
       - uses: taiki-e/install-action@v2

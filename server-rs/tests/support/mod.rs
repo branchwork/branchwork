@@ -29,9 +29,76 @@ pub mod worktree;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+/// Process-wide cap on how many `TestDashboard` servers BOOT concurrently.
+///
+/// Every integration test spawns a real `branchwork-server` and
+/// [`wait_healthy`] polls `/api/health` until it answers. At cargo's
+/// default per-binary parallelism (= core count) that many servers boot
+/// simultaneously; on CI's 4-vCPU runners they starve each other during
+/// the CPU-heavy boot (DB open + migrations + bind) and one loses the
+/// race — `wait_healthy` exhausts its 60 s budget, or an early request
+/// comes back `s==0` (that transient is separately absorbed by the
+/// retry in [`http`]). It was a ~50% per-run flake on the Rust gate,
+/// independent of which test drew the short straw.
+///
+/// A permit is held only across spawn + `wait_healthy` (see
+/// `new_with_env`), so concurrent *boots* are bounded to ~half the cores
+/// while healthy servers and the ~1200 cheap non-server unit tests still
+/// run at full parallelism — faster than a blanket `--test-threads=2`
+/// (which throttles everything) and deadlock-free even for a test that
+/// stands up several dashboards. The counter is per-process: each test
+/// binary gets its own, and cargo runs binaries sequentially, so this
+/// bounds the true peak.
+fn server_slots() -> &'static (Mutex<usize>, Condvar) {
+    static SLOTS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    SLOTS.get_or_init(|| {
+        // ≤ cores/2 — the known-good ratio. The flake appeared at the
+        // 1-server-per-core default; halving it was reliable in CI.
+        // `BRANCHWORK_TEST_SERVER_SLOTS` overrides for big/small hosts.
+        let permits = std::env::var("BRANCHWORK_TEST_SERVER_SLOTS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| {
+                (std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+                    / 2)
+                .max(1)
+            });
+        (Mutex::new(permits), Condvar::new())
+    })
+}
+
+/// RAII boot permit from [`server_slots`]. Acquired before spawn and
+/// dropped once the server is healthy, so it bounds concurrent boots
+/// without being held across user test code.
+struct ServerSlot;
+
+impl ServerSlot {
+    fn acquire() -> Self {
+        let (lock, cv) = server_slots();
+        let mut free = lock.lock().unwrap();
+        while *free == 0 {
+            free = cv.wait(free).unwrap();
+        }
+        *free -= 1;
+        ServerSlot
+    }
+}
+
+impl Drop for ServerSlot {
+    fn drop(&mut self) {
+        let (lock, cv) = server_slots();
+        *lock.lock().unwrap() += 1;
+        cv.notify_one();
+    }
+}
 
 pub struct TestDashboard {
     pub dir: tempfile::TempDir,
@@ -124,10 +191,20 @@ impl TestDashboard {
         for (k, v) in extras {
             cmd.env(*k, *v);
         }
-        let child = cmd.spawn().expect("spawn branchwork-server");
+
+        // Bound how many servers BOOT at once so a boot storm can't form.
+        // The permit is released the moment this server is healthy (before
+        // `new` returns), NOT held for the test's lifetime — so a test that
+        // stands up several dashboards never holds two permits and can't
+        // deadlock, while concurrent boots stay capped.
+        let child = {
+            let _boot = ServerSlot::acquire();
+            let child = cmd.spawn().expect("spawn branchwork-server");
+            wait_healthy(&format!("http://127.0.0.1:{port}"));
+            child
+        };
 
         let base_url = format!("http://127.0.0.1:{port}");
-        wait_healthy(&base_url);
 
         Self {
             dir,
