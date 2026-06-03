@@ -409,7 +409,25 @@ function dispatch(msg: WsMessage) {
     }
     case "agent_branch_merged":
     case "agent_branch_discarded": {
-      // Branch was merged/discarded — refetch so the Merge button disappears
+      // Branch was merged/discarded — the Merge button is gated on
+      // `agent.branch`, so it must clear. Optimistically patch the store
+      // FIRST: relying on fetchAgents() alone was racy — it coalesces onto
+      // any in-flight /api/agents round-trip (see getInFlightAgentsFetch),
+      // and one that started before the server cleared the branch returns
+      // stale data with the branch still set. That left the button up until
+      // a full page reload (the reported bug). Patch by branch name to mirror
+      // the server's `UPDATE agents SET branch = NULL WHERE branch = ?`
+      // (clears sibling rows too); fall back to the agent id if the frame
+      // omits the branch.
+      const d = msg.data as { id?: string; merged?: string; deleted?: string };
+      const branch = d.merged ?? d.deleted;
+      if (branch) {
+        agentStore.clearAgentBranch({ branch });
+      } else if (d.id) {
+        agentStore.clearAgentBranch({ agentId: d.id });
+      }
+      // Reconcile against the server (cost/status/siblings); self-heals if
+      // the optimistic patch missed anything.
       agentStore.fetchAgents();
       break;
     }

@@ -90,6 +90,54 @@ describe("ws-store handleWsMessage", () => {
     expect(fetchAgents).toHaveBeenCalledTimes(1);
   });
 
+  it("agent_branch_merged optimistically clears the branch so the Merge button hides without a reload", () => {
+    // Regression: relying on fetchAgents() alone was racy (it coalesces onto
+    // an in-flight /api/agents call started before the server cleared the
+    // branch, returning stale data with the branch still set), so the Merge
+    // button stayed up until a full page reload. The handler must patch the
+    // store synchronously — by branch name, mirroring the server's
+    // `UPDATE agents SET branch = NULL WHERE branch = ?` (siblings too).
+    const fetchAgents = vi.fn().mockResolvedValue(undefined);
+    useAgentStore.setState({
+      fetchAgents,
+      agents: [
+        { id: "agent-a", branch: "branchwork/p/1.1" },
+        { id: "agent-b", branch: "branchwork/p/1.1" }, // sibling on same branch
+        { id: "agent-c", branch: "branchwork/p/2.1" }, // unrelated
+      ] as unknown as ReturnType<typeof useAgentStore.getState>["agents"],
+    });
+
+    handleWsMessage({
+      type: "agent_branch_merged",
+      data: { id: "agent-a", merged: "branchwork/p/1.1", into: "master" },
+    });
+
+    const agents = useAgentStore.getState().agents;
+    expect(agents.find((a) => a.id === "agent-a")?.branch).toBeNull();
+    expect(agents.find((a) => a.id === "agent-b")?.branch).toBeNull();
+    expect(agents.find((a) => a.id === "agent-c")?.branch).toBe("branchwork/p/2.1");
+    // Still reconciles against the server.
+    expect(fetchAgents).toHaveBeenCalledTimes(1);
+  });
+
+  it("agent_branch_discarded clears the branch by name too", () => {
+    const fetchAgents = vi.fn().mockResolvedValue(undefined);
+    useAgentStore.setState({
+      fetchAgents,
+      agents: [
+        { id: "agent-d", branch: "branchwork/p/3.1" },
+      ] as unknown as ReturnType<typeof useAgentStore.getState>["agents"],
+    });
+
+    handleWsMessage({
+      type: "agent_branch_discarded",
+      data: { id: "agent-d", deleted: "branchwork/p/3.1" },
+    });
+
+    expect(useAgentStore.getState().agents.find((a) => a.id === "agent-d")?.branch).toBeNull();
+    expect(fetchAgents).toHaveBeenCalledTimes(1);
+  });
+
   it("agent_spawn_failed refetches agents so the inline banner appears", () => {
     // Task 1.1, runner-install-and-spawn-reliability: when the runner
     // can't `Command::spawn` the session daemon, the server pre-renders
