@@ -2457,6 +2457,38 @@ fn migrate(conn: &Connection) {
     )
     .ok();
 
+    // ── DAG plan model tables (Phase 1 of DAG-based plan model) ────────────
+    // These coexist with task_status (which remains for v1/phase-based plans).
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS node_status (
+            plan_name   TEXT NOT NULL,
+            node_id     TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            source      TEXT,
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (plan_name, node_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS plan_artifacts (
+            plan_name     TEXT    NOT NULL,
+            artifact_name TEXT    NOT NULL,
+            direction     TEXT    NOT NULL CHECK (direction IN ('input', 'output')),
+            value         TEXT,
+            satisfied_at  TEXT,
+            PRIMARY KEY (plan_name, artifact_name, direction)
+        );
+
+        CREATE TABLE IF NOT EXISTS gate_approvals (
+            plan_name   TEXT NOT NULL,
+            node_id     TEXT NOT NULL,
+            approved_by TEXT,
+            approved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (plan_name, node_id)
+        );",
+    )
+    .ok();
+
     // Seed the default org and migrate orphaned users/plans into it.
     crate::auth::orgs::ensure_default_org(conn);
 

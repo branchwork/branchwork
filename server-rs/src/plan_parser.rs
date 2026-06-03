@@ -499,9 +499,34 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
     tasks
 }
 
+// ── Schema version detection ────────────────────────────────────────────────
+
+/// Lightweight pre-parse to detect `schema_version: 2` without deserializing
+/// the full document. Returns 1 (legacy) or 2 (DAG).
+pub fn detect_schema_version(raw: &str) -> u8 {
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        #[serde(default = "default_v1")]
+        schema_version: u8,
+    }
+    fn default_v1() -> u8 {
+        1
+    }
+    serde_yaml::from_str::<VersionProbe>(raw)
+        .map(|p| p.schema_version)
+        .unwrap_or(1)
+}
+
 // ── YAML parser ─────────────────────────────────────────────────────────────
 
 pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedPlan, String> {
+    // Route v2 plans to the DAG parser, then convert back to ParsedPlan for
+    // backward-compatible consumers (dashboard, auto-advance v1 path).
+    if detect_schema_version(raw) >= 2 {
+        let dag = crate::dag::parse_dag_yaml(raw, name, file_path)?;
+        return Ok(dag_plan_to_parsed(&dag));
+    }
+
     let yaml: YamlPlan = serde_yaml::from_str(raw).map_err(|e| e.to_string())?;
 
     let verification = yaml.verification.clone();
@@ -687,6 +712,98 @@ pub fn is_plan_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| matches!(e, "md" | "yaml" | "yml"))
+}
+
+/// Parse a plan file and return a DagPlan (works for both v1 and v2).
+/// v1 plans are auto-converted via `parsed_plan_to_dag`.
+#[allow(dead_code)] // Wired in by Phase 2 (DAG scheduler)
+pub fn parse_plan_file_as_dag(file_path: &Path) -> std::io::Result<crate::dag::DagPlan> {
+    let raw = std::fs::read_to_string(file_path)?;
+    let name = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    if (ext == "yaml" || ext == "yml") && detect_schema_version(&raw) >= 2 {
+        let mut dag = crate::dag::parse_dag_yaml(&raw, name, &file_path.to_string_lossy())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let meta = std::fs::metadata(file_path)?;
+        if dag.created_at.is_empty() {
+            dag.created_at = file_time_iso(&meta, true);
+        }
+        dag.modified_at = file_time_iso(&meta, false);
+        return Ok(dag);
+    }
+
+    // v1 path: parse as ParsedPlan, convert to DAG
+    let plan = parse_plan_file(file_path)?;
+    Ok(crate::dag::parsed_plan_to_dag(&plan))
+}
+
+/// Convert a DagPlan back into a ParsedPlan for backward-compatible consumers.
+/// Task nodes become tasks in a single phase; gates are excluded (they don't
+/// map to the v1 model). This is a lossy conversion — sub-plans are flattened.
+fn dag_plan_to_parsed(dag: &crate::dag::DagPlan) -> ParsedPlan {
+    use crate::dag::NodeType;
+
+    let tasks: Vec<PlanTask> = dag
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Task)
+        .enumerate()
+        .map(|(i, n)| PlanTask {
+            number: if n.id.contains('.') {
+                n.id.clone()
+            } else {
+                format!("1.{}", i + 1)
+            },
+            title: n.title.clone(),
+            description: n.description.clone(),
+            file_paths: n.file_paths.clone(),
+            acceptance: n.acceptance.clone(),
+            dependencies: n
+                .depends_on
+                .iter()
+                .filter(|d| {
+                    dag.nodes
+                        .iter()
+                        .any(|node| node.id == **d && node.node_type == NodeType::Task)
+                })
+                .cloned()
+                .collect(),
+            produces_commit: n.produces_commit,
+            status: n.status.clone(),
+            status_updated_at: n.status_updated_at.clone(),
+            cost_usd: n.cost_usd,
+            ci: None,
+        })
+        .collect();
+
+    let phase = PlanPhase {
+        number: 1,
+        title: dag.title.clone(),
+        description: dag.context.clone(),
+        tasks,
+        ci_blocking_workflows: None,
+        phase_verification: None,
+    };
+
+    ParsedPlan {
+        name: dag.name.clone(),
+        file_path: dag.file_path.clone(),
+        title: dag.title.clone(),
+        context: dag.context.clone(),
+        project: dag.project.clone(),
+        created_at: dag.created_at.clone(),
+        modified_at: dag.modified_at.clone(),
+        phases: vec![phase],
+        verification: None,
+        ci_blocking_workflows: None,
+        phase_verification: None,
+        total_cost_usd: dag.total_cost_usd,
+        max_budget_usd: dag.max_budget_usd,
+    }
 }
 
 fn file_time_iso(meta: &std::fs::Metadata, created: bool) -> String {

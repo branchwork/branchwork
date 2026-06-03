@@ -598,6 +598,25 @@ mod tests {
             params![plan],
         )
         .unwrap();
+        // DAG model tables (Phase 1 of DAG-based plan model).
+        conn.execute(
+            "INSERT INTO node_status (plan_name, node_id, status) \
+             VALUES (?1, 'init', 'completed')",
+            params![plan],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plan_artifacts (plan_name, artifact_name, direction) \
+             VALUES (?1, 'spec', 'output')",
+            params![plan],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gate_approvals (plan_name, node_id, approved_by) \
+             VALUES (?1, 'init', 'test-user')",
+            params![plan],
+        )
+        .unwrap();
     }
 
     fn read_snapshot_row(

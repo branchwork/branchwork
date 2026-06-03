@@ -7,6 +7,8 @@ mod ci;
 mod config;
 mod credential_material;
 mod crypto;
+#[allow(dead_code)] // Wired in by Phase 2 (DAG scheduler)
+mod dag;
 mod db;
 mod file_watcher;
 mod git_helpers;

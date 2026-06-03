@@ -5133,6 +5133,9 @@ pub(crate) const PLAN_CASCADE_TABLES: &[&str] = &[
     "task_learnings",
     "plan_org",
     "plan_runner_affinity",
+    "node_status",
+    "plan_artifacts",
+    "gate_approvals",
 ];
 
 /// Tables that contain a `plan_name` column but are intentionally NOT
