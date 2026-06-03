@@ -213,6 +213,19 @@ impl BranchworkMcp {
             }
         }
 
+        // Task 2.2 (DAG model): for `schema_version: 2` plans, `req.task` is a
+        // DAG node ID. Mirror the reported status into `node_status` so the DAG
+        // scheduler (which reads that table, not `task_status`) sees the
+        // completion when the `try_auto_advance` trigger below routes to it.
+        // No-op for v1 plans.
+        crate::dag_scheduler::record_node_status_if_v2(
+            &self.ctx.db,
+            &self.ctx.plans_dir,
+            &req.plan,
+            &req.task,
+            &req.status,
+        );
+
         // Phase 1, Task 1.2: any learning capture clears the pending-learning
         // gate. Fires whenever `reason` was set (the branch above wrote a
         // task_learnings row); a no-reason status update is a no-op here.

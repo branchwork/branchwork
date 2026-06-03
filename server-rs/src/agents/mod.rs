@@ -2261,6 +2261,36 @@ pub async fn try_auto_advance(
     port: u16,
     merged_sha: Option<String>,
 ) {
+    // ── Schema-version router (Task 2.2) ────────────────────────────────
+    // `schema_version: 2` (DAG) plans are scheduled by graph evaluation,
+    // not the phase walker below. Detect the version up front and hand v2
+    // plans off to `dag_scheduler::try_dag_advance`, then return.
+    //
+    // Every advance trigger — the auto-mode merge/CI loop (`auto_mode.rs`),
+    // the HTTP `PUT /tasks/:id/status` handler, the MCP `update_task_status`
+    // tool, and plan resume — funnels through this single entry point, so
+    // routing here covers all of them at once (the task's "key call sites").
+    //
+    // `merged_sha` (phase-end verification gating) has no DAG analogue yet —
+    // gate execution is Phase 3 — so it is intentionally dropped on the v2
+    // path. The just-completed task number becomes the `completed_node_id`
+    // the DAG scheduler reports in its `node_advanced` broadcast. The
+    // `auto_advance_enabled || auto_mode_enabled` master gate is re-checked
+    // inside `try_dag_advance`, so v2 plans are gated identically to v1.
+    if plan_parser::plan_file_schema_version(&plans_dir, &plan_name) >= 2 {
+        crate::dag_scheduler::try_dag_advance(
+            registry,
+            plans_dir,
+            plan_name,
+            Some(completed_task_number),
+            effort,
+            port,
+        )
+        .await;
+        return;
+    }
+
+    // ── v1 phase walker (unchanged) ─────────────────────────────────────
     // Either auto-advance (phase-level opt-in) or auto-mode (the
     // merge-CI-advance loop's master gate, which already excludes paused
     // plans via paused_reason IS NULL) is enough to advance. The
@@ -6186,6 +6216,170 @@ mod tests {
             has_phase_advanced(&events, plan),
             "phase_advanced MUST fire when no verification is configured: {events:?}",
         );
+    }
+
+    // ── Schema-version router (Task 2.2) ──────────────────────────────────
+    //
+    // `try_auto_advance` detects the plan's `schema_version` and routes v2
+    // (DAG) plans to `dag_scheduler::try_dag_advance` while leaving v1 plans
+    // on the phase walker. The two tests below pin the headline acceptance:
+    // a v2 plan reaches the DAG scheduler, and a v1 plan is unaffected.
+
+    /// Write a `schema_version: 2` (DAG) plan whose `project` resolves to a
+    /// non-existent dir (so `git worktree add` fails harmlessly on spawn).
+    fn write_dag_advance_plan(plans_dir: &Path, plan_name: &str, nodes_yaml: &str) {
+        let path = plans_dir.join(format!("{plan_name}.yaml"));
+        let yaml = format!(
+            "schema_version: 2\n\
+             title: \"{plan_name} title\"\n\
+             project: branchwork-no-such-dir-{plan_name}\n\
+             nodes:\n{nodes_yaml}"
+        );
+        std::fs::write(path, yaml).unwrap();
+    }
+
+    /// Acceptance: a `schema_version: 2` plan routes to the DAG scheduler.
+    /// `init` (gate) is pre-completed in `node_status`; one `try_auto_advance`
+    /// call must claim the two downstream task nodes (proof the DAG scheduler
+    /// ran — the v1 phase walker never touches `node_status`) and broadcast
+    /// the DAG-specific `node_advanced` event, not `task_advanced`.
+    #[tokio::test]
+    async fn try_auto_advance_routes_v2_plan_to_dag_scheduler() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        let plan = "dag-route";
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        write_dag_advance_plan(
+            &plans_dir,
+            plan,
+            "  - id: init\n\
+             \x20   type: gate\n\
+             \x20   gate_kind: init\n\
+             \x20 - id: a\n\
+             \x20   type: task\n\
+             \x20   depends_on: [init]\n\
+             \x20 - id: b\n\
+             \x20   type: task\n\
+             \x20   depends_on: [init]\n",
+        );
+        enable_auto_advance(&db, plan);
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO node_status (plan_name, node_id, status) \
+                 VALUES (?1, 'init', 'completed')",
+                params![plan],
+            )
+            .unwrap();
+        }
+
+        try_auto_advance(
+            registry,
+            plans_dir.clone(),
+            plan.to_string(),
+            "init".to_string(),
+            Effort::High,
+            3100,
+            None,
+        )
+        .await;
+
+        // Both downstream task nodes were claimed in `node_status` — the
+        // table only the DAG scheduler writes.
+        let conn = db.lock().unwrap();
+        let claimed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_status \
+                 WHERE plan_name = ?1 AND node_id IN ('a', 'b') AND status = 'in_progress'",
+                params![plan],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed, 2, "DAG scheduler must claim both task nodes");
+        drop(conn);
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("\"type\":\"node_advanced\"")),
+            "DAG scheduler must broadcast node_advanced: {events:?}",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.contains("\"type\":\"task_advanced\"")),
+            "v1 task_advanced must NOT fire for a v2 plan: {events:?}",
+        );
+    }
+
+    /// Regression: a v1 plan executes identically to before the router —
+    /// the phase walker spawns the next task via `task_status` and never
+    /// touches `node_status`.
+    #[tokio::test]
+    async fn try_auto_advance_v1_plan_does_not_touch_node_status() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let (registry, _rx) = test_registry(db.clone());
+
+        let plan = "v1-no-dag";
+        let _cleanup = SettingsCleanup {
+            db: db.clone(),
+            plan_name: plan.to_string(),
+        };
+
+        write_advance_plan(
+            &plans_dir,
+            plan,
+            "  - number: 1\n\
+             \x20   title: P1\n\
+             \x20   tasks:\n\
+             \x20     - number: \"a\"\n\
+             \x20       title: A\n\
+             \x20     - number: \"b\"\n\
+             \x20       title: B\n\
+             \x20       dependencies: [\"a\"]\n",
+        );
+        enable_auto_advance(&db, plan);
+        set_task_status(&db, plan, "a", "completed");
+
+        try_auto_advance(
+            registry,
+            plans_dir,
+            plan.to_string(),
+            "a".to_string(),
+            Effort::High,
+            3100,
+            None,
+        )
+        .await;
+
+        let conn = db.lock().unwrap();
+        let node_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_status WHERE plan_name = ?1",
+                params![plan],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(node_rows, 0, "v1 plan must not write node_status");
+
+        let b_spawned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE plan_name = ?1 AND task_id = 'b'",
+                params![plan],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_spawned, 1, "v1 phase walker must spawn the next task");
     }
 
     // ──────────────────────────────────────────────────────────────────

@@ -73,6 +73,47 @@ fn claim_node(db: &Db, plan_name: &str, node_id: &str) -> bool {
     updated > 0
 }
 
+/// Mirror a reported task status into the `node_status` table, but **only**
+/// when `plan_name` resolves to a `schema_version: 2` (DAG) plan. A no-op for
+/// v1 plans (which have no `node_status` rows).
+///
+/// This closes the "node-status write gap" the DAG scheduler opened in Task
+/// 2.1: [`build_task_prompt`] instructs spawned agents to report completion
+/// via the `update_task_status` MCP tool / `PUT /tasks/:id/status`, both of
+/// which write the `task_status` table. The DAG scheduler, however, reads
+/// `node_status`. Without this mirror a v2 plan would route to the scheduler
+/// (Task 2.2's headline) but never advance — the just-completed node would be
+/// invisible to [`try_dag_advance`]'s done-set.
+///
+/// Called from the two status-write sites **after** the `task_status` row is
+/// written, so for a v2 plan the same status lands in both tables. Sub-plan
+/// completion propagation (a node completing should auto-complete its parent
+/// when every sibling is done) is layered on top of these writes in Task 2.3.
+///
+/// `source` is recorded as `'manual'` (the status was reported by an
+/// agent/operator, not synthesised by [`claim_node`]'s `'auto'` claim).
+pub fn record_node_status_if_v2(
+    db: &Db,
+    plans_dir: &Path,
+    plan_name: &str,
+    node_id: &str,
+    status: &str,
+) {
+    if plan_parser::plan_file_schema_version(plans_dir, plan_name) < 2 {
+        return;
+    }
+    let conn = db.lock().unwrap();
+    let _ = conn.execute(
+        "INSERT INTO node_status (plan_name, node_id, status, source, updated_at)
+         VALUES (?1, ?2, ?3, 'manual', datetime('now'))
+         ON CONFLICT(plan_name, node_id)
+         DO UPDATE SET status = excluded.status,
+                       source = 'manual',
+                       updated_at = excluded.updated_at",
+        params![plan_name, node_id, status],
+    );
+}
+
 // ── Status snapshot + hydration ───────────────────────────────────────────
 
 /// Snapshot every `node_status` row for a plan into a
@@ -364,7 +405,6 @@ async fn spawn_dag_task_node(ctx: &SchedulerCtx<'_>, node: &DagNode, scoped_id: 
 /// Takes `registry` by value so callers (Phase 2.2's version router) can
 /// `tokio::spawn` it without lifetime gymnastics — same shape as
 /// `try_auto_advance`.
-#[allow(dead_code)] // wired in by Phase 2.2 (route try_auto_advance by version)
 pub async fn try_dag_advance(
     registry: AgentRegistry,
     plans_dir: PathBuf,
@@ -564,6 +604,78 @@ mod tests {
         assert!(claim_node(&db, "p", "n1"));
         // n2 claims even though n1's (and ag1's) work is in flight.
         assert!(claim_node(&db, "p", "n2"));
+    }
+
+    // ── record_node_status_if_v2 (node-status write gap) ──────────────────
+
+    #[test]
+    fn record_node_status_writes_for_v2_plan() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let plan = "rec-v2";
+        write_dag_plan(&plans_dir, plan, "  - id: a\n    type: task\n");
+
+        record_node_status_if_v2(&db, &plans_dir, plan, "a", "completed");
+
+        let conn = db.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM node_status WHERE plan_name = ?1 AND node_id = 'a'",
+                params![plan],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn record_node_status_is_noop_for_v1_plan() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan = "rec-v1";
+        // Legacy (v1) plan: no schema_version field.
+        std::fs::write(
+            plans_dir.join(format!("{plan}.yaml")),
+            "title: t\nphases:\n  - number: 1\n    title: P1\n    tasks:\n      - number: \"1.1\"\n        title: T\n",
+        )
+        .unwrap();
+
+        record_node_status_if_v2(&db, &plans_dir, plan, "1.1", "completed");
+
+        let conn = db.lock().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_status WHERE plan_name = ?1",
+                params![plan],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "v1 plan must not get a node_status row");
+    }
+
+    #[test]
+    fn record_node_status_overwrites_existing_claim() {
+        // claim_node writes 'in_progress'; a later completion report from the
+        // status-write site overwrites it to 'completed' — the path that lets
+        // the DAG advance past a node.
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let plan = "rec-overwrite";
+        write_dag_plan(&plans_dir, plan, "  - id: a\n    type: task\n");
+
+        assert!(claim_node(&db, plan, "a"));
+        record_node_status_if_v2(&db, &plans_dir, plan, "a", "completed");
+
+        let conn = db.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM node_status WHERE plan_name = ?1 AND node_id = 'a'",
+                params![plan],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
     }
 
     // ── ready-node identification (acceptance: diamond) ───────────────────

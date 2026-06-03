@@ -3218,6 +3218,18 @@ pub async fn set_task_status(
     );
     drop(db);
 
+    // Task 2.2 (DAG model): for `schema_version: 2` plans, `task_number` is a
+    // DAG node ID. Mirror the status into `node_status` so the DAG scheduler
+    // (which reads that table) sees the completion when the `try_auto_advance`
+    // trigger below routes to it. No-op for v1 plans.
+    crate::dag_scheduler::record_node_status_if_v2(
+        &state.db,
+        &state.plans_dir,
+        &name,
+        &task_number,
+        &body.status,
+    );
+
     // Broadcast so the dashboard updates in real-time
     crate::ws::broadcast_event(
         &state.broadcast_tx,

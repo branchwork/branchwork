@@ -517,6 +517,32 @@ pub fn detect_schema_version(raw: &str) -> u8 {
         .unwrap_or(1)
 }
 
+/// Detect a named plan's schema version (1 = legacy phases, 2 = DAG) by
+/// locating its file under `plans_dir` and probing the `schema_version`
+/// field. Markdown plans (which can't express the DAG model), missing files,
+/// and unreadable files all default to **1**.
+///
+/// This is the gate the version router ([`crate::agents::try_auto_advance`])
+/// uses to decide whether a plan is scheduled by the phase walker (v1) or the
+/// DAG scheduler (v2). Defaulting to v1 on any ambiguity means a transient
+/// read error can never misroute a legacy plan into the DAG path.
+pub fn plan_file_schema_version(plans_dir: &Path, name: &str) -> u8 {
+    let Some(path) = find_plan_file(plans_dir, name) else {
+        return 1;
+    };
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    if ext != "yaml" && ext != "yml" {
+        return 1;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => detect_schema_version(&raw),
+        Err(_) => 1,
+    }
+}
+
 // ── YAML parser ─────────────────────────────────────────────────────────────
 
 pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedPlan, String> {
@@ -716,7 +742,6 @@ pub fn is_plan_ext(path: &Path) -> bool {
 
 /// Parse a plan file and return a DagPlan (works for both v1 and v2).
 /// v1 plans are auto-converted via `parsed_plan_to_dag`.
-#[allow(dead_code)] // Wired in by Phase 2 (DAG scheduler)
 pub fn parse_plan_file_as_dag(file_path: &Path) -> std::io::Result<crate::dag::DagPlan> {
     let raw = std::fs::read_to_string(file_path)?;
     let name = file_path
@@ -2076,5 +2101,41 @@ phases:
             with_project > 0,
             "expected at least some plans to have inferred projects"
         );
+    }
+
+    // ── plan_file_schema_version (Task 2.2 version router gate) ───────────
+
+    #[test]
+    fn plan_file_schema_version_detects_v1_v2_and_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plans = dir.path();
+
+        // Explicit v2 YAML → 2.
+        std::fs::write(
+            plans.join("dag.yaml"),
+            "schema_version: 2\ntitle: t\nnodes: []\n",
+        )
+        .unwrap();
+        assert_eq!(plan_file_schema_version(plans, "dag"), 2);
+
+        // Legacy YAML with no schema_version → 1.
+        std::fs::write(plans.join("legacy.yaml"), "title: t\nphases: []\n").unwrap();
+        assert_eq!(plan_file_schema_version(plans, "legacy"), 1);
+
+        // Markdown plans can't express the DAG model → always 1, even if the
+        // body mentions schema_version.
+        std::fs::write(
+            plans.join("md-plan.md"),
+            "# Plan\n\nschema_version: 2 (just prose)\n",
+        )
+        .unwrap();
+        assert_eq!(plan_file_schema_version(plans, "md-plan"), 1);
+
+        // Missing file → 1 (defensive default: never misroute to the DAG path).
+        assert_eq!(plan_file_schema_version(plans, "does-not-exist"), 1);
+
+        // Malformed YAML → 1 (detect_schema_version swallows parse errors).
+        std::fs::write(plans.join("broken.yaml"), "schema_version: [oops\n").unwrap();
+        assert_eq!(plan_file_schema_version(plans, "broken"), 1);
     }
 }
