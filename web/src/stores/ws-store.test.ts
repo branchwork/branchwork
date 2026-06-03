@@ -124,9 +124,9 @@ describe("ws-store handleWsMessage", () => {
     const fetchAgents = vi.fn().mockResolvedValue(undefined);
     useAgentStore.setState({
       fetchAgents,
-      agents: [
-        { id: "agent-d", branch: "branchwork/p/3.1" },
-      ] as unknown as ReturnType<typeof useAgentStore.getState>["agents"],
+      agents: [{ id: "agent-d", branch: "branchwork/p/3.1" }] as unknown as ReturnType<
+        typeof useAgentStore.getState
+      >["agents"],
     });
 
     handleWsMessage({
@@ -174,6 +174,7 @@ describe("ws-store handleWsMessage", () => {
           maxFixAttempts: 3,
           pausedReason: null,
           parallel: false,
+          worktreeIsolation: false,
           runnerId: null,
           runnerFailover: "pause",
         },

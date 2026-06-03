@@ -104,10 +104,14 @@ export interface PlanConfig {
   /// the wire is normal. Cleared on resume by the server-side
   /// `auto_mode_resume` helper.
   pausedFiles?: string[] | null;
-  /// Per-plan opt-in for fan-out spawn (3.5.2). Toggling to true is rejected
-  /// at the API layer with 412 until worktree-per-agent isolation ships
-  /// (3.5.3) — the UI renders the switch disabled until then.
+  /// Per-plan opt-in for fan-out spawn (3.5.2). Rejected at the API layer
+  /// with 412 unless `worktreeIsolation` is also on — the UI gates the
+  /// Parallel switch on it.
   parallel: boolean;
+  /// Per-project opt-in for worktree-per-agent isolation (ADR 0002), the
+  /// prerequisite for `parallel`. Stored on `plan_project`; the UI renders
+  /// it as the Worktree-isolation switch and only enables Parallel when on.
+  worktreeIsolation: boolean;
   /// Per-plan runner pin (T11.4). `null` = "any online runner" (today's
   /// behaviour); set = pin every spawn for this plan to that runner. The
   /// dispatcher pauses the plan with `paused_reason='runner_offline'` if
@@ -126,6 +130,9 @@ export interface PlanConfigPatch {
   autoMode?: boolean;
   maxFixAttempts?: number;
   parallel?: boolean;
+  /// Per-project worktree-isolation opt-in. `false` also force-clears
+  /// `parallel` server-side (opt-in=false ⟹ parallel=false).
+  worktreeIsolation?: boolean;
   /// Explicit `null` clears the loop's self-pause and re-evaluates from the
   /// last completed task. Only the loop sets non-null values; the wire
   /// silently ignores non-null patches here.

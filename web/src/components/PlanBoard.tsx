@@ -940,12 +940,16 @@ const AUTO_MODE_TOOLTIP =
   "Auto-mode: merges each task on completion, waits for CI, fixes failures up to N times before pausing.";
 const AUTO_ADVANCE_TOOLTIP =
   "Auto-advance: when a task completes, automatically start the next ready task in the plan.";
-/// Hover text for the disabled Parallel switch. The toggle is rendered but
-/// inert until worktree-per-agent isolation (ADR 0002) ships and the
-/// project opts in. PUTs of `parallel: true` are rejected 412 in the
-/// meantime — keeping the switch visible documents the future capability
-/// without letting an operator trip the gate by accident.
-const PARALLEL_DISABLED_TOOLTIP = "Available once worktree isolation ships";
+/// Worktree-isolation opt-in (ADR 0002): the per-project prerequisite for
+/// running tasks in parallel. Each agent gets its own `git worktree`, so
+/// concurrent tasks don't trample a shared working tree.
+const WORKTREE_ISOLATION_TOOLTIP =
+  "Give each agent its own git worktree so tasks can run in parallel without sharing a working tree. Required before enabling Parallel.";
+/// Parallel fan-out, enabled once worktree isolation is on.
+const PARALLEL_TOOLTIP =
+  "Run independent ready tasks concurrently, each in its own worktree, instead of one at a time.";
+/// Why the Parallel switch is disabled when isolation is off.
+const PARALLEL_NEEDS_ISOLATION_TOOLTIP = "Enable Worktree isolation first.";
 
 /// Hover text for the per-plan Runner pin (T11.4). Explains the trade-off
 /// upfront so the user understands why the plan can pause if the pinned
@@ -1039,11 +1043,23 @@ function AutoModeControls({ planName }: { planName: string }) {
         onChange={(v) => update({ autoMode: v })}
       />
       <Switch
+        label="Worktree isolation"
+        title={WORKTREE_ISOLATION_TOOLTIP}
+        checked={config.worktreeIsolation}
+        disabled={busy}
+        // Turning isolation OFF also clears parallel (the server enforces
+        // opt-in=false ⟹ parallel=false; mirror it in the same PUT so the
+        // UI doesn't briefly show Parallel on with isolation off).
+        onChange={(v) =>
+          update(v ? { worktreeIsolation: true } : { worktreeIsolation: false, parallel: false })
+        }
+      />
+      <Switch
         label="Parallel"
-        title={PARALLEL_DISABLED_TOOLTIP}
+        title={config.worktreeIsolation ? PARALLEL_TOOLTIP : PARALLEL_NEEDS_ISOLATION_TOOLTIP}
         checked={config.parallel}
-        disabled
-        onChange={() => {}}
+        disabled={busy || !config.worktreeIsolation}
+        onChange={(v) => update({ parallel: v })}
       />
       <RunnerPicker
         runnerId={config.runnerId}

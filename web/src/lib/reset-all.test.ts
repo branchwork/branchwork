@@ -54,6 +54,7 @@ function seedAllStores() {
         maxFixAttempts: 3,
         pausedReason: null,
         parallel: false,
+        worktreeIsolation: false,
         runnerId: null,
         runnerFailover: "pause",
       },
