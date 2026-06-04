@@ -10,15 +10,18 @@
 //!
 //! Dispatch by node type:
 //! - **Task**: claim ([`claim_node`]) + spawn an agent in its own worktree.
-//! - **Gate**: left pending — the gate execution engine is Phase 3.
+//! - **Gate**: claim + run the Phase 3 engine ([`crate::gates::execute_gate`])
+//!   — `Passed` ⇒ complete + advance, `Failed` ⇒ fail the node, `Blocked` ⇒
+//!   leave `in_progress` (completion arrives out-of-band via the approval
+//!   API or the CI poller; the scheduler does not re-poll). Gate execution
+//!   needs the wired [`crate::state::AppState`]; when it's absent (pure unit
+//!   tests) the gate is left pending — graceful degradation.
 //! - **SubPlan**: claim the parent active + recurse into its children
 //!   (scoped IDs `<parent>.<child>`). Parent-completion propagation is
 //!   Phase 2.3.
 //!
 //! The mode router that decides v1 (phase walker) vs v2 (this scheduler) per
-//! plan is Phase 2.2 — until then [`try_dag_advance`] has no production
-//! caller, hence the `#[allow(dead_code)]` on the module declaration in
-//! `main.rs`.
+//! plan is Phase 2.2.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -71,6 +74,24 @@ fn claim_node(db: &Db, plan_name: &str, node_id: &str) -> bool {
         )
         .unwrap_or(0);
     updated > 0
+}
+
+/// Unconditionally set a node's `node_status` to `status` (upsert). Used by
+/// the gate engine wiring to record a gate's terminal verdict
+/// (`completed` / `failed`) or to revert a transiently-claimed node. The
+/// `claim_node` flip is conditional (only pending/failed → in_progress);
+/// this write is not — the scheduler has already decided the new status.
+fn set_node_status(db: &Db, plan_name: &str, node_id: &str, status: &str) {
+    let conn = db.lock().unwrap();
+    let _ = conn.execute(
+        "INSERT INTO node_status (plan_name, node_id, status, source, updated_at)
+         VALUES (?1, ?2, ?3, 'auto', datetime('now'))
+         ON CONFLICT(plan_name, node_id)
+         DO UPDATE SET status = excluded.status,
+                       source = 'auto',
+                       updated_at = excluded.updated_at",
+        params![plan_name, node_id, status],
+    );
 }
 
 /// Mirror a reported task status into the `node_status` table, but **only**
@@ -225,6 +246,12 @@ struct SchedulerCtx<'a> {
 /// `None`, inside a sub-plan otherwise), then recurse into active sub-plans.
 /// Returns nothing; claimed task node IDs are pushed onto `spawned`.
 ///
+/// `executed_gates` tracks gate node IDs already run in this advance call so
+/// the [`try_dag_advance`] re-loop (which re-evaluates after a gate passes)
+/// never executes the same gate twice. `progressed` is set when a gate
+/// transitions to `completed`, signalling the caller to re-snapshot and
+/// re-schedule (downstream nodes the gate just unblocked).
+///
 /// `async fn` recursion is boxed at the call site (`Box::pin(...).await`) to
 /// keep the future finite.
 async fn schedule_scope(
@@ -233,6 +260,8 @@ async fn schedule_scope(
     prefix: Option<&str>,
     done: &HashSet<String>,
     spawned: &mut Vec<String>,
+    executed_gates: &mut HashSet<String>,
+    progressed: &mut bool,
 ) {
     // Step 3 of the algorithm: find actionable nodes at this scope.
     let ready: Vec<&DagNode> = match prefix {
@@ -260,10 +289,87 @@ async fn schedule_scope(
                     spawned.push(scoped);
                 }
             }
-            // Step 5: gate execution (init / end / CI / approval) is the
-            // Phase 3 engine. Until then gates stay `pending` and the plan
-            // correctly blocks at the gate.
-            NodeType::Gate => {}
+            // Step 5: gate execution (init / end / CI / approval) — the
+            // Phase 3 engine. Gates run only when the `AppState` is wired
+            // (production + integration tests); in pure scheduler unit tests
+            // it's absent and the gate is left pending (graceful
+            // degradation, the plan correctly blocks at the gate).
+            NodeType::Gate => {
+                let Some(state) = ctx.registry.app_state.get() else {
+                    continue;
+                };
+                // Run each gate at most once per advance call — the re-loop
+                // below re-evaluates downstream after a gate passes, and we
+                // must not re-execute (e.g. re-run an End gate's compiles).
+                if executed_gates.contains(&scoped) {
+                    continue;
+                }
+                // Claim so concurrent advances don't double-execute (an End
+                // gate runs cargo build/test; two in the same dir clobber).
+                // A lost claim means another advance owns it, or it's
+                // already terminal — either way leave it.
+                if !claim_node(&ctx.registry.db, &ctx.dag.name, &scoped) {
+                    continue;
+                }
+                executed_gates.insert(scoped.clone());
+                broadcast_event(
+                    &ctx.registry.broadcast_tx,
+                    "node_status_changed",
+                    json!({
+                        "plan_name": ctx.dag.name,
+                        "node_id": scoped,
+                        "status": "in_progress",
+                    }),
+                );
+                match crate::gates::execute_gate(state, &ctx.dag.name, node).await {
+                    crate::gates::GateOutcome::Passed => {
+                        set_node_status(&ctx.registry.db, &ctx.dag.name, &scoped, "completed");
+                        broadcast_event(
+                            &ctx.registry.broadcast_tx,
+                            "node_status_changed",
+                            json!({
+                                "plan_name": ctx.dag.name,
+                                "node_id": scoped,
+                                "status": "completed",
+                            }),
+                        );
+                        // The done-set changed — re-loop to advance whatever
+                        // this gate just unblocked.
+                        *progressed = true;
+                    }
+                    crate::gates::GateOutcome::Failed(reason) => {
+                        set_node_status(&ctx.registry.db, &ctx.dag.name, &scoped, "failed");
+                        broadcast_event(
+                            &ctx.registry.broadcast_tx,
+                            "node_status_changed",
+                            json!({
+                                "plan_name": ctx.dag.name,
+                                "node_id": scoped,
+                                "status": "failed",
+                            }),
+                        );
+                        broadcast_event(
+                            &ctx.registry.broadcast_tx,
+                            "gate_failed",
+                            json!({
+                                "plan_name": ctx.dag.name,
+                                "node_id": scoped,
+                                "reason": reason,
+                            }),
+                        );
+                    }
+                    // Blocked: the claim already set the node `in_progress`,
+                    // and `execute_gate` broadcast the
+                    // `gate_ready_for_approval` / `gate_awaiting_approval`
+                    // event. The scheduler does NOT re-poll a blocked gate;
+                    // completion arrives out-of-band — the approval API
+                    // (init / approval gates) or the CI poller (ci / end
+                    // gates whose CI is still in flight; that hook is a
+                    // follow-up). Leaving it `in_progress` keeps `ready_nodes`
+                    // from re-evaluating it.
+                    crate::gates::GateOutcome::Blocked(_reason) => {}
+                }
+            }
             // Step 6: mark the sub-plan active so it isn't re-claimed; the
             // recursion below schedules its children.
             NodeType::SubPlan => {
@@ -295,6 +401,8 @@ async fn schedule_scope(
             Some(&scoped),
             done,
             spawned,
+            executed_gates,
+            progressed,
         ))
         .await;
     }
@@ -431,14 +539,9 @@ pub async fn try_dag_advance(
         Err(_) => return,
     };
 
-    // Step 2: snapshot node statuses → hydrate the in-memory plan + build
-    // the done-set (completed | skipped node IDs).
-    let status_map = snapshot_node_statuses(&registry.db, &plan_name);
-    hydrate_statuses(&mut dag.nodes, None, &status_map);
-    let done_set = done_node_ids(&status_map);
-
     // Budget + work_dir (mirrors try_auto_advance). Budget exhausted ⇒
-    // return without spawning.
+    // return without spawning. Both are plan-static, so they're computed
+    // once and reused across the re-loop below.
     let budget = match remaining_budget(&registry.db, &plan_name) {
         Ok(b) => b,
         Err(_) => return,
@@ -451,16 +554,54 @@ pub async fn try_dag_advance(
             .unwrap_or_else(|| std::env::current_dir().unwrap())
     };
 
-    let ctx = SchedulerCtx {
-        registry: &registry,
-        dag: &dag,
-        effort,
-        port,
-        budget,
-        work_dir: &work_dir,
-    };
     let mut spawned: Vec<String> = Vec::new();
-    schedule_scope(&ctx, &dag.nodes, None, &done_set, &mut spawned).await;
+    // Gate nodes already executed in this advance call (run at most once).
+    let mut executed_gates: HashSet<String> = HashSet::new();
+
+    // Re-loop: a gate transitioning to `completed` (Passed) changes the
+    // done-set, so re-snapshot and re-schedule to advance whatever the gate
+    // just unblocked within the same call. Bounded: each gate executes at
+    // most once (`executed_gates` + the per-node claim) and task spawns
+    // never set `progressed`, so the loop terminates once the last reachable
+    // gate settles. The counter is a backstop against an unforeseen cycle.
+    let mut guard = 0u32;
+    loop {
+        guard += 1;
+        if guard > 64 {
+            eprintln!("[dag-scheduler] advance re-loop guard tripped for plan {plan_name}");
+            break;
+        }
+
+        // Step 2 (per pass): snapshot node statuses → hydrate the in-memory
+        // plan + rebuild the done-set (completed | skipped node IDs).
+        let status_map = snapshot_node_statuses(&registry.db, &plan_name);
+        hydrate_statuses(&mut dag.nodes, None, &status_map);
+        let done_set = done_node_ids(&status_map);
+
+        let ctx = SchedulerCtx {
+            registry: &registry,
+            dag: &dag,
+            effort,
+            port,
+            budget,
+            work_dir: &work_dir,
+        };
+        let mut progressed = false;
+        schedule_scope(
+            &ctx,
+            &dag.nodes,
+            None,
+            &done_set,
+            &mut spawned,
+            &mut executed_gates,
+            &mut progressed,
+        )
+        .await;
+
+        if !progressed {
+            break;
+        }
+    }
 
     // `node_advanced` fires only when at least one node was actually claimed
     // + spawned. If every candidate lost the claim race (a concurrent
@@ -536,6 +677,32 @@ mod tests {
             out.push(e);
         }
         out
+    }
+
+    /// Wire an `AppState` into the registry so gate nodes execute (the
+    /// production path). The `OnceLock` is `Arc`-shared, so setting it on
+    /// `registry` makes it visible to the clone `try_dag_advance` receives by
+    /// value. `plans_dir` must match the one passed to `try_dag_advance` so
+    /// the gate engine's `project_dir_for` resolves. The circular
+    /// `registry → AppState → registry` `Arc` leaks at process end — fine for
+    /// a test.
+    fn wire_app_state(registry: &AgentRegistry, db: Db, plans_dir: PathBuf) {
+        use std::sync::{Arc, Mutex as StdMutex};
+        let state = crate::state::AppState {
+            db,
+            plans_dir,
+            port: 3100,
+            effort: Arc::new(StdMutex::new(Effort::High)),
+            broadcast_tx: registry.broadcast_tx.clone(),
+            registry: registry.clone(),
+            runners: crate::saas::runner_ws::new_runner_registry(),
+            settings_path: PathBuf::from("/tmp/branchwork-dag-gate-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(HashSet::new())),
+            started_at: std::time::Instant::now(),
+        };
+        let _ = registry.app_state.set(state);
     }
 
     // ── claim_node ──────────────────────────────────────────────────────
@@ -906,16 +1073,16 @@ nodes:
         assert_eq!(claimed, 0, "no node claimed when advance is gated off");
     }
 
-    /// A gate node whose deps are satisfied is left `pending` (no claim, no
-    /// spawn) — gate execution is Phase 3. Downstream task nodes that depend
-    /// on the gate therefore stay blocked.
+    /// Graceful degradation: when the `AppState` is not wired into the
+    /// registry (pure scheduler unit test), gate nodes are left `pending`
+    /// (no claim, no spawn) and downstream task nodes stay blocked. Real
+    /// gate execution is exercised by the app_state-wired tests below and by
+    /// the unit tests in `crate::gates`.
     #[tokio::test]
-    async fn gate_node_is_left_pending_blocking_downstream() {
+    async fn gate_left_pending_when_app_state_unwired() {
         let (db, dir) = fresh_db();
         let plans_dir = dir.path().join("plans");
         let plan_name = "dag-gate-block";
-        // init completed → `gate` (a non-init gate) is ready, `a` depends on
-        // `gate`. We expect `gate` to stay pending and `a` to stay unclaimed.
         let nodes = r#"  - id: init
     type: gate
     gate_kind: init
@@ -943,6 +1110,7 @@ nodes:
         }
 
         let (registry, _rx) = test_registry(db.clone());
+        // NOTE: app_state intentionally NOT wired.
         try_dag_advance(
             registry,
             plans_dir,
@@ -954,7 +1122,6 @@ nodes:
         .await;
 
         let conn = db.lock().unwrap();
-        // Gate left pending (no row written by the scheduler).
         let gate_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM node_status WHERE plan_name = ?1 AND node_id = 'gate'",
@@ -962,8 +1129,7 @@ nodes:
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(gate_rows, 0, "gate must stay pending (Phase 3 executes it)");
-        // Downstream task blocked.
+        assert_eq!(gate_rows, 0, "gate must stay pending without app_state");
         let a_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM node_status WHERE plan_name = ?1 AND node_id = 'a'",
@@ -972,5 +1138,177 @@ nodes:
             )
             .unwrap();
         assert_eq!(a_rows, 0, "task behind an un-executed gate must not spawn");
+    }
+
+    /// With `AppState` wired, an **approval** gate executes, returns
+    /// `Blocked`, and the scheduler leaves it `in_progress` (claimed) while
+    /// keeping downstream tasks blocked — and broadcasts
+    /// `gate_awaiting_approval` so the dashboard can surface it.
+    #[tokio::test]
+    async fn approval_gate_blocks_downstream_with_app_state() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let plan_name = "dag-approval-block";
+        let nodes = r#"  - id: init
+    type: gate
+    gate_kind: init
+  - id: approve
+    type: gate
+    gate_kind: approval
+    depends_on: [init]
+  - id: a
+    type: task
+    depends_on: [approve]
+"#;
+        write_dag_plan(&plans_dir, plan_name, nodes);
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO node_status (plan_name, node_id, status) VALUES (?1, 'init', 'completed')",
+                params![plan_name],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+
+        let (registry, mut rx) = test_registry(db.clone());
+        wire_app_state(&registry, db.clone(), plans_dir.clone());
+        try_dag_advance(
+            registry,
+            plans_dir,
+            plan_name.to_string(),
+            Some("init".to_string()),
+            Effort::High,
+            3100,
+        )
+        .await;
+
+        let conn = db.lock().unwrap();
+        let approve_status: String = conn
+            .query_row(
+                "SELECT status FROM node_status WHERE plan_name = ?1 AND node_id = 'approve'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            approve_status, "in_progress",
+            "blocked approval gate stays in_progress (not re-polled)"
+        );
+        let a_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_status WHERE plan_name = ?1 AND node_id = 'a'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_rows, 0, "task behind a blocked gate must not spawn");
+        drop(conn);
+
+        let events = collect_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("\"type\":\"gate_awaiting_approval\"")),
+            "expected gate_awaiting_approval broadcast, got {events:?}"
+        );
+    }
+
+    /// With `AppState` wired, a **CI** gate over a project with no
+    /// `.github/workflows` (the test's project dir does not exist on disk) is
+    /// vacuously green ⇒ `Passed`. The scheduler completes it and the re-loop
+    /// advances the downstream task in the *same* `try_dag_advance` call.
+    #[tokio::test]
+    async fn vacuous_ci_gate_passes_and_unblocks_downstream() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let plan_name = "dag-ci-vacuous";
+        let nodes = r#"  - id: init
+    type: gate
+    gate_kind: init
+  - id: gate
+    type: gate
+    gate_kind: ci
+    depends_on: [init]
+  - id: a
+    type: task
+    title: "After CI"
+    depends_on: [gate]
+"#;
+        write_dag_plan(&plans_dir, plan_name, nodes);
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO node_status (plan_name, node_id, status) VALUES (?1, 'init', 'completed')",
+                params![plan_name],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+
+        let (registry, mut rx) = test_registry(db.clone());
+        wire_app_state(&registry, db.clone(), plans_dir.clone());
+        try_dag_advance(
+            registry,
+            plans_dir,
+            plan_name.to_string(),
+            Some("init".to_string()),
+            Effort::High,
+            3100,
+        )
+        .await;
+
+        let conn = db.lock().unwrap();
+        let gate_status: String = conn
+            .query_row(
+                "SELECT status FROM node_status WHERE plan_name = ?1 AND node_id = 'gate'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            gate_status, "completed",
+            "vacuous CI gate (no workflows) must pass"
+        );
+        // The re-loop advanced `a` after the gate completed.
+        let a_status: String = conn
+            .query_row(
+                "SELECT status FROM node_status WHERE plan_name = ?1 AND node_id = 'a'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a_status, "in_progress",
+            "task must spawn once CI gate passes"
+        );
+        // start_pty_agent inserted an agents row for `a` (worktree setup
+        // fails on the fake project dir, but the row + claim persist).
+        let agent_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE plan_name = ?1 AND task_id = 'a'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_count, 1, "downstream task must have spawned an agent");
+        drop(conn);
+
+        // A single `node_advanced` names the spawned task.
+        let events = collect_events(&mut rx);
+        let advanced: Vec<&String> = events
+            .iter()
+            .filter(|e| e.contains("\"type\":\"node_advanced\""))
+            .collect();
+        assert_eq!(advanced.len(), 1, "exactly one node_advanced broadcast");
+        assert!(advanced[0].contains("\"a\""), "names a: {}", advanced[0]);
     }
 }
