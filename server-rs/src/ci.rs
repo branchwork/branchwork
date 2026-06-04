@@ -37,7 +37,7 @@ const MAX_RUN_AGE_SECS: i64 = 30 * 60;
 
 // ── Detection helpers ───────────────────────────────────────────────────────
 
-fn has_github_actions(cwd: &Path) -> bool {
+pub(crate) fn has_github_actions(cwd: &Path) -> bool {
     let workflows = cwd.join(".github").join("workflows");
     let Ok(entries) = std::fs::read_dir(&workflows) else {
         return false;

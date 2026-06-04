@@ -856,25 +856,53 @@ pub(crate) async fn run_pre_merge_gate(
         };
     let worktree_path = worktree.path().to_path_buf();
 
-    // Track start time for the whole-gate ceiling. We don't subtract
-    // it from the per-check budget directly — the brief says fail
-    // CLOSED if the cumulative time exceeds the cap.
-    let started = Instant::now();
+    // Run the configured checks against the worktree. The whole-gate
+    // ceiling + per-check timeouts + short-circuit-on-first-failure live in
+    // the shared [`run_pre_merge_checks_in`] runner so the DAG End gate's
+    // `compiles` check (which runs against the project's merged
+    // default-branch tree, not a per-agent worktree) reuses the exact same
+    // machinery.
+    let outcome = run_pre_merge_checks_in(checks, &worktree_path, total_timeout).await;
 
+    // Preserve the pre-T1.2 behaviour where the dashboard learns of a
+    // whole-gate timeout the moment the gate gives up. The caller pauses on
+    // any `Fail` too, but this keeps the early `PAUSED` pill signal.
+    if let GateOutcome::Fail { check, .. } = &outcome
+        && check == "_total_timeout_"
+    {
+        broadcast_state(state, plan_name, task_id, state_labels::PAUSED, None, None);
+    }
+    outcome
+}
+
+/// Run a list of `[auto_mode.pre_merge_checks]` against `base_dir`,
+/// short-circuiting on the first failure.
+///
+/// Each check runs via `sh -c` in `base_dir/<check.cwd or .>` with its own
+/// `timeout_secs`; the cumulative wall-clock is capped at `total_timeout`
+/// (fail-closed past the ceiling, surfaced as the synthetic check name
+/// `_total_timeout_`). Shared by [`run_pre_merge_gate`] (which runs against
+/// a fresh worktree at the agent's branch tip) and the DAG End gate's
+/// `compiles` check (which runs against the project's merged default-branch
+/// working tree) so both honour identical timeout + short-circuit
+/// semantics. The caller owns config resolution and any broadcast on the
+/// returned outcome.
+pub(crate) async fn run_pre_merge_checks_in(
+    checks: &[crate::repo_config::PreMergeCheck],
+    base_dir: &std::path::Path,
+    total_timeout: Duration,
+) -> GateOutcome {
+    let started = Instant::now();
     for check in checks {
-        // Compute the cwd for this check: `<worktree>/<check.cwd or .>`.
+        // Compute the cwd for this check: `<base_dir>/<check.cwd or .>`.
         let cwd = match check.cwd.as_deref() {
-            Some(sub) if !sub.is_empty() => worktree_path.join(sub),
-            _ => worktree_path.clone(),
+            Some(sub) if !sub.is_empty() => base_dir.join(sub),
+            _ => base_dir.to_path_buf(),
         };
 
-        // Honor the whole-gate ceiling: if we're already past it,
-        // fail closed without running another check. (Plan name is
-        // synthetic so the audit row + pause reason both name the
-        // explicit ceiling rather than the check that happened to be
-        // next in line — easier to triage.)
+        // Honor the whole-gate ceiling: if we're already past it, fail
+        // closed without running another check.
         if started.elapsed() >= total_timeout {
-            broadcast_state(state, plan_name, task_id, state_labels::PAUSED, None, None);
             return GateOutcome::Fail {
                 check: "_total_timeout_".to_string(),
                 exit_code: None,
@@ -888,8 +916,7 @@ pub(crate) async fn run_pre_merge_gate(
         }
 
         let per_check_timeout = Duration::from_secs(check.timeout_secs as u64);
-        let outcome = run_single_check(&check.cmd, &cwd, per_check_timeout).await;
-        match outcome {
+        match run_single_check(&check.cmd, &cwd, per_check_timeout).await {
             SingleCheckOutcome::Passed => {
                 // Continue to the next check.
             }
