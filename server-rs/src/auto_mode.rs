@@ -1589,12 +1589,27 @@ fn broadcast_state(
     broadcast_event(&state.broadcast_tx, "auto_mode_state", payload);
 }
 
-/// Mark `agent_id` as `merge_status='deferred_for_cadence'`, broadcast
-/// `auto_mode_merge_deferred` and the matching `auto_mode_state(deferred)`
-/// pill update, and write an audit row. Used by [`run_state_machine`]
-/// when [`should_merge_now`] returns false on a clean task completion.
+/// Mark `agent_id` as `merge_status='deferred_for_cadence'`, mark the
+/// task `completed` (the agent finished cleanly; only the *merge* is
+/// pending), broadcast `auto_mode_merge_deferred`, `task_status_changed`,
+/// and the matching `auto_mode_state(deferred)` pill update, and write an
+/// audit row. Used by [`run_state_machine`] when [`should_merge_now`]
+/// returns false on a clean task completion.
+///
 /// The agent's `branch` column is left intact — the cadence-boundary
 /// drain reads it back when it's time to merge.
+///
+/// Why mark the task completed here: task completion used to depend on the
+/// agent self-reporting via the MCP `update_task_status` tool, which is
+/// best-effort — agents that forgot to call it left the task stuck at
+/// `in_progress` forever even though the branch was ready, while agents
+/// that did call it showed `completed`. Two identical underlying states
+/// rendered differently. Authoring the status server-side here makes it
+/// deterministic. `source='auto'` so a manual user edit still wins (and a
+/// future auto re-sync can overwrite — auto rows are overwriteable, T2.3
+/// of the navbar plan). The UI distinguishes "done, will merge later" from
+/// "done, already merged" via the agent's `merge_status='deferred_for_cadence'`
+/// (the "Awaiting cadence" pill in `TaskCard.tsx`).
 async fn defer_for_cadence(
     state: &AppState,
     org_id: &str,
@@ -1610,6 +1625,16 @@ async fn defer_for_cadence(
             params![agent_id],
         )
         .ok();
+        conn.execute(
+            "INSERT INTO task_status (plan_name, task_number, status, source, updated_at) \
+             VALUES (?1, ?2, 'completed', 'auto', datetime('now')) \
+             ON CONFLICT(plan_name, task_number) \
+             DO UPDATE SET status = excluded.status, \
+                           source = 'auto', \
+                           updated_at = excluded.updated_at",
+            params![plan_name, task_id],
+        )
+        .ok();
     }
 
     let cadence_wire = db::merge_cadence_wire(cadence);
@@ -1623,6 +1648,16 @@ async fn defer_for_cadence(
         &state.broadcast_tx,
         "auto_mode_merge_deferred",
         payload.clone(),
+    );
+    broadcast_event(
+        &state.broadcast_tx,
+        "task_status_changed",
+        serde_json::json!({
+            "plan_name": plan_name,
+            "task_number": task_id,
+            "status": "completed",
+            "reason": "auto_mode: agent finished clean, merge deferred for cadence",
+        }),
     );
     broadcast_state(
         state,
@@ -8911,7 +8946,9 @@ mod tests {
 
     /// Direct cover for [`defer_for_cadence`]: a non-boundary completion
     /// stamps `merge_status='deferred_for_cadence'` on the agent row,
-    /// emits the `auto_mode_merge_deferred` broadcast, and audits the
+    /// marks the task `completed/auto` (server-authored, no longer
+    /// dependent on the agent self-reporting via MCP), emits the
+    /// `auto_mode_merge_deferred` broadcast, and audits the
     /// `AUTO_MODE_MERGE_DEFERRED` action. The agent's `branch` column
     /// is left intact so the eventual drain can find the branch back.
     #[tokio::test]
@@ -8954,6 +8991,27 @@ mod tests {
             .unwrap_or(None)
         };
         assert_eq!(branch.as_deref(), Some("branchwork/p/1.1"));
+
+        // Task is now server-authored as completed (source='auto') — this
+        // is the fix for the "stuck in_progress while ready to merge" bug,
+        // where completion used to depend on the agent self-reporting.
+        let (ts_status, ts_source): (Option<String>, Option<String>) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status, source FROM task_status \
+                 WHERE plan_name = 'p' AND task_number = '1.1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .unwrap_or((None, None))
+        };
+        assert_eq!(ts_status.as_deref(), Some("completed"));
+        assert_eq!(ts_source.as_deref(), Some("auto"));
 
         // Broadcast payload carries plan/task/agent_id/cadence.
         let payloads = drain_merge_deferred_payloads(&mut rx);

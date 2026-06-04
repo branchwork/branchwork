@@ -1139,6 +1139,14 @@ impl AgentRegistry {
         // the row pointing at a ghost; the merge banner keeps offering an
         // action that can't succeed.
         self.reconcile_orphaned_branches().await;
+
+        // Fourth pass: unstick tasks whose agent finished clean and was
+        // deferred for cadence (branch ready, merge pending) but whose
+        // `task_status` was never advanced to `completed` — the
+        // pre-fix bug where completion depended on the agent self-reporting
+        // via MCP. `defer_for_cadence` now writes the status server-side,
+        // so this only matters for rows that wedged before the fix shipped.
+        self.reconcile_deferred_task_statuses().await;
     }
 
     /// Revert `task_status` rows stuck in `checking` when their check-agent
@@ -1265,6 +1273,110 @@ impl AgentRegistry {
                     );
                 }
             }
+        }
+    }
+
+    /// Upgrade tasks that are wedged at `in_progress`/`pending` despite
+    /// having an agent that finished cleanly and is sitting on
+    /// `merge_status='deferred_for_cadence'` with its branch intact.
+    ///
+    /// Before the `defer_for_cadence` fix, task completion was authored by
+    /// the agent self-reporting via the MCP `update_task_status` tool. When
+    /// an agent forgot to call it, the task stayed `in_progress` forever
+    /// even though the branch was ready to merge — identical to a sibling
+    /// task whose agent *did* self-report and showed `completed`. This boot
+    /// sweep drains that backlog idempotently.
+    ///
+    /// Conservative by design — it only touches tasks whose status is
+    /// `in_progress`, `pending`, or absent. A `failed`/`skipped`/`completed`
+    /// row reflects a real outcome (CI failure, user skip, already-merged)
+    /// and is left alone. Tasks with a still-live agent are skipped so a
+    /// fresh re-run isn't stomped.
+    async fn reconcile_deferred_task_statuses(&self) {
+        // Distinct (plan, task) pairs that have a clean, deferred,
+        // branch-bearing agent. `status NOT IN (running, starting)` keeps
+        // us off tasks that are actively being worked again.
+        let candidates: Vec<(String, String)> = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = match db.prepare(
+                "SELECT DISTINCT plan_name, task_id FROM agents \
+                 WHERE merge_status = 'deferred_for_cadence' \
+                       AND branch IS NOT NULL \
+                       AND task_id IS NOT NULL \
+                       AND plan_name IS NOT NULL \
+                       AND status NOT IN ('running', 'starting')",
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map(|it| it.flatten().collect())
+                .unwrap_or_default()
+        };
+
+        for (plan_name, task_number) in candidates {
+            // Skip if a fresh agent is actively re-running this task.
+            let live = {
+                let db = self.db.lock().unwrap();
+                db.query_row(
+                    "SELECT 1 FROM agents \
+                     WHERE plan_name = ?1 AND task_id = ?2 \
+                           AND status IN ('running', 'starting') LIMIT 1",
+                    rusqlite::params![plan_name, task_number],
+                    |_| Ok(()),
+                )
+                .is_ok()
+            };
+            if live {
+                continue;
+            }
+
+            // Only upgrade from a non-terminal status. A missing row reads
+            // as implicit `pending`, which is also upgradeable.
+            let current: Option<String> = {
+                let db = self.db.lock().unwrap();
+                db.query_row(
+                    "SELECT status FROM task_status WHERE plan_name = ?1 AND task_number = ?2",
+                    rusqlite::params![plan_name, task_number],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+            };
+            let upgradeable = matches!(
+                current.as_deref(),
+                None | Some("in_progress") | Some("pending")
+            );
+            if !upgradeable {
+                continue;
+            }
+
+            {
+                let db = self.db.lock().unwrap();
+                db.execute(
+                    "INSERT INTO task_status (plan_name, task_number, status, source, updated_at) \
+                     VALUES (?1, ?2, 'completed', 'auto', datetime('now')) \
+                     ON CONFLICT(plan_name, task_number) \
+                     DO UPDATE SET status = excluded.status, \
+                                   source = 'auto', \
+                                   updated_at = datetime('now')",
+                    rusqlite::params![plan_name, task_number],
+                )
+                .ok();
+            }
+            broadcast_event(
+                &self.broadcast_tx,
+                "task_status_changed",
+                serde_json::json!({
+                    "plan_name": plan_name,
+                    "task_number": task_number,
+                    "status": "completed",
+                    "reason": "boot_sweep: deferred-for-cadence agent finished clean, branch ready",
+                }),
+            );
+            println!(
+                "[Branchwork] Unstuck deferred task {plan_name}/{task_number} → completed \
+                 (agent finished clean, merge pending cadence)"
+            );
         }
     }
 
@@ -3831,6 +3943,91 @@ mod tests {
             task_status_of(&db, "p1", "1.6").as_deref(),
             Some("checking"),
             "live check-agent must keep task_status at checking"
+        );
+    }
+
+    /// Insert an agent that finished clean and was deferred for cadence —
+    /// branch intact, `merge_status='deferred_for_cadence'`, status not in
+    /// the running/starting set.
+    fn insert_deferred_agent(db: &Db, id: &str, plan_name: &str, task_id: &str, branch: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents \
+                 (id, cwd, status, mode, plan_name, task_id, branch, merge_status) \
+             VALUES (?1, '/tmp/proj', 'completed', 'pty', ?2, ?3, ?4, 'deferred_for_cadence')",
+            params![id, plan_name, task_id, branch],
+        )
+        .unwrap();
+    }
+
+    /// The Phase-1 fix: a task wedged at `in_progress` whose agent finished
+    /// clean and is sitting on `deferred_for_cadence` (branch ready) gets
+    /// drained to `completed` by the boot sweep — and stays `in_progress`
+    /// for the terminal/live cases that must be left alone.
+    #[tokio::test]
+    async fn reconcile_deferred_unsticks_in_progress_but_respects_terminal_and_live() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // (a) The bug: stuck in_progress, deferred agent with branch ready.
+        set_task_status(&db, "p1", "2.3", "in_progress");
+        insert_deferred_agent(&db, "ag-2.3", "p1", "2.3", "branchwork/p1/2.3");
+
+        // (b) No task_status row at all (implicit pending) — also upgradeable.
+        insert_deferred_agent(&db, "ag-2.4", "p1", "2.4", "branchwork/p1/2.4");
+
+        // (c) Terminal user/CI outcome must be left alone.
+        set_task_status(&db, "p1", "9.1", "failed");
+        insert_deferred_agent(&db, "ag-9.1", "p1", "9.1", "branchwork/p1/9.1");
+
+        // (d) A live re-run agent for the same task: skip (don't stomp it).
+        set_task_status(&db, "p1", "5.5", "in_progress");
+        insert_deferred_agent(&db, "ag-5.5-old", "p1", "5.5", "branchwork/p1/5.5");
+        insert_running_agent(&db, "ag-5.5-new", "p1", "5.5");
+
+        registry.reconcile_deferred_task_statuses().await;
+
+        assert_eq!(
+            task_status_of(&db, "p1", "2.3").as_deref(),
+            Some("completed"),
+            "(a) stuck in_progress + deferred branch → completed"
+        );
+        assert_eq!(
+            task_status_of(&db, "p1", "2.4").as_deref(),
+            Some("completed"),
+            "(b) implicit-pending + deferred branch → completed"
+        );
+        assert_eq!(
+            task_status_of(&db, "p1", "9.1").as_deref(),
+            Some("failed"),
+            "(c) terminal 'failed' must be left alone"
+        );
+        assert_eq!(
+            task_status_of(&db, "p1", "5.5").as_deref(),
+            Some("in_progress"),
+            "(d) task with a live re-run agent must not be stomped"
+        );
+
+        // Source is 'auto' so a manual edit can still override later.
+        let source: Option<String> = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT source FROM task_status WHERE plan_name = 'p1' AND task_number = '2.3'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        assert_eq!(source.as_deref(), Some("auto"));
+
+        // Each upgraded task broadcasts a task_status_changed(completed).
+        let events = drain_events(&mut rx);
+        assert!(
+            events.iter().any(|e| e.contains("task_status_changed")
+                && e.contains("2.3")
+                && e.contains("completed")),
+            "expected task_status_changed for 2.3 in {events:?}"
         );
     }
 
