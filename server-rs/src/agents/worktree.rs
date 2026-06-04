@@ -338,12 +338,27 @@ pub(crate) fn setup_worktree_in(
         WorktreeError::BasePathInvalid(format!("non-utf8 worktree path: {}", path.display()))
     })?;
 
-    if is_continue && branch_exists(project_dir, branch) {
-        // Re-attach a worktree to the agent's existing branch.
+    // The decision is purely "does the per-task branch already exist?", not
+    // `is_continue`. A `continue` resumes the branch; a fresh re-run of a
+    // task whose prior branch is still parked (unmerged / not yet discarded)
+    // ALSO finds the branch — and the old `-b` path failed there with
+    // "a branch named '…' already exists" (and a plain checkout fails with
+    // "already used by worktree at …" when a stale worktree still holds it).
+    // Both were the transient rerun-collision the operator hit. We keep
+    // `is_continue` in the signature for callers but don't branch on it here.
+    let _ = is_continue;
+    if branch_exists(project_dir, branch) {
+        // Free the branch from any stale worktree (a dead prior agent's — the
+        // spawn gate guarantees no *live* agent for this task), then check it
+        // out into the new per-agent worktree. Non-destructive: the branch is
+        // never deleted, so a prior attempt's commits survive. A re-run that
+        // wants a clean slate discards the branch first (which clears it),
+        // routing the next spawn to the fresh `-b` path below.
+        detach_branch_from_stale_worktree(project_dir, branch, &path);
         git_checked(project_dir, &["worktree", "add", path_str, branch])?;
     } else {
-        // Fresh start, or a continue whose branch was never created:
-        // branch off `base_branch` (or HEAD).
+        // Fresh start (or a continue whose branch was never created): branch
+        // off `base_branch` (or HEAD).
         let base_ref = base_branch.unwrap_or("HEAD");
         git_checked(
             project_dir,
@@ -352,6 +367,38 @@ pub(crate) fn setup_worktree_in(
     }
 
     Ok(path)
+}
+
+/// Remove any worktree (other than `target`) currently checked out on
+/// `branch`, so the new per-agent worktree can claim it. `git worktree add
+/// <path> <branch>` refuses to share a branch across worktrees, so when a
+/// prior agent's worktree for the same task is still on disk the checkout
+/// fails with "already used by worktree at …". This force-removes that stale
+/// worktree and prunes administrative entries for already-deleted dirs.
+///
+/// Best-effort: if listing or removal fails, the subsequent `git worktree
+/// add` surfaces the real error rather than this masking it.
+#[allow(dead_code)] // call sites land in Phase 2
+fn detach_branch_from_stale_worktree(project_dir: &Path, branch: &str, target: &Path) {
+    let out = match Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(project_dir)
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return,
+    };
+    let text = String::from_utf8_lossy(&out);
+    let target_canon = canonical_or_self(target);
+    for entry in parse_worktree_porcelain(&text) {
+        if entry.branch.as_deref() == Some(branch) && canonical_or_self(&entry.path) != target_canon
+        {
+            let _ = remove_worktree(project_dir, &entry.path);
+        }
+    }
+    // Drop administrative entries for now-deleted dirs so the branch ref is
+    // fully free for the checkout.
+    let _ = git_succeeds(project_dir, &["worktree", "prune"]);
 }
 
 /// Best-effort removal of a worktree, escalating force as needed:
@@ -1088,6 +1135,62 @@ mod tests {
             }
             other => panic!("expected GitCommandFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn setup_worktree_rerun_reuses_parked_branch_and_frees_stale_worktree() {
+        // The rerun-collision rough edge: a prior agent left the per-task
+        // branch parked in its worktree (unmerged / not discarded). A fresh
+        // re-run (is_continue=false) under a NEW agent id used to fail with
+        // "a branch named '…' already exists" / "already used by worktree at
+        // …". It must now succeed: free the stale worktree, reuse the branch.
+        let proj = TempDir::new().unwrap();
+        let base = TempDir::new().unwrap();
+        git_init_master(proj.path());
+
+        // First run (agent "aaaaaaaa") creates the branch + its worktree.
+        let first = setup_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            "p",
+            "2.3",
+            "aaaaaaaa1111",
+            "branchwork/p/2.3",
+            None,
+            false,
+        )
+        .expect("first run creates the branch worktree");
+        assert!(first.exists());
+
+        // Fresh re-run under a DIFFERENT agent id, same task/branch,
+        // is_continue=false — the exact case that used to hard-fail.
+        let second = setup_worktree_in(
+            base.path(),
+            proj.path(),
+            "proj",
+            "p",
+            "2.3",
+            "bbbbbbbb2222",
+            "branchwork/p/2.3",
+            None,
+            false,
+        )
+        .expect("re-run must succeed by freeing the stale worktree and reusing the branch");
+
+        assert!(second.exists(), "new per-agent worktree exists");
+        assert_ne!(first, second, "re-run gets its own worktree path");
+        assert!(
+            !first.exists(),
+            "the stale prior worktree must have been freed"
+        );
+        assert_eq!(
+            git_status_porcelain(&second),
+            "",
+            "the reused-branch worktree is a clean working tree"
+        );
+        // Branch is preserved (non-destructive) and now checked out at `second`.
+        assert!(branch_exists(proj.path(), "branchwork/p/2.3"));
     }
 
     #[test]
