@@ -12,6 +12,7 @@ mod dag;
 mod dag_scheduler;
 mod db;
 mod file_watcher;
+mod gates;
 mod git_helpers;
 mod hooks;
 mod mcp;
