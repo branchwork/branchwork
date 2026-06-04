@@ -1702,11 +1702,18 @@ export function AwaitingCadenceChip({ planName }: { planName: string }) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [flushing, setFlushing] = useState(false);
 
+  // Require a branch: a `deferred_for_cadence` row whose branch is gone
+  // (merged/discarded/reconciled-away) has nothing left to flush, so it
+  // must not inflate the count — otherwise the chip shows "N awaiting" with
+  // a Flush button that can never drain them (the server-side fix clears
+  // such dangling flags, but the guard keeps the count honest regardless).
   const count = useMemo(
     () =>
       agents.reduce(
         (n, a) =>
-          a.plan_name === planName && a.merge_status === "deferred_for_cadence" ? n + 1 : n,
+          a.plan_name === planName && a.merge_status === "deferred_for_cadence" && a.branch
+            ? n + 1
+            : n,
         0,
       ),
     [agents, planName],

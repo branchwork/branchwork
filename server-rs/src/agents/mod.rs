@@ -1147,6 +1147,15 @@ impl AgentRegistry {
         // via MCP. `defer_for_cadence` now writes the status server-side,
         // so this only matters for rows that wedged before the fix shipped.
         self.reconcile_deferred_task_statuses().await;
+
+        // Fifth pass: clear `merge_status='deferred_for_cadence'` on rows that
+        // have NO branch. A deferred row whose branch was merged/discarded/
+        // reconciled-away is a phantom "awaiting cadence" entry — counted by
+        // the dashboard chip but unmergeable, unflushable, and undismissable
+        // (every action is gated on the branch). The clear-branch paths now
+        // clear merge_status too, so this only drains rows that wedged before
+        // that fix shipped (and is a cheap belt-and-suspenders).
+        self.reconcile_dangling_deferred_flags().await;
     }
 
     /// Revert `task_status` rows stuck in `checking` when their check-agent
@@ -1380,6 +1389,56 @@ impl AgentRegistry {
         }
     }
 
+    /// Clear `merge_status='deferred_for_cadence'` on agent rows that have no
+    /// branch. Such a row is a phantom "awaiting cadence" entry: the
+    /// dashboard chip counts it, but the branch it was waiting to merge is
+    /// gone (merged, discarded, or reconciled away), so it can never be
+    /// flushed, merged, or dismissed — every action path is gated on the
+    /// branch. This drains the backlog left by the pre-fix clear-branch
+    /// paths (which cleared `branch` but not `merge_status`); the fixed paths
+    /// now clear both, so going forward this is just a cheap safety net.
+    async fn reconcile_dangling_deferred_flags(&self) {
+        let cleared: Vec<String> = {
+            let db = self.db.lock().unwrap();
+            let ids: Vec<String> = {
+                let mut stmt = match db.prepare(
+                    "SELECT id FROM agents \
+                     WHERE merge_status = 'deferred_for_cadence' AND branch IS NULL",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .map(|it| it.flatten().collect())
+                    .unwrap_or_default()
+            };
+            db.execute(
+                "UPDATE agents SET merge_status = NULL \
+                 WHERE merge_status = 'deferred_for_cadence' AND branch IS NULL",
+                [],
+            )
+            .ok();
+            ids
+        };
+
+        for agent_id in &cleared {
+            broadcast_event(
+                &self.broadcast_tx,
+                "agent_merge_status_cleared",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "reason": "boot_sweep: deferred-for-cadence flag with no branch to merge",
+                }),
+            );
+        }
+        if !cleared.is_empty() {
+            println!(
+                "[Branchwork] Cleared {} dangling deferred-for-cadence flag(s) with no branch",
+                cleared.len()
+            );
+        }
+    }
+
     /// Clear `agents.branch` for rows whose branch no longer resolves in
     /// the project's git. Called by [`cleanup_and_reattach`] on boot, so
     /// the merge banner stops offering an action that can't succeed when
@@ -1445,8 +1504,14 @@ impl AgentRegistry {
             }
             {
                 let db = self.db.lock().unwrap();
+                // Clear `merge_status` alongside `branch`: a row whose branch
+                // vanished can no longer be merged, so leaving
+                // `merge_status='deferred_for_cadence'` would strand it as a
+                // phantom "awaiting cadence" entry the user can't flush,
+                // merge, or dismiss (every action path is gated on the
+                // branch). See `reconcile_dangling_deferred_flags`.
                 db.execute(
-                    "UPDATE agents SET branch = NULL WHERE id = ?1",
+                    "UPDATE agents SET branch = NULL, merge_status = NULL WHERE id = ?1",
                     rusqlite::params![agent_id],
                 )
                 .ok();
@@ -4028,6 +4093,58 @@ mod tests {
                 && e.contains("2.3")
                 && e.contains("completed")),
             "expected task_status_changed for 2.3 in {events:?}"
+        );
+    }
+
+    fn agent_merge_status(db: &Db, id: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT merge_status FROM agents WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// A `deferred_for_cadence` row whose branch is gone is a phantom
+    /// "awaiting cadence" entry — unmergeable/unflushable/undismissable. The
+    /// boot sweep must clear its `merge_status`; a row that still has a
+    /// branch (genuinely pending merge) must be left alone.
+    #[tokio::test]
+    async fn reconcile_clears_dangling_deferred_flag_only_when_branch_is_gone() {
+        let (db, _dir) = fresh_db();
+        let (registry, mut rx) = test_registry(db.clone());
+
+        // Dangling: deferred flag but no branch — must be cleared.
+        insert_deferred_agent(&db, "dangling", "p1", "2.3", "branchwork/p1/2.3");
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("UPDATE agents SET branch = NULL WHERE id = 'dangling'", [])
+                .unwrap();
+        }
+        // Legit: deferred flag WITH a branch still parked — must remain.
+        insert_deferred_agent(&db, "legit", "p1", "2.4", "branchwork/p1/2.4");
+
+        registry.reconcile_dangling_deferred_flags().await;
+
+        assert_eq!(
+            agent_merge_status(&db, "dangling"),
+            None,
+            "branchless deferred flag must be cleared"
+        );
+        assert_eq!(
+            agent_merge_status(&db, "legit").as_deref(),
+            Some("deferred_for_cadence"),
+            "branch-bearing deferred flag must be left alone"
+        );
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("agent_merge_status_cleared") && e.contains("dangling")),
+            "expected agent_merge_status_cleared for the dangling row in {events:?}"
         );
     }
 

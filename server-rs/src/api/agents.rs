@@ -1496,8 +1496,12 @@ async fn discard_finalize(
 ) -> axum::response::Response {
     {
         let db = state.db.lock().unwrap();
+        // Clear `merge_status` alongside `branch`: discarding the branch
+        // means there's nothing left to merge, so a lingering
+        // `merge_status='deferred_for_cadence'` would keep the row counted as
+        // "awaiting cadence" with no branch to flush/merge/dismiss.
         db.execute(
-            "UPDATE agents SET branch = NULL WHERE branch = ?",
+            "UPDATE agents SET branch = NULL, merge_status = NULL WHERE branch = ?",
             params![task_branch],
         )
         .ok();
