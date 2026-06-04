@@ -329,6 +329,33 @@ pub async fn run_startup_sweep(state: AppState) {
 /// `worktree_orphans` (idempotent on the `path` PK). The early `return`s here
 /// skip only the recording pass — [`run_startup_sweep`] still runs the stale
 /// warning afterwards.
+/// Worktrees that must never be reported as orphans (and so never offered
+/// for reaping). Two cases:
+///   1. `finished_at IS NULL` — a live agent is actively working there.
+///   2. `branch IS NOT NULL` — the agent finished but its branch is still
+///      parked on disk, unmerged. This is the deferred-for-cadence /
+///      ready-to-merge case: the worktree holds real work waiting for the
+///      merge cadence boundary. Both merge and discard clear the `branch`
+///      column, so a non-null branch reliably means "unmerged work lives
+///      here" — reaping it would lose the branch. Without this, every
+///      cadence-deferred task's worktree got recorded as an orphan.
+///
+/// A global set is correct — `list_orphans` scopes by slug, and a protected
+/// worktree in any project should never be reported.
+fn protected_worktree_cwds(conn: &rusqlite::Connection) -> HashSet<PathBuf> {
+    let mut stmt = match conn.prepare(
+        "SELECT cwd FROM agents \
+         WHERE cwd IS NOT NULL AND (finished_at IS NULL OR branch IS NOT NULL)",
+    ) {
+        Ok(s) => s,
+        Err(_) => return HashSet::new(),
+    };
+    match stmt.query_map([], |row| row.get::<_, String>(0)) {
+        Ok(it) => it.flatten().map(PathBuf::from).collect(),
+        Err(_) => HashSet::new(),
+    }
+}
+
 async fn record_fresh_orphans(state: &AppState) {
     // Distinct (cwd, org_id) anchors. We need a still-existing git working
     // tree to derive each project's stable main-worktree root; both live
@@ -359,22 +386,9 @@ async fn record_fresh_orphans(state: &AppState) {
         return;
     }
 
-    // Live cwds: agents that have NOT finished. Their worktrees must never
-    // be reaped. A global set is correct — `list_orphans` scopes by slug,
-    // and a live agent in any project should never be reported.
-    let live_cwds: HashSet<PathBuf> = {
+    let protected_cwds = {
         let conn = state.db.lock().unwrap();
-        let mut stmt = match conn
-            .prepare("SELECT cwd FROM agents WHERE finished_at IS NULL AND cwd IS NOT NULL")
-        {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0));
-        match rows {
-            Ok(it) => it.flatten().map(PathBuf::from).collect(),
-            Err(_) => return,
-        }
+        protected_worktree_cwds(&conn)
     };
 
     // Resolve distinct (project_dir, org_id) from the anchors. The
@@ -399,7 +413,7 @@ async fn record_fresh_orphans(state: &AppState) {
             &org_id,
             &project_dir,
             &project_slug,
-            &live_cwds,
+            &protected_cwds,
         )
         .await
         {
@@ -476,6 +490,62 @@ fn stale_orphan_warning_line(o: &crate::db::StaleOrphanRow) -> String {
 mod tests {
     use super::*;
     use crate::db::StaleOrphanRow;
+
+    fn insert_agent(
+        conn: &rusqlite::Connection,
+        id: &str,
+        cwd: &str,
+        finished_at: Option<&str>,
+        branch: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO agents (id, cwd, status, mode, finished_at, branch) \
+             VALUES (?1, ?2, 'completed', 'pty', ?3, ?4)",
+            params![id, cwd, finished_at, branch],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn protected_cwds_covers_live_and_branch_parked_but_not_merged_orphans() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = crate::db::init(&dir.path().join("t.db"));
+        let conn = db.lock().unwrap();
+
+        // Live agent (still running) — protected via finished_at IS NULL.
+        insert_agent(&conn, "live", "/wt/live", None, None);
+        // Finished but branch parked, unmerged (deferred_for_cadence) — the
+        // case this fix protects.
+        insert_agent(
+            &conn,
+            "deferred",
+            "/wt/deferred",
+            Some("2026-06-04 00:00:00"),
+            Some("branchwork/p/2.3"),
+        );
+        // Finished AND merged (branch cleared) — a genuine orphan candidate,
+        // must NOT be protected.
+        insert_agent(
+            &conn,
+            "merged",
+            "/wt/merged",
+            Some("2026-06-04 00:00:00"),
+            None,
+        );
+
+        let protected = protected_worktree_cwds(&conn);
+
+        assert!(protected.contains(&PathBuf::from("/wt/live")), "live agent");
+        assert!(
+            protected.contains(&PathBuf::from("/wt/deferred")),
+            "branch-parked (deferred-for-cadence) worktree must be protected"
+        );
+        assert!(
+            !protected.contains(&PathBuf::from("/wt/merged")),
+            "merged (branch cleared) worktree is a real orphan candidate"
+        );
+        assert_eq!(protected.len(), 2);
+    }
 
     #[test]
     fn stale_orphan_warning_line_matches_spec_format() {
