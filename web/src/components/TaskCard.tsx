@@ -929,6 +929,16 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
             <div className="text-[9px] text-gray-600">
               &#8594; {branchAgent.source_branch ?? "main"}
             </div>
+            {/* The branch is parked in a per-agent worktree on disk until
+                it merges (the deferred-for-cadence / ready-to-merge case).
+                Surface it here so the operator can see — and clean up — the
+                checkout without digging through the admin orphan view; this
+                was previously only shown for a *running* agent, so a
+                finished, merge-pending task showed no worktree info at all.
+                `agents.cwd` is already on the wire — no backend change. */}
+            {isWorktreeCwd(branchAgent.cwd, branchAgent.id) && (
+              <WorktreePathRow cwd={branchAgent.cwd} label="worktree:" />
+            )}
           </div>
           <div className="flex-shrink-0 flex items-center gap-1">
             {confirmDiscard ? (
@@ -1057,6 +1067,12 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
 
 interface WorktreePathRowProps {
   cwd: string;
+  /// Leading label. "running in:" for a live agent (default); "worktree:"
+  /// for a finished agent whose branch is still parked on disk (the
+  /// merge-deferred / ready-to-merge case) — there the worktree isn't being
+  /// mutated, it's just sitting there holding the branch, so the present
+  /// tense would be misleading.
+  label?: string;
 }
 
 /// Small "running in: <worktree path>" row beneath the status pill (Task
@@ -1067,7 +1083,7 @@ interface WorktreePathRowProps {
 /// path survives instead of the leading base dirs. The full, untruncated
 /// path lives in the `title` attribute and is exactly what the copy button
 /// writes to the clipboard.
-function WorktreePathRow({ cwd }: WorktreePathRowProps) {
+function WorktreePathRow({ cwd, label = "running in:" }: WorktreePathRowProps) {
   const [copied, setCopied] = useState(false);
 
   // Split at the last separator so the meaningful final segment
@@ -1098,7 +1114,7 @@ function WorktreePathRow({ cwd }: WorktreePathRowProps) {
       className="mt-1.5 flex items-center gap-1 text-[10px] text-gray-500"
       data-testid="worktree-path-row"
     >
-      <span className="flex-shrink-0">running in:</span>
+      <span className="flex-shrink-0">{label}</span>
       <span className="flex min-w-0 flex-1 overflow-hidden font-mono text-gray-400" title={cwd}>
         <span className="truncate min-w-0">{head}</span>
         <span className="flex-shrink-0 whitespace-nowrap">{tail}</span>

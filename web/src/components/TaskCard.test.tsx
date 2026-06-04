@@ -1058,11 +1058,14 @@ describe("TaskCard worktree path indicator (Task 6.1)", () => {
     expect(screen.queryByTestId("worktree-path-row")).toBeNull();
   });
 
-  it("does NOT render when no agent is running (only a completed branch agent)", () => {
+  it("renders a 'worktree:' row (not 'running in:') for a finished branch agent", () => {
+    // Phase 2: a finished agent whose branch is parked on disk (the
+    // merge-deferred / ready-to-merge case) surfaces its worktree so the
+    // operator can see/clean up the checkout. The label is past-tense
+    // "worktree:" because nothing is mutating it — distinct from the live
+    // "running in:" row.
     const t = task({ number: "1.1", status: "completed" });
     seed(t, {
-      // Completed agent whose cwd is worktree-shaped — must still NOT show
-      // "running in" because the gate is on a running/starting agent.
       agents: [
         agent({
           id: WT_AGENT_ID,
@@ -1070,6 +1073,32 @@ describe("TaskCard worktree path indicator (Task 6.1)", () => {
           status: "completed",
           cwd: WT_CWD,
           branch: "branchwork/p1/1.1",
+          merge_status: "deferred_for_cadence",
+        }),
+      ],
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+
+    const row = screen.getByTestId("worktree-path-row");
+    expect(row.textContent).toMatch(/worktree:/);
+    expect(row.textContent).not.toMatch(/running in:/);
+    expect(row.querySelector(`[title="${WT_CWD}"]`)).not.toBeNull();
+  });
+
+  it("does NOT render any worktree row for a finished branch agent in legacy shared-cwd mode", () => {
+    // Branch parked at the bare project root (legacy, no per-agent
+    // worktree) carries no `-<short id>` suffix, so there's nothing to
+    // surface — the row stays hidden.
+    const t = task({ number: "1.1", status: "completed" });
+    seed(t, {
+      agents: [
+        agent({
+          id: WT_AGENT_ID,
+          task_id: "1.1",
+          status: "completed",
+          cwd: "/home/x/projects/myproj",
+          branch: "branchwork/p1/1.1",
+          merge_status: "deferred_for_cadence",
         }),
       ],
     });
