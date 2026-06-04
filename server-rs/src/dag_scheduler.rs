@@ -205,6 +205,68 @@ fn scope_id(prefix: Option<&str>, id: &str) -> String {
     }
 }
 
+/// Build the git branch name for a DAG task node:
+/// `branchwork/<plan>/<scoped_id>`.
+///
+/// This is the v2 (DAG) analogue of the v1 `branchwork/<plan>/<task_number>`
+/// convention. A top-level node uses its bare id (`wire-api` →
+/// `branchwork/my-plan/wire-api`); a sub-plan child uses its dotted scoped id
+/// (`integration.wire` → `branchwork/my-plan/integration.wire`) — dots are
+/// valid inside a git ref component.
+///
+/// Node IDs are author-written strings with no enforced charset, so the
+/// scoped id is passed through [`sanitize_branch_segment`] before
+/// interpolation to guarantee a valid git ref (otherwise
+/// `git worktree add -b …` would fail and the node would never spawn). For a
+/// well-formed id this is a no-op, so the acceptance case `wire-api` and every
+/// ordinary plan are unaffected. The plan name is already a validated slug, so
+/// only the node-id segment is sanitised — matching the v1 path, which trusts
+/// the (already-safe) plan slug too.
+fn dag_branch_name(plan_name: &str, scoped_id: &str) -> String {
+    format!(
+        "branchwork/{plan_name}/{}",
+        sanitize_branch_segment(scoped_id)
+    )
+}
+
+/// Sanitise a (possibly dotted) scoped node id into a git-ref-safe string.
+///
+/// Each dot-separated segment has any character outside `[A-Za-z0-9_-]`
+/// collapsed to `-`; empty segments (from a leading/trailing or doubled dot)
+/// are dropped, and the surviving segments are rejoined with `.`. This keeps
+/// the dotted scope structure (`parent.child`) while rejecting the ref-breaking
+/// shapes git forbids: spaces and `~^:?*[\`, ASCII control chars, `..`,
+/// leading/trailing dots. A trailing `.lock` (also rejected by git) is
+/// rewritten to `-lock`, and an id that sanitises away entirely falls back to
+/// `node`.
+fn sanitize_branch_segment(scoped_id: &str) -> String {
+    let mut joined = scoped_id
+        .split('.')
+        .map(|seg| {
+            seg.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+
+    if joined.is_empty() {
+        joined.push_str("node");
+    }
+    // Git rejects a ref component ending in `.lock`.
+    if let Some(stripped) = joined.strip_suffix(".lock") {
+        joined = format!("{stripped}-lock");
+    }
+    joined
+}
+
 /// Whether all of `node`'s dependencies are satisfied at the given scope.
 /// Sibling references (deps that name another node at this level) are scoped
 /// under `prefix`; anything else is treated as an already-scoped /
@@ -473,10 +535,11 @@ async fn spawn_dag_task_node(ctx: &SchedulerCtx<'_>, node: &DagNode, scoped_id: 
         mcp_available,
     );
 
-    // Branch naming for DAG task nodes is refined in Phase 2.4; the
-    // `branchwork/<plan>/<node>` shape matches the v1 convention and is a
-    // safe default (scoped IDs like `integration.wire` are valid git refs).
-    let branch_name = format!("branchwork/{}/{}", ctx.dag.name, scoped_id);
+    // Branch naming for DAG task nodes: `branchwork/<plan>/<node>` (the v2
+    // analogue of v1's `branchwork/<plan>/<task_number>`). Scoped sub-plan
+    // children carry their dotted id (`branchwork/<plan>/<parent>.<child>`).
+    // See [`dag_branch_name`] for the git-ref-safety guarantees.
+    let branch_name = dag_branch_name(&ctx.dag.name, scoped_id);
 
     pty_agent::start_pty_agent(
         ctx.registry,
@@ -845,6 +908,75 @@ mod tests {
         assert_eq!(status, "completed");
     }
 
+    // ── dag_branch_name (Phase 2.4 branch naming) ─────────────────────────
+
+    /// Acceptance: a v2 task node named `wire-api` spawns on branch
+    /// `branchwork/my-plan/wire-api`.
+    #[test]
+    fn dag_branch_name_uses_node_id_verbatim() {
+        assert_eq!(
+            dag_branch_name("my-plan", "wire-api"),
+            "branchwork/my-plan/wire-api"
+        );
+    }
+
+    /// Scoped sub-plan children keep their dotted id (dots are valid git refs).
+    #[test]
+    fn dag_branch_name_keeps_scoped_sub_plan_dots() {
+        assert_eq!(
+            dag_branch_name("my-plan", "integration.wire"),
+            "branchwork/my-plan/integration.wire"
+        );
+        // Deeply nested scope.
+        assert_eq!(dag_branch_name("p", "a.b.c"), "branchwork/p/a.b.c");
+    }
+
+    /// Common safe identifiers (underscores, digits, mixed case) pass through
+    /// unchanged — sanitisation must be a no-op for well-formed ids.
+    #[test]
+    fn dag_branch_name_noop_for_safe_ids() {
+        for id in ["a", "Task_1", "wire-api-2", "v1-2", "ABC.def_3"] {
+            assert_eq!(
+                dag_branch_name("p", id),
+                format!("branchwork/p/{id}"),
+                "safe id `{id}` must be unchanged"
+            );
+        }
+    }
+
+    /// Git-unsafe characters (space, `~^:?*[\`, control chars) collapse to `-`
+    /// so `git worktree add -b` can't be handed an invalid ref.
+    #[test]
+    fn dag_branch_name_sanitizes_unsafe_chars() {
+        assert_eq!(dag_branch_name("p", "wire api"), "branchwork/p/wire-api");
+        assert_eq!(dag_branch_name("p", "feature/x"), "branchwork/p/feature-x");
+        assert_eq!(
+            dag_branch_name("p", "a~b^c:d?e*f[g\\h"),
+            "branchwork/p/a-b-c-d-e-f-g-h"
+        );
+    }
+
+    /// Empty / doubled / edge dots are normalised away so no segment is empty
+    /// and the ref never starts or ends with `.` (both git-illegal).
+    #[test]
+    fn dag_branch_name_normalizes_dots() {
+        assert_eq!(dag_branch_name("p", "a..b"), "branchwork/p/a.b");
+        assert_eq!(dag_branch_name("p", ".lead"), "branchwork/p/lead");
+        assert_eq!(dag_branch_name("p", "trail."), "branchwork/p/trail");
+    }
+
+    /// A trailing `.lock` component (rejected by git) is rewritten.
+    #[test]
+    fn dag_branch_name_rewrites_dot_lock_suffix() {
+        assert_eq!(dag_branch_name("p", "foo.lock"), "branchwork/p/foo-lock");
+    }
+
+    /// An id that sanitises away entirely falls back to a non-empty stub.
+    #[test]
+    fn dag_branch_name_falls_back_when_id_empties_out() {
+        assert_eq!(dag_branch_name("p", "..."), "branchwork/p/node");
+    }
+
     // ── ready-node identification (acceptance: diamond) ───────────────────
 
     /// Acceptance: a diamond (init → A + B → merge → end) correctly
@@ -1025,6 +1157,128 @@ nodes:
             payload.contains("\"b\""),
             "node_advanced names b: {payload}"
         );
+    }
+
+    /// End-to-end acceptance: a v2 task node named `wire-api` spawns on the
+    /// branch `branchwork/<plan>/wire-api`. The fake project dir makes worktree
+    /// setup fail, but `start_pty_agent` still records the agent row — with the
+    /// branch column — on the failure path, so we can read the branch back.
+    #[tokio::test]
+    async fn wire_api_node_spawns_on_branchwork_plan_node_branch() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let plan_name = "my-plan";
+
+        // init (gate, pre-completed) → wire-api (task).
+        let nodes = r#"  - id: init
+    type: gate
+    gate_kind: init
+  - id: wire-api
+    type: task
+    title: "Wire the API"
+    depends_on: [init]
+"#;
+        write_dag_plan(&plans_dir, plan_name, nodes);
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO node_status (plan_name, node_id, status) VALUES (?1, 'init', 'completed')",
+                params![plan_name],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+
+        let (registry, _rx) = test_registry(db.clone());
+        try_dag_advance(
+            registry,
+            plans_dir,
+            plan_name.to_string(),
+            Some("init".to_string()),
+            Effort::High,
+            3100,
+        )
+        .await;
+
+        let conn = db.lock().unwrap();
+        let branch: String = conn
+            .query_row(
+                "SELECT branch FROM agents WHERE plan_name = ?1 AND task_id = 'wire-api'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .expect("an agent row for the wire-api node");
+        assert_eq!(branch, "branchwork/my-plan/wire-api");
+        // The task id stays the raw node id (only the branch is name-mapped).
+        let task_id: String = conn
+            .query_row(
+                "SELECT task_id FROM agents WHERE plan_name = ?1 AND task_id = 'wire-api'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_id, "wire-api");
+    }
+
+    /// A sub-plan child spawns on the dotted scoped branch
+    /// `branchwork/<plan>/<parent>.<child>`.
+    #[tokio::test]
+    async fn sub_plan_child_spawns_on_scoped_dotted_branch() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let plan_name = "scoped-plan";
+
+        // init (gate, pre-completed) → integration (sub-plan) → wire (task).
+        let nodes = r#"  - id: init
+    type: gate
+    gate_kind: init
+  - id: integration
+    type: sub_plan
+    depends_on: [init]
+    nodes:
+      - id: wire
+        type: task
+        title: "Wire"
+"#;
+        write_dag_plan(&plans_dir, plan_name, nodes);
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO node_status (plan_name, node_id, status) VALUES (?1, 'init', 'completed')",
+                params![plan_name],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+
+        let (registry, _rx) = test_registry(db.clone());
+        try_dag_advance(
+            registry,
+            plans_dir,
+            plan_name.to_string(),
+            Some("init".to_string()),
+            Effort::High,
+            3100,
+        )
+        .await;
+
+        let conn = db.lock().unwrap();
+        let branch: String = conn
+            .query_row(
+                "SELECT branch FROM agents WHERE plan_name = ?1 AND task_id = 'integration.wire'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .expect("an agent row for the integration.wire node");
+        assert_eq!(branch, "branchwork/scoped-plan/integration.wire");
     }
 
     #[tokio::test]
