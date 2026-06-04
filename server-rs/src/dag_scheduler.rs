@@ -17,8 +17,10 @@
 //!   needs the wired [`crate::state::AppState`]; when it's absent (pure unit
 //!   tests) the gate is left pending — graceful degradation.
 //! - **SubPlan**: claim the parent active + recurse into its children
-//!   (scoped IDs `<parent>.<child>`). Parent-completion propagation is
-//!   Phase 2.3.
+//!   (scoped IDs `<parent>.<child>`); once every child node finishes, the
+//!   parent sub-plan node auto-completes
+//!   ([`propagate_sub_plan_completion`], Phase 2.3) so the parent graph
+//!   advances past it.
 //!
 //! The mode router that decides v1 (phase walker) vs v2 (this scheduler) per
 //! plan is Phase 2.2.
@@ -445,7 +447,8 @@ async fn schedule_scope(
     // just claimed above) and re-entry on later ticks (scheduling children
     // that became ready after an earlier child finished). Parent-completion
     // propagation — marking the sub-plan `completed` once all children
-    // finish — lands in Phase 2.3.
+    // finish — is handled by [`propagate_sub_plan_completion`], which
+    // [`try_dag_advance`] runs before each scheduling pass.
     for node in nodes {
         if node.node_type != NodeType::SubPlan {
             continue;
@@ -467,6 +470,91 @@ async fn schedule_scope(
             progressed,
         ))
         .await;
+    }
+}
+
+// ── Sub-plan completion propagation (Task 2.3) ───────────────────────────────
+
+/// Recursively propagate **sub-plan completion** up the graph: a `SubPlan`
+/// node completes once every one of its direct child nodes is done
+/// (`completed` | `skipped`). For each sub-plan newly found complete this
+/// writes `completed` to `node_status`, broadcasts `node_status_changed`, and
+/// sets `*propagated` — the signal [`try_dag_advance`] uses to re-snapshot so
+/// the parent graph sees the completion and schedules whatever depended on the
+/// sub-plan.
+///
+/// **Why direct children (`node.nodes`) and not a
+/// `node_status LIKE '<id>.%'` query** (the literal Task 2.3 sketch): a child
+/// still `pending` may have **no** `node_status` row yet — rows are created
+/// lazily on claim/report. A `LIKE` scan would then see only the rows that
+/// exist (e.g. one completed child) and call that "all done", completing the
+/// parent prematurely. Enumerating the plan's actual child set from the
+/// in-memory DAG is the only correct membership test.
+///
+/// **Nested sub-plans** are handled by this recursion plus the caller's
+/// re-loop: the pass reads an *immutable* `done` snapshot, so a sub-plan
+/// completed here is not yet visible to its own parent within the same pass.
+/// The caller re-snapshots whenever `*propagated` is set, so the next pass
+/// picks the parent up. The cascade therefore settles in one pass per nesting
+/// level (bounded by the re-loop guard).
+///
+/// A **child-less** sub-plan is *not* vacuously completed here: there is no
+/// work to gate on, and auto-completing it could mask a malformed plan. Such a
+/// node stays as the scheduler left it (claimed `in_progress`).
+fn propagate_sub_plan_completion(
+    db: &Db,
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    plan_name: &str,
+    nodes: &[DagNode],
+    prefix: Option<&str>,
+    done: &HashSet<String>,
+    propagated: &mut bool,
+) {
+    for node in nodes {
+        if node.node_type != NodeType::SubPlan {
+            continue;
+        }
+        let scoped = scope_id(prefix, &node.id);
+
+        // Recurse first so nested sub-plans are visited (and completed on
+        // their own passes) before this one is evaluated.
+        if !node.nodes.is_empty() {
+            propagate_sub_plan_completion(
+                db,
+                broadcast_tx,
+                plan_name,
+                &node.nodes,
+                Some(&scoped),
+                done,
+                propagated,
+            );
+        }
+
+        // Already done, or nothing to gate on → leave it.
+        if done.contains(&scoped) || node.nodes.is_empty() {
+            continue;
+        }
+
+        // Complete the sub-plan once every direct child is done.
+        let all_children_done = node
+            .nodes
+            .iter()
+            .all(|child| done.contains(&scope_id(Some(&scoped), &child.id)));
+        if !all_children_done {
+            continue;
+        }
+
+        set_node_status(db, plan_name, &scoped, "completed");
+        broadcast_event(
+            broadcast_tx,
+            "node_status_changed",
+            json!({
+                "plan_name": plan_name,
+                "node_id": scoped,
+                "status": "completed",
+            }),
+        );
+        *propagated = true;
     }
 }
 
@@ -640,6 +728,26 @@ pub async fn try_dag_advance(
         let status_map = snapshot_node_statuses(&registry.db, &plan_name);
         hydrate_statuses(&mut dag.nodes, None, &status_map);
         let done_set = done_node_ids(&status_map);
+
+        // Step 2b (Task 2.3): sub-plan completion propagation. Mark any
+        // sub-plan whose children are all done as `completed`. If any did,
+        // re-loop to re-snapshot *before* scheduling — the parent graph now
+        // sees the sub-plan done, so whatever depends on it becomes ready on
+        // the next pass. Re-uses the same re-snapshot machinery the gate
+        // engine relies on; the loop guard bounds the cascade.
+        let mut propagated = false;
+        propagate_sub_plan_completion(
+            &registry.db,
+            &registry.broadcast_tx,
+            &plan_name,
+            &dag.nodes,
+            None,
+            &done_set,
+            &mut propagated,
+        );
+        if propagated {
+            continue;
+        }
 
         let ctx = SchedulerCtx {
             registry: &registry,
@@ -1564,5 +1672,360 @@ nodes:
             .collect();
         assert_eq!(advanced.len(), 1, "exactly one node_advanced broadcast");
         assert!(advanced[0].contains("\"a\""), "names a: {}", advanced[0]);
+    }
+
+    // ── sub-plan completion propagation (Task 2.3) ────────────────────────
+
+    /// A sub-plan whose two child tasks are both done is marked `completed`,
+    /// `propagated` is set, and a `node_status_changed` (completed) broadcast
+    /// fires for the parent.
+    #[test]
+    fn propagate_completes_sub_plan_when_all_children_done() {
+        let (db, _dir) = fresh_db();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let yaml = r#"
+schema_version: 2
+title: "Sub-plan"
+nodes:
+  - id: sp
+    type: sub_plan
+    nodes:
+      - id: a
+        type: task
+      - id: b
+        type: task
+"#;
+        let plan = parse_dag_yaml(yaml, "sp-done", "sp-done.yaml").unwrap();
+        let done: HashSet<String> = ["sp.a".to_string(), "sp.b".to_string()].into();
+
+        let mut propagated = false;
+        propagate_sub_plan_completion(
+            &db,
+            &tx,
+            "sp-done",
+            &plan.nodes,
+            None,
+            &done,
+            &mut propagated,
+        );
+        assert!(propagated, "sub-plan with all children done must propagate");
+
+        let conn = db.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM node_status WHERE plan_name = 'sp-done' AND node_id = 'sp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+        drop(conn);
+
+        let events = collect_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("\"node_id\":\"sp\"") && e.contains("\"status\":\"completed\"")),
+            "expected node_status_changed sp completed, got {events:?}"
+        );
+    }
+
+    /// The premature-completion guard: a still-`pending` child has **no**
+    /// `node_status` row, so it isn't in the done-set. The parent must NOT
+    /// complete — this is exactly the case a naive `LIKE '<id>.%'` scan would
+    /// get wrong (it would see only the one completed child's row).
+    #[test]
+    fn propagate_does_not_complete_when_a_child_has_no_status_row() {
+        let (db, _dir) = fresh_db();
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let yaml = r#"
+schema_version: 2
+title: "Sub-plan"
+nodes:
+  - id: sp
+    type: sub_plan
+    nodes:
+      - id: a
+        type: task
+      - id: b
+        type: task
+"#;
+        let plan = parse_dag_yaml(yaml, "sp-partial", "sp-partial.yaml").unwrap();
+        // Only `a` is done; `b` has no row at all (the realistic
+        // pending-and-unclaimed state).
+        let done: HashSet<String> = ["sp.a".to_string()].into();
+
+        let mut propagated = false;
+        propagate_sub_plan_completion(
+            &db,
+            &tx,
+            "sp-partial",
+            &plan.nodes,
+            None,
+            &done,
+            &mut propagated,
+        );
+        assert!(
+            !propagated,
+            "must not propagate while a child is unfinished"
+        );
+
+        let conn = db.lock().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_status WHERE plan_name = 'sp-partial' AND node_id = 'sp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "parent must not be written while a child is pending"
+        );
+    }
+
+    /// A child-less sub-plan is not vacuously completed (no work to gate on).
+    #[test]
+    fn propagate_skips_childless_sub_plan() {
+        let (db, _dir) = fresh_db();
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        // A bare sub_plan plus a sibling task so the plan still validates.
+        let yaml = r#"
+schema_version: 2
+title: "Empty sub-plan"
+nodes:
+  - id: sp
+    type: sub_plan
+  - id: a
+    type: task
+"#;
+        let plan = parse_dag_yaml(yaml, "sp-empty", "sp-empty.yaml").unwrap();
+        let done: HashSet<String> = HashSet::new();
+
+        let mut propagated = false;
+        propagate_sub_plan_completion(
+            &db,
+            &tx,
+            "sp-empty",
+            &plan.nodes,
+            None,
+            &done,
+            &mut propagated,
+        );
+        assert!(
+            !propagated,
+            "child-less sub-plan must not vacuously complete"
+        );
+
+        let conn = db.lock().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_status WHERE plan_name = 'sp-empty' AND node_id = 'sp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// Acceptance (Task 2.3): a sub-plan with two internal tasks. With both
+    /// children completed, a single `try_dag_advance` call auto-completes the
+    /// parent sub-plan node and spawns the downstream node that depends on it.
+    #[tokio::test]
+    async fn sub_plan_completion_unblocks_downstream() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let plan_name = "dag-subplan";
+
+        let nodes = r#"  - id: init
+    type: gate
+    gate_kind: init
+  - id: sp
+    type: sub_plan
+    title: "Integration"
+    depends_on: [init]
+    nodes:
+      - id: a
+        type: task
+        title: "Sub task A"
+      - id: b
+        type: task
+        title: "Sub task B"
+  - id: after
+    type: task
+    title: "Downstream"
+    depends_on: [sp]
+"#;
+        write_dag_plan(&plans_dir, plan_name, nodes);
+
+        {
+            let conn = db.lock().unwrap();
+            // init done; sub-plan claimed (in_progress) by a prior tick; both
+            // children completed (the agents reported them, which is what
+            // triggers this advance in production).
+            for (id, status) in [
+                ("init", "completed"),
+                ("sp", "in_progress"),
+                ("sp.a", "completed"),
+                ("sp.b", "completed"),
+            ] {
+                conn.execute(
+                    "INSERT INTO node_status (plan_name, node_id, status) VALUES (?1, ?2, ?3)",
+                    params![plan_name, id, status],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+
+        let (registry, mut rx) = test_registry(db.clone());
+        try_dag_advance(
+            registry,
+            plans_dir.clone(),
+            plan_name.to_string(),
+            Some("sp.b".to_string()),
+            Effort::High,
+            3100,
+        )
+        .await;
+
+        let conn = db.lock().unwrap();
+        // Parent sub-plan auto-completed.
+        let sp_status: String = conn
+            .query_row(
+                "SELECT status FROM node_status WHERE plan_name = ?1 AND node_id = 'sp'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sp_status, "completed", "sub-plan must auto-complete");
+
+        // Downstream node became ready → claimed (in_progress).
+        let after_status: String = conn
+            .query_row(
+                "SELECT status FROM node_status WHERE plan_name = ?1 AND node_id = 'after'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_status, "in_progress",
+            "downstream node must spawn once the sub-plan completes"
+        );
+
+        // start_pty_agent inserted an agents row for `after` (worktree setup
+        // fails on the fake project dir, but the row + claim persist).
+        let agent_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE plan_name = ?1 AND task_id = 'after'",
+                params![plan_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_count, 1, "downstream task must have spawned an agent");
+        drop(conn);
+
+        let events = collect_events(&mut rx);
+        // The sub-plan's completion was broadcast.
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("\"node_id\":\"sp\"") && e.contains("\"status\":\"completed\"")),
+            "expected node_status_changed sp completed, got {events:?}"
+        );
+        // node_advanced names the spawned downstream node.
+        let advanced: Vec<&String> = events
+            .iter()
+            .filter(|e| e.contains("\"type\":\"node_advanced\""))
+            .collect();
+        assert_eq!(advanced.len(), 1, "exactly one node_advanced broadcast");
+        assert!(
+            advanced[0].contains("\"after\""),
+            "node_advanced names after: {}",
+            advanced[0]
+        );
+    }
+
+    /// Nested sub-plans cascade: completing the leaf task under
+    /// `outer.inner.x` completes `outer.inner`, then `outer`, then unblocks
+    /// the node depending on `outer` — all within one `try_dag_advance` call
+    /// (the re-loop drives one level per pass).
+    #[tokio::test]
+    async fn nested_sub_plan_completion_cascades() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        let plan_name = "dag-nested-subplan";
+
+        let nodes = r#"  - id: init
+    type: gate
+    gate_kind: init
+  - id: outer
+    type: sub_plan
+    depends_on: [init]
+    nodes:
+      - id: inner
+        type: sub_plan
+        nodes:
+          - id: x
+            type: task
+            title: "Deep task"
+  - id: after
+    type: task
+    title: "Downstream"
+    depends_on: [outer]
+"#;
+        write_dag_plan(&plans_dir, plan_name, nodes);
+
+        {
+            let conn = db.lock().unwrap();
+            for (id, status) in [
+                ("init", "completed"),
+                ("outer", "in_progress"),
+                ("outer.inner", "in_progress"),
+                ("outer.inner.x", "completed"),
+            ] {
+                conn.execute(
+                    "INSERT INTO node_status (plan_name, node_id, status) VALUES (?1, ?2, ?3)",
+                    params![plan_name, id, status],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO plan_auto_advance (plan_name, enabled) VALUES (?1, 1)",
+                params![plan_name],
+            )
+            .unwrap();
+        }
+
+        let (registry, _rx) = test_registry(db.clone());
+        try_dag_advance(
+            registry,
+            plans_dir,
+            plan_name.to_string(),
+            Some("outer.inner.x".to_string()),
+            Effort::High,
+            3100,
+        )
+        .await;
+
+        let conn = db.lock().unwrap();
+        for (node_id, expect) in [
+            ("outer.inner", "completed"),
+            ("outer", "completed"),
+            ("after", "in_progress"),
+        ] {
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM node_status WHERE plan_name = ?1 AND node_id = ?2",
+                    params![plan_name, node_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| panic!("no node_status row for {node_id}"));
+            assert_eq!(status, expect, "node {node_id} expected {expect}");
+        }
     }
 }
