@@ -91,8 +91,16 @@ pub async fn list_agents(
     let db = state.db.lock().unwrap();
     let mut stmt = db
         .prepare(
+            // `prompt` is deliberately NOT selected: it can be >1 MB per row
+            // and the list returns up to 50, which made this endpoint a
+            // ~47 MB / ~4 s response — heavy enough that the dashboard's
+            // reconnect/visibility refetch (and any poll) couldn't keep the
+            // agent view in sync with DB truth (the "agent shows running but
+            // isn't" drift). No frontend consumer reads `agent.prompt`; the
+            // full prompt is still on each agent row in the DB and surfaced
+            // by the per-agent output/diff endpoints when an agent is opened.
             "SELECT id, session_id, pid, parent_agent_id, plan_name, task_id, \
-                    cwd, status, mode, prompt, started_at, finished_at, \
+                    cwd, status, mode, started_at, finished_at, \
                     last_tool, last_activity_at, base_commit, branch, \
                     source_branch, cost_usd, driver, merge_status, \
                     spawn_error \
@@ -120,28 +128,27 @@ pub async fn list_agents(
                 "cwd": row.get::<_, String>(6)?,
                 "status": row.get::<_, String>(7)?,
                 "mode": row.get::<_, String>(8)?,
-                "prompt": row.get::<_, Option<String>>(9)?,
-                "started_at": row.get::<_, String>(10)?,
-                "finished_at": row.get::<_, Option<String>>(11)?,
-                "last_tool": row.get::<_, Option<String>>(12)?,
-                "last_activity_at": row.get::<_, Option<String>>(13)?,
-                "base_commit": row.get::<_, Option<String>>(14)?,
-                "branch": row.get::<_, Option<String>>(15)?,
-                "source_branch": row.get::<_, Option<String>>(16)?,
-                "cost_usd": row.get::<_, Option<f64>>(17)?,
-                "driver": row.get::<_, Option<String>>(18)?,
+                "started_at": row.get::<_, String>(9)?,
+                "finished_at": row.get::<_, Option<String>>(10)?,
+                "last_tool": row.get::<_, Option<String>>(11)?,
+                "last_activity_at": row.get::<_, Option<String>>(12)?,
+                "base_commit": row.get::<_, Option<String>>(13)?,
+                "branch": row.get::<_, Option<String>>(14)?,
+                "source_branch": row.get::<_, Option<String>>(15)?,
+                "cost_usd": row.get::<_, Option<f64>>(16)?,
+                "driver": row.get::<_, Option<String>>(17)?,
                 // T2.3 (Task 2.3): `merge_status='deferred_for_cadence'`
                 // is the signal the dashboard reads to know which agents
                 // are sitting on committed branches waiting for the
                 // cadence boundary. NULL on every non-deferred agent.
-                "merge_status": row.get::<_, Option<String>>(19)?,
+                "merge_status": row.get::<_, Option<String>>(18)?,
                 // Task 1.1 (runner-install-and-spawn-reliability): pre-
                 // rendered "runner could not spawn: <path> (<errno_tag>)"
                 // message, written by the SaaS runner_ws handler when
                 // the runner reports `AgentSpawnFailed`. NULL on every
                 // successful spawn — UI gates the inline error banner
                 // on this field being non-null.
-                "spawn_error": row.get::<_, Option<String>>(20)?,
+                "spawn_error": row.get::<_, Option<String>>(19)?,
             }))
         })
         .unwrap()

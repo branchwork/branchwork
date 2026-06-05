@@ -120,6 +120,24 @@ export function App() {
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [user, fetchPlans, fetchAgents]);
 
+  // Periodic agent reconcile — a safety net for the case the reconnect and
+  // visibility refetches miss: a tab that stays open, visible, AND connected
+  // but drops an individual `agent_stopped`/`agent_started` frame. Without a
+  // poll the agent list silently drifts from DB truth ("agent shows running
+  // but isn't") until the user reloads. Cheap now that `GET /api/agents`
+  // omits the (multi-MB) prompt field. Agents-only; plans drift is covered by
+  // plan_updated events. Paused while the tab is hidden to avoid background
+  // churn — visibilitychange above re-syncs on return.
+  useEffect(() => {
+    if (!user) return;
+    const id = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        fetchAgents().catch(() => {});
+      }
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [user, fetchAgents]);
+
   if (authLoading) {
     return (
       <div className="flex h-screen items-center justify-center bg-gray-950 text-gray-500 text-sm">

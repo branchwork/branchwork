@@ -16,7 +16,10 @@ export interface Agent {
   // 'stream-json' = check agents / plan_creator that emit newline-delimited
   // JSON instead of raw PTY bytes (rendered by StreamJsonView, not xterm).
   mode: "pty" | "stream-json" | "remote";
-  prompt: string | null;
+  /// Optional: the agent's full prompt can be >1 MB, so `GET /api/agents`
+  /// (the list) deliberately omits it to stay small (it's fetched per-agent
+  /// on demand). No component currently reads it from the list row.
+  prompt?: string | null;
   started_at: string;
   finished_at: string | null;
   last_tool: string | null;
