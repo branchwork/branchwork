@@ -353,6 +353,7 @@ export function PlanBoard() {
         )}
       </div>
 
+      <InitGateWaitingBanner planName={plan.name} />
       <UncommittedWorkBanner planName={plan.name} />
       <RunnerOfflineBanner planName={plan.name} />
       <AutoPushRebaseConflictBanner planName={plan.name} />
@@ -1206,6 +1207,51 @@ export function FailoverPicker({
         <option value="sibling">sibling</option>
       </select>
     </label>
+  );
+}
+
+/// Banner above the board while a v2 (DAG) plan's `init` gate has passed
+/// its preconditions and is awaiting human sign-off (Task 3.5). The
+/// global `<InitGateModal/>` (App.tsx) renders the approve dialog; this
+/// banner is the in-board "Waiting for confirmation" reminder and — once
+/// the operator has dismissed the dialog — a way to re-open it. Reads the
+/// transient `initGates` slice the modal's `gate_ready_for_approval`
+/// subscription populates.
+export function InitGateWaitingBanner({ planName }: { planName: string }) {
+  const gate = usePlanStore((s) => s.initGates[planName] ?? null);
+  const dismissInitGate = usePlanStore((s) => s.dismissInitGate);
+
+  if (!gate) return null;
+
+  return (
+    <div
+      role="status"
+      className="mb-4 flex items-start gap-3 rounded border border-sky-700/50 bg-sky-900/20 px-4 py-3 text-sm"
+    >
+      <span
+        aria-hidden="true"
+        className="mt-0.5 inline-flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-sky-700/60 text-xs font-bold text-sky-100"
+      >
+        ?
+      </span>
+      <div className="flex-1 text-sky-100">
+        <div className="font-medium">Waiting for confirmation</div>
+        <div className="mt-0.5 text-sky-200/80">
+          The init gate passed its checks. Review and start the plan to make downstream tasks
+          spawnable.
+        </div>
+      </div>
+      {gate.dismissed && (
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => dismissInitGate(planName, false)}
+          data-testid="init-gate-review"
+        >
+          Review &amp; start
+        </Button>
+      )}
+    </div>
   );
 }
 

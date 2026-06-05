@@ -234,6 +234,39 @@ export interface PreMergeCheckFailureState {
   agentId: string | null;
 }
 
+/// Transient state for a v2 (DAG) plan's `init` gate awaiting human
+/// sign-off (Task 3.5 of the dag-based-plan-model plan). Driven by the
+/// `gate_ready_for_approval` WS event (where `gate_kind === "init"`),
+/// which fires once the init gate's preconditions (`git_repo` /
+/// `remote_configured` / `clean_tree`, or a custom `checks` list) all
+/// passed. The global `<InitGateModal/>` (App.tsx) owns the
+/// `subscribeToWsEvents` subscription that populates this slice (fetching
+/// the plan title + context) and the approve dialog; the PlanBoard
+/// `<InitGateWaitingBanner/>` is the in-board "Waiting for confirmation"
+/// reminder. Cleared on `gate_approved` / `gate_failed` (or the matching
+/// terminal `gate_status_changed`) and by `reset()`.
+export interface InitGatePending {
+  /// Scoped DAG node id of the init gate (e.g. `init` at top level, or
+  /// `parent.init` inside a sub-plan). Passed verbatim to the approve
+  /// endpoint `POST /api/plans/:name/gates/:node_id/approve`.
+  nodeId: string;
+  /// Plan title (fetched from `/api/plans/:name`). Falls back to the
+  /// summary-list title or the plan name when the fetch fails.
+  planTitle: string;
+  /// Plan context summary (fetched from `/api/plans/:name`). Empty when
+  /// the plan has no context or the fetch failed.
+  context: string;
+  /// The verified precondition check names (e.g. `["git_repo",
+  /// "remote_configured", "clean_tree"]`). `gate_ready_for_approval`
+  /// only fires once all passed, so the modal renders every entry green.
+  checks: string[];
+  /// True once the operator closed the modal (Esc / "Later") without
+  /// approving. The `<InitGateWaitingBanner/>` stays visible and its
+  /// "Review & start" button flips this back to `false` to re-open the
+  /// dialog.
+  dismissed: boolean;
+}
+
 export type ToastKind = "info" | "error" | "success";
 
 /// Optional inline action attached to a toast. When `snapshotId` is set
@@ -349,6 +382,16 @@ interface PlanStore {
   /// + the audit row); the banner falls back to a "see audit log"
   /// hint in that case.
   preMergeCheckFailures: Record<string, PreMergeCheckFailureState | null>;
+  /// Per-plan transient state for a v2 (DAG) plan's `init` gate awaiting
+  /// approval (Task 3.5). Populated by the `<InitGateModal/>`'s
+  /// `gate_ready_for_approval` subscription (after fetching the plan
+  /// title + context); read by both the modal and the PlanBoard
+  /// `<InitGateWaitingBanner/>`. Cleared on approve / fail. Not persisted
+  /// server-side — a reload re-derives it only if the gate re-broadcasts
+  /// (the gate stays `in_progress`/blocked until approved, so a fresh
+  /// page load won't replay the event; the PlanBoard gate card surfaces
+  /// the blocked state in that case).
+  initGates: Record<string, InitGatePending>;
   /// Transient toast queue. Driven by ws-store on destructive
   /// operations (e.g. `plan_deleted` pushes an "Undo" toast). The
   /// renderer reads this slice; auto-dismiss is wired into `pushToast`
@@ -399,6 +442,16 @@ interface PlanStore {
   /// code + output snippet. Passing `null` clears the slice — driven
   /// by `auto_mode_resumed` (user clicked Resume) and by `reset()`.
   setPreMergeCheckFailure: (planName: string, state: PreMergeCheckFailureState | null) => void;
+  /// Record (or clear, when `state === null`) the pending `init` gate for
+  /// `planName` (Task 3.5). Driven by the `<InitGateModal/>`'s WS
+  /// subscription on `gate_ready_for_approval` / `gate_approved` /
+  /// `gate_failed`.
+  setInitGatePending: (planName: string, state: InitGatePending | null) => void;
+  /// Toggle the `dismissed` flag on a pending init gate (no-op when none
+  /// is pending). `dismissInitGate(plan, true)` is the modal's "Later"/Esc
+  /// path; `dismissInitGate(plan, false)` is the banner's "Review & start"
+  /// re-open path.
+  dismissInitGate: (planName: string, dismissed: boolean) => void;
   pushToast: (toast: PushToastInput) => string;
   dismissToast: (id: string) => void;
   /// DELETE /api/plans/:name (with `?hard=true` when `opts.hard`).
@@ -448,6 +501,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
   autoPushRebases: {},
   autoPushRebaseConflicts: {},
   preMergeCheckFailures: {},
+  initGates: {},
   toasts: [],
 
   fetchPlans: () => {
@@ -777,6 +831,26 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     });
   },
 
+  setInitGatePending: (planName, state) => {
+    set((s) => {
+      const next = { ...s.initGates };
+      if (state === null) {
+        delete next[planName];
+      } else {
+        next[planName] = state;
+      }
+      return { initGates: next };
+    });
+  },
+
+  dismissInitGate: (planName, dismissed) => {
+    set((s) => {
+      const existing = s.initGates[planName];
+      if (!existing || existing.dismissed === dismissed) return s;
+      return { initGates: { ...s.initGates, [planName]: { ...existing, dismissed } } };
+    });
+  },
+
   pushToast: ({ id, kind, message, action, ttlMs }) => {
     const toastId = id ?? `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     set((s) => ({
@@ -829,6 +903,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       autoPushRebases: {},
       autoPushRebaseConflicts: {},
       preMergeCheckFailures: {},
+      initGates: {},
       toasts: [],
     });
   },
