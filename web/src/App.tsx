@@ -38,6 +38,7 @@ const CredentialsPage = lazy(() =>
 );
 import { Toaster } from "./components/Toaster.js";
 import { ConnectionBanner } from "./components/ConnectionBanner.js";
+import { InitGateModal } from "./components/InitGateModal.js";
 import { LearningsDuePanel } from "./components/LearningsDuePanel.js";
 import { RunnerStatus } from "./components/RunnerStatus.js";
 import { OrgChip } from "./components/OrgChip.js";
@@ -220,6 +221,12 @@ export function App() {
       </main>
 
       <Toaster />
+
+      {/* Global init-gate approval dialog (Task 3.5 of dag-based-plan-
+          model). Mounts here so a v2 plan's `gate_ready_for_approval`
+          event surfaces the "Start Plan" modal over any route. Self-hides
+          when no init gate is pending. */}
+      <InitGateModal />
 
       {/* Connection indicator + org chip + logout. Hidden on `<md`
           where the org chip / runner status / connection dot reflow
