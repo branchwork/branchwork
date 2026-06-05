@@ -1859,6 +1859,182 @@ async fn do_standard_resume(state: &AppState, auth: &OptionalAuthUser, name: &st
         .into_response()
 }
 
+// ── POST /api/plans/:name/gates/:node_id/approve (DAG plan model, Phase 3) ────
+//
+// Approve a blocked DAG gate node. A v2 (DAG) plan can carry `init` /
+// `approval` gate nodes that [`crate::gates::execute_gate`] leaves
+// `Blocked` (in_progress) pending a human sign-off — the gate engine has
+// broadcast `gate_awaiting_approval` to the dashboard. This endpoint is the
+// operator clicking "Approve":
+//
+//   1. records the `gate_approvals` row (so a *re-run* of the gate engine
+//      short-circuits to `Passed`),
+//   2. flips the node's `node_status` straight to `completed` (the gate is
+//      done; no need to re-run checks),
+//   3. broadcasts `gate_approved` + `gate_status_changed` so the dashboard
+//      updates without a refetch, and
+//   4. re-enters [`crate::dag_scheduler::try_dag_advance`] to schedule the
+//      downstream nodes the gate was blocking.
+//
+// Idempotent: a second approve is a harmless no-op (the `gate_approvals`
+// upsert ignores the conflict, the status write is already `completed`, and
+// `try_dag_advance` re-evaluates the graph safely).
+
+pub async fn approve_gate(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path((name, node_id)): Path<(String, String)>,
+) -> Response {
+    // Resolve the plan and confirm `node_id` names a gate node. Only v2 (DAG)
+    // plans have gate nodes; `parse_plan_file_as_dag` auto-converts v1 plans
+    // (which carry only synthetic init/end gates), so a v1 plan with a real
+    // node id simply won't match and 404s.
+    let Some(plan_path) = plan_parser::find_plan_file(&state.plans_dir, &name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "plan_not_found" })),
+        )
+            .into_response();
+    };
+    let dag = match plan_parser::parse_plan_file_as_dag(&plan_path) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "plan_parse_failed",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(node) = crate::dag::find_node_scoped(&dag, &node_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "gate_not_found",
+                "message": format!("no node '{node_id}' in plan '{name}'"),
+            })),
+        )
+            .into_response();
+    };
+    if node.node_type != crate::dag::NodeType::Gate {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "not_a_gate",
+                "message": format!("node '{node_id}' is not a gate"),
+            })),
+        )
+            .into_response();
+    }
+
+    let gate_kind = node.gate_kind.map(|k| k.as_str()).unwrap_or("unknown");
+    let approved_by = auth.0.as_ref().map(|u| u.email.clone());
+
+    // Record the approval + complete the node in one DB section. The
+    // `gate_approvals` upsert is idempotent (ON CONFLICT DO NOTHING) so a
+    // re-approve never errors; the `node_status` write flips the node to
+    // `completed` with `source = 'manual'` (an operator-driven transition,
+    // not a `claim_node` auto-flip).
+    {
+        let db = state.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT INTO gate_approvals (plan_name, node_id, approved_by) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(plan_name, node_id) DO NOTHING",
+            params![name, node_id, approved_by],
+        );
+        let _ = db.execute(
+            "INSERT INTO node_status (plan_name, node_id, status, source, updated_at) \
+             VALUES (?1, ?2, 'completed', 'manual', datetime('now')) \
+             ON CONFLICT(plan_name, node_id) \
+             DO UPDATE SET status = 'completed', source = 'manual', updated_at = datetime('now')",
+            params![name, node_id],
+        );
+    }
+
+    // Audit the operator action (resource = the plan; diff names the gate).
+    {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::GATE_APPROVE,
+            crate::audit::resources::PLAN,
+            Some(&name),
+            Some(
+                &serde_json::json!({
+                    "node_id": node_id,
+                    "gate_kind": gate_kind,
+                })
+                .to_string(),
+            ),
+        );
+    }
+
+    // Tell the dashboard: the gate was approved + its status is now completed.
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "gate_approved",
+        serde_json::json!({
+            "plan_name": name,
+            "node_id": node_id,
+        }),
+    );
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "gate_status_changed",
+        serde_json::json!({
+            "plan_name": name,
+            "node_id": node_id,
+            "status": "completed",
+            "gate_kind": gate_kind,
+        }),
+    );
+
+    // Re-enter the DAG scheduler so the nodes this gate was blocking become
+    // ready. Detached so the HTTP response returns before scheduling work
+    // (mirrors the resume path). `try_dag_advance` re-checks the
+    // auto-advance / auto-mode master gate internally.
+    {
+        let registry = state.registry.clone();
+        let plans_dir = state.plans_dir.clone();
+        let plan_name = name.clone();
+        let from_node = node_id.clone();
+        let effort = *state.effort.lock().unwrap();
+        let port = state.config_port();
+        tokio::spawn(async move {
+            crate::dag_scheduler::try_dag_advance(
+                registry,
+                plans_dir,
+                plan_name,
+                Some(from_node),
+                effort,
+                port,
+            )
+            .await;
+        });
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "plan": name,
+            "nodeId": node_id,
+            "gateKind": gate_kind,
+            "status": "completed",
+            "approvedBy": approved_by,
+        })),
+    )
+        .into_response()
+}
+
 // ── GET/PUT /api/plans/:name/settings (Task 3.1) ─────────────────────────────
 //
 // Plan-level settings panel API: surface the per-plan

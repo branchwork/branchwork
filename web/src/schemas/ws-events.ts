@@ -560,6 +560,109 @@ const LearningPromoted = v.object({
   }),
 });
 
+/// --- DAG plan model events (dag-based-plan-model plan) ---
+/// `schema_version: 2` (DAG) plans are scheduled by graph evaluation
+/// (`dag_scheduler.rs`) over the `node_status` table instead of the v1
+/// phase walker. These events keep the dashboard's node graph + gate UI in
+/// sync. No dashboard handler reacts to them yet (the DAG plan view is a
+/// follow-up); they are schematized here so the validator does not warn-drop
+/// legitimate server frames.
+
+/// Any DAG node (task / gate / sub-plan) changed status. The generic
+/// node-graph sync event — fires for every node type so a future graph view
+/// can repaint a single node without a full plan refetch. `node_id` is the
+/// scoped id (`wire-api` at top level, `parent.child` inside a sub-plan).
+const NodeStatusChanged = v.object({
+  type: v.literal("node_status_changed"),
+  data: v.object({
+    plan_name: v.string(),
+    node_id: v.string(),
+    status: v.string(),
+  }),
+});
+
+/// The DAG scheduler claimed + spawned one or more ready nodes after a node
+/// completed. `from_node` is the node whose completion triggered the advance
+/// (null on the initial kick); `to_nodes` is the scoped ids just scheduled.
+const NodeAdvanced = v.object({
+  type: v.literal("node_advanced"),
+  data: v.object({
+    plan: v.string(),
+    from_node: NullishStr,
+    to_nodes: v.optional(v.array(v.string())),
+  }),
+});
+
+/// A *gate* node changed status — fired alongside `node_status_changed` but
+/// carrying `gate_kind` (`init | end | ci | approval`) so the dashboard can
+/// drive gate-specific UI (approve affordance, failure banner) distinctly
+/// from the generic node-graph sync. Emitted by `dag_scheduler.rs` at each
+/// gate transition (in_progress / completed / failed) and by the gate
+/// approval endpoint (status="completed").
+const GateStatusChanged = v.object({
+  type: v.literal("gate_status_changed"),
+  data: v.object({
+    plan_name: v.string(),
+    node_id: v.string(),
+    status: v.string(),
+    gate_kind: v.string(),
+  }),
+});
+
+/// A gate is blocked awaiting human sign-off — the uniform "show the Approve
+/// button" signal. Fired by `gates.rs` for both `init` gates (after their
+/// preconditions pass) and `approval` gates. `title` is the gate node's
+/// display title; `gate_kind` distinguishes the two.
+const GateAwaitingApproval = v.object({
+  type: v.literal("gate_awaiting_approval"),
+  data: v.object({
+    plan_name: v.string(),
+    node_id: v.string(),
+    title: v.string(),
+    gate_kind: v.optional(v.string()),
+  }),
+});
+
+/// An `init` gate's shell preconditions (`git_repo` / `remote_configured` /
+/// `clean_tree`, or a custom `checks` list) all passed — it is now awaiting
+/// approval. Carries the verified `checks` for the dashboard to render; the
+/// companion `gate_awaiting_approval` is the uniform approve signal.
+const GateReadyForApproval = v.object({
+  type: v.literal("gate_ready_for_approval"),
+  data: v.object({
+    plan_name: v.string(),
+    node_id: v.string(),
+    gate_kind: v.string(),
+    title: v.optional(v.string()),
+    checks: v.optional(v.array(v.string())),
+  }),
+});
+
+/// An operator approved a blocked gate via
+/// `POST /api/plans/:name/gates/:node_id/approve`. The node is now
+/// `completed` (the paired `gate_status_changed` carries the new status +
+/// `gate_kind`); the scheduler re-advances to unblock downstream nodes.
+const GateApproved = v.object({
+  type: v.literal("gate_approved"),
+  data: v.object({
+    plan_name: v.string(),
+    node_id: v.string(),
+  }),
+});
+
+/// A gate failed — one of its checks did not pass (e.g. an `init` gate's
+/// dirty tree, an `end` gate's unmerged branch / failing CI). `reason` is
+/// the human-readable failure. The plan stalls at the gate until the
+/// underlying condition is fixed and the gate re-runs (or is approved).
+const GateFailed = v.object({
+  type: v.literal("gate_failed"),
+  data: v.object({
+    plan_name: v.string(),
+    node_id: v.string(),
+    reason: v.string(),
+  }),
+});
+
 export const WsMessageSchema = v.variant("type", [
   Connected,
   PlanUpdated,
@@ -606,6 +709,13 @@ export const WsMessageSchema = v.variant("type", [
   CiFailureObserved,
   PromotionCandidate,
   LearningPromoted,
+  NodeStatusChanged,
+  NodeAdvanced,
+  GateStatusChanged,
+  GateAwaitingApproval,
+  GateReadyForApproval,
+  GateApproved,
+  GateFailed,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;

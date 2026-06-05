@@ -34,7 +34,7 @@ use serde_json::json;
 use crate::agents::pty_agent::{self, StartPtyOpts};
 use crate::agents::{AgentRegistry, auto_advance_enabled, build_task_prompt, remaining_budget};
 use crate::config::Effort;
-use crate::dag::{DagNode, DagPlan, NodeType, ready_nodes, ready_sub_plan_nodes};
+use crate::dag::{DagNode, DagPlan, GateKind, NodeType, ready_nodes, ready_sub_plan_nodes};
 use crate::db::Db;
 use crate::plan_parser::{self, ParsedPlan, PlanPhase, PlanTask};
 use crate::ws::broadcast_event;
@@ -93,6 +93,31 @@ fn set_node_status(db: &Db, plan_name: &str, node_id: &str, status: &str) {
                        source = 'auto',
                        updated_at = excluded.updated_at",
         params![plan_name, node_id, status],
+    );
+}
+
+/// Broadcast a gate-specific `gate_status_changed` event carrying the gate's
+/// `gate_kind`. Fires alongside the generic `node_status_changed` at each gate
+/// transition so the dashboard can drive gate-specific UI (the approve
+/// affordance, failure banners) distinctly from the node-graph status sync.
+/// A gate node with no `gate_kind` (a malformed gate `execute_gate` will fail)
+/// reports `"unknown"`.
+fn broadcast_gate_status(
+    tx: &tokio::sync::broadcast::Sender<String>,
+    plan_name: &str,
+    node_id: &str,
+    status: &str,
+    gate_kind: Option<GateKind>,
+) {
+    broadcast_event(
+        tx,
+        "gate_status_changed",
+        json!({
+            "plan_name": plan_name,
+            "node_id": node_id,
+            "status": status,
+            "gate_kind": gate_kind.map(|k| k.as_str()).unwrap_or("unknown"),
+        }),
     );
 }
 
@@ -385,6 +410,13 @@ async fn schedule_scope(
                         "status": "in_progress",
                     }),
                 );
+                broadcast_gate_status(
+                    &ctx.registry.broadcast_tx,
+                    &ctx.dag.name,
+                    &scoped,
+                    "in_progress",
+                    node.gate_kind,
+                );
                 match crate::gates::execute_gate(state, &ctx.dag.name, node).await {
                     crate::gates::GateOutcome::Passed => {
                         set_node_status(&ctx.registry.db, &ctx.dag.name, &scoped, "completed");
@@ -396,6 +428,13 @@ async fn schedule_scope(
                                 "node_id": scoped,
                                 "status": "completed",
                             }),
+                        );
+                        broadcast_gate_status(
+                            &ctx.registry.broadcast_tx,
+                            &ctx.dag.name,
+                            &scoped,
+                            "completed",
+                            node.gate_kind,
                         );
                         // The done-set changed — re-loop to advance whatever
                         // this gate just unblocked.
@@ -411,6 +450,13 @@ async fn schedule_scope(
                                 "node_id": scoped,
                                 "status": "failed",
                             }),
+                        );
+                        broadcast_gate_status(
+                            &ctx.registry.broadcast_tx,
+                            &ctx.dag.name,
+                            &scoped,
+                            "failed",
+                            node.gate_kind,
                         );
                         broadcast_event(
                             &ctx.registry.broadcast_tx,
@@ -1672,6 +1718,28 @@ nodes:
             .collect();
         assert_eq!(advanced.len(), 1, "exactly one node_advanced broadcast");
         assert!(advanced[0].contains("\"a\""), "names a: {}", advanced[0]);
+
+        // Task 3.3: the CI gate emitted gate-specific `gate_status_changed`
+        // events carrying `gate_kind: "ci"` — in_progress (claim) then
+        // completed (Passed) — alongside the generic `node_status_changed`.
+        let gate_status: Vec<&String> = events
+            .iter()
+            .filter(|e| e.contains("\"type\":\"gate_status_changed\""))
+            .collect();
+        assert!(
+            gate_status
+                .iter()
+                .any(|e| e.contains("\"gate_kind\":\"ci\"")
+                    && e.contains("\"status\":\"in_progress\"")),
+            "expected gate_status_changed(ci, in_progress), got {gate_status:?}"
+        );
+        assert!(
+            gate_status
+                .iter()
+                .any(|e| e.contains("\"gate_kind\":\"ci\"")
+                    && e.contains("\"status\":\"completed\"")),
+            "expected gate_status_changed(ci, completed), got {gate_status:?}"
+        );
     }
 
     // ── sub-plan completion propagation (Task 2.3) ────────────────────────

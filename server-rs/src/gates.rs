@@ -21,9 +21,10 @@
 //! Per-kind semantics:
 //! - **Init**: run shell preconditions (`git_repo`, `remote_configured`,
 //!   `clean_tree`) in the project dir. All pass ⇒ broadcast
-//!   `gate_ready_for_approval` and return `Blocked` (waiting for approval);
-//!   any fail ⇒ `Failed`. A pre-existing `gate_approvals` row short-circuits
-//!   to `Passed`.
+//!   `gate_ready_for_approval` (with the verified `checks`) **and**
+//!   `gate_awaiting_approval` (the uniform approve signal), then return
+//!   `Blocked` (waiting for approval); any fail ⇒ `Failed`. A pre-existing
+//!   `gate_approvals` row short-circuits to `Passed`.
 //! - **End**: `all_merged` (no agent for the plan still carries an unmerged
 //!   branch), `compiles` (reuses [`crate::auto_mode::run_pre_merge_checks_in`]
 //!   over the project's merged tree from `branchwork.toml`), and `ci_green`
@@ -123,14 +124,29 @@ async fn execute_init_gate(state: &AppState, plan_name: &str, node: &DagNode) ->
     }
 
     // All preconditions hold — the gate is ready for a human to approve.
+    // `gate_ready_for_approval` carries the verified `checks` detail; the
+    // companion `gate_awaiting_approval` is the uniform "a human must approve
+    // this gate" signal both init and approval gates emit so the dashboard
+    // can drive a single Approve affordance off one event type.
     broadcast_event(
         &state.broadcast_tx,
         "gate_ready_for_approval",
         json!({
             "plan_name": plan_name,
             "node_id": node.id,
-            "gate_kind": "init",
+            "gate_kind": GateKind::Init.as_str(),
+            "title": node.title,
             "checks": checks,
+        }),
+    );
+    broadcast_event(
+        &state.broadcast_tx,
+        "gate_awaiting_approval",
+        json!({
+            "plan_name": plan_name,
+            "node_id": node.id,
+            "title": node.title,
+            "gate_kind": GateKind::Init.as_str(),
         }),
     );
     GateOutcome::Blocked("preconditions passed — awaiting approval".to_string())
@@ -356,7 +372,8 @@ async fn execute_approval_gate(state: &AppState, plan_name: &str, node: &DagNode
         json!({
             "plan_name": plan_name,
             "node_id": node.id,
-            "gate_kind": "approval",
+            "title": node.title,
+            "gate_kind": GateKind::Approval.as_str(),
         }),
     );
     GateOutcome::Blocked("awaiting approval".to_string())
@@ -641,6 +658,20 @@ mod tests {
                 .any(|e| e.contains("\"type\":\"gate_ready_for_approval\"")),
             "expected a gate_ready_for_approval broadcast, got {events:?}"
         );
+        // …and the uniform "awaiting approval" signal (carrying the gate's
+        // title + gate_kind) fires for init gates too (Task 3.3).
+        let awaiting = events
+            .iter()
+            .find(|e| e.contains("\"type\":\"gate_awaiting_approval\""))
+            .expect("expected a gate_awaiting_approval broadcast for the init gate");
+        assert!(
+            awaiting.contains("\"title\":\"Precondition check\""),
+            "gate_awaiting_approval must carry the node title, got {awaiting}"
+        );
+        assert!(
+            awaiting.contains("\"gate_kind\":\"init\""),
+            "gate_awaiting_approval must carry gate_kind, got {awaiting}"
+        );
     }
 
     // ── Acceptance: end gate, all branches merged → Passed ────────────────
@@ -816,11 +847,18 @@ mod tests {
         let outcome = execute_gate(&state, "p", &approval_node()).await;
         assert!(matches!(outcome, GateOutcome::Blocked(_)));
         let events = drain(&mut rx);
+        let awaiting = events
+            .iter()
+            .find(|e| e.contains("\"type\":\"gate_awaiting_approval\""))
+            .unwrap_or_else(|| panic!("expected gate_awaiting_approval, got {events:?}"));
+        // Task 3.3: the approval gate's event carries the node title + kind.
         assert!(
-            events
-                .iter()
-                .any(|e| e.contains("\"type\":\"gate_awaiting_approval\"")),
-            "expected gate_awaiting_approval, got {events:?}"
+            awaiting.contains("\"title\":\"Approval\""),
+            "gate_awaiting_approval must carry the node title, got {awaiting}"
+        );
+        assert!(
+            awaiting.contains("\"gate_kind\":\"approval\""),
+            "gate_awaiting_approval must carry gate_kind, got {awaiting}"
         );
     }
 

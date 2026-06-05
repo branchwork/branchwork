@@ -30,6 +30,21 @@ pub enum GateKind {
     Approval,
 }
 
+impl GateKind {
+    /// The wire/string form of a gate kind, matching the serde
+    /// `rename_all = "snake_case"` representation. Used by the WS event
+    /// broadcasts (`gate_status_changed` / `gate_awaiting_approval` carry
+    /// `gate_kind`) so the dashboard can render kind-specific gate UI.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GateKind::Init => "init",
+            GateKind::End => "end",
+            GateKind::Ci => "ci",
+            GateKind::Approval => "approval",
+        }
+    }
+}
+
 // ── DagNode ─────────────────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -460,6 +475,31 @@ pub fn all_node_ids(plan: &DagPlan) -> Vec<String> {
     flat.into_iter().map(|(id, _)| id).collect()
 }
 
+/// Find a node by its **scoped** ID (top-level `wire-api` or nested
+/// `parent.child`), walking sub-plans with the same scoping convention as
+/// [`flatten_nodes`]. Returns the matching [`DagNode`] reference, or `None`
+/// if no node has that scoped ID. Used by the gate approval endpoint to look
+/// up a gate node's `gate_kind` + `title` for the WS broadcast.
+pub fn find_node_scoped<'a>(plan: &'a DagPlan, scoped_id: &str) -> Option<&'a DagNode> {
+    fn walk<'a>(nodes: &'a [DagNode], prefix: Option<&str>, target: &str) -> Option<&'a DagNode> {
+        for node in nodes {
+            let scoped = match prefix {
+                Some(p) => format!("{p}.{}", node.id),
+                None => node.id.clone(),
+            };
+            if scoped == target {
+                return Some(node);
+            }
+            // Recurse into sub-plan children (an empty `nodes` returns None).
+            if let Some(found) = walk(&node.nodes, Some(&scoped), target) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(&plan.nodes, None, scoped_id)
+}
+
 /// Get the topological order of node IDs (for scheduling).
 pub fn topological_order(plan: &DagPlan) -> Result<Vec<String>, String> {
     let flat = flatten_nodes(&plan.nodes, None);
@@ -695,6 +735,55 @@ mod tests {
         assert!(order.contains(&"integration.wire".to_string()));
         assert!(order.contains(&"integration.test".to_string()));
         assert_eq!(order.len(), 5); // init, integration, integration.wire, integration.test, end
+    }
+
+    #[test]
+    fn gate_kind_as_str_round_trips_snake_case() {
+        assert_eq!(GateKind::Init.as_str(), "init");
+        assert_eq!(GateKind::End.as_str(), "end");
+        assert_eq!(GateKind::Ci.as_str(), "ci");
+        assert_eq!(GateKind::Approval.as_str(), "approval");
+    }
+
+    #[test]
+    fn find_node_scoped_finds_top_level_and_nested() {
+        let plan = make_plan(vec![
+            gate_node("init", GateKind::Init, &[]),
+            DagNode {
+                id: "integration".to_string(),
+                node_type: NodeType::SubPlan,
+                title: "Integration".to_string(),
+                description: String::new(),
+                depends_on: vec!["init".to_string()],
+                file_paths: Vec::new(),
+                acceptance: String::new(),
+                produces_commit: false,
+                gate_kind: None,
+                checks: Vec::new(),
+                workflows: Vec::new(),
+                nodes: vec![
+                    task_node("wire", &[]),
+                    gate_node("g", GateKind::Approval, &[]),
+                ],
+                status: None,
+                status_updated_at: None,
+                cost_usd: None,
+            },
+            gate_node("end", GateKind::End, &["integration"]),
+        ]);
+
+        // Top-level node by bare id.
+        let init = find_node_scoped(&plan, "init").expect("init node");
+        assert_eq!(init.gate_kind, Some(GateKind::Init));
+        // Nested node by scoped (dotted) id.
+        let wire = find_node_scoped(&plan, "integration.wire").expect("nested task");
+        assert_eq!(wire.node_type, NodeType::Task);
+        let g = find_node_scoped(&plan, "integration.g").expect("nested gate");
+        assert_eq!(g.gate_kind, Some(GateKind::Approval));
+        // The bare id of a nested node does NOT match (must be scoped).
+        assert!(find_node_scoped(&plan, "wire").is_none());
+        // Unknown id.
+        assert!(find_node_scoped(&plan, "nope").is_none());
     }
 
     #[test]

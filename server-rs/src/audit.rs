@@ -224,6 +224,14 @@ pub mod actions {
     /// failures and validation refusals do not audit.
     pub const LEARNING_PROMOTE: &str = "learning.promote";
 
+    /// `POST /api/plans/:name/gates/:node_id/approve` — an operator approved
+    /// a blocked DAG gate (an `init` or `approval` gate awaiting human
+    /// sign-off; Phase 3 of dag-based-plan-model). Inserts the
+    /// `gate_approvals` row, flips the node to `completed`, and re-enters
+    /// `try_dag_advance` to unblock downstream. Diff carries
+    /// `{node_id, gate_kind}`; resource is `PLAN`.
+    pub const GATE_APPROVE: &str = "gate.approve";
+
     /// `POST /api/orgs/:slug/orphan-worktrees/cleanup` — an org admin
     /// reaped one or more leaked per-agent worktrees recorded by the boot
     /// sweep (Phase 5, Task 5.2 of worktree-per-agent-isolation). Diff
