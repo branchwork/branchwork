@@ -165,6 +165,20 @@ async fn execute_init_gate(
         return GateOutcome::Passed;
     }
 
+    // Cross-plan inputs gate (Phase 4): before running this plan's own
+    // preconditions, every declared `inputs:` must be satisfied by the
+    // producing plan's recorded output. Until then the gate stays `Blocked`
+    // with `waiting for <plan>/<artifact>`; the producing plan's End gate
+    // re-advances us once it records the output (see
+    // `crate::artifacts::reset_dependent_init_gates`).
+    let inputs = plan_inputs(&state.plans_dir, plan_name);
+    if !crate::artifacts::check_inputs_satisfied(&state.db, plan_name, &inputs) {
+        let reason = crate::artifacts::first_unsatisfied_input(&state.db, &inputs)
+            .map(|(p, a)| format!("waiting for {p}/{a}"))
+            .unwrap_or_else(|| "waiting for upstream plan outputs".to_string());
+        return GateOutcome::Blocked(reason);
+    }
+
     let Some(project_dir) = crate::ci::project_dir_for(&state.plans_dir, &state.db, plan_name)
     else {
         return GateOutcome::Failed(
@@ -314,8 +328,69 @@ async fn execute_end_gate(
     match (failed_reason, blocked_reason) {
         (Some(reason), _) => GateOutcome::Failed(reason),
         (None, Some(reason)) => GateOutcome::Blocked(reason),
-        (None, None) => GateOutcome::Passed,
+        (None, None) => {
+            // The plan's work is verified and merged — record its declared
+            // outputs as satisfied so downstream plans' Init gates can proceed,
+            // then re-advance any consumer that was waiting on them.
+            record_and_notify_outputs(state, plan_name, project_dir.as_deref());
+            GateOutcome::Passed
+        }
     }
+}
+
+/// Record a passing End gate's declared `outputs:` and push a re-advance to any
+/// dependent plan whose Init gate was blocked waiting on them (Phase 4).
+///
+/// The "computed value" for each output is the plan's merged HEAD commit SHA (a
+/// single point-in-time marker for everything the plan produced). `None` in
+/// SaaS / when HEAD can't resolve → stored as the boolean marker `"true"` by
+/// [`crate::artifacts::record_output_artifacts`].
+fn record_and_notify_outputs(state: &AppState, plan_name: &str, project_dir: Option<&Path>) {
+    let outputs = plan_outputs(&state.plans_dir, plan_name);
+    if outputs.is_empty() {
+        return;
+    }
+    let value = project_dir.and_then(crate::agents::git_head_sha);
+    crate::artifacts::record_output_artifacts(&state.db, plan_name, &outputs, value.as_deref());
+
+    // Producer-push: flip each waiting consumer's blocked Init gate back to
+    // `pending` and re-enter the DAG scheduler so it re-checks (now satisfied)
+    // and proceeds. Detached, mirroring the approve / retry re-advance paths.
+    let resumed =
+        crate::artifacts::reset_dependent_init_gates(&state.db, &state.plans_dir, plan_name);
+    for consumer in resumed {
+        let registry = state.registry.clone();
+        let plans_dir = state.plans_dir.clone();
+        let effort = *state.effort.lock().unwrap();
+        let port = state.config_port();
+        tokio::spawn(async move {
+            crate::dag_scheduler::try_dag_advance(
+                registry, plans_dir, consumer, None, effort, port,
+            )
+            .await;
+        });
+    }
+}
+
+/// Load a plan's declared cross-plan `inputs` from its file. A missing /
+/// unparseable plan (e.g. a unit-test gate with no file on disk, or a v1 plan)
+/// has no declared inputs — return empty so the gate doesn't block spuriously.
+fn plan_inputs(plans_dir: &Path, plan_name: &str) -> Vec<crate::dag::PlanArtifact> {
+    load_dag(plans_dir, plan_name)
+        .map(|d| d.inputs)
+        .unwrap_or_default()
+}
+
+/// Load a plan's declared `outputs` (see [`plan_inputs`] for the empty cases).
+fn plan_outputs(plans_dir: &Path, plan_name: &str) -> Vec<crate::dag::PlanArtifact> {
+    load_dag(plans_dir, plan_name)
+        .map(|d| d.outputs)
+        .unwrap_or_default()
+}
+
+fn load_dag(plans_dir: &Path, plan_name: &str) -> Option<crate::dag::DagPlan> {
+    let path = crate::plan_parser::find_plan_file(plans_dir, plan_name)?;
+    crate::plan_parser::parse_plan_file_as_dag(&path).ok()
 }
 
 /// Write the End gate's per-check results to `gate_checks` and broadcast a
@@ -1339,5 +1414,196 @@ mod tests {
             evaluate_ci_aggregate(&a, &["tests.yml".to_string()], "abc"),
             GateOutcome::Blocked(_)
         ));
+    }
+
+    // ── Cross-plan artifact gating (Phase 4) ──────────────────────────────
+
+    fn output_artifact(name: &str) -> crate::dag::PlanArtifact {
+        crate::dag::PlanArtifact {
+            name: name.to_string(),
+            from_plan: None,
+            artifact: None,
+            description: None,
+        }
+    }
+
+    /// A v2 plan declaring a single input from `from_plan` named `artifact`.
+    const CONSUMER_YAML: &str = "schema_version: 2\n\
+        title: B\n\
+        inputs:\n\
+        \x20 - name: schema\n\
+        \x20   fromPlan: a\n\
+        nodes:\n\
+        \x20 - id: init\n\
+        \x20   type: gate\n\
+        \x20   gate_kind: init\n";
+
+    /// Acceptance (consumer side): an Init gate with an unsatisfied cross-plan
+    /// input stays Blocked with `waiting for <plan>/<artifact>`, before its own
+    /// git preconditions even run.
+    #[tokio::test]
+    async fn init_gate_blocks_on_unsatisfied_inputs() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(plans_dir.join("b.yaml"), CONSUMER_YAML).unwrap();
+        // A project exists, but the inputs gate fires before it's consulted.
+        let project_dir = dir.path().join("bproj");
+        git_init(&project_dir);
+        seed_project(&db, "b", &project_dir);
+
+        let (state, _rx) = test_state(db, plans_dir);
+        let outcome = execute_gate(&state, "b", "init", &init_node()).await;
+        match outcome {
+            GateOutcome::Blocked(reason) => assert_eq!(reason, "waiting for a/schema"),
+            other => panic!("expected Blocked(waiting for a/schema), got {other:?}"),
+        }
+    }
+
+    /// Acceptance (the full hand-off): once the producing plan records its
+    /// output, the consumer's Init gate re-check passes the inputs gate and
+    /// proceeds to its own preconditions (here: blocks awaiting approval — NOT
+    /// the inputs-blocked reason).
+    #[tokio::test]
+    async fn init_gate_proceeds_past_inputs_after_producer_records_output() {
+        let (db, dir) = fresh_db();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(plans_dir.join("b.yaml"), CONSUMER_YAML).unwrap();
+        // Clean git repo + remote so the init preconditions pass.
+        let project_dir = dir.path().join("bproj");
+        git_init(&project_dir);
+        run_git(
+            &project_dir,
+            &["remote", "add", "origin", "https://example.com/x.git"],
+        );
+        seed_project(&db, "b", &project_dir);
+
+        // Producer A records the output B is waiting on.
+        crate::artifacts::record_output_artifacts(
+            &db,
+            "a",
+            &[output_artifact("schema")],
+            Some("sha-a"),
+        );
+
+        let (state, _rx) = test_state(db, plans_dir);
+        let outcome = execute_gate(&state, "b", "init", &init_node()).await;
+        match outcome {
+            GateOutcome::Blocked(reason) => {
+                assert!(
+                    !reason.starts_with("waiting for"),
+                    "inputs should be satisfied now, got {reason}"
+                );
+                assert!(
+                    reason.contains("awaiting approval"),
+                    "expected the preconditions-passed approval block, got {reason}"
+                );
+            }
+            other => panic!("expected Blocked(awaiting approval), got {other:?}"),
+        }
+    }
+
+    /// Acceptance (producer side): a passing End gate records the plan's
+    /// declared outputs in `plan_artifacts`, valued at the merged HEAD SHA and
+    /// stamped `satisfied_at`.
+    #[tokio::test]
+    async fn end_gate_passing_records_declared_outputs() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init(&project_dir); // HEAD commit; no workflows, no branchwork.toml
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(
+            plans_dir.join("a.yaml"),
+            "schema_version: 2\n\
+             title: A\n\
+             outputs:\n\
+             \x20 - name: schema\n\
+             nodes:\n\
+             \x20 - id: end\n\
+             \x20   type: gate\n\
+             \x20   gate_kind: end\n",
+        )
+        .unwrap();
+        seed_project(&db, "a", &project_dir);
+
+        let head = crate::agents::git_head_sha(&project_dir).expect("HEAD sha");
+
+        crate::repo_config::clear_cache_for_tests();
+        let (state, _rx) = test_state(db, plans_dir);
+        let outcome = execute_gate(&state, "a", "end", &end_node()).await;
+        assert_eq!(outcome, GateOutcome::Passed, "clean end gate must pass");
+
+        let conn = state.db.lock().unwrap();
+        let (value, satisfied): (String, Option<String>) = conn
+            .query_row(
+                "SELECT value, satisfied_at FROM plan_artifacts \
+                 WHERE plan_name='a' AND artifact_name='schema' AND direction='output'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("end gate should have recorded the output");
+        assert_eq!(value, head, "output value should be the merged HEAD SHA");
+        assert!(satisfied.is_some(), "output must be stamped satisfied_at");
+    }
+
+    /// Acceptance (the producer push): when plan A's End gate passes, a
+    /// dependent plan B whose Init gate was blocked on A's output is flipped
+    /// back to `pending` so the scheduler re-claims and re-checks it.
+    #[tokio::test]
+    async fn end_gate_passing_re_advances_blocked_consumer() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init(&project_dir);
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        // Producer A declares `schema`; consumer B's Init gate waits on it.
+        std::fs::write(
+            plans_dir.join("a.yaml"),
+            "schema_version: 2\n\
+             title: A\n\
+             outputs:\n\
+             \x20 - name: schema\n\
+             nodes:\n\
+             \x20 - id: end\n\
+             \x20   type: gate\n\
+             \x20   gate_kind: end\n",
+        )
+        .unwrap();
+        std::fs::write(plans_dir.join("b.yaml"), CONSUMER_YAML).unwrap();
+        seed_project(&db, "a", &project_dir);
+
+        // B's Init gate is currently blocked (claimed → in_progress). B has no
+        // auto-mode enabled, so the spawned `try_dag_advance(B)` is a no-op —
+        // leaving the synchronous reset (in_progress → pending) observable.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO node_status (plan_name, node_id, status) \
+                 VALUES ('b', 'init', 'in_progress')",
+                [],
+            )
+            .unwrap();
+        }
+
+        crate::repo_config::clear_cache_for_tests();
+        let (state, _rx) = test_state(db, plans_dir);
+        let outcome = execute_gate(&state, "a", "end", &end_node()).await;
+        assert_eq!(outcome, GateOutcome::Passed);
+
+        let status: String = {
+            let conn = state.db.lock().unwrap();
+            conn.query_row(
+                "SELECT status FROM node_status WHERE plan_name='b' AND node_id='init'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            status, "pending",
+            "consumer's blocked Init gate should be re-opened after the producer's output lands"
+        );
     }
 }

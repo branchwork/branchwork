@@ -1,5 +1,6 @@
 mod agents;
 mod api;
+mod artifacts;
 mod audit;
 mod auth;
 mod auto_mode;
