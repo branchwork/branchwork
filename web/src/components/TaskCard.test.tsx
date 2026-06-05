@@ -1106,3 +1106,47 @@ describe("TaskCard worktree path indicator (Task 6.1)", () => {
     expect(screen.queryByTestId("worktree-path-row")).toBeNull();
   });
 });
+
+describe("TaskCard spawn-error banner", () => {
+  // Agents are stored started_at DESC; the array order here mirrors that.
+  it("shows the spawn-error banner when the task's most recent attempt failed at spawn", () => {
+    const t = task({ number: "2.3", status: "pending" });
+    seed(t, {
+      agents: [
+        agent({
+          id: "failed-1",
+          task_id: "2.3",
+          status: "failed",
+          branch: null,
+          spawn_error: "worktree setup failed: branch already used by worktree at ...",
+        }),
+      ],
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    expect(screen.getByTestId("spawn-error-banner")).toBeTruthy();
+  });
+
+  it("suppresses a stale spawn-error banner once a newer attempt succeeded", () => {
+    // The reported bug: a failed spawn (older) leaves a `failed`+spawn_error
+    // row that never flips status; a later successful re-run is a different,
+    // completed row. The banner must key off the MOST RECENT attempt, so it
+    // disappears here instead of lingering as a phantom "merge error".
+    const t = task({ number: "2.3", status: "completed" });
+    seed(t, {
+      agents: [
+        // Most recent: the successful re-run (completed, branch since cleared).
+        agent({ id: "rerun-ok", task_id: "2.3", status: "completed", branch: null }),
+        // Older: the spawn that failed before cleanup freed the worktree.
+        agent({
+          id: "failed-old",
+          task_id: "2.3",
+          status: "failed",
+          branch: null,
+          spawn_error: "worktree setup failed: branch already used by worktree at ...",
+        }),
+      ],
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    expect(screen.queryByTestId("spawn-error-banner")).toBeNull();
+  });
+});

@@ -199,21 +199,27 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
       let branch: import("../stores/agent-store.js").Agent | undefined;
       let running: import("../stores/agent-store.js").Agent | undefined;
       let spawnFailed: import("../stores/agent-store.js").Agent | undefined;
+      // Agents are ordered started_at DESC, so the FIRST row we see for this
+      // task is its most recent attempt.
+      let seenForTask = false;
       for (const a of s.agents) {
         if (a.plan_name !== planName || a.task_id !== task.number) continue;
+        const isMostRecent = !seenForTask;
+        seenForTask = true;
         if (a.status === "running" || a.status === "starting") {
           if (!running) running = a;
         } else if (a.branch) {
           if (!branch) branch = a;
         }
-        // The agents store is ordered started_at DESC, so the first
-        // failed-with-spawn_error match is the most recent. Surface it
-        // on the task card so a fresh Start click that crashed the
-        // runner spawn doesn't go silent (Task 1.1, runner-install-and-
-        // spawn-reliability plan). A subsequent successful spawn flips
-        // the row's `status` away from `failed` (and a fresh Start
-        // produces a new row entirely), so the banner naturally clears.
-        if (a.status === "failed" && a.spawn_error && !spawnFailed && !running && !branch) {
+        // Surface a spawn failure ONLY when the task's most-recent attempt
+        // is the one that failed at spawn (Task 1.1, runner-install-and-
+        // spawn-reliability plan). A failed spawn inserts its OWN `failed`
+        // row that never flips status — a later successful/running attempt
+        // is a DIFFERENT row — so without the most-recent guard a stale
+        // spawn-error banner lingers forever on a task that has since
+        // succeeded (mistaken for a live "merge error"). The retry-cleanup
+        // case 8f15209f/141ddb6b → 6694c4b2(completed) is exactly this.
+        if (isMostRecent && a.status === "failed" && a.spawn_error) {
           spawnFailed = a;
         }
       }
