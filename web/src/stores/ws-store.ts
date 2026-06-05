@@ -900,6 +900,25 @@ function dispatch(msg: WsMessage) {
       });
       break;
     }
+    case "node_status_changed":
+    case "gate_status_changed": {
+      // DAG (schema_version: 2) plan model. A node — task, gate, or sub-plan
+      // — changed status; patch it on the selected plan's `nodes` graph so
+      // its card (TaskCard / GateCard) repaints without a refetch.
+      // `gate_status_changed` fires alongside `node_status_changed` for gates
+      // and carries the same `status` (plus `gate_kind`, which the card reads
+      // from the static node), so handling both is idempotent. `node_id` is
+      // the scoped id; `patchNodeStatus` walks the tree to match. No-op for
+      // v1 plans (no `nodes`). The companion `node_advanced` /
+      // `gate_awaiting_approval` / `gate_ready_for_approval` / `gate_approved`
+      // / `gate_failed` events carry no authoritative status beyond these, so
+      // they fall through unhandled (the card's awaiting-approval vs checking
+      // distinction is derived from `gate_kind` + `status`, both already in
+      // hand).
+      const d = msg.data;
+      usePlanStore.getState().patchNodeStatus(d.plan_name, d.node_id, d.status);
+      break;
+    }
   }
 
   // Notify external subscribers AFTER the built-in switch so they see
