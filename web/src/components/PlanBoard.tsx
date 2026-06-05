@@ -1,11 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
   usePlanStore,
   type ParsedPlan,
   type PlanConfig,
   type PlanConfigPatch,
   type PlanNode,
-  type PlanTask,
   type PlanVerdict,
 } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
@@ -13,8 +12,6 @@ import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
 import { fetchJson, postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
-import { TaskCard } from "./TaskCard.js";
-import { GateCard } from "./GateCard.js";
 import { EditableText } from "./EditableText.js";
 import { DeletePlanModal } from "./DeletePlanModal.js";
 import { PlanSettings } from "./PlanSettings.js";
@@ -27,6 +24,13 @@ import { exportPlan } from "../lib/plan-export.js";
 import { useGoToAgent } from "../hooks/use-route-selection.js";
 import { StaleDataChip } from "./StaleDataChip.js";
 import { CompletedTasksContext } from "../lib/plan-context.js";
+import { collectTaskNodes } from "../lib/dag-nodes.js";
+
+// Lazy-load the v2 (DAG) board: the gate / sub-plan / node-graph rendering code
+// (GateCard, SubPlanCard, DagBoard) only matters for `schema_version: 2` plans,
+// so keeping it out of the first-paint entry chunk preserves the gzipped budget
+// enforced by `scripts/check-bundle-size.ts`. v1 phase plans never pay for it.
+const DagBoard = lazy(() => import("./DagBoard.js").then((m) => ({ default: m.DagBoard })));
 
 type PlanBoardTab = "board" | "settings";
 
@@ -407,10 +411,15 @@ export function PlanBoard() {
       {activeTab === "board" ? (
         isDagPlan ? (
           // v2 (DAG) plans: render the node graph top-to-bottom — gate nodes
-          // as diamond GateCards, task nodes as TaskCards. The status filter
-          // is a phase-board affordance; the DAG flow stays fully visible so
-          // gates read as the verification checkpoints between task groups.
-          <DagBoard planName={plan.name} nodes={plan.nodes!} completedSet={completedSet} />
+          // as diamond GateCards, task nodes as TaskCards, sub-plan nodes as
+          // collapsible SubPlanCard groups. The status filter is a phase-board
+          // affordance; the DAG flow stays fully visible so gates read as the
+          // verification checkpoints between task groups. Lazy-loaded.
+          <Suspense
+            fallback={<div className="py-8 text-center text-xs text-gray-600">Loading board…</div>}
+          >
+            <DagBoard planName={plan.name} nodes={plan.nodes!} completedSet={completedSet} />
+          </Suspense>
         ) : (
           <>
             {/* Status filter */}
@@ -466,104 +475,10 @@ export function PlanBoard() {
   );
 }
 
-// ── DAG (schema_version: 2) board ────────────────────────────────────────────
-
-/// Recursively collect every task node from a DAG node tree (descending into
-/// sub-plans). Used for the header's "N/M tasks done" stats — gates are
-/// structural and excluded.
-function collectTaskNodes(nodes: PlanNode[]): PlanNode[] {
-  const out: PlanNode[] = [];
-  const walk = (ns: PlanNode[]) => {
-    for (const n of ns) {
-      if (n.type === "task") out.push(n);
-      if (n.nodes && n.nodes.length > 0) walk(n.nodes);
-    }
-  };
-  walk(nodes);
-  return out;
-}
-
-/// Map a DAG task node to the `PlanTask` shape `TaskCard` consumes. `number`
-/// is the **scoped** node id so TaskCard's agent lookups (`a.task_id ===
-/// task.number`) line up with what the DAG scheduler spawns agents with.
-/// `filePaths` / `acceptance` / `description` are defaulted so TaskCard's
-/// direct field accesses (e.g. `task.filePaths.length`) never throw.
-function nodeToTask(node: PlanNode, scopedId: string): PlanTask {
-  return {
-    number: scopedId,
-    title: node.title,
-    description: node.description ?? "",
-    filePaths: node.filePaths ?? [],
-    acceptance: node.acceptance ?? "",
-    dependencies: node.dependsOn ?? [],
-    producesCommit: node.producesCommit,
-    status: node.status,
-    statusUpdatedAt: node.statusUpdatedAt,
-    costUsd: node.costUsd,
-    ci: null,
-  };
-}
-
-/// The v2 board: a top-to-bottom rendering of the DAG node graph. Gate nodes
-/// render as diamond `GateCard`s; task nodes as full-width `TaskCard`s;
-/// sub-plan nodes as a labelled container that recurses its children (with
-/// scoped ids). Shares the `CompletedTasksContext` so TaskCard dependency
-/// gating reads the plan-wide done-node set.
-function DagBoard({
-  planName,
-  nodes,
-  completedSet,
-}: {
-  planName: string;
-  nodes: PlanNode[];
-  completedSet: ReadonlySet<string>;
-}) {
-  return (
-    <CompletedTasksContext.Provider value={completedSet}>
-      <div className="space-y-2 pb-4">
-        {nodes.map((node) => (
-          <DagNodeRenderer key={node.id} planName={planName} node={node} scopedId={node.id} />
-        ))}
-      </div>
-    </CompletedTasksContext.Provider>
-  );
-}
-
-function DagNodeRenderer({
-  planName,
-  node,
-  scopedId,
-}: {
-  planName: string;
-  node: PlanNode;
-  scopedId: string;
-}) {
-  if (node.type === "gate") {
-    return <GateCard planName={planName} nodeId={scopedId} node={node} />;
-  }
-  if (node.type === "sub_plan") {
-    return (
-      <div className="my-2 rounded-lg border border-indigo-800/40 bg-indigo-950/20 p-3">
-        <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-indigo-300">
-          {node.title || scopedId}
-        </div>
-        <div className="space-y-2">
-          {(node.nodes ?? []).map((child) => (
-            <DagNodeRenderer
-              key={child.id}
-              planName={planName}
-              node={child}
-              scopedId={`${scopedId}.${child.id}`}
-            />
-          ))}
-        </div>
-      </div>
-    );
-  }
-  // Task node — full-width TaskCard. phaseNumber=1 maps to the single phase
-  // the v2→ParsedPlan conversion produces (used only for the cadence tooltip).
-  return <TaskCard task={nodeToTask(node, scopedId)} planName={planName} phaseNumber={1} />;
-}
+// The v2 (DAG) board — including the `collectTaskNodes`/`nodeToTask` helpers,
+// the `DagNodeRenderer` dispatcher and the `SubPlanCard` group — lives in
+// `DagBoard.tsx` (lazy-loaded above) so it stays out of the first-paint entry
+// chunk. The header stats import `collectTaskNodes` from `lib/dag-nodes.ts`.
 
 interface CheckPlanButtonProps {
   plan: ParsedPlan;
