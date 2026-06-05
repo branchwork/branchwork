@@ -18,23 +18,32 @@
 //! - A producing plan's **End** gate, on success, records each declared
 //!   `outputs:` entry as `direction='output'` with a computed `value` (the
 //!   merged commit SHA, a file hash, or a boolean marker) and a non-NULL
-//!   `satisfied_at` ([`record_output_artifacts`]). It then re-advances any
-//!   consumer whose Init gate was waiting on those outputs
-//!   ([`reset_dependent_init_gates`]).
+//!   `satisfied_at` ([`record_output_artifacts`]). The caller then broadcasts a
+//!   `plan_output_produced { plan_name, artifact_name }` event per output.
+//! - The cross-plan **listener** ([`spawn_listener`], Phase 4.2) subscribes to
+//!   the dashboard broadcast channel and, on each `plan_output_produced`,
+//!   re-evaluates every plan with an unsatisfied input referencing that
+//!   producer: once all of a consumer's inputs are satisfied it flips the
+//!   consumer's blocked Init gate back to `pending` and re-enters the DAG
+//!   scheduler ([`reset_dependent_init_gates`] + `try_dag_advance`).
 //! - A consuming plan's **Init** gate checks every declared input against the
 //!   producing plan's satisfied output row ([`check_inputs_satisfied`]). Until
 //!   they are all satisfied the gate stays `Blocked` with reason
 //!   `waiting for <plan>/<artifact>` (built from [`first_unsatisfied_input`]).
 //!
-//! The Init/End gate wiring lives in [`crate::gates`]; this module is the pure
-//! DB + plan-file resolution layer it calls into.
+//! The Init/End gate wiring lives in [`crate::gates`]. The resolution helpers
+//! here are a pure DB + plan-file layer (no broadcast / scheduler deps); the
+//! [`spawn_listener`] / [`handle_plan_output_produced`] entry points are a thin
+//! event-driven wiring layer on top that the gate engine + `main.rs` drive.
 
 use std::path::Path;
 
 use rusqlite::params;
+use tokio::sync::broadcast;
 
 use crate::dag::{DagNode, GateKind, NodeType, PlanArtifact};
 use crate::db::Db;
+use crate::state::AppState;
 
 // ── Input resolution ───────────────────────────────────────────────────────
 
@@ -125,31 +134,41 @@ pub fn check_inputs_satisfied(db: &Db, plan_name: &str, inputs: &[PlanArtifact])
 /// gate's natural point-in-time marker), a file hash, or a boolean. `None`
 /// (SaaS, or when HEAD can't resolve) is stored as the boolean marker `"true"`.
 /// A re-run of the End gate updates the existing row (idempotent).
+///
+/// Returns the artifact names actually written (those whose upsert succeeded).
+/// The caller broadcasts one `plan_output_produced { plan_name, artifact_name }`
+/// event per returned name so the cross-plan listener
+/// ([`spawn_listener`]) can re-evaluate dependent plans' Init gates — keeping
+/// this module a pure DB layer (the broadcast lives with the caller, which
+/// owns the [`crate::state::AppState`]).
 pub fn record_output_artifacts(
     db: &Db,
     plan_name: &str,
     outputs: &[PlanArtifact],
     value: Option<&str>,
-) {
+) -> Vec<String> {
     if outputs.is_empty() {
-        return;
+        return Vec::new();
     }
     let value = value.unwrap_or("true");
+    let mut written = Vec::with_capacity(outputs.len());
     let conn = db.lock().unwrap();
     for output in outputs {
-        if let Err(e) = conn.execute(
+        match conn.execute(
             "INSERT INTO plan_artifacts (plan_name, artifact_name, direction, value, satisfied_at) \
              VALUES (?1, ?2, 'output', ?3, datetime('now')) \
              ON CONFLICT(plan_name, artifact_name, direction) \
              DO UPDATE SET value = excluded.value, satisfied_at = excluded.satisfied_at",
             params![plan_name, output.name, value],
         ) {
-            eprintln!(
+            Ok(_) => written.push(output.name.clone()),
+            Err(e) => eprintln!(
                 "[artifacts] failed to record output '{}' for plan '{plan_name}': {e}",
                 output.name
-            );
+            ),
         }
     }
+    written
 }
 
 // ── Dependent re-advance (push) ────────────────────────────────────────────
@@ -262,12 +281,117 @@ pub fn reset_dependent_init_gates(db: &Db, plans_dir: &Path, producing_plan: &st
     resumed
 }
 
+// ── Cross-plan listener (Phase 4.2) ─────────────────────────────────────────
+
+/// Parsed payload of a `plan_output_produced` broadcast.
+///
+/// `producing_plan` is the plan whose End gate just recorded the output (the
+/// event's `plan_name`); `artifact_name` is the produced output. The listener
+/// keys its re-evaluation off `producing_plan` (a consumer's specific artifact
+/// is verified by [`check_inputs_satisfied`] downstream), so `artifact_name`
+/// is informational — useful for logs and for a future artifact-scoped scan.
+#[derive(Debug, Clone)]
+pub struct PlanOutputProducedPayload {
+    pub producing_plan: String,
+    pub artifact_name: String,
+}
+
+/// Pull a `plan_output_produced` payload out of a broadcast envelope. Returns
+/// `None` for any other event type. The cheap string-contains check
+/// short-circuits before the JSON parse so the hot path stays cheap (mirrors
+/// [`crate::agents::phase_check::parse_phase_completed`]).
+pub fn parse_plan_output_produced(msg: &str) -> Option<PlanOutputProducedPayload> {
+    if !msg.contains("\"type\":\"plan_output_produced\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(msg).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("plan_output_produced") {
+        return None;
+    }
+    let data = v.get("data")?;
+    Some(PlanOutputProducedPayload {
+        producing_plan: data.get("plan_name").and_then(|s| s.as_str())?.to_string(),
+        artifact_name: data
+            .get("artifact_name")
+            .and_then(|s| s.as_str())?
+            .to_string(),
+    })
+}
+
+/// Spawn the per-process cross-plan listener task. Subscribes to the dashboard
+/// broadcast channel, filters for `plan_output_produced` envelopes, and
+/// dispatches each one onto its own tokio task so a slow re-advance can't block
+/// the recv loop. Wired in at startup ([`crate::main`]) alongside the
+/// phase-verify listener; always on — a no-op for plans with no cross-plan
+/// consumers.
+pub fn spawn_listener(state: AppState) {
+    let mut rx = state.broadcast_tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    if let Some(payload) = parse_plan_output_produced(&msg) {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            handle_plan_output_produced(&state, payload).await;
+                        });
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("[artifacts] listener lagged, skipped {n} events");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// React to a `plan_output_produced` event: re-evaluate every plan whose Init
+/// gate was blocked waiting on the producing plan's outputs. For each consumer
+/// now fully satisfied, [`reset_dependent_init_gates`] flips its blocked Init
+/// gate back to `pending`; we then re-enter the DAG scheduler so it re-claims
+/// and re-runs the gate (now past the inputs check).
+///
+/// This is the event-driven analogue of the approve / retry re-advance paths
+/// (reset → re-advance). The synchronous reset happens inline; the
+/// `try_dag_advance` per consumer is detached so a slow scheduler pass can't
+/// block the listener.
+pub async fn handle_plan_output_produced(state: &AppState, payload: PlanOutputProducedPayload) {
+    let PlanOutputProducedPayload {
+        producing_plan,
+        artifact_name,
+    } = payload;
+    let resumed = reset_dependent_init_gates(&state.db, &state.plans_dir, &producing_plan);
+    if resumed.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[artifacts] {producing_plan}/{artifact_name} produced — re-advancing {} consumer(s): {resumed:?}",
+        resumed.len()
+    );
+    for consumer in resumed {
+        let registry = state.registry.clone();
+        let plans_dir = state.plans_dir.clone();
+        let effort = *state.effort.lock().unwrap();
+        let port = state.config_port();
+        tokio::spawn(async move {
+            crate::dag_scheduler::try_dag_advance(
+                registry, plans_dir, consumer, None, effort, port,
+            )
+            .await;
+        });
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::params;
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::TempDir;
 
     fn fresh_db() -> (Db, TempDir) {
@@ -643,5 +767,138 @@ mod tests {
         // Top-level init + the nested sub-plan's init (scoped), but not the
         // End gate.
         assert_eq!(ids, vec!["init".to_string(), "sub.init".to_string()]);
+    }
+
+    // ── Cross-plan listener (Phase 4.2) ────────────────────────────────────
+
+    /// Build a minimal `AppState` over `db` + `plans_dir` for the listener
+    /// handler tests (mirrors `gates.rs::tests::test_state`). `server_exe` is a
+    /// nonexistent path so any spawned `try_dag_advance` that reaches a task
+    /// spawn fails fast — harmless here since the consumers used in these tests
+    /// have no auto-advance, so `try_dag_advance` returns at its master gate.
+    fn test_state(db: Db, plans_dir: PathBuf) -> AppState {
+        let (broadcast_tx, _rx) = broadcast::channel::<String>(64);
+        let registry = crate::agents::AgentRegistry::new(
+            db.clone(),
+            broadcast_tx.clone(),
+            None,
+            plans_dir.clone(),
+            PathBuf::from("/nonexistent/branchwork-server"),
+            0,
+            true,
+        );
+        let runners = crate::saas::runner_ws::new_runner_registry();
+        AppState {
+            db,
+            plans_dir,
+            port: 0,
+            effort: Arc::new(StdMutex::new(crate::config::Effort::Medium)),
+            broadcast_tx,
+            registry,
+            runners,
+            settings_path: PathBuf::from("/tmp/branchwork-artifacts-test-settings.json"),
+            cancellation_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            auto_finish_dedupe: Arc::new(StdMutex::new(HashSet::new())),
+            dirty_tree_watchers: Arc::new(StdMutex::new(HashSet::new())),
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn parse_plan_output_produced_extracts_producer_and_artifact() {
+        let envelope = serde_json::json!({
+            "type": "plan_output_produced",
+            "data": { "plan_name": "producer", "artifact_name": "schema" },
+            "timestamp": "2026-01-01T00:00:00Z",
+        })
+        .to_string();
+        let p = parse_plan_output_produced(&envelope).expect("parses a well-formed envelope");
+        assert_eq!(p.producing_plan, "producer");
+        assert_eq!(p.artifact_name, "schema");
+
+        // A different event type → None (cheap short-circuit + strict check).
+        assert!(parse_plan_output_produced("{\"type\":\"gate_approved\"}").is_none());
+        // Non-JSON → None (never panics).
+        assert!(parse_plan_output_produced("not json at all").is_none());
+        // Right type, missing field → None.
+        let missing = serde_json::json!({
+            "type": "plan_output_produced",
+            "data": { "plan_name": "producer" },
+        })
+        .to_string();
+        assert!(parse_plan_output_produced(&missing).is_none());
+    }
+
+    /// Acceptance (Phase 4.2): the listener handler re-advances a consumer whose
+    /// Init gate was blocked on the producer's output. The consumer has no
+    /// auto-advance, so the spawned `try_dag_advance(consumer)` is a no-op,
+    /// leaving the synchronous reset (in_progress → pending) observable.
+    #[tokio::test]
+    async fn handle_plan_output_produced_re_advances_blocked_consumer() {
+        let (db, d) = fresh_db();
+        let plans_dir = d.path().join("plans");
+        write_plan(
+            &plans_dir,
+            "consumer",
+            &consumer_plan_yaml("producer", "schema"),
+        );
+        // Consumer's Init gate is blocked; the producer has recorded its output.
+        seed_node_status(&db, "consumer", "init", "in_progress");
+        record_output_artifacts(&db, "producer", &[output("schema")], Some("sha"));
+
+        let state = test_state(db.clone(), plans_dir);
+        handle_plan_output_produced(
+            &state,
+            PlanOutputProducedPayload {
+                producing_plan: "producer".to_string(),
+                artifact_name: "schema".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            node_status(&db, "consumer", "init").as_deref(),
+            Some("pending"),
+            "consumer's blocked Init gate must be re-opened after the producer's output lands"
+        );
+    }
+
+    /// The handler leaves a consumer still waiting on a *different* producer
+    /// blocked: only `producer` has produced, so a consumer that also needs
+    /// `other` stays `in_progress`.
+    #[tokio::test]
+    async fn handle_plan_output_produced_skips_consumer_waiting_on_other_producer() {
+        let (db, d) = fresh_db();
+        let plans_dir = d.path().join("plans");
+        let body = "schema_version: 2\n\
+             title: Consumer\n\
+             inputs:\n\
+             \x20 - name: a\n\
+             \x20   fromPlan: producer\n\
+             \x20 - name: b\n\
+             \x20   fromPlan: other\n\
+             nodes:\n\
+             \x20 - id: init\n\
+             \x20   type: gate\n\
+             \x20   gate_kind: init\n";
+        write_plan(&plans_dir, "consumer", body);
+        seed_node_status(&db, "consumer", "init", "in_progress");
+        record_output_artifacts(&db, "producer", &[output("a")], Some("sha"));
+
+        let state = test_state(db.clone(), plans_dir);
+        handle_plan_output_produced(
+            &state,
+            PlanOutputProducedPayload {
+                producing_plan: "producer".to_string(),
+                artifact_name: "a".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            node_status(&db, "consumer", "init").as_deref(),
+            Some("in_progress"),
+            "consumer still waiting on `other` must stay blocked"
+        );
     }
 }

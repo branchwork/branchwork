@@ -349,6 +349,14 @@ async fn run_server(cli: Cli) {
     // boundary that has a verify command configured.
     agents::phase_check::spawn_listener(state.clone());
 
+    // Start the cross-plan artifact listener (DAG plan model, Task 4.2).
+    // Always on — a no-op for plans with no cross-plan consumers. Subscribes
+    // to the dashboard broadcast channel; on each `plan_output_produced`
+    // (fired when a producing plan's End gate records its outputs) it flips any
+    // consumer plan whose Init gate was blocked on that output back to
+    // `pending` and re-enters the DAG scheduler so the consumer auto-unblocks.
+    artifacts::spawn_listener(state.clone());
+
     // Hourly retention purger: hard-deletes plan_snapshots rows past
     // `expires_at` (and their archive YAML), audits one
     // `plan.snapshot_purged` row per snapshot.

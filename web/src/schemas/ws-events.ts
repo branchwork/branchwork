@@ -689,6 +689,21 @@ const GateCheckResults = v.object({
   }),
 });
 
+/// A producing plan's End gate recorded a declared cross-plan output (Phase
+/// 4.2). `plan_name` is the producer; `artifact_name` is the output just
+/// satisfied. The server-side cross-plan listener reacts to this to re-advance
+/// any consumer plan whose Init gate was blocked waiting on the output. The
+/// dashboard can use it to refresh a cross-plan dependency view; no handler
+/// reacts to it yet, so it is schematized here so the validator does not
+/// warn-drop the frame.
+const PlanOutputProduced = v.object({
+  type: v.literal("plan_output_produced"),
+  data: v.object({
+    plan_name: v.string(),
+    artifact_name: v.string(),
+  }),
+});
+
 export const WsMessageSchema = v.variant("type", [
   Connected,
   PlanUpdated,
@@ -743,6 +758,7 @@ export const WsMessageSchema = v.variant("type", [
   GateApproved,
   GateFailed,
   GateCheckResults,
+  PlanOutputProduced,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;

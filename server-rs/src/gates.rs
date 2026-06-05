@@ -168,9 +168,10 @@ async fn execute_init_gate(
     // Cross-plan inputs gate (Phase 4): before running this plan's own
     // preconditions, every declared `inputs:` must be satisfied by the
     // producing plan's recorded output. Until then the gate stays `Blocked`
-    // with `waiting for <plan>/<artifact>`; the producing plan's End gate
-    // re-advances us once it records the output (see
-    // `crate::artifacts::reset_dependent_init_gates`).
+    // with `waiting for <plan>/<artifact>`; once the producing plan's End gate
+    // records the output it broadcasts `plan_output_produced`, and the
+    // cross-plan listener re-advances us (see
+    // `crate::artifacts::handle_plan_output_produced`).
     let inputs = plan_inputs(&state.plans_dir, plan_name);
     if !crate::artifacts::check_inputs_satisfied(&state.db, plan_name, &inputs) {
         let reason = crate::artifacts::first_unsatisfied_input(&state.db, &inputs)
@@ -330,45 +331,46 @@ async fn execute_end_gate(
         (None, Some(reason)) => GateOutcome::Blocked(reason),
         (None, None) => {
             // The plan's work is verified and merged — record its declared
-            // outputs as satisfied so downstream plans' Init gates can proceed,
-            // then re-advance any consumer that was waiting on them.
+            // outputs as satisfied and broadcast `plan_output_produced` so the
+            // cross-plan listener re-advances any consumer that was waiting on
+            // them (Phase 4.2).
             record_and_notify_outputs(state, plan_name, project_dir.as_deref());
             GateOutcome::Passed
         }
     }
 }
 
-/// Record a passing End gate's declared `outputs:` and push a re-advance to any
-/// dependent plan whose Init gate was blocked waiting on them (Phase 4).
+/// Record a passing End gate's declared `outputs:` and announce each one with a
+/// `plan_output_produced { plan_name, artifact_name }` broadcast (Phase 4.2).
 ///
 /// The "computed value" for each output is the plan's merged HEAD commit SHA (a
 /// single point-in-time marker for everything the plan produced). `None` in
 /// SaaS / when HEAD can't resolve → stored as the boolean marker `"true"` by
 /// [`crate::artifacts::record_output_artifacts`].
+///
+/// The re-advance of dependent consumers is **not** done inline here — it is
+/// driven by the cross-plan listener ([`crate::artifacts::spawn_listener`])
+/// reacting to the `plan_output_produced` events. Decoupling via the event
+/// means any path that records an output (not just this End gate) triggers the
+/// same re-evaluation, and the dashboard gets a first-class cross-plan event.
 fn record_and_notify_outputs(state: &AppState, plan_name: &str, project_dir: Option<&Path>) {
     let outputs = plan_outputs(&state.plans_dir, plan_name);
     if outputs.is_empty() {
         return;
     }
     let value = project_dir.and_then(crate::agents::git_head_sha);
-    crate::artifacts::record_output_artifacts(&state.db, plan_name, &outputs, value.as_deref());
+    let written =
+        crate::artifacts::record_output_artifacts(&state.db, plan_name, &outputs, value.as_deref());
 
-    // Producer-push: flip each waiting consumer's blocked Init gate back to
-    // `pending` and re-enter the DAG scheduler so it re-checks (now satisfied)
-    // and proceeds. Detached, mirroring the approve / retry re-advance paths.
-    let resumed =
-        crate::artifacts::reset_dependent_init_gates(&state.db, &state.plans_dir, plan_name);
-    for consumer in resumed {
-        let registry = state.registry.clone();
-        let plans_dir = state.plans_dir.clone();
-        let effort = *state.effort.lock().unwrap();
-        let port = state.config_port();
-        tokio::spawn(async move {
-            crate::dag_scheduler::try_dag_advance(
-                registry, plans_dir, consumer, None, effort, port,
-            )
-            .await;
-        });
+    for artifact_name in written {
+        broadcast_event(
+            &state.broadcast_tx,
+            "plan_output_produced",
+            json!({
+                "plan_name": plan_name,
+                "artifact_name": artifact_name,
+            }),
+        );
     }
 }
 
@@ -1548,62 +1550,65 @@ mod tests {
         assert!(satisfied.is_some(), "output must be stamped satisfied_at");
     }
 
-    /// Acceptance (the producer push): when plan A's End gate passes, a
-    /// dependent plan B whose Init gate was blocked on A's output is flipped
-    /// back to `pending` so the scheduler re-claims and re-checks it.
+    /// Acceptance (producer side, Phase 4.2): a passing End gate broadcasts one
+    /// `plan_output_produced { plan_name, artifact_name }` per declared output.
+    /// The cross-plan listener reacts to these to re-advance blocked consumers
+    /// — that re-advance is exercised in
+    /// `crate::artifacts::tests::handle_plan_output_produced_*` and end-to-end
+    /// in `tests/cross_plan_artifacts.rs`.
     #[tokio::test]
-    async fn end_gate_passing_re_advances_blocked_consumer() {
+    async fn end_gate_passing_broadcasts_plan_output_produced() {
         let (db, dir) = fresh_db();
         let project_dir = dir.path().join("project");
         git_init(&project_dir);
         let plans_dir = dir.path().join("plans");
         std::fs::create_dir_all(&plans_dir).unwrap();
-        // Producer A declares `schema`; consumer B's Init gate waits on it.
+        // Producer A declares two outputs.
         std::fs::write(
             plans_dir.join("a.yaml"),
             "schema_version: 2\n\
              title: A\n\
              outputs:\n\
              \x20 - name: schema\n\
+             \x20 - name: client\n\
              nodes:\n\
              \x20 - id: end\n\
              \x20   type: gate\n\
              \x20   gate_kind: end\n",
         )
         .unwrap();
-        std::fs::write(plans_dir.join("b.yaml"), CONSUMER_YAML).unwrap();
         seed_project(&db, "a", &project_dir);
 
-        // B's Init gate is currently blocked (claimed → in_progress). B has no
-        // auto-mode enabled, so the spawned `try_dag_advance(B)` is a no-op —
-        // leaving the synchronous reset (in_progress → pending) observable.
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO node_status (plan_name, node_id, status) \
-                 VALUES ('b', 'init', 'in_progress')",
-                [],
-            )
-            .unwrap();
-        }
-
         crate::repo_config::clear_cache_for_tests();
-        let (state, _rx) = test_state(db, plans_dir);
+        let (state, mut rx) = test_state(db, plans_dir);
         let outcome = execute_gate(&state, "a", "end", &end_node()).await;
         assert_eq!(outcome, GateOutcome::Passed);
 
-        let status: String = {
-            let conn = state.db.lock().unwrap();
-            conn.query_row(
-                "SELECT status FROM node_status WHERE plan_name='b' AND node_id='init'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
+        let events = drain(&mut rx);
+        let produced: Vec<&String> = events
+            .iter()
+            .filter(|e| e.contains("\"type\":\"plan_output_produced\""))
+            .collect();
         assert_eq!(
-            status, "pending",
-            "consumer's blocked Init gate should be re-opened after the producer's output lands"
+            produced.len(),
+            2,
+            "one plan_output_produced per declared output, got {events:?}"
+        );
+        assert!(
+            produced.iter().all(|e| e.contains("\"plan_name\":\"a\"")),
+            "events must carry the producing plan name, got {produced:?}"
+        );
+        assert!(
+            produced
+                .iter()
+                .any(|e| e.contains("\"artifact_name\":\"schema\"")),
+            "missing the `schema` output event, got {produced:?}"
+        );
+        assert!(
+            produced
+                .iter()
+                .any(|e| e.contains("\"artifact_name\":\"client\"")),
+            "missing the `client` output event, got {produced:?}"
         );
     }
 }
