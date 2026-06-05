@@ -324,8 +324,65 @@ pub async fn get_plan(
         if let Some(v) = verdict {
             obj.insert("verdict".to_string(), v);
         }
+
+        // DAG (schema_version: 2) plans: attach the full node graph so the
+        // dashboard can render gate cards. The phases-based ParsedPlan above
+        // drops gate nodes entirely (`dag_plan_to_parsed` excludes them), so
+        // a v2 plan would otherwise surface only its task nodes — no gates,
+        // no init/end verification — in the board. The `nodes` array carries
+        // every node (task / gate / sub-plan) with its runtime `status`
+        // merged from `node_status` (keyed by scoped id, the same scheme the
+        // scheduler writes with) and per-task agent cost from `task_costs`.
+        // The dashboard renders the node graph when `nodes` is present and
+        // falls back to `phases` otherwise.
+        if plan_parser::plan_file_schema_version(&state.plans_dir, &name) >= 2
+            && let Ok(mut dag) = plan_parser::parse_plan_file_as_dag(&plan_path)
+        {
+            merge_node_runtime(&db, &name, &mut dag.nodes, None, &task_costs);
+            if let Ok(nodes) = serde_json::to_value(&dag.nodes) {
+                obj.insert("nodes".to_string(), nodes);
+            }
+        }
     }
     Json(value).into_response()
+}
+
+/// Merge runtime state (`node_status` + per-task agent cost) into a DAG node
+/// tree for the `nodes` field of `GET /api/plans/:name`. Recurses into
+/// sub-plans, keying every node by its **scoped** id (`wire-api` at top
+/// level, `parent.child` inside a sub-plan) — the same scheme the scheduler
+/// and `record_node_status_if_v2` write with. A node with no `node_status`
+/// row defaults to `pending` so the dashboard always has an explicit state.
+fn merge_node_runtime(
+    conn: &rusqlite::Connection,
+    plan_name: &str,
+    nodes: &mut [crate::dag::DagNode],
+    prefix: Option<&str>,
+    task_costs: &HashMap<String, f64>,
+) {
+    for node in nodes.iter_mut() {
+        let scoped = match prefix {
+            Some(p) => format!("{p}.{}", node.id),
+            None => node.id.clone(),
+        };
+        match conn.query_row(
+            "SELECT status, updated_at FROM node_status WHERE plan_name = ?1 AND node_id = ?2",
+            params![plan_name, scoped],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            Ok((status, updated_at)) => {
+                node.status = Some(status);
+                node.status_updated_at = Some(updated_at);
+            }
+            Err(_) => node.status = Some("pending".to_string()),
+        }
+        if let Some(cost) = task_costs.get(&scoped) {
+            node.cost_usd = Some(*cost);
+        }
+        if !node.nodes.is_empty() {
+            merge_node_runtime(conn, plan_name, &mut node.nodes, Some(&scoped), task_costs);
+        }
+    }
 }
 
 // ── GET /api/plans/{name}/export ─────────────────────────────────────────────
@@ -2033,6 +2090,183 @@ pub async fn approve_gate(
         })),
     )
         .into_response()
+}
+
+// ── POST /api/plans/:name/gates/:node_id/retry (DAG plan model, Phase 3) ─────
+//
+// Re-run a *failed* DAG gate. A gate that [`crate::gates::execute_gate`]
+// reported `Failed` (e.g. an `init` gate's dirty tree, an `end` gate's
+// unmerged branch or red CI) is left `failed` in `node_status` and the plan
+// stalls there. This endpoint is the operator clicking "Retry" on the gate
+// card: it resets the node to `pending` and re-enters
+// [`crate::dag_scheduler::try_dag_advance`], which re-claims the gate
+// (`claim_node` flips `pending` → `in_progress`) and re-executes its checks
+// against the now-fixed condition.
+//
+// Resetting to `pending` (rather than leaving it `failed`) gives the
+// dashboard immediate feedback that the retry was accepted — the card flips
+// out of the red "failed" state. The scheduler then drives the gate forward;
+// if neither auto-advance nor auto-mode is enabled for the plan,
+// `try_dag_advance` is a no-op and the gate simply sits at `pending` until
+// the master gate is turned on — the same master-gate contract the approve +
+// resume paths already follow.
+
+pub async fn retry_gate(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path((name, node_id)): Path<(String, String)>,
+) -> Response {
+    let gate_kind = match resolve_gate_kind(&state.plans_dir, &name, &node_id) {
+        Ok(k) => k,
+        Err(resp) => return *resp,
+    };
+
+    // Reset the node to `pending` so the next `try_dag_advance` re-claims it
+    // (`claim_node` accepts both `pending` and `failed`, but `pending` is the
+    // honest "this gate has not run yet for the current attempt" state and
+    // clears the red card immediately).
+    {
+        let db = state.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT INTO node_status (plan_name, node_id, status, source, updated_at) \
+             VALUES (?1, ?2, 'pending', 'manual', datetime('now')) \
+             ON CONFLICT(plan_name, node_id) \
+             DO UPDATE SET status = 'pending', source = 'manual', updated_at = datetime('now')",
+            params![name, node_id],
+        );
+    }
+
+    {
+        let db = state.db.lock().unwrap();
+        crate::audit::log(
+            &db,
+            auth.org_id(),
+            auth.0.as_ref().map(|u| u.id.as_str()),
+            auth.0.as_ref().map(|u| u.email.as_str()),
+            crate::audit::actions::GATE_RETRY,
+            crate::audit::resources::PLAN,
+            Some(&name),
+            Some(
+                &serde_json::json!({
+                    "node_id": node_id,
+                    "gate_kind": gate_kind,
+                })
+                .to_string(),
+            ),
+        );
+    }
+
+    // Tell the dashboard the gate is being re-run (its card leaves the failed
+    // state). The paired `node_status_changed` would also fire from the
+    // scheduler when it re-claims, but emitting here makes the reset visible
+    // even when the master gate is off.
+    crate::ws::broadcast_event(
+        &state.broadcast_tx,
+        "gate_status_changed",
+        serde_json::json!({
+            "plan_name": name,
+            "node_id": node_id,
+            "status": "pending",
+            "gate_kind": gate_kind,
+        }),
+    );
+
+    // Re-enter the DAG scheduler so the reset gate is re-claimed + re-run.
+    // Detached so the HTTP response returns before scheduling work (mirrors
+    // the approve + resume paths). `try_dag_advance` re-checks the
+    // auto-advance / auto-mode master gate internally.
+    {
+        let registry = state.registry.clone();
+        let plans_dir = state.plans_dir.clone();
+        let plan_name = name.clone();
+        let from_node = node_id.clone();
+        let effort = *state.effort.lock().unwrap();
+        let port = state.config_port();
+        tokio::spawn(async move {
+            crate::dag_scheduler::try_dag_advance(
+                registry,
+                plans_dir,
+                plan_name,
+                Some(from_node),
+                effort,
+                port,
+            )
+            .await;
+        });
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "plan": name,
+            "nodeId": node_id,
+            "gateKind": gate_kind,
+            "status": "pending",
+        })),
+    )
+        .into_response()
+}
+
+/// Resolve a DAG gate node for the retry endpoint, returning the gate's
+/// `gate_kind` string on success or a ready `Response` (404 plan/gate not
+/// found, 422 parse failure, 409 not-a-gate) on failure. Mirrors the inline
+/// resolution `approve_gate` does; boxed to keep the `Result` small
+/// (clippy::result_large_err — `Response` is large on the stack).
+fn resolve_gate_kind(
+    plans_dir: &std::path::Path,
+    name: &str,
+    node_id: &str,
+) -> Result<String, Box<Response>> {
+    let Some(plan_path) = plan_parser::find_plan_file(plans_dir, name) else {
+        return Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "plan_not_found" })),
+            )
+                .into_response(),
+        ));
+    };
+    let dag = plan_parser::parse_plan_file_as_dag(&plan_path).map_err(|e| {
+        Box::new(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "plan_parse_failed",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response(),
+        )
+    })?;
+    let Some(node) = crate::dag::find_node_scoped(&dag, node_id) else {
+        return Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "gate_not_found",
+                    "message": format!("no node '{node_id}' in plan '{name}'"),
+                })),
+            )
+                .into_response(),
+        ));
+    };
+    if node.node_type != crate::dag::NodeType::Gate {
+        return Err(Box::new(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "not_a_gate",
+                    "message": format!("node '{node_id}' is not a gate"),
+                })),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(node
+        .gate_kind
+        .map(|k| k.as_str().to_string())
+        .unwrap_or_else(|| "unknown".to_string()))
 }
 
 // ── GET/PUT /api/plans/:name/settings (Task 3.1) ─────────────────────────────

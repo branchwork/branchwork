@@ -232,6 +232,13 @@ pub mod actions {
     /// `{node_id, gate_kind}`; resource is `PLAN`.
     pub const GATE_APPROVE: &str = "gate.approve";
 
+    /// `POST /api/plans/:name/gates/:node_id/retry` — an operator re-ran a
+    /// failed DAG gate (Phase 3 of dag-based-plan-model). Resets the node's
+    /// `node_status` to `pending` and re-enters `try_dag_advance` so the gate
+    /// re-executes its checks. Diff carries `{node_id, gate_kind}`; resource
+    /// is `PLAN`.
+    pub const GATE_RETRY: &str = "gate.retry";
+
     /// `POST /api/orgs/:slug/orphan-worktrees/cleanup` — an org admin
     /// reaped one or more leaked per-agent worktrees recorded by the boot
     /// sweep (Phase 5, Task 5.2 of worktree-per-agent-isolation). Diff

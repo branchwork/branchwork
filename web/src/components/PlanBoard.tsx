@@ -4,6 +4,8 @@ import {
   type ParsedPlan,
   type PlanConfig,
   type PlanConfigPatch,
+  type PlanNode,
+  type PlanTask,
   type PlanVerdict,
 } from "../stores/plan-store.js";
 import { useSettingsStore } from "../stores/settings-store.js";
@@ -11,6 +13,8 @@ import { useAgentStore, type Agent } from "../stores/agent-store.js";
 import { useRunnerStore } from "../stores/runner-store.js";
 import { fetchJson, postJson, putJson } from "../api.js";
 import { PhaseCard } from "./PhaseCard.js";
+import { TaskCard } from "./TaskCard.js";
+import { GateCard } from "./GateCard.js";
 import { EditableText } from "./EditableText.js";
 import { DeletePlanModal } from "./DeletePlanModal.js";
 import { PlanSettings } from "./PlanSettings.js";
@@ -60,6 +64,22 @@ export function PlanBoard() {
   // order stays stable across renders.
   const completedSet = useMemo<ReadonlySet<string>>(() => {
     if (!plan) return new Set<string>();
+    // v2 (DAG) plans gate on completed/skipped *node* ids (scoped); v1 plans
+    // gate on completed/skipped *task* numbers. A plan is one or the other,
+    // so a single set keyed appropriately drives the dependency check for
+    // both the DAG board and the phase board.
+    if (plan.nodes && plan.nodes.length > 0) {
+      const out = new Set<string>();
+      const walk = (nodes: PlanNode[], prefix: string) => {
+        for (const n of nodes) {
+          const scoped = prefix ? `${prefix}.${n.id}` : n.id;
+          if (n.status === "completed" || n.status === "skipped") out.add(scoped);
+          if (n.nodes && n.nodes.length > 0) walk(n.nodes, scoped);
+        }
+      };
+      walk(plan.nodes, "");
+      return out;
+    }
     return new Set<string>(
       plan.phases
         .flatMap((p) => p.tasks)
@@ -74,11 +94,19 @@ export function PlanBoard() {
 
   if (!plan) return null;
 
-  // Aggregate stats
-  const allTasks = plan.phases.flatMap((p) => p.tasks);
-  const total = allTasks.length;
-  const done = allTasks.filter((t) => t.status === "completed" || t.status === "skipped").length;
-  const inProgress = allTasks.filter((t) => t.status === "in_progress").length;
+  // v2 (DAG) plans carry a `nodes` graph; v1 plans carry `phases`. The board
+  // renders one or the other (see the `activeTab === "board"` branch below).
+  const isDagPlan = !!plan.nodes && plan.nodes.length > 0;
+
+  // Aggregate stats — count *task* progress. For v2 plans the task list is
+  // the (recursively flattened) task nodes; gates are structural and don't
+  // count toward "N/M tasks done".
+  const statTasks: Array<{ status?: string }> = isDagPlan
+    ? collectTaskNodes(plan.nodes!)
+    : plan.phases.flatMap((p) => p.tasks);
+  const total = statTasks.length;
+  const done = statTasks.filter((t) => t.status === "completed" || t.status === "skipped").length;
+  const inProgress = statTasks.filter((t) => t.status === "in_progress").length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
   async function handleReset() {
@@ -376,57 +404,164 @@ export function PlanBoard() {
       />
 
       {activeTab === "board" ? (
-        <>
-          {/* Status filter */}
-          <div className="flex items-center gap-1 mb-4">
-            <span className="text-[10px] text-gray-600 mr-1">Filter</span>
-            {[
-              { value: null, label: "All" },
-              { value: "pending", label: "Pending", color: "text-gray-400" },
-              { value: "in_progress", label: "Active", color: "text-amber-400" },
-              { value: "completed", label: "Done", color: "text-emerald-400" },
-              { value: "failed", label: "Failed", color: "text-red-400" },
-            ].map((f) => (
-              <TouchTarget key={f.value ?? "all"}>
-                <button
-                  onClick={() => setStatusFilter(f.value)}
-                  className={`px-2 py-0.5 text-[10px] rounded transition ${
-                    statusFilter === f.value
-                      ? `${f.color ?? "text-gray-200"} bg-gray-800 font-semibold`
-                      : "text-gray-600 hover:text-gray-400"
-                  }`}
-                >
-                  {f.label}
-                </button>
-              </TouchTarget>
-            ))}
-          </div>
-
-          {/* Phase cards -- vertical layout. The CompletedTasksContext
-              provider hoists the plan-wide done/skipped Set to a single
-              allocation per plan render (audit §10 minor): every TaskCard
-              dependency-gate check reads from this Set instead of rebuilding
-              its own. */}
-          <CompletedTasksContext.Provider value={completedSet}>
-            <div className="space-y-3 pb-4">
-              {plan.phases.map((phase) => (
-                <PhaseCard
-                  key={phase.number}
-                  phase={phase}
-                  planName={plan.name}
-                  statusFilter={statusFilter}
-                />
+        isDagPlan ? (
+          // v2 (DAG) plans: render the node graph top-to-bottom — gate nodes
+          // as diamond GateCards, task nodes as TaskCards. The status filter
+          // is a phase-board affordance; the DAG flow stays fully visible so
+          // gates read as the verification checkpoints between task groups.
+          <DagBoard planName={plan.name} nodes={plan.nodes!} completedSet={completedSet} />
+        ) : (
+          <>
+            {/* Status filter */}
+            <div className="flex items-center gap-1 mb-4">
+              <span className="text-[10px] text-gray-600 mr-1">Filter</span>
+              {[
+                { value: null, label: "All" },
+                { value: "pending", label: "Pending", color: "text-gray-400" },
+                { value: "in_progress", label: "Active", color: "text-amber-400" },
+                { value: "completed", label: "Done", color: "text-emerald-400" },
+                { value: "failed", label: "Failed", color: "text-red-400" },
+              ].map((f) => (
+                <TouchTarget key={f.value ?? "all"}>
+                  <button
+                    onClick={() => setStatusFilter(f.value)}
+                    className={`px-2 py-0.5 text-[10px] rounded transition ${
+                      statusFilter === f.value
+                        ? `${f.color ?? "text-gray-200"} bg-gray-800 font-semibold`
+                        : "text-gray-600 hover:text-gray-400"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                </TouchTarget>
               ))}
             </div>
-          </CompletedTasksContext.Provider>
 
-          <VerificationSection verification={plan.verification ?? null} />
-        </>
+            {/* Phase cards -- vertical layout. The CompletedTasksContext
+                provider hoists the plan-wide done/skipped Set to a single
+                allocation per plan render (audit §10 minor): every TaskCard
+                dependency-gate check reads from this Set instead of rebuilding
+                its own. */}
+            <CompletedTasksContext.Provider value={completedSet}>
+              <div className="space-y-3 pb-4">
+                {plan.phases.map((phase) => (
+                  <PhaseCard
+                    key={phase.number}
+                    phase={phase}
+                    planName={plan.name}
+                    statusFilter={statusFilter}
+                  />
+                ))}
+              </div>
+            </CompletedTasksContext.Provider>
+
+            <VerificationSection verification={plan.verification ?? null} />
+          </>
+        )
       ) : (
         <PlanSettings planName={plan.name} />
       )}
     </div>
   );
+}
+
+// ── DAG (schema_version: 2) board ────────────────────────────────────────────
+
+/// Recursively collect every task node from a DAG node tree (descending into
+/// sub-plans). Used for the header's "N/M tasks done" stats — gates are
+/// structural and excluded.
+function collectTaskNodes(nodes: PlanNode[]): PlanNode[] {
+  const out: PlanNode[] = [];
+  const walk = (ns: PlanNode[]) => {
+    for (const n of ns) {
+      if (n.type === "task") out.push(n);
+      if (n.nodes && n.nodes.length > 0) walk(n.nodes);
+    }
+  };
+  walk(nodes);
+  return out;
+}
+
+/// Map a DAG task node to the `PlanTask` shape `TaskCard` consumes. `number`
+/// is the **scoped** node id so TaskCard's agent lookups (`a.task_id ===
+/// task.number`) line up with what the DAG scheduler spawns agents with.
+/// `filePaths` / `acceptance` / `description` are defaulted so TaskCard's
+/// direct field accesses (e.g. `task.filePaths.length`) never throw.
+function nodeToTask(node: PlanNode, scopedId: string): PlanTask {
+  return {
+    number: scopedId,
+    title: node.title,
+    description: node.description ?? "",
+    filePaths: node.filePaths ?? [],
+    acceptance: node.acceptance ?? "",
+    dependencies: node.dependsOn ?? [],
+    producesCommit: node.producesCommit,
+    status: node.status,
+    statusUpdatedAt: node.statusUpdatedAt,
+    costUsd: node.costUsd,
+    ci: null,
+  };
+}
+
+/// The v2 board: a top-to-bottom rendering of the DAG node graph. Gate nodes
+/// render as diamond `GateCard`s; task nodes as full-width `TaskCard`s;
+/// sub-plan nodes as a labelled container that recurses its children (with
+/// scoped ids). Shares the `CompletedTasksContext` so TaskCard dependency
+/// gating reads the plan-wide done-node set.
+function DagBoard({
+  planName,
+  nodes,
+  completedSet,
+}: {
+  planName: string;
+  nodes: PlanNode[];
+  completedSet: ReadonlySet<string>;
+}) {
+  return (
+    <CompletedTasksContext.Provider value={completedSet}>
+      <div className="space-y-2 pb-4">
+        {nodes.map((node) => (
+          <DagNodeRenderer key={node.id} planName={planName} node={node} scopedId={node.id} />
+        ))}
+      </div>
+    </CompletedTasksContext.Provider>
+  );
+}
+
+function DagNodeRenderer({
+  planName,
+  node,
+  scopedId,
+}: {
+  planName: string;
+  node: PlanNode;
+  scopedId: string;
+}) {
+  if (node.type === "gate") {
+    return <GateCard planName={planName} nodeId={scopedId} node={node} />;
+  }
+  if (node.type === "sub_plan") {
+    return (
+      <div className="my-2 rounded-lg border border-indigo-800/40 bg-indigo-950/20 p-3">
+        <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-indigo-300">
+          {node.title || scopedId}
+        </div>
+        <div className="space-y-2">
+          {(node.nodes ?? []).map((child) => (
+            <DagNodeRenderer
+              key={child.id}
+              planName={planName}
+              node={child}
+              scopedId={`${scopedId}.${child.id}`}
+            />
+          ))}
+        </div>
+      </div>
+    );
+  }
+  // Task node — full-width TaskCard. phaseNumber=1 maps to the single phase
+  // the v2→ParsedPlan conversion produces (used only for the cadence tooltip).
+  return <TaskCard task={nodeToTask(node, scopedId)} planName={planName} phaseNumber={1} />;
 }
 
 interface CheckPlanButtonProps {

@@ -34,6 +34,43 @@ export interface PlanTask {
   ci?: CiStatus | null;
 }
 
+/// Node type for `schema_version: 2` (DAG) plans. Matches the server's
+/// `dag::NodeType` snake_case wire form (`SubPlan` → `"sub_plan"`).
+export type PlanNodeType = "task" | "gate" | "sub_plan";
+
+/// Gate kind for DAG gate nodes. Matches `dag::GateKind` snake_case.
+export type GateKind = "init" | "end" | "ci" | "approval";
+
+/// A node in a DAG (`schema_version: 2`) plan. Served on the `nodes` field
+/// of `GET /api/plans/:name` for v2 plans (absent for v1 phase-based plans).
+/// Mirrors the server's `dag::DagNode` (camelCase wire form): `node_type`
+/// serializes as `type`, `depends_on` → `dependsOn`, etc. Runtime `status`
+/// is merged server-side from the `node_status` table (default `"pending"`).
+export interface PlanNode {
+  id: string;
+  /// `node_type` on the server; the discriminator between task / gate /
+  /// sub-plan rendering.
+  type: PlanNodeType;
+  title: string;
+  description?: string;
+  /// Scoped or sibling node ids this node depends on (the graph edges).
+  dependsOn?: string[];
+  // Task-node fields
+  filePaths?: string[];
+  acceptance?: string;
+  producesCommit?: boolean;
+  // Gate-node fields
+  gateKind?: GateKind;
+  checks?: string[];
+  workflows?: string[];
+  // Sub-plan children (nested DAG)
+  nodes?: PlanNode[];
+  // Runtime state (merged from `node_status` on the wire)
+  status?: string;
+  statusUpdatedAt?: string;
+  costUsd?: number;
+}
+
 export interface PlanPhase {
   number: number;
   title: string;
@@ -65,6 +102,11 @@ export interface ParsedPlan {
   createdAt: string;
   modifiedAt: string;
   phases: PlanPhase[];
+  /// DAG node graph for `schema_version: 2` plans. Present (non-empty) only
+  /// for v2 plans; v1 plans serve `phases` and omit this. When present the
+  /// board renders the node graph (TaskCard / GateCard per `node.type`)
+  /// instead of the phase cards. See `PlanBoard`'s `isDagPlan` branch.
+  nodes?: PlanNode[];
   verification?: string | null;
   verdict?: PlanVerdict | null;
   totalCostUsd?: number;
@@ -363,6 +405,12 @@ interface PlanStore {
   /// Driven by the `plan_deleted` WS event.
   removePlan: (planName: string) => void;
   patchTaskStatus: (planName: string, taskNumber: string, status: string) => void;
+  /// Patch a DAG node's status on the selected v2 plan. Driven by the
+  /// `node_status_changed` / `gate_status_changed` WS events (and the gate
+  /// approve/retry responses). `nodeId` is the scoped id (`wire-api` at top
+  /// level, `parent.child` in a sub-plan); the walk reconstructs scoped ids
+  /// to match. No-op for v1 plans (no `nodes`) or a different selected plan.
+  patchNodeStatus: (planName: string, nodeId: string, status: string) => void;
   patchTaskCi: (planName: string, taskNumber: string, ci: CiStatus) => void;
   /// Drop the CI badge for a single task on the selected plan. Driven by
   /// `ci_run_dismissed` — the server already wrote `dismissed_at` on the
@@ -434,6 +482,38 @@ let inFlightPlansFetch: Promise<void> | null = null;
 /// patches behind it without poking at module-internal state.
 export function getInFlightPlansFetch(): Promise<void> | null {
   return inFlightPlansFetch;
+}
+
+/// Walk a DAG node tree and return a new tree with the node whose **scoped**
+/// id equals `targetScopedId` patched to `status`. Scoped ids are rebuilt
+/// during the walk (`parent.child`) to match the WS event's `node_id`.
+/// Returns the input unchanged (same nodes) when no node matches. Exported
+/// for unit tests.
+export function patchNodeInTree(
+  nodes: PlanNode[],
+  targetScopedId: string,
+  status: string,
+  prefix = "",
+): PlanNode[] {
+  let changed = false;
+  const next = nodes.map((n) => {
+    const scoped = prefix ? `${prefix}.${n.id}` : n.id;
+    if (scoped === targetScopedId) {
+      changed = true;
+      return { ...n, status, statusUpdatedAt: new Date().toISOString() };
+    }
+    if (n.nodes && n.nodes.length > 0) {
+      const children = patchNodeInTree(n.nodes, targetScopedId, status, scoped);
+      if (children !== n.nodes) {
+        changed = true;
+        return { ...n, nodes: children };
+      }
+    }
+    return n;
+  });
+  // Preserve the input reference when nothing matched so the recursive
+  // `!==` check above is meaningful and unmatched subtrees don't re-render.
+  return changed ? next : nodes;
 }
 
 export const usePlanStore = create<PlanStore>((set, get) => ({
@@ -661,6 +741,14 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       return { ...p, doneCount: p.doneCount + delta };
     });
     set({ plans: updatedPlans });
+  },
+
+  patchNodeStatus: (planName, nodeId, status) => {
+    const { selectedPlan } = get();
+    if (selectedPlan?.name !== planName || !selectedPlan.nodes) return;
+    const nodes = patchNodeInTree(selectedPlan.nodes, nodeId, status);
+    if (nodes === selectedPlan.nodes) return; // unknown node id — no-op
+    set({ selectedPlan: { ...selectedPlan, nodes } });
   },
 
   savePlan: async (plan: ParsedPlan) => {

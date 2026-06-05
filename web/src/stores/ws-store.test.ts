@@ -1039,3 +1039,54 @@ describe("auto_push_rebased pill", () => {
     expect(state["plan-b"]!.branch).toBe("main");
   });
 });
+
+describe("DAG node/gate status events", () => {
+  function seedDagPlan() {
+    usePlanStore.setState({
+      selectedPlan: {
+        name: "dag-p",
+        filePath: "dag-p.yaml",
+        title: "DAG",
+        context: "",
+        project: "proj",
+        createdAt: "",
+        modifiedAt: "",
+        phases: [],
+        nodes: [
+          { id: "init", type: "gate", title: "Init", gateKind: "init", status: "in_progress" },
+          { id: "a", type: "task", title: "A", status: "pending" },
+        ],
+      } as ParsedPlan,
+    });
+  }
+
+  it("gate_status_changed patches the gate node status on the selected plan", () => {
+    seedDagPlan();
+    handleWsMessage({
+      type: "gate_status_changed",
+      data: { plan_name: "dag-p", node_id: "init", status: "completed", gate_kind: "init" },
+    });
+    const nodes = usePlanStore.getState().selectedPlan?.nodes;
+    expect(nodes?.find((n) => n.id === "init")?.status).toBe("completed");
+  });
+
+  it("node_status_changed patches a task node status", () => {
+    seedDagPlan();
+    handleWsMessage({
+      type: "node_status_changed",
+      data: { plan_name: "dag-p", node_id: "a", status: "in_progress" },
+    });
+    const nodes = usePlanStore.getState().selectedPlan?.nodes;
+    expect(nodes?.find((n) => n.id === "a")?.status).toBe("in_progress");
+  });
+
+  it("ignores a node event for a non-selected plan", () => {
+    seedDagPlan();
+    handleWsMessage({
+      type: "node_status_changed",
+      data: { plan_name: "other", node_id: "init", status: "failed" },
+    });
+    const nodes = usePlanStore.getState().selectedPlan?.nodes;
+    expect(nodes?.find((n) => n.id === "init")?.status).toBe("in_progress");
+  });
+});
