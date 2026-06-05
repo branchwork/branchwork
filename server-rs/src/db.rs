@@ -2485,6 +2485,23 @@ fn migrate(conn: &Connection) {
             approved_by TEXT,
             approved_at TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (plan_name, node_id)
+        );
+
+        -- Per-check results for a gate node (Task 3.6: End gate dashboard
+        -- rendering). `results_json` is the JSON array of per-check verdicts
+        -- ({name, status, detail, output?, url?}) the gate engine
+        -- (`crate::gates`) writes when it runs an End gate; `GET
+        -- /api/plans/:name` reads it back to attach `gateChecks` to the gate
+        -- node so the dashboard renders the all_merged / compiles / ci_green
+        -- results inline (and survives a reload — the live update arrives via
+        -- the `gate_check_results` WS event). Keyed by scoped node id, the
+        -- same scheme `node_status` uses.
+        CREATE TABLE IF NOT EXISTS gate_checks (
+            plan_name    TEXT NOT NULL,
+            node_id      TEXT NOT NULL,
+            results_json TEXT NOT NULL,
+            updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (plan_name, node_id)
         );",
     )
     .ok();
@@ -2544,6 +2561,41 @@ fn cleanup_stale_auto_completed(conn: &Connection) {
             _ => {}
         }
     }
+}
+
+// ── gate_checks: per-check results for a gate node (Task 3.6) ─────────────
+
+/// Persist the per-check results for a gate node (the End gate's
+/// `all_merged` / `compiles` / `ci_green` verdicts). `results_json` is the
+/// serialized JSON array the gate engine produces; an UPSERT keyed by
+/// `(plan_name, node_id)` so a re-run (Retry) overwrites the prior pass.
+/// Best-effort: a write failure is logged and swallowed (the gate's outcome
+/// is unaffected — the results are a display affordance).
+pub fn write_gate_checks(db: &Db, plan_name: &str, node_id: &str, results_json: &str) {
+    let conn = db.lock().unwrap();
+    if let Err(e) = conn.execute(
+        "INSERT INTO gate_checks (plan_name, node_id, results_json, updated_at) \
+         VALUES (?1, ?2, ?3, datetime('now')) \
+         ON CONFLICT(plan_name, node_id) DO UPDATE SET \
+            results_json = excluded.results_json, \
+            updated_at   = excluded.updated_at",
+        params![plan_name, node_id, results_json],
+    ) {
+        eprintln!("[gate_checks] write failed for {plan_name}/{node_id}: {e}");
+    }
+}
+
+/// Read the stored per-check results JSON for a gate node, or `None` when no
+/// row exists yet (the gate hasn't run). Returns the raw JSON string; the
+/// caller (`get_plan`) parses it into a `serde_json::Value` and injects it as
+/// the node's `gateChecks` field without depending on the result type.
+pub fn read_gate_checks_json(conn: &Connection, plan_name: &str, node_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT results_json FROM gate_checks WHERE plan_name = ?1 AND node_id = ?2",
+        params![plan_name, node_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
 }
 
 // ── worktree_orphans: server-boot orphan-worktree sweep (Task 5.1) ────────

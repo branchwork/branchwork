@@ -417,7 +417,7 @@ async fn schedule_scope(
                     "in_progress",
                     node.gate_kind,
                 );
-                match crate::gates::execute_gate(state, &ctx.dag.name, node).await {
+                match crate::gates::execute_gate(state, &ctx.dag.name, &scoped, node).await {
                     crate::gates::GateOutcome::Passed => {
                         set_node_status(&ctx.registry.db, &ctx.dag.name, &scoped, "completed");
                         broadcast_event(

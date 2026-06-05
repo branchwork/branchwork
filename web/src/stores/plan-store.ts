@@ -41,6 +41,22 @@ export type PlanNodeType = "task" | "gate" | "sub_plan";
 /// Gate kind for DAG gate nodes. Matches `dag::GateKind` snake_case.
 export type GateKind = "init" | "end" | "ci" | "approval";
 
+/// One End-gate check's structured result (Task 3.6). Served on the gate
+/// node's `gateChecks` field for v2 plans and pushed live via the
+/// `gate_check_results` WS event. Mirrors the server's `gates::GateCheckResult`.
+export interface GateCheckResult {
+  /// `all_merged` | `compiles` | `ci_green` (or a custom check name).
+  name: string;
+  /// `passed` | `failed` | `blocked` | `skipped`.
+  status: string;
+  /// Human one-liner (e.g. "3/3 branches merged", "check 'build' failed").
+  detail: string;
+  /// Failing-check output snippet (the `compiles` build log), when present.
+  output?: string;
+  /// Link to the relevant CI run (the `ci_green` check), when derivable.
+  url?: string;
+}
+
 /// A node in a DAG (`schema_version: 2`) plan. Served on the `nodes` field
 /// of `GET /api/plans/:name` for v2 plans (absent for v1 phase-based plans).
 /// Mirrors the server's `dag::DagNode` (camelCase wire form): `node_type`
@@ -63,6 +79,10 @@ export interface PlanNode {
   gateKind?: GateKind;
   checks?: string[];
   workflows?: string[];
+  /// Per-check results for an End gate (Task 3.6). Served by
+  /// `GET /api/plans/:name` from the `gate_checks` table and patched live by
+  /// the `gate_check_results` WS event. Absent until the gate has run.
+  gateChecks?: GateCheckResult[];
   // Sub-plan children (nested DAG)
   nodes?: PlanNode[];
   // Runtime state (merged from `node_status` on the wire)
@@ -454,6 +474,10 @@ interface PlanStore {
   /// level, `parent.child` in a sub-plan); the walk reconstructs scoped ids
   /// to match. No-op for v1 plans (no `nodes`) or a different selected plan.
   patchNodeStatus: (planName: string, nodeId: string, status: string) => void;
+  /// Patch an End gate node's per-check results on the selected v2 plan
+  /// (Task 3.6). Driven by the `gate_check_results` WS event. `nodeId` is the
+  /// scoped id; no-op for v1 plans or an unmatched node.
+  patchGateChecks: (planName: string, nodeId: string, checks: GateCheckResult[]) => void;
   patchTaskCi: (planName: string, taskNumber: string, ci: CiStatus) => void;
   /// Drop the CI badge for a single task on the selected plan. Driven by
   /// `ci_run_dismissed` — the server already wrote `dismissed_at` on the
@@ -566,6 +590,35 @@ export function patchNodeInTree(
   });
   // Preserve the input reference when nothing matched so the recursive
   // `!==` check above is meaningful and unmatched subtrees don't re-render.
+  return changed ? next : nodes;
+}
+
+/// Walk a DAG node tree and return a new tree with the gate node whose
+/// **scoped** id equals `targetScopedId` patched with `gateChecks` (Task 3.6).
+/// Mirrors [`patchNodeInTree`]: scoped ids are rebuilt during the walk and the
+/// input reference is preserved when nothing matches. Exported for unit tests.
+export function patchGateChecksInTree(
+  nodes: PlanNode[],
+  targetScopedId: string,
+  gateChecks: GateCheckResult[],
+  prefix = "",
+): PlanNode[] {
+  let changed = false;
+  const next = nodes.map((n) => {
+    const scoped = prefix ? `${prefix}.${n.id}` : n.id;
+    if (scoped === targetScopedId) {
+      changed = true;
+      return { ...n, gateChecks };
+    }
+    if (n.nodes && n.nodes.length > 0) {
+      const children = patchGateChecksInTree(n.nodes, targetScopedId, gateChecks, scoped);
+      if (children !== n.nodes) {
+        changed = true;
+        return { ...n, nodes: children };
+      }
+    }
+    return n;
+  });
   return changed ? next : nodes;
 }
 
@@ -801,6 +854,14 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     const { selectedPlan } = get();
     if (selectedPlan?.name !== planName || !selectedPlan.nodes) return;
     const nodes = patchNodeInTree(selectedPlan.nodes, nodeId, status);
+    if (nodes === selectedPlan.nodes) return; // unknown node id — no-op
+    set({ selectedPlan: { ...selectedPlan, nodes } });
+  },
+
+  patchGateChecks: (planName, nodeId, checks) => {
+    const { selectedPlan } = get();
+    if (selectedPlan?.name !== planName || !selectedPlan.nodes) return;
+    const nodes = patchGateChecksInTree(selectedPlan.nodes, nodeId, checks);
     if (nodes === selectedPlan.nodes) return; // unknown node id — no-op
     set({ selectedPlan: { ...selectedPlan, nodes } });
   },

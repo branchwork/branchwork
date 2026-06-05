@@ -339,7 +339,12 @@ pub async fn get_plan(
             && let Ok(mut dag) = plan_parser::parse_plan_file_as_dag(&plan_path)
         {
             merge_node_runtime(&db, &name, &mut dag.nodes, None, &task_costs);
-            if let Ok(nodes) = serde_json::to_value(&dag.nodes) {
+            if let Ok(mut nodes) = serde_json::to_value(&dag.nodes) {
+                // Attach the End gate's persisted per-check results (Task 3.6)
+                // so the GateCard renders the all_merged / compiles / ci_green
+                // verdicts inline — and the view survives a reload (the live
+                // update arrives via the `gate_check_results` WS event).
+                inject_gate_checks(&db, &name, &mut nodes, None);
                 obj.insert("nodes".to_string(), nodes);
             }
         }
@@ -381,6 +386,49 @@ fn merge_node_runtime(
         }
         if !node.nodes.is_empty() {
             merge_node_runtime(conn, plan_name, &mut node.nodes, Some(&scoped), task_costs);
+        }
+    }
+}
+
+/// Inject each gate node's persisted per-check results (`gate_checks` table)
+/// into the serialized `nodes` JSON as a `gateChecks` array (Task 3.6).
+/// Operates on the already-serialized JSON (after [`merge_node_runtime`]) so
+/// no runtime-only field has to live on the `DagNode` struct. Re-derives the
+/// scoped node id the same way `merge_node_runtime` does (`end` at the top
+/// level, `parent.end` inside a sub-plan) and recurses into sub-plan children.
+/// Only gate nodes with a stored row gain the field; everything else is left
+/// untouched.
+fn inject_gate_checks(
+    conn: &rusqlite::Connection,
+    plan_name: &str,
+    nodes: &mut serde_json::Value,
+    prefix: Option<&str>,
+) {
+    let Some(arr) = nodes.as_array_mut() else {
+        return;
+    };
+    for node in arr.iter_mut() {
+        let Some(node_obj) = node.as_object_mut() else {
+            continue;
+        };
+        let id = node_obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let scoped = match prefix {
+            Some(p) => format!("{p}.{id}"),
+            None => id.clone(),
+        };
+        let is_gate = node_obj.get("type").and_then(|v| v.as_str()) == Some("gate");
+        if is_gate
+            && let Some(json_str) = crate::db::read_gate_checks_json(conn, plan_name, &scoped)
+            && let Ok(checks) = serde_json::from_str::<serde_json::Value>(&json_str)
+        {
+            node_obj.insert("gateChecks".to_string(), checks);
+        }
+        if let Some(children) = node_obj.get_mut("nodes") {
+            inject_gate_checks(conn, plan_name, children, Some(&scoped));
         }
     }
 }
@@ -5652,6 +5700,7 @@ pub(crate) const PLAN_CASCADE_TABLES: &[&str] = &[
     "node_status",
     "plan_artifacts",
     "gate_approvals",
+    "gate_checks",
 ];
 
 /// Tables that contain a `plan_name` column but are intentionally NOT

@@ -1,5 +1,10 @@
 import { useState } from "react";
-import { usePlanStore, type GateKind, type PlanNode } from "../stores/plan-store.js";
+import {
+  usePlanStore,
+  type GateCheckResult,
+  type GateKind,
+  type PlanNode,
+} from "../stores/plan-store.js";
 import { postJson } from "../api.js";
 import { toastError } from "../lib/toast.js";
 
@@ -104,6 +109,96 @@ const GATE_STATE_CONFIG: Record<GateVisualState, StateConfig> = {
   },
 };
 
+/// Human label for an End-gate check name.
+const CHECK_LABELS: Record<string, string> = {
+  all_merged: "All merged",
+  compiles: "Compiles",
+  ci_green: "CI green",
+};
+
+function checkLabel(name: string): string {
+  return CHECK_LABELS[name] ?? name;
+}
+
+/// Per-check status glyph + colour. No emoji — text-presentation Unicode only,
+/// matching the repo convention.
+const CHECK_STATUS_CONFIG: Record<string, { glyph: string; className: string }> = {
+  passed: { glyph: "✓", className: "text-emerald-400" },
+  failed: { glyph: "✗", className: "text-red-400" },
+  blocked: { glyph: "…", className: "text-amber-400" },
+  skipped: { glyph: "○", className: "text-gray-600" },
+};
+
+/// Front-clip the persisted output snippet for display. The server already
+/// caps it (4 KB); we render at most 2 KB so a long capture doesn't dominate
+/// the card (mirrors the PreMergeCheckFailedBanner clip).
+const CHECK_SNIPPET_CAP = 2 * 1024;
+
+/// Inline per-check results for an End gate (Task 3.6). One row per check
+/// (all_merged / compiles / ci_green): a ✓/✗ glyph, the check label, its
+/// detail, an optional CI link (ci_green), and a collapsible output snippet
+/// for a failing build (the PreMergeCheckFailedBanner `<details>` pattern).
+export function GateChecksList({ checks }: { checks: GateCheckResult[] }) {
+  return (
+    <ul className="mt-1.5 space-y-1" data-testid="gate-checks">
+      {checks.map((c) => {
+        const cfg = CHECK_STATUS_CONFIG[c.status] ?? CHECK_STATUS_CONFIG.skipped;
+        const snippet =
+          c.output && c.output.length > CHECK_SNIPPET_CAP
+            ? `${c.output.slice(0, CHECK_SNIPPET_CAP)}\n[…truncated — see Activity log…]`
+            : c.output;
+        return (
+          <li
+            key={c.name}
+            className="text-xs"
+            data-testid={`gate-check-${c.name}`}
+            data-check-status={c.status}
+          >
+            <div className="flex items-center gap-1.5">
+              <span aria-hidden="true" className={`font-bold leading-none ${cfg.className}`}>
+                {cfg.glyph}
+              </span>
+              <span className="font-medium text-gray-300">{checkLabel(c.name)}</span>
+              <span className="text-gray-600">·</span>
+              {c.url ? (
+                <a
+                  href={c.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="truncate text-sky-400 hover:text-sky-300 hover:underline"
+                  title={c.detail}
+                >
+                  {c.detail} ↗
+                </a>
+              ) : (
+                <span
+                  className={`truncate ${c.status === "failed" ? "text-red-300" : "text-gray-400"}`}
+                  title={c.detail}
+                >
+                  {c.detail}
+                </span>
+              )}
+            </div>
+            {snippet ? (
+              <details className="ml-5 mt-1">
+                <summary className="cursor-pointer select-none text-[10px] text-red-300/80 hover:text-red-200">
+                  Show output
+                </summary>
+                <pre
+                  data-testid={`gate-check-output-${c.name}`}
+                  className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-red-950/40 px-2 py-1.5 font-mono text-[10px] text-red-200/90"
+                >
+                  {snippet}
+                </pre>
+              </details>
+            ) : null}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 interface GateCardProps {
   planName: string;
   /// The **scoped** node id (`init` at top level, `parent.child` inside a
@@ -188,11 +283,15 @@ export function GateCard({ planName, nodeId, node }: GateCardProps) {
           <div className="truncate text-sm font-medium text-gray-200" title={title}>
             {title}
           </div>
-          {node.checks && node.checks.length > 0 && (
+          {node.gateChecks && node.gateChecks.length > 0 ? (
+            // The gate has run — show each check's verdict inline (Task 3.6).
+            <GateChecksList checks={node.gateChecks} />
+          ) : node.checks && node.checks.length > 0 ? (
+            // Not run yet — show the declared check names.
             <div className="mt-0.5 truncate font-mono text-[10px] text-gray-500">
               {node.checks.join(" · ")}
             </div>
-          )}
+          ) : null}
         </div>
 
         {state === "awaiting_approval" && (

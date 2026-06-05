@@ -919,6 +919,15 @@ function dispatch(msg: WsMessage) {
       usePlanStore.getState().patchNodeStatus(d.plan_name, d.node_id, d.status);
       break;
     }
+    case "gate_check_results": {
+      // Task 3.6: an End gate ran its checks. Patch the gate node's
+      // `gateChecks` so the GateCard renders the per-check verdicts inline
+      // without a refetch. `gate_status_changed` carries the node's pass/fail
+      // status separately; this event carries only the per-check detail.
+      const d = msg.data;
+      usePlanStore.getState().patchGateChecks(d.plan_name, d.node_id, d.checks);
+      break;
+    }
   }
 
   // Notify external subscribers AFTER the built-in switch so they see

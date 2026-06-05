@@ -45,6 +45,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::dag::{DagNode, GateKind};
@@ -64,6 +65,55 @@ pub enum GateOutcome {
     Blocked(String),
 }
 
+/// One End-gate check's structured result (Task 3.6: End gate dashboard
+/// rendering). The End gate runs each declared check (`all_merged`,
+/// `compiles`, `ci_green`) and records one of these per check, persists the
+/// set to the `gate_checks` table, and broadcasts a `gate_check_results` WS
+/// event. `GET /api/plans/:name` attaches the stored set to the gate node as
+/// `gateChecks` so the dashboard renders the per-check verdicts inline on the
+/// GateCard (and the view survives a reload).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateCheckResult {
+    /// Check name: `all_merged` | `compiles` | `ci_green` (or a custom name
+    /// declared on the node).
+    pub name: String,
+    /// `passed` | `failed` | `blocked` | `skipped`. `blocked` ≡ the check is
+    /// waiting on an external event (CI still in flight); `skipped` ≡ the
+    /// check was not run (no config, or an earlier check already failed).
+    pub status: String,
+    /// Human one-liner for the row — e.g. `"3/3 branches merged"`,
+    /// `"check 'build' failed (exit 7)"`, `"CI green"`.
+    pub detail: String,
+    /// Captured output snippet for a failing check (the `compiles` build log).
+    /// Bounded; the dashboard renders it in a collapsible `<details>` block
+    /// (the PreMergeCheckFailedBanner pattern).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// Link to the relevant CI run (the `ci_green` check) when derivable from
+    /// the project's `origin` remote; `None` in SaaS mode or for non-github
+    /// remotes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl GateCheckResult {
+    fn new(name: &str, status: &str, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            status: status.to_string(),
+            detail: detail.into(),
+            output: None,
+            url: None,
+        }
+    }
+}
+
+/// Cap on the persisted `compiles` output snippet. Mirrors the audit-snippet
+/// cap the pre-merge gate uses so the stored JSON, the WS frame, and the
+/// dashboard banner all stay bounded.
+const COMPILE_OUTPUT_SNIPPET_CAP_BYTES: usize = 4 * 1024;
+
 /// Default checks per gate kind when a node declares none explicitly.
 /// `parsed_plan_to_dag` always populates these for synthetic gates, but a
 /// hand-written v2 plan may omit them.
@@ -78,26 +128,40 @@ fn default_end_checks() -> &'static [&'static str] {
 ///
 /// Pure dispatch on `node.gate_kind`. `plan_name` resolves the project dir,
 /// the org (for the CI dispatch), and the plan's agents (for `all_merged`).
-/// `node` supplies the gate kind, the declared `checks`, and (for CI gates)
-/// the declared `workflows`. Side effects are limited to broadcasting the
-/// `gate_ready_for_approval` / `gate_awaiting_approval` WS events — node
-/// status writes are the scheduler's job.
-pub async fn execute_gate(state: &AppState, plan_name: &str, node: &DagNode) -> GateOutcome {
+/// `scoped_id` is the node's scoped id (`end` at the top level,
+/// `parent.end` inside a sub-plan) — the key the scheduler / approval API /
+/// `gate_checks` all use, so approval lookups and persisted check results
+/// match across nested plans. `node` supplies the gate kind, the declared
+/// `checks`, and (for CI gates) the declared `workflows`. Side effects are
+/// limited to broadcasting the `gate_ready_for_approval` /
+/// `gate_awaiting_approval` / `gate_check_results` WS events and persisting
+/// the End gate's `gate_checks` — node status writes are the scheduler's job.
+pub async fn execute_gate(
+    state: &AppState,
+    plan_name: &str,
+    scoped_id: &str,
+    node: &DagNode,
+) -> GateOutcome {
     match node.gate_kind {
-        Some(GateKind::Init) => execute_init_gate(state, plan_name, node).await,
-        Some(GateKind::End) => execute_end_gate(state, plan_name, node).await,
+        Some(GateKind::Init) => execute_init_gate(state, plan_name, scoped_id, node).await,
+        Some(GateKind::End) => execute_end_gate(state, plan_name, scoped_id, node).await,
         Some(GateKind::Ci) => execute_ci_gate(state, plan_name, node).await,
-        Some(GateKind::Approval) => execute_approval_gate(state, plan_name, node).await,
+        Some(GateKind::Approval) => execute_approval_gate(state, plan_name, scoped_id, node).await,
         None => GateOutcome::Failed(format!("gate node '{}' has no gate_kind declared", node.id)),
     }
 }
 
 // ── Init gate ────────────────────────────────────────────────────────────
 
-async fn execute_init_gate(state: &AppState, plan_name: &str, node: &DagNode) -> GateOutcome {
+async fn execute_init_gate(
+    state: &AppState,
+    plan_name: &str,
+    scoped_id: &str,
+    node: &DagNode,
+) -> GateOutcome {
     // Pre-approved out of band (e.g. operator approved before the gate was
     // first reached) ⇒ pass straight through.
-    if gate_approved(&state.db, plan_name, &node.id) {
+    if gate_approved(&state.db, plan_name, scoped_id) {
         return GateOutcome::Passed;
     }
 
@@ -133,7 +197,7 @@ async fn execute_init_gate(state: &AppState, plan_name: &str, node: &DagNode) ->
         "gate_ready_for_approval",
         json!({
             "plan_name": plan_name,
-            "node_id": node.id,
+            "node_id": scoped_id,
             "gate_kind": GateKind::Init.as_str(),
             "title": node.title,
             "checks": checks,
@@ -144,7 +208,7 @@ async fn execute_init_gate(state: &AppState, plan_name: &str, node: &DagNode) ->
         "gate_awaiting_approval",
         json!({
             "plan_name": plan_name,
-            "node_id": node.id,
+            "node_id": scoped_id,
             "title": node.title,
             "gate_kind": GateKind::Init.as_str(),
         }),
@@ -185,7 +249,12 @@ fn run_init_check(name: &str, cwd: &Path) -> GateOutcome {
 
 // ── End gate ─────────────────────────────────────────────────────────────
 
-async fn execute_end_gate(state: &AppState, plan_name: &str, node: &DagNode) -> GateOutcome {
+async fn execute_end_gate(
+    state: &AppState,
+    plan_name: &str,
+    scoped_id: &str,
+    node: &DagNode,
+) -> GateOutcome {
     let project_dir = crate::ci::project_dir_for(&state.plans_dir, &state.db, plan_name);
 
     let checks: Vec<String> = if node.checks.is_empty() {
@@ -194,75 +263,188 @@ async fn execute_end_gate(state: &AppState, plan_name: &str, node: &DagNode) -> 
         node.checks.clone()
     };
 
-    // Run checks in order; a `Failed` short-circuits, a `Blocked` is
-    // remembered and returned after the rest (so e.g. an unmerged branch is
-    // reported before we ever wait on CI).
-    let mut blocked: Option<String> = None;
+    // Run checks in order, recording a structured result for every one so the
+    // dashboard can show all three verdicts inline. A `Failed` short-circuits
+    // the *expensive* downstream checks (we don't run cargo build / poll CI
+    // once an earlier check has already doomed the gate) — those are recorded
+    // as `skipped`. A `Blocked` (CI still in flight) does not short-circuit;
+    // it's remembered and surfaced after the rest. The overall outcome mirrors
+    // the original semantics: any failure ⇒ Failed; else any block ⇒ Blocked;
+    // else Passed.
+    let mut results: Vec<GateCheckResult> = Vec::with_capacity(checks.len());
+    let mut failed_reason: Option<String> = None;
+    let mut blocked_reason: Option<String> = None;
+
     for check in &checks {
-        let outcome = match check.as_str() {
-            "all_merged" => check_all_merged(&state.db, plan_name),
-            "compiles" => check_compiles(project_dir.as_deref()).await,
-            "ci_green" => check_ci_green(state, plan_name, project_dir.as_deref(), &[]).await,
+        if failed_reason.is_some() {
+            results.push(GateCheckResult::new(
+                check,
+                "skipped",
+                "not run — an earlier check failed",
+            ));
+            continue;
+        }
+        let (outcome, result) = match check.as_str() {
+            "all_merged" => check_all_merged_detailed(&state.db, plan_name),
+            "compiles" => check_compiles_detailed(project_dir.as_deref()).await,
+            "ci_green" => {
+                check_ci_green_detailed(state, plan_name, project_dir.as_deref(), &[]).await
+            }
             other => {
                 eprintln!("[gates] end gate: unknown check '{other}' — skipping");
-                GateOutcome::Passed
+                (
+                    GateOutcome::Passed,
+                    GateCheckResult::new(other, "skipped", "unknown check — skipped"),
+                )
             }
         };
+        results.push(result);
         match outcome {
             GateOutcome::Passed => {}
-            GateOutcome::Failed(reason) => return GateOutcome::Failed(reason),
-            GateOutcome::Blocked(reason) => blocked = Some(reason),
+            GateOutcome::Failed(reason) => failed_reason = Some(reason),
+            GateOutcome::Blocked(reason) => blocked_reason = Some(reason),
         }
     }
 
-    match blocked {
-        Some(reason) => GateOutcome::Blocked(reason),
-        None => GateOutcome::Passed,
+    // Persist the per-check verdicts and push them to the dashboard. Done for
+    // every run (pass, fail, or blocked) so the GateCard always shows the
+    // latest results — and a reload re-reads them from `gate_checks`.
+    persist_and_broadcast_end_checks(state, plan_name, scoped_id, &results);
+
+    match (failed_reason, blocked_reason) {
+        (Some(reason), _) => GateOutcome::Failed(reason),
+        (None, Some(reason)) => GateOutcome::Blocked(reason),
+        (None, None) => GateOutcome::Passed,
     }
+}
+
+/// Write the End gate's per-check results to `gate_checks` and broadcast a
+/// `gate_check_results` WS event so the dashboard repaints the GateCard
+/// without a refetch. The persisted copy is what `GET /api/plans/:name`
+/// re-reads on reload.
+fn persist_and_broadcast_end_checks(
+    state: &AppState,
+    plan_name: &str,
+    scoped_id: &str,
+    results: &[GateCheckResult],
+) {
+    let json_str = serde_json::to_string(results).unwrap_or_else(|_| "[]".to_string());
+    crate::db::write_gate_checks(&state.db, plan_name, scoped_id, &json_str);
+    broadcast_event(
+        &state.broadcast_tx,
+        "gate_check_results",
+        json!({
+            "plan_name": plan_name,
+            "node_id": scoped_id,
+            "gate_kind": GateKind::End.as_str(),
+            "checks": results,
+        }),
+    );
 }
 
 /// `all_merged`: every branch produced by the plan's agents has been merged
 /// (i.e. `agents.branch` cleared to NULL by the merge path). Any non-NULL
-/// branch is unmerged work that must land before the plan is "done".
-fn check_all_merged(db: &Db, plan_name: &str) -> GateOutcome {
+/// branch is unmerged work that must land before the plan is "done". The
+/// structured result reports an `N/M branches merged` count for the card.
+fn check_all_merged_detailed(db: &Db, plan_name: &str) -> (GateOutcome, GateCheckResult) {
     let unmerged = unmerged_branches(db, plan_name);
+    let merged = merged_branch_count(db, plan_name);
+    let total = merged + unmerged.len();
     if unmerged.is_empty() {
-        GateOutcome::Passed
+        let detail = if total == 0 {
+            "no branches to merge".to_string()
+        } else {
+            format!("{merged}/{total} branches merged")
+        };
+        (
+            GateOutcome::Passed,
+            GateCheckResult::new("all_merged", "passed", detail),
+        )
     } else {
-        GateOutcome::Failed(format!(
+        let detail = format!(
+            "{merged}/{total} branches merged — unmerged: {}",
+            unmerged.join(", ")
+        );
+        let reason = format!(
             "all_merged: {} unmerged branch(es): {}",
             unmerged.len(),
             unmerged.join(", ")
-        ))
+        );
+        (
+            GateOutcome::Failed(reason),
+            GateCheckResult::new("all_merged", "failed", detail),
+        )
     }
 }
 
 /// `compiles`: run the project's `[auto_mode.pre_merge_checks]` against the
 /// merged default-branch working tree. Opt-in — no config (or no project)
-/// ⇒ pass.
-async fn check_compiles(project_dir: Option<&Path>) -> GateOutcome {
+/// ⇒ `skipped` (and treated as a pass for the overall outcome). On failure
+/// the structured result carries the failing check name + a bounded output
+/// snippet so the dashboard can show the build log inline.
+async fn check_compiles_detailed(project_dir: Option<&Path>) -> (GateOutcome, GateCheckResult) {
+    let skipped = |detail: &str| {
+        (
+            GateOutcome::Passed,
+            GateCheckResult::new("compiles", "skipped", detail),
+        )
+    };
     let Some(project_dir) = project_dir else {
-        return GateOutcome::Passed;
+        return skipped("no project directory on the server");
     };
     let Some(repo_cfg) = crate::repo_config::load_for_project_dir(project_dir) else {
-        return GateOutcome::Passed;
+        return skipped("no branchwork.toml — no checks configured");
     };
     let checks = &repo_cfg.auto_mode.pre_merge_checks;
     if checks.is_empty() {
-        return GateOutcome::Passed;
+        return skipped("no pre-merge checks configured");
     }
     let total_timeout = Duration::from_secs(repo_cfg.auto_mode.pre_merge_total_timeout_secs as u64);
     match crate::auto_mode::run_pre_merge_checks_in(checks, project_dir, total_timeout).await {
-        crate::auto_mode::GateOutcome::Pass => GateOutcome::Passed,
+        crate::auto_mode::GateOutcome::Pass => (
+            GateOutcome::Passed,
+            GateCheckResult::new(
+                "compiles",
+                "passed",
+                format!("{} check(s) passed", checks.len()),
+            ),
+        ),
         crate::auto_mode::GateOutcome::Fail {
-            check, exit_code, ..
-        } => GateOutcome::Failed(format!(
-            "compiles: check '{check}' failed (exit {})",
-            exit_code
+            check,
+            exit_code,
+            output,
+        } => {
+            let exit_str = exit_code
                 .map(|c| c.to_string())
-                .unwrap_or_else(|| "killed".to_string())
-        )),
+                .unwrap_or_else(|| "killed".to_string());
+            let detail = format!("check '{check}' failed (exit {exit_str})");
+            let reason = format!("compiles: {detail}");
+            let mut result = GateCheckResult::new("compiles", "failed", detail);
+            result.output = Some(crate::auto_mode::truncate_output(
+                &output,
+                COMPILE_OUTPUT_SNIPPET_CAP_BYTES,
+            ));
+            (GateOutcome::Failed(reason), result)
+        }
     }
+}
+
+/// Count of distinct merged task branches for the plan: completed task agents
+/// whose `branch` was cleared to NULL by the merge path. Combined with the
+/// unmerged-branch list, this gives the `N/M branches merged` count shown on
+/// the gate card. A soft signal (best-effort count) — the pass/fail verdict
+/// is driven solely by whether any unmerged branch remains.
+fn merged_branch_count(db: &Db, plan_name: &str) -> usize {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT COUNT(DISTINCT task_id) FROM agents \
+         WHERE plan_name = ?1 AND task_id IS NOT NULL \
+           AND branch IS NULL AND status = 'completed'",
+        params![plan_name],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+    .max(0) as usize
 }
 
 // ── CI gate ──────────────────────────────────────────────────────────────
@@ -273,43 +455,95 @@ async fn execute_ci_gate(state: &AppState, plan_name: &str, node: &DagNode) -> G
 }
 
 /// Poll GitHub Actions on the project HEAD and map the aggregate to a gate
-/// outcome. Reuses [`crate::saas::dispatch::get_ci_run_status_dispatch`]
-/// (mode-aware: SaaS dispatches to the runner, standalone shells out to
-/// `gh`).
-///
-/// `declared` filters the aggregate to a specific set of workflows (the CI
-/// gate's `workflows:`); empty ⇒ evaluate the full blocking subset.
-///
-/// A project with no `.github/workflows` is vacuously green (nothing to
-/// wait for). No CI runs yet for the HEAD SHA ⇒ `Blocked` (pending). A
-/// transient dispatch error ⇒ `Blocked` (retry next tick).
+/// outcome (CI-gate path — discards the structured detail). Delegates to
+/// [`check_ci_green_detailed`].
 async fn check_ci_green(
     state: &AppState,
     plan_name: &str,
     project_dir: Option<&Path>,
     declared: &[String],
 ) -> GateOutcome {
+    check_ci_green_detailed(state, plan_name, project_dir, declared)
+        .await
+        .0
+}
+
+/// Poll GitHub Actions on the project HEAD and report both the gate outcome
+/// and the structured `ci_green` check result (Task 3.6). Reuses
+/// [`crate::saas::dispatch::get_ci_run_status_dispatch`] (mode-aware: SaaS
+/// dispatches to the runner, standalone shells out to `gh`).
+///
+/// `declared` filters the aggregate to a specific set of workflows (the CI
+/// gate's `workflows:`); empty ⇒ evaluate the full blocking subset.
+///
+/// A project with no `.github/workflows` is vacuously green (nothing to
+/// wait for) ⇒ `skipped`. No CI runs yet for the HEAD SHA ⇒ `Blocked`
+/// (pending). A transient dispatch error ⇒ `Blocked` (retry next tick).
+/// On a terminal aggregate the structured result links to the relevant run
+/// (the failing run on failure, else the first observed run).
+async fn check_ci_green_detailed(
+    state: &AppState,
+    plan_name: &str,
+    project_dir: Option<&Path>,
+    declared: &[String],
+) -> (GateOutcome, GateCheckResult) {
     let Some(project_dir) = project_dir else {
         // No project dir resolvable on the server (SaaS, or unconfigured) —
         // can't probe workflows locally. Treat as vacuously green so a plan
         // without server-visible CI isn't stuck forever.
-        return GateOutcome::Passed;
+        return (
+            GateOutcome::Passed,
+            GateCheckResult::new("ci_green", "skipped", "no project directory on the server"),
+        );
     };
     if !crate::ci::has_github_actions(project_dir) {
-        return GateOutcome::Passed;
+        return (
+            GateOutcome::Passed,
+            GateCheckResult::new("ci_green", "skipped", "no GitHub Actions workflows"),
+        );
     }
     let Some(sha) = crate::agents::git_head_sha(project_dir) else {
-        return GateOutcome::Blocked("ci_green: cannot resolve project HEAD".to_string());
+        return (
+            GateOutcome::Blocked("ci_green: cannot resolve project HEAD".to_string()),
+            GateCheckResult::new("ci_green", "blocked", "cannot resolve project HEAD"),
+        );
     };
     let org = org_for_plan(&state.db, plan_name);
     // `task_number` is wire-only correlation metadata for the dispatch; a
     // gate isn't a task, so pass an empty marker.
     match crate::saas::dispatch::get_ci_run_status_dispatch(state, &org, plan_name, "", &sha).await
     {
-        Ok(Some(agg)) => evaluate_ci_aggregate(&agg, declared, &sha),
-        Ok(None) => GateOutcome::Blocked(format!("ci_green: no CI runs yet for {sha}")),
-        Err(e) => GateOutcome::Blocked(format!("ci_green: CI status unavailable ({e})")),
+        Ok(Some(agg)) => {
+            let outcome = evaluate_ci_aggregate(&agg, declared, &sha);
+            let (status, detail) = match &outcome {
+                GateOutcome::Passed => ("passed", "CI green".to_string()),
+                GateOutcome::Failed(_) => ("failed", "CI failed".to_string()),
+                GateOutcome::Blocked(_) => ("blocked", "CI still in progress".to_string()),
+            };
+            let mut result = GateCheckResult::new("ci_green", status, detail);
+            // Link the most relevant run: the failing run on failure, else the
+            // first observed run. Soft signal — `None` in SaaS / non-github.
+            result.url =
+                ci_link_run_id(&agg).and_then(|id| crate::ci::derive_run_url(project_dir, &id));
+            (outcome, result)
+        }
+        Ok(None) => (
+            GateOutcome::Blocked(format!("ci_green: no CI runs yet for {sha}")),
+            GateCheckResult::new("ci_green", "blocked", "no CI runs yet for this commit"),
+        ),
+        Err(e) => (
+            GateOutcome::Blocked(format!("ci_green: CI status unavailable ({e})")),
+            GateCheckResult::new("ci_green", "blocked", "CI status unavailable"),
+        ),
     }
+}
+
+/// Pick the CI run id to link from the gate card: the failing run when one is
+/// known, else the first observed run (a green run worth linking to).
+fn ci_link_run_id(agg: &crate::saas::runner_protocol::CiAggregate) -> Option<String> {
+    agg.failing_run_id
+        .clone()
+        .or_else(|| agg.runs.first().map(|r| r.run_id.clone()))
 }
 
 /// Map a [`crate::saas::runner_protocol::CiAggregate`] to a gate outcome.
@@ -362,8 +596,13 @@ fn evaluate_ci_aggregate(
 
 // ── Approval gate ────────────────────────────────────────────────────────
 
-async fn execute_approval_gate(state: &AppState, plan_name: &str, node: &DagNode) -> GateOutcome {
-    if gate_approved(&state.db, plan_name, &node.id) {
+async fn execute_approval_gate(
+    state: &AppState,
+    plan_name: &str,
+    scoped_id: &str,
+    node: &DagNode,
+) -> GateOutcome {
+    if gate_approved(&state.db, plan_name, scoped_id) {
         return GateOutcome::Passed;
     }
     broadcast_event(
@@ -371,7 +610,7 @@ async fn execute_approval_gate(state: &AppState, plan_name: &str, node: &DagNode
         "gate_awaiting_approval",
         json!({
             "plan_name": plan_name,
-            "node_id": node.id,
+            "node_id": scoped_id,
             "title": node.title,
             "gate_kind": GateKind::Approval.as_str(),
         }),
@@ -643,7 +882,7 @@ mod tests {
         seed_project(&db, "p", &project_dir);
 
         let (state, mut rx) = test_state(db, plans_dir);
-        let outcome = execute_gate(&state, "p", &init_node()).await;
+        let outcome = execute_gate(&state, "p", "init", &init_node()).await;
 
         assert!(
             matches!(outcome, GateOutcome::Blocked(_)),
@@ -691,7 +930,7 @@ mod tests {
 
         crate::repo_config::clear_cache_for_tests();
         let (state, _rx) = test_state(db, plans_dir);
-        let outcome = execute_gate(&state, "p", &end_node()).await;
+        let outcome = execute_gate(&state, "p", "end", &end_node()).await;
 
         assert_eq!(
             outcome,
@@ -719,7 +958,7 @@ mod tests {
         seed_project(&db, "p", &project_dir);
 
         let (state, _rx) = test_state(db, plans_dir);
-        let outcome = execute_gate(&state, "p", &init_node()).await;
+        let outcome = execute_gate(&state, "p", "init", &init_node()).await;
         match outcome {
             GateOutcome::Failed(reason) => assert!(
                 reason.contains("clean_tree"),
@@ -741,7 +980,7 @@ mod tests {
         seed_project(&db, "p", &project_dir);
 
         let (state, _rx) = test_state(db, plans_dir);
-        let outcome = execute_gate(&state, "p", &init_node()).await;
+        let outcome = execute_gate(&state, "p", "init", &init_node()).await;
         match outcome {
             GateOutcome::Failed(reason) => assert!(
                 reason.contains("remote_configured"),
@@ -773,7 +1012,7 @@ mod tests {
         }
 
         let (state, _rx) = test_state(db, plans_dir);
-        let outcome = execute_gate(&state, "p", &init_node()).await;
+        let outcome = execute_gate(&state, "p", "init", &init_node()).await;
         assert_eq!(outcome, GateOutcome::Passed);
     }
 
@@ -793,7 +1032,7 @@ mod tests {
 
         crate::repo_config::clear_cache_for_tests();
         let (state, _rx) = test_state(db, plans_dir);
-        let outcome = execute_gate(&state, "p", &end_node()).await;
+        let outcome = execute_gate(&state, "p", "end", &end_node()).await;
         match outcome {
             GateOutcome::Failed(reason) => {
                 assert!(reason.contains("all_merged"), "got {reason}");
@@ -825,7 +1064,7 @@ mod tests {
         seed_project(&db, "p", &project_dir);
 
         let (state, _rx) = test_state(db, plans_dir);
-        let outcome = execute_gate(&state, "p", &end_node()).await;
+        let outcome = execute_gate(&state, "p", "end", &end_node()).await;
         match outcome {
             GateOutcome::Failed(reason) => {
                 assert!(reason.contains("compiles"), "got {reason}");
@@ -833,6 +1072,145 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // ── Task 3.6: structured per-check results (persist + broadcast) ──────
+
+    /// Read the persisted per-check results for a gate node, parsed back into
+    /// the typed shape for assertions.
+    fn read_results(db: &Db, plan: &str, node_id: &str) -> Vec<GateCheckResult> {
+        let conn = db.lock().unwrap();
+        let json = crate::db::read_gate_checks_json(&conn, plan, node_id)
+            .unwrap_or_else(|| panic!("no gate_checks row for {plan}/{node_id}"));
+        serde_json::from_str(&json).expect("gate_checks JSON parses")
+    }
+
+    fn find_check<'a>(results: &'a [GateCheckResult], name: &str) -> &'a GateCheckResult {
+        results
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("no '{name}' check in {results:?}"))
+    }
+
+    /// Acceptance: a plan where everything is merged → the End gate passes and
+    /// the dashboard learns every check's verdict (persisted + broadcast).
+    #[tokio::test]
+    async fn end_gate_passing_persists_and_broadcasts_per_check_results() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init(&project_dir); // no .github/workflows, no branchwork.toml
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        seed_project(&db, "p", &project_dir);
+        // Two completed task agents whose branches were merged (branch cleared).
+        seed_agent(&db, "a1", "p", "1.1", None);
+        seed_agent(&db, "a2", "p", "1.2", None);
+        crate::repo_config::clear_cache_for_tests();
+
+        let (state, mut rx) = test_state(db.clone(), plans_dir);
+        let outcome = execute_gate(&state, "p", "end", &end_node()).await;
+        assert_eq!(outcome, GateOutcome::Passed);
+
+        // Persisted so the GateCard survives a reload.
+        let results = read_results(&db, "p", "end");
+        assert_eq!(results.len(), 3, "all three checks recorded: {results:?}");
+        let all_merged = find_check(&results, "all_merged");
+        assert_eq!(all_merged.status, "passed");
+        assert_eq!(all_merged.detail, "2/2 branches merged");
+        assert_eq!(find_check(&results, "compiles").status, "skipped"); // no toml
+        assert_eq!(find_check(&results, "ci_green").status, "skipped"); // no workflows
+
+        // Broadcast for the live dashboard.
+        let events = drain(&mut rx);
+        let ev = events
+            .iter()
+            .find(|e| e.contains("\"type\":\"gate_check_results\""))
+            .unwrap_or_else(|| panic!("expected gate_check_results, got {events:?}"));
+        assert!(ev.contains("\"node_id\":\"end\""), "got {ev}");
+        assert!(ev.contains("\"gate_kind\":\"end\""), "got {ev}");
+        assert!(ev.contains("2/2 branches merged"), "got {ev}");
+    }
+
+    /// Acceptance: if compiles fails, the failure output is visible (captured
+    /// as a bounded snippet on the structured result).
+    #[tokio::test]
+    async fn end_gate_compile_failure_records_output_snippet() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init(&project_dir);
+        std::fs::write(
+            project_dir.join("branchwork.toml"),
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               { name = \"build\", cmd = \"echo COMPILE_FAILED_MARKER; exit 7\", timeout_secs = 10 },\n\
+             ]\n",
+        )
+        .unwrap();
+        crate::repo_config::clear_cache_for_tests();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        seed_project(&db, "p", &project_dir);
+
+        let (state, _rx) = test_state(db.clone(), plans_dir);
+        let outcome = execute_gate(&state, "p", "end", &end_node()).await;
+        assert!(matches!(outcome, GateOutcome::Failed(_)));
+
+        let results = read_results(&db, "p", "end");
+        let compiles = find_check(&results, "compiles");
+        assert_eq!(compiles.status, "failed");
+        assert!(compiles.detail.contains("build"), "got {}", compiles.detail);
+        assert!(
+            compiles.detail.contains("exit 7"),
+            "got {}",
+            compiles.detail
+        );
+        let output = compiles
+            .output
+            .as_deref()
+            .expect("compile failure carries its output snippet");
+        assert!(output.contains("COMPILE_FAILED_MARKER"), "got {output}");
+        // ci_green is recorded but not run (an earlier check failed).
+        assert_eq!(find_check(&results, "ci_green").status, "skipped");
+    }
+
+    /// A failing earlier check short-circuits the expensive later checks — they
+    /// are recorded as `skipped` (never run), not `failed`.
+    #[tokio::test]
+    async fn end_gate_unmerged_branch_skips_later_checks() {
+        let (db, dir) = fresh_db();
+        let project_dir = dir.path().join("project");
+        git_init(&project_dir);
+        // A branchwork.toml that WOULD fail compiles — but it must not run,
+        // because all_merged fails first and short-circuits.
+        std::fs::write(
+            project_dir.join("branchwork.toml"),
+            "[auto_mode]\n\
+             pre_merge_checks = [\n  \
+               { name = \"build\", cmd = \"exit 1\", timeout_secs = 10 },\n\
+             ]\n",
+        )
+        .unwrap();
+        crate::repo_config::clear_cache_for_tests();
+        let plans_dir = dir.path().join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        seed_project(&db, "p", &project_dir);
+        seed_agent(&db, "a1", "p", "1.1", None);
+        seed_agent(&db, "a2", "p", "1.2", Some("branchwork/p/1.2"));
+
+        let (state, _rx) = test_state(db.clone(), plans_dir);
+        let outcome = execute_gate(&state, "p", "end", &end_node()).await;
+        assert!(matches!(outcome, GateOutcome::Failed(_)));
+
+        let results = read_results(&db, "p", "end");
+        let all_merged = find_check(&results, "all_merged");
+        assert_eq!(all_merged.status, "failed");
+        assert_eq!(
+            all_merged.detail,
+            "1/2 branches merged — unmerged: branchwork/p/1.2"
+        );
+        // compiles never ran (short-circuit) ⇒ skipped, not failed.
+        assert_eq!(find_check(&results, "compiles").status, "skipped");
+        assert_eq!(find_check(&results, "ci_green").status, "skipped");
     }
 
     // ── Approval gate: blocks + broadcasts awaiting-approval ──────────────
@@ -844,7 +1222,7 @@ mod tests {
         std::fs::create_dir_all(&plans_dir).unwrap();
         let (state, mut rx) = test_state(db, plans_dir);
 
-        let outcome = execute_gate(&state, "p", &approval_node()).await;
+        let outcome = execute_gate(&state, "p", "approve", &approval_node()).await;
         assert!(matches!(outcome, GateOutcome::Blocked(_)));
         let events = drain(&mut rx);
         let awaiting = events
@@ -876,7 +1254,7 @@ mod tests {
         let plans_dir = dir.path().join("plans");
         std::fs::create_dir_all(&plans_dir).unwrap();
         let (state, _rx) = test_state(db, plans_dir);
-        let outcome = execute_gate(&state, "p", &approval_node()).await;
+        let outcome = execute_gate(&state, "p", "approve", &approval_node()).await;
         assert_eq!(outcome, GateOutcome::Passed);
     }
 

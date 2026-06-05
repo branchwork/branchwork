@@ -168,6 +168,119 @@ describe("GateCard rendering", () => {
   });
 });
 
+describe("GateCard end-gate check results (Task 3.6)", () => {
+  function endGate(overrides: Partial<PlanNode> = {}): PlanNode {
+    return gateNode({
+      id: "end",
+      gateKind: "end",
+      title: "Final verification",
+      checks: ["all_merged", "compiles", "ci_green"],
+      ...overrides,
+    });
+  }
+
+  it("renders each check's verdict inline with its detail", () => {
+    render(
+      <GateCard
+        planName={PLAN}
+        nodeId="end"
+        node={endGate({
+          status: "completed",
+          gateChecks: [
+            { name: "all_merged", status: "passed", detail: "3/3 branches merged" },
+            { name: "compiles", status: "passed", detail: "2 check(s) passed" },
+            { name: "ci_green", status: "passed", detail: "CI green" },
+          ],
+        })}
+      />,
+    );
+    const checks = screen.getByTestId("gate-checks");
+    // All three named checks render with their human label + detail.
+    expect(within(checks).getByTestId("gate-check-all_merged").textContent).toContain("All merged");
+    expect(within(checks).getByTestId("gate-check-all_merged").textContent).toContain(
+      "3/3 branches merged",
+    );
+    expect(within(checks).getByTestId("gate-check-compiles").textContent).toContain("Compiles");
+    expect(within(checks).getByTestId("gate-check-ci_green").textContent).toContain("CI green");
+    // Passed checks carry the passed status marker.
+    expect(
+      within(checks).getByTestId("gate-check-all_merged").getAttribute("data-check-status"),
+    ).toBe("passed");
+  });
+
+  it("renders the ci_green detail as a link when a run URL is present", () => {
+    render(
+      <GateCard
+        planName={PLAN}
+        nodeId="end"
+        node={endGate({
+          status: "failed",
+          gateChecks: [
+            { name: "all_merged", status: "passed", detail: "3/3 branches merged" },
+            { name: "compiles", status: "passed", detail: "1 check(s) passed" },
+            {
+              name: "ci_green",
+              status: "failed",
+              detail: "CI failed",
+              url: "https://github.com/o/r/actions/runs/42",
+            },
+          ],
+        })}
+      />,
+    );
+    const link = within(screen.getByTestId("gate-check-ci_green")).getByRole("link");
+    expect(link.getAttribute("href")).toBe("https://github.com/o/r/actions/runs/42");
+    expect(link.textContent).toContain("CI failed");
+  });
+
+  it("shows the failing compile output in a collapsible block (the failure is visible)", () => {
+    render(
+      <GateCard
+        planName={PLAN}
+        nodeId="end"
+        node={endGate({
+          status: "failed",
+          gateChecks: [
+            { name: "all_merged", status: "passed", detail: "1/1 branches merged" },
+            {
+              name: "compiles",
+              status: "failed",
+              detail: "check 'build' failed (exit 7)",
+              output: "error[E0599]: COMPILE_FAILED_MARKER\nerror: aborting",
+            },
+            { name: "ci_green", status: "skipped", detail: "not run — an earlier check failed" },
+          ],
+        })}
+      />,
+    );
+    const compiles = screen.getByTestId("gate-check-compiles");
+    expect(compiles.getAttribute("data-check-status")).toBe("failed");
+    expect(compiles.textContent).toContain("check 'build' failed (exit 7)");
+    // Acceptance: if compile fails, the failure output is visible.
+    const out = within(compiles).getByTestId("gate-check-output-compiles");
+    expect(out.textContent).toContain("COMPILE_FAILED_MARKER");
+    // ci_green was skipped (short-circuited) — shown with the skipped marker.
+    expect(screen.getByTestId("gate-check-ci_green").getAttribute("data-check-status")).toBe(
+      "skipped",
+    );
+  });
+
+  it("falls back to the declared check names when the gate hasn't run yet", () => {
+    render(
+      <GateCard
+        planName={PLAN}
+        nodeId="end"
+        node={endGate({ status: "pending" })} // no gateChecks
+      />,
+    );
+    expect(screen.queryByTestId("gate-checks")).toBeNull();
+    // The static check-names line is still shown.
+    expect(screen.getByTestId("gate-card").textContent).toContain(
+      "all_merged · compiles · ci_green",
+    );
+  });
+});
+
 describe("GateCard actions", () => {
   it("Approve POSTs to the approve endpoint and optimistically completes the node", async () => {
     const calls = installFetchMock();

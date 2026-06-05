@@ -632,7 +632,7 @@ async fn poll_once(state: &AppState, project_dirs: &std::collections::HashMap<St
 /// path — `cwd` is the runner's filesystem, not the server's). The
 /// dashboard already handles `run_url == None` so this is a soft signal,
 /// not a hard error.
-fn derive_run_url(cwd: &Path, run_id: &str) -> Option<String> {
+pub(crate) fn derive_run_url(cwd: &Path, run_id: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(cwd)

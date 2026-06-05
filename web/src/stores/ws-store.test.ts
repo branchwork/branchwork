@@ -1089,4 +1089,37 @@ describe("DAG node/gate status events", () => {
     const nodes = usePlanStore.getState().selectedPlan?.nodes;
     expect(nodes?.find((n) => n.id === "init")?.status).toBe("in_progress");
   });
+
+  it("gate_check_results patches the gate node's per-check results (Task 3.6)", () => {
+    usePlanStore.setState({
+      selectedPlan: {
+        name: "dag-p",
+        filePath: "dag-p.yaml",
+        title: "DAG",
+        context: "",
+        project: "proj",
+        createdAt: "",
+        modifiedAt: "",
+        phases: [],
+        nodes: [{ id: "end", type: "gate", title: "End", gateKind: "end", status: "in_progress" }],
+      } as ParsedPlan,
+    });
+    handleWsMessage({
+      type: "gate_check_results",
+      data: {
+        plan_name: "dag-p",
+        node_id: "end",
+        gate_kind: "end",
+        checks: [
+          { name: "all_merged", status: "passed", detail: "3/3 branches merged" },
+          { name: "compiles", status: "failed", detail: "check 'build' failed (exit 7)" },
+          { name: "ci_green", status: "skipped", detail: "not run — an earlier check failed" },
+        ],
+      },
+    });
+    const end = usePlanStore.getState().selectedPlan?.nodes?.find((n) => n.id === "end");
+    expect(end?.gateChecks).toHaveLength(3);
+    expect(end?.gateChecks?.[0]).toMatchObject({ name: "all_merged", status: "passed" });
+    expect(end?.gateChecks?.[1]).toMatchObject({ name: "compiles", status: "failed" });
+  });
 });

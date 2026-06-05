@@ -617,6 +617,12 @@ mod tests {
             params![plan],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO gate_checks (plan_name, node_id, results_json) \
+             VALUES (?1, 'end', '[{\"name\":\"all_merged\",\"status\":\"passed\",\"detail\":\"1/1 branches merged\"}]')",
+            params![plan],
+        )
+        .unwrap();
     }
 
     fn read_snapshot_row(

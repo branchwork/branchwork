@@ -80,6 +80,18 @@ fn set_node_status(d: &TestDashboard, plan: &str, node_id: &str, status: &str) {
         .unwrap();
 }
 
+fn set_gate_checks(d: &TestDashboard, plan: &str, node_id: &str, results_json: &str) {
+    db_conn(d)
+        .execute(
+            "INSERT INTO gate_checks (plan_name, node_id, results_json, updated_at) \
+             VALUES (?1, ?2, ?3, datetime('now')) \
+             ON CONFLICT(plan_name, node_id) \
+             DO UPDATE SET results_json = excluded.results_json",
+            rusqlite::params![plan, node_id, results_json],
+        )
+        .unwrap();
+}
+
 fn node_status(d: &TestDashboard, plan: &str, node_id: &str) -> Option<String> {
     db_conn(d)
         .query_row(
@@ -211,6 +223,48 @@ fn get_plan_exposes_nodes_for_v2_plan_with_merged_status() {
     assert_eq!(end["type"], "gate");
     assert_eq!(end["gateKind"], "end");
     assert_eq!(end["status"], "failed");
+}
+
+/// Task 3.6: a persisted End-gate `gate_checks` row is surfaced on the gate
+/// node as `gateChecks` so the dashboard renders the per-check verdicts on
+/// reload (not just from the live `gate_check_results` WS event).
+#[test]
+fn get_plan_exposes_persisted_gate_checks_on_the_end_gate() {
+    let d = TestDashboard::new();
+    let plan = "dag-gate-checks";
+    std::fs::write(d.plans_dir.join(format!("{plan}.yaml")), dag_plan(plan)).unwrap();
+    set_node_status(&d, plan, "end", "failed");
+    set_gate_checks(
+        &d,
+        plan,
+        "end",
+        r#"[{"name":"all_merged","status":"passed","detail":"2/2 branches merged"},
+            {"name":"compiles","status":"failed","detail":"check 'build' failed (exit 7)","output":"COMPILE_MARKER"},
+            {"name":"ci_green","status":"skipped","detail":"not run — an earlier check failed"}]"#,
+    );
+
+    let (code, body) = d.get(&format!("/api/plans/{plan}"));
+    assert_eq!(code, 200, "GET plan must succeed, got {body}");
+
+    let end = find_node(&body["nodes"], "end");
+    let checks = end["gateChecks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("end gate must carry gateChecks: {end}"));
+    assert_eq!(checks.len(), 3);
+    assert_eq!(checks[0]["name"], "all_merged");
+    assert_eq!(checks[0]["status"], "passed");
+    assert_eq!(checks[0]["detail"], "2/2 branches merged");
+    assert_eq!(checks[1]["name"], "compiles");
+    assert_eq!(checks[1]["status"], "failed");
+    // Acceptance: the failure output is visible on reload.
+    assert_eq!(checks[1]["output"], "COMPILE_MARKER");
+
+    // The init gate (no gate_checks row) carries no gateChecks field.
+    let init = find_node(&body["nodes"], "init");
+    assert!(
+        init.get("gateChecks").is_none(),
+        "init gate without a gate_checks row must not carry gateChecks: {init}"
+    );
 }
 
 #[test]

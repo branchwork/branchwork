@@ -1131,7 +1131,7 @@ fn combine_streams(stdout: &[u8], stderr: &[u8]) -> String {
 /// Truncation respects char boundaries (we only ever split at byte
 /// indices that we walk back to a UTF-8 leading byte) so we don't emit
 /// invalid UTF-8 in the audit payload.
-fn truncate_output(s: &str, cap: usize) -> String {
+pub(crate) fn truncate_output(s: &str, cap: usize) -> String {
     if s.len() <= cap {
         return s.to_string();
     }

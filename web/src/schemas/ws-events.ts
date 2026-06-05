@@ -663,6 +663,32 @@ const GateFailed = v.object({
   }),
 });
 
+/// An End gate ran its checks (Task 3.6). Carries the per-check verdicts
+/// (`all_merged` / `compiles` / `ci_green`) so the GateCard renders them
+/// inline — `status` per check (`passed | failed | blocked | skipped`),
+/// a human `detail`, an optional `output` snippet (the failing build log)
+/// and an optional CI `url`. Fires alongside `gate_status_changed`; the
+/// dashboard patches the node's `gateChecks` so the card repaints without a
+/// refetch. The same set is persisted (`gate_checks` table) and re-served on
+/// `GET /api/plans/:name`, so a reload re-renders without the event.
+const GateCheckResults = v.object({
+  type: v.literal("gate_check_results"),
+  data: v.object({
+    plan_name: v.string(),
+    node_id: v.string(),
+    gate_kind: v.string(),
+    checks: v.array(
+      v.object({
+        name: v.string(),
+        status: v.string(),
+        detail: v.string(),
+        output: v.optional(v.string()),
+        url: v.optional(v.string()),
+      }),
+    ),
+  }),
+});
+
 export const WsMessageSchema = v.variant("type", [
   Connected,
   PlanUpdated,
@@ -716,6 +742,7 @@ export const WsMessageSchema = v.variant("type", [
   GateReadyForApproval,
   GateApproved,
   GateFailed,
+  GateCheckResults,
 ]);
 
 export type WsMessage = v.InferOutput<typeof WsMessageSchema>;

@@ -38,7 +38,14 @@ const CredentialsPage = lazy(() =>
 );
 import { Toaster } from "./components/Toaster.js";
 import { ConnectionBanner } from "./components/ConnectionBanner.js";
-import { InitGateModal } from "./components/InitGateModal.js";
+// Lazy-load the init-gate approval modal: it only renders when a DAG plan's
+// init gate becomes ready for sign-off (a low-frequency, v2-plan-only
+// surface), so keeping it out of the first-paint chunk preserves the gzipped
+// budget enforced by `scripts/check-bundle-size.ts`. Mirrors the
+// NewProjectModal / CredentialsPage lazy-boundary pattern above.
+const InitGateModal = lazy(() =>
+  import("./components/InitGateModal.js").then((m) => ({ default: m.InitGateModal })),
+);
 import { LearningsDuePanel } from "./components/LearningsDuePanel.js";
 import { RunnerStatus } from "./components/RunnerStatus.js";
 import { OrgChip } from "./components/OrgChip.js";
@@ -225,8 +232,11 @@ export function App() {
       {/* Global init-gate approval dialog (Task 3.5 of dag-based-plan-
           model). Mounts here so a v2 plan's `gate_ready_for_approval`
           event surfaces the "Start Plan" modal over any route. Self-hides
-          when no init gate is pending. */}
-      <InitGateModal />
+          when no init gate is pending. Lazy-loaded (null fallback — it
+          renders nothing until a gate is pending). */}
+      <Suspense fallback={null}>
+        <InitGateModal />
+      </Suspense>
 
       {/* Connection indicator + org chip + logout. Hidden on `<md`
           where the org chip / runner status / connection dot reflow
