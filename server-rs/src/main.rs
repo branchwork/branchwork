@@ -439,6 +439,10 @@ async fn run_server(cli: Cli) {
             post(api::plans::approve_gate),
         )
         .route(
+            "/api/plans/{name}/gates/{node_id}/retry",
+            post(api::plans::retry_gate),
+        )
+        .route(
             "/api/plans/{name}/settings",
             get(api::plans::get_plan_settings).put(api::plans::put_plan_settings),
         )
