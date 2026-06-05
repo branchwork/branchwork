@@ -44,16 +44,23 @@ use crate::db::Db;
 /// malformed cross-plan reference we can't resolve a producer for. The produced
 /// artifact name is `input.artifact` when set, else the input's own `name`
 /// (the common case where the consumer reuses the upstream artifact's name).
-fn input_source(input: &PlanArtifact) -> Option<(&str, &str)> {
+///
+/// Public so the plan-graph endpoint (`GET /api/plan-graph`) can render the
+/// resolved producer + artifact for each declared input.
+pub fn input_producer(input: &PlanArtifact) -> Option<(&str, &str)> {
     let from_plan = input.from_plan.as_deref()?;
     let artifact = input.artifact.as_deref().unwrap_or(input.name.as_str());
     Some((from_plan, artifact))
 }
 
-/// Whether the producing plan has recorded a satisfied output row for
-/// `artifact` (`direction='output'` and `satisfied_at IS NOT NULL`).
-fn output_satisfied(db: &Db, from_plan: &str, artifact: &str) -> bool {
-    let conn = db.lock().unwrap();
+/// Connection-based core of [`output_satisfied`]: whether the producing plan
+/// has recorded a satisfied output row for `artifact` (`direction='output'`
+/// and `satisfied_at IS NOT NULL`).
+///
+/// Public so callers that already hold the DB lock (e.g. the plan-graph
+/// endpoint, which checks many inputs/outputs under one lock) can reuse the
+/// query without re-locking the non-reentrant mutex.
+pub fn output_satisfied_conn(conn: &rusqlite::Connection, from_plan: &str, artifact: &str) -> bool {
     conn.query_row(
         "SELECT 1 FROM plan_artifacts \
          WHERE plan_name = ?1 AND artifact_name = ?2 \
@@ -64,6 +71,14 @@ fn output_satisfied(db: &Db, from_plan: &str, artifact: &str) -> bool {
     .is_ok()
 }
 
+/// Whether the producing plan has recorded a satisfied output row for
+/// `artifact`. Locks the DB internally; see [`output_satisfied_conn`] for the
+/// already-locked variant.
+fn output_satisfied(db: &Db, from_plan: &str, artifact: &str) -> bool {
+    let conn = db.lock().unwrap();
+    output_satisfied_conn(&conn, from_plan, artifact)
+}
+
 /// The first declared input not yet satisfied, as `(producing_plan, artifact)`.
 /// Used by the Init gate to build its `waiting for <plan>/<artifact>` block
 /// reason. An input with no `from_plan` can never resolve a producer, so it is
@@ -71,7 +86,7 @@ fn output_satisfied(db: &Db, from_plan: &str, artifact: &str) -> bool {
 /// is satisfied (or the slice is empty).
 pub fn first_unsatisfied_input(db: &Db, inputs: &[PlanArtifact]) -> Option<(String, String)> {
     for input in inputs {
-        match input_source(input) {
+        match input_producer(input) {
             Some((from_plan, artifact)) => {
                 if !output_satisfied(db, from_plan, artifact) {
                     return Some((from_plan.to_string(), artifact.to_string()));
@@ -166,7 +181,7 @@ fn dependent_plans(plans_dir: &Path, producing_plan: &str) -> Vec<String> {
         let depends = dag
             .inputs
             .iter()
-            .filter_map(input_source)
+            .filter_map(input_producer)
             .any(|(from_plan, _)| from_plan == producing_plan);
         if depends {
             out.push(dag.name);

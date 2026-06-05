@@ -154,6 +154,123 @@ pub async fn list_plans(
     Json(entries)
 }
 
+// ── GET /api/plan-graph ──────────────────────────────────────────────────────
+
+/// One declared cross-plan input on a v2 plan, with its resolved producer and
+/// whether the producer's output is satisfied yet.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanGraphInput {
+    /// The consuming plan's local name for this artifact.
+    name: String,
+    /// The producing plan (`input.fromPlan`). `None` for a malformed input
+    /// with no producer — surfaced so the dashboard can flag it.
+    from_plan: Option<String>,
+    /// The produced artifact name (`input.artifact`, defaulting to `name`).
+    /// `None` when `from_plan` is `None`.
+    artifact: Option<String>,
+    /// Whether the producing plan's End gate has recorded the output.
+    satisfied: bool,
+}
+
+/// One declared output on a v2 plan, with whether its End gate recorded it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanGraphOutput {
+    name: String,
+    satisfied: bool,
+}
+
+/// Cross-plan artifact overlay for a single v2 plan. Only plans that declare
+/// at least one input or output appear in the response.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanGraphEntry {
+    plan: String,
+    inputs: Vec<PlanGraphInput>,
+    outputs: Vec<PlanGraphOutput>,
+}
+
+/// `GET /api/plan-graph` — the cross-plan dependency overlay (Task 4.3 of the
+/// DAG-based plan model). Returns, for every `schema_version: 2` plan the
+/// caller's org can see that declares cross-plan `inputs:`/`outputs:`, the
+/// resolved producer for each input plus the satisfaction state of each
+/// input/output (computed from the `plan_artifacts` table). The dashboard's
+/// `MultiPlanBoard` joins this overlay with the plan list it already has
+/// (title + progress + project grouping) to draw the dependency graph — an
+/// arrow from a producer card to a consumer card for each input whose
+/// `fromPlan` is a plan in the same project, and a "waiting for X from Y"
+/// badge on a consumer whose inputs aren't all satisfied yet.
+///
+/// Plans without cross-plan artifacts (the common case, incl. every v1 plan)
+/// are omitted — they render as isolated cards from the plan list alone.
+pub async fn plan_graph(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+) -> impl IntoResponse {
+    let org_id = auth.org_id().to_string();
+    let summaries = plan_parser::list_plans(&state.plans_dir);
+
+    let db = state.db.lock().unwrap();
+    let mut entries: Vec<PlanGraphEntry> = Vec::new();
+
+    for s in &summaries {
+        if !orgs::plan_belongs_to_org(&db, &s.name, &org_id) {
+            continue;
+        }
+        // v1 plans can't express cross-plan artifacts; skip the full DAG parse
+        // for them (matches the `get_plan` v2 gate).
+        if plan_parser::plan_file_schema_version(&state.plans_dir, &s.name) < 2 {
+            continue;
+        }
+        let Some(path) = plan_parser::find_plan_file(&state.plans_dir, &s.name) else {
+            continue;
+        };
+        let Ok(dag) = plan_parser::parse_plan_file_as_dag(&path) else {
+            continue;
+        };
+        if dag.inputs.is_empty() && dag.outputs.is_empty() {
+            continue;
+        }
+
+        let inputs: Vec<PlanGraphInput> = dag
+            .inputs
+            .iter()
+            .map(|inp| match crate::artifacts::input_producer(inp) {
+                Some((from_plan, artifact)) => PlanGraphInput {
+                    name: inp.name.clone(),
+                    from_plan: Some(from_plan.to_string()),
+                    artifact: Some(artifact.to_string()),
+                    satisfied: crate::artifacts::output_satisfied_conn(&db, from_plan, artifact),
+                },
+                None => PlanGraphInput {
+                    name: inp.name.clone(),
+                    from_plan: None,
+                    artifact: None,
+                    satisfied: false,
+                },
+            })
+            .collect();
+
+        let outputs: Vec<PlanGraphOutput> = dag
+            .outputs
+            .iter()
+            .map(|out| PlanGraphOutput {
+                name: out.name.clone(),
+                satisfied: crate::artifacts::output_satisfied_conn(&db, &s.name, &out.name),
+            })
+            .collect();
+
+        entries.push(PlanGraphEntry {
+            plan: s.name.clone(),
+            inputs,
+            outputs,
+        });
+    }
+
+    Json(entries)
+}
+
 // ── GET /api/plans/:name ─────────────────────────────────────────────────────
 
 pub async fn get_plan(

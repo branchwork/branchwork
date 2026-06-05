@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { usePlanStore, type PlanSummary } from "../stores/plan-store.js";
 import { useAgentStore } from "../stores/agent-store.js";
@@ -10,6 +10,14 @@ import { isPlanDone } from "../lib/predicates.js";
 import { exportPlan, exportPlanBundle } from "../lib/plan-export.js";
 import { toastError } from "../lib/toast.js";
 import { StaleDataChip } from "./StaleDataChip.js";
+
+// Lazy-load the cross-plan graph view (Task 4.3) — it ships SVG-edge layout
+// + measurement logic that the default list view never needs, so the lazy
+// boundary keeps the first-paint entry chunk inside the gzipped budget
+// (`scripts/check-bundle-size.ts`). Mirrors the App.tsx lazy-page pattern.
+const MultiPlanBoard = lazy(() =>
+  import("./MultiPlanBoard.js").then((m) => ({ default: m.MultiPlanBoard })),
+);
 
 /// Auto-namer shape used by the Claude Code CLI: three lowercase
 /// hyphen-separated tokens with the middle token ending in `-ing`
@@ -80,6 +88,10 @@ export function ProjectDashboard() {
   // workflow. Selection state is preserved across the toggle so the
   // user can mix stale + non-stale picks if they really want to.
   const [showStale, setShowStale] = useState(false);
+  // List vs graph view (Task 4.3). The graph view renders the cross-plan
+  // dependency board; the stale-filter + multi-select affordances are
+  // list-only, so they hide when graph mode is active.
+  const [view, setView] = useState<"list" | "graph">("list");
 
   const toggleSelected = useCallback((name: string) => {
     setSelected((prev) => {
@@ -202,6 +214,29 @@ export function ProjectDashboard() {
     return out;
   }, [projectStats, selected]);
 
+  // Project grouping for the graph view. Unlike `projectStats`, this is NOT
+  // filtered by the stale toggle — the dependency graph is about how plans
+  // relate, so it always shows every plan grouped by project. MUST be declared
+  // before the early returns below (Rules of Hooks).
+  const graphProjects = useMemo(() => {
+    const byProject = new Map<string, PlanSummary[]>();
+    for (const p of plans) {
+      const key = p.project ?? "Unassigned";
+      if (!byProject.has(key)) byProject.set(key, []);
+      byProject.get(key)!.push(p);
+    }
+    return [...byProject.entries()]
+      .map(([name, ps]) => ({
+        name,
+        plans: [...ps].sort((a, b) => a.title.localeCompare(b.title)),
+      }))
+      .sort((a, b) => {
+        if (a.name === "Unassigned") return 1;
+        if (b.name === "Unassigned") return -1;
+        return a.name.localeCompare(b.name);
+      });
+  }, [plans]);
+
   if (loading && plans.length === 0) {
     return <div className="flex items-center justify-center h-full text-gray-500">Loading...</div>;
   }
@@ -255,39 +290,91 @@ export function ProjectDashboard() {
           </div>
         </div>
         <div className="flex-shrink-0 flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setShowStale((v) => !v)}
-            aria-pressed={showStale}
-            className={`px-3 py-1.5 text-xs rounded border transition ${
-              showStale
-                ? "bg-amber-900/40 border-amber-700 text-amber-200 hover:bg-amber-800/40"
-                : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600 hover:text-gray-100"
-            }`}
-            title="Filter to plans likely safe to retire: completed, auto-named, and older than 30 days"
-            data-testid="show-stale-toggle"
+          {/* List | Graph view toggle (Task 4.3). */}
+          <div
+            className="inline-flex rounded border border-gray-700 overflow-hidden"
+            role="group"
+            aria-label="Dashboard view"
+            data-testid="view-toggle"
           >
-            {showStale ? "Showing stale" : "Show stale plans"}
-          </button>
-          <button
-            type="button"
-            onClick={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
-            aria-pressed={selectionMode}
-            className={`px-3 py-1.5 text-xs rounded border transition ${
-              selectionMode
-                ? "bg-indigo-900/40 border-indigo-700 text-indigo-200 hover:bg-indigo-800/40"
-                : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600 hover:text-gray-100"
-            }`}
-            title={
-              selectionMode ? "Exit selection mode" : "Pick multiple plans to delete in one batch"
-            }
-          >
-            {selectionMode ? "Cancel selection" : "Select"}
-          </button>
+            <button
+              type="button"
+              onClick={() => setView("list")}
+              aria-pressed={view === "list"}
+              className={`px-3 py-1.5 text-xs transition ${
+                view === "list"
+                  ? "bg-indigo-900/40 text-indigo-200"
+                  : "bg-gray-800 text-gray-400 hover:text-gray-100"
+              }`}
+            >
+              List
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                // List-only affordances (multi-select, stale filter) don't
+                // apply to the graph; clear them so a stale banner / bulk
+                // footer can't linger over the graph view.
+                exitSelectionMode();
+                setShowStale(false);
+                setView("graph");
+              }}
+              aria-pressed={view === "graph"}
+              className={`px-3 py-1.5 text-xs border-l border-gray-700 transition ${
+                view === "graph"
+                  ? "bg-indigo-900/40 text-indigo-200"
+                  : "bg-gray-800 text-gray-400 hover:text-gray-100"
+              }`}
+              title="Show cross-plan dependency graph"
+            >
+              Graph
+            </button>
+          </div>
+          {view === "list" && (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowStale((v) => !v)}
+                aria-pressed={showStale}
+                className={`px-3 py-1.5 text-xs rounded border transition ${
+                  showStale
+                    ? "bg-amber-900/40 border-amber-700 text-amber-200 hover:bg-amber-800/40"
+                    : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600 hover:text-gray-100"
+                }`}
+                title="Filter to plans likely safe to retire: completed, auto-named, and older than 30 days"
+                data-testid="show-stale-toggle"
+              >
+                {showStale ? "Showing stale" : "Show stale plans"}
+              </button>
+              <button
+                type="button"
+                onClick={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
+                aria-pressed={selectionMode}
+                className={`px-3 py-1.5 text-xs rounded border transition ${
+                  selectionMode
+                    ? "bg-indigo-900/40 border-indigo-700 text-indigo-200 hover:bg-indigo-800/40"
+                    : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600 hover:text-gray-100"
+                }`}
+                title={
+                  selectionMode
+                    ? "Exit selection mode"
+                    : "Pick multiple plans to delete in one batch"
+                }
+              >
+                {selectionMode ? "Cancel selection" : "Select"}
+              </button>
+            </>
+          )}
         </div>
       </div>
 
-      {showStale && (
+      {view === "graph" && (
+        <Suspense fallback={<div className="text-sm text-gray-500">Loading graph…</div>}>
+          <MultiPlanBoard projects={graphProjects} />
+        </Suspense>
+      )}
+
+      {view === "list" && showStale && (
         <div
           className="mb-4 rounded border border-amber-800/60 bg-amber-900/20 px-4 py-2.5 flex items-center justify-between gap-3"
           data-testid="stale-banner"
@@ -316,22 +403,24 @@ export function ProjectDashboard() {
         </div>
       )}
 
-      {/* Project cards grid */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-        {projectStats.map((ps) => (
-          <ProjectCard
-            key={ps.name}
-            stats={ps}
-            onPlanClick={(name) => {
-              void selectPlan(name);
-            }}
-            selectionMode={selectionMode}
-            selected={selected}
-            onToggleSelect={toggleSelected}
-            forceExpandDone={showStale}
-          />
-        ))}
-      </div>
+      {/* Project cards grid (list view only) */}
+      {view === "list" && (
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          {projectStats.map((ps) => (
+            <ProjectCard
+              key={ps.name}
+              stats={ps}
+              onPlanClick={(name) => {
+                void selectPlan(name);
+              }}
+              selectionMode={selectionMode}
+              selected={selected}
+              onToggleSelect={toggleSelected}
+              forceExpandDone={showStale}
+            />
+          ))}
+        </div>
+      )}
 
       {/* Sticky bulk-selection footer (delete + export) */}
       {selectionMode && selected.size > 0 && (

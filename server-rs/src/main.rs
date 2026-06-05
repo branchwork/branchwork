@@ -404,6 +404,10 @@ async fn run_server(cli: Cli) {
         .route("/api/events", get(api::agents::get_events))
         // Plan routes
         .route("/api/plans", get(api::plans::list_plans))
+        // Cross-plan dependency overlay for the MultiPlanBoard graph view
+        // (Task 4.3, DAG-based plan model). Static path — registered before
+        // the `/api/plans/{name}` param route so matchit prefers it.
+        .route("/api/plan-graph", get(api::plans::plan_graph))
         .route(
             "/api/plans/{name}",
             get(api::plans::get_plan)

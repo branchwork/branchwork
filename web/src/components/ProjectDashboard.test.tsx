@@ -420,3 +420,57 @@ describe("ProjectDashboard plan navigation", () => {
     expect(selectPlan).not.toHaveBeenCalled();
   });
 });
+
+describe("ProjectDashboard view toggle (Task 4.3)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function seedFetch(): void {
+    // The lazy MultiPlanBoard fetches /api/plan-graph on mount.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = typeof input === "string" ? input : input.toString();
+        const body = path.includes("/api/plan-graph") ? [] : {};
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+  }
+
+  it("defaults to the list view (project grid visible, graph hidden)", () => {
+    const recent = new Date(Date.now() - 1 * 86400000).toISOString();
+    usePlanStore.setState({
+      plans: [
+        plan({ name: "p1", project: "alpha", taskCount: 2, doneCount: 0, modifiedAt: recent }),
+      ],
+    });
+    render(<ProjectDashboard />);
+    // Project header (list view) is present.
+    expect(screen.getByText("alpha")).toBeTruthy();
+    expect(screen.queryByTestId("multi-plan-board")).toBeNull();
+  });
+
+  it("switches to the graph view, hiding the list-only controls", async () => {
+    seedFetch();
+    const recent = new Date(Date.now() - 1 * 86400000).toISOString();
+    usePlanStore.setState({
+      plans: [
+        plan({ name: "p1", project: "alpha", taskCount: 2, doneCount: 0, modifiedAt: recent }),
+      ],
+    });
+    render(<ProjectDashboard />);
+    // Stale + Select controls visible in list view.
+    expect(screen.getByTestId("show-stale-toggle")).toBeTruthy();
+
+    fireEvent.click(within(screen.getByTestId("view-toggle")).getByText("Graph"));
+
+    // Lazy MultiPlanBoard mounts.
+    await screen.findByTestId("multi-plan-board");
+    // List-only controls are gone in graph view.
+    expect(screen.queryByTestId("show-stale-toggle")).toBeNull();
+  });
+});
