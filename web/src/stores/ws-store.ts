@@ -919,6 +919,19 @@ function dispatch(msg: WsMessage) {
       usePlanStore.getState().patchNodeStatus(d.plan_name, d.node_id, d.status);
       break;
     }
+    case "sub_plan_completed": {
+      // Task 5.2: a sub-plan node completed (every direct child finished, per
+      // the scheduler's Task 2.3 propagation). Patch the sub-plan node's status
+      // to `completed` so its `SubPlanCard` flips to the completed state.
+      // `parent_node_id` is the scoped id; `patchNodeStatus` walks the tree to
+      // match. Idempotent with the companion `node_status_changed` (both set
+      // status="completed") — the dedicated event is the authoritative
+      // sub-plan-completion signal the card subscribes to. No-op for v1 plans
+      // (no `nodes`) or a different selected plan.
+      const d = msg.data;
+      usePlanStore.getState().patchNodeStatus(d.plan_name, d.parent_node_id, "completed");
+      break;
+    }
     case "gate_check_results": {
       // Task 3.6: an End gate ran its checks. Patch the gate node's
       // `gateChecks` so the GateCard renders the per-check verdicts inline

@@ -1090,6 +1090,92 @@ describe("DAG node/gate status events", () => {
     expect(nodes?.find((n) => n.id === "init")?.status).toBe("in_progress");
   });
 
+  it("sub_plan_completed flips the sub-plan node status to completed (Task 5.2)", () => {
+    usePlanStore.setState({
+      selectedPlan: {
+        name: "dag-p",
+        filePath: "dag-p.yaml",
+        title: "DAG",
+        context: "",
+        project: "proj",
+        createdAt: "",
+        modifiedAt: "",
+        phases: [],
+        nodes: [
+          {
+            id: "sp",
+            type: "sub_plan",
+            title: "Integration",
+            status: "in_progress",
+            nodes: [
+              { id: "a", type: "task", title: "A", status: "completed" },
+              { id: "b", type: "task", title: "B", status: "completed" },
+            ],
+          },
+        ],
+      } as ParsedPlan,
+    });
+    handleWsMessage({
+      type: "sub_plan_completed",
+      data: { plan_name: "dag-p", parent_node_id: "sp" },
+    });
+    const sp = usePlanStore.getState().selectedPlan?.nodes?.find((n) => n.id === "sp");
+    expect(sp?.status).toBe("completed");
+  });
+
+  it("sub_plan_completed patches a nested sub-plan by its scoped id", () => {
+    usePlanStore.setState({
+      selectedPlan: {
+        name: "dag-p",
+        filePath: "dag-p.yaml",
+        title: "DAG",
+        context: "",
+        project: "proj",
+        createdAt: "",
+        modifiedAt: "",
+        phases: [],
+        nodes: [
+          {
+            id: "outer",
+            type: "sub_plan",
+            title: "Outer",
+            status: "in_progress",
+            nodes: [
+              {
+                id: "inner",
+                type: "sub_plan",
+                title: "Inner",
+                status: "in_progress",
+                nodes: [{ id: "x", type: "task", title: "X", status: "completed" }],
+              },
+            ],
+          },
+        ],
+      } as ParsedPlan,
+    });
+    handleWsMessage({
+      type: "sub_plan_completed",
+      data: { plan_name: "dag-p", parent_node_id: "outer.inner" },
+    });
+    const outer = usePlanStore.getState().selectedPlan?.nodes?.find((n) => n.id === "outer");
+    const inner = outer?.nodes?.find((n) => n.id === "inner");
+    expect(inner?.status).toBe("completed");
+    // The outer parent is untouched (its own completion fires a separate event).
+    expect(outer?.status).toBe("in_progress");
+  });
+
+  it("ignores sub_plan_completed for a non-selected plan", () => {
+    seedDagPlan();
+    handleWsMessage({
+      type: "sub_plan_completed",
+      data: { plan_name: "other", parent_node_id: "init" },
+    });
+    const nodes = usePlanStore.getState().selectedPlan?.nodes;
+    // Unchanged — the selected plan has no `sp` node and the event named a
+    // different plan anyway.
+    expect(nodes?.find((n) => n.id === "init")?.status).toBe("in_progress");
+  });
+
   it("gate_check_results patches the gate node's per-check results (Task 3.6)", () => {
     usePlanStore.setState({
       selectedPlan: {

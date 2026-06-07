@@ -69,6 +69,37 @@ describe("SubPlanCard progress summary", () => {
   });
 });
 
+describe("SubPlanCard completed state (Task 5.2)", () => {
+  it("shows the completed (emerald) badge when every task is done", () => {
+    renderCard(subPlan("auth", [task("a", "completed"), task("b", "skipped")]));
+    expect(screen.getByTestId("sub-plan-progress").className).toContain("emerald");
+  });
+
+  it("shows the in-progress (indigo) badge while a task is outstanding", () => {
+    renderCard(subPlan("auth", [task("a", "completed"), task("b", "pending")]));
+    const badge = screen.getByTestId("sub-plan-progress");
+    expect(badge.className).toContain("indigo");
+    expect(badge.className).not.toContain("emerald");
+  });
+
+  it("flips to completed from the propagated node status even with a non-task child", () => {
+    // A sub-plan whose own node.status is `completed` (set by the
+    // `sub_plan_completed` WS event → patchNodeStatus) reads as done even
+    // though the task-only progress count can't see the completed gate child.
+    const node: PlanNode = {
+      id: "auth",
+      type: "sub_plan",
+      title: "Auth",
+      status: "completed",
+      nodes: [task("login", "completed"), gate("approve")],
+    };
+    renderCard(node);
+    // Task-only progress is 1/1 (the gate isn't counted), but the badge is
+    // emerald because node.status === "completed" is authoritative.
+    expect(screen.getByTestId("sub-plan-progress").className).toContain("emerald");
+  });
+});
+
 describe("SubPlanCard collapse / expand", () => {
   it("defaults expanded while work is outstanding and renders children", () => {
     renderCard(subPlan("auth", [task("a", "completed"), task("b", "pending")]));

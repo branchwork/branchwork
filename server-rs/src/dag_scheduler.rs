@@ -524,10 +524,12 @@ async fn schedule_scope(
 /// Recursively propagate **sub-plan completion** up the graph: a `SubPlan`
 /// node completes once every one of its direct child nodes is done
 /// (`completed` | `skipped`). For each sub-plan newly found complete this
-/// writes `completed` to `node_status`, broadcasts `node_status_changed`, and
-/// sets `*propagated` — the signal [`try_dag_advance`] uses to re-snapshot so
-/// the parent graph sees the completion and schedules whatever depended on the
-/// sub-plan.
+/// writes `completed` to `node_status`, broadcasts `node_status_changed`
+/// (generic node-graph sync) **and** `sub_plan_completed` (Task 5.2 — the
+/// dedicated sub-plan signal the dashboard subscribes to so the `SubPlanCard`
+/// flips to its completed state), and sets `*propagated` — the signal
+/// [`try_dag_advance`] uses to re-snapshot so the parent graph sees the
+/// completion and schedules whatever depended on the sub-plan.
 ///
 /// **Why direct children (`node.nodes`) and not a
 /// `node_status LIKE '<id>.%'` query** (the literal Task 2.3 sketch): a child
@@ -598,6 +600,19 @@ fn propagate_sub_plan_completion(
                 "plan_name": plan_name,
                 "node_id": scoped,
                 "status": "completed",
+            }),
+        );
+        // Task 5.2: dedicated sub-plan-completion signal. Carries the scoped
+        // parent node id; the dashboard subscribes to this to flip the
+        // `SubPlanCard` to its completed state (and a future graph view can
+        // animate the group collapse) distinctly from the generic per-node
+        // sync above.
+        broadcast_event(
+            broadcast_tx,
+            "sub_plan_completed",
+            json!({
+                "plan_name": plan_name,
+                "parent_node_id": scoped,
             }),
         );
         *propagated = true;
@@ -1796,6 +1811,15 @@ nodes:
                 .any(|e| e.contains("\"node_id\":\"sp\"") && e.contains("\"status\":\"completed\"")),
             "expected node_status_changed sp completed, got {events:?}"
         );
+        // Task 5.2: the dedicated sub_plan_completed event fires too, naming
+        // the scoped parent node id.
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("\"type\":\"sub_plan_completed\"")
+                    && e.contains("\"parent_node_id\":\"sp\"")),
+            "expected sub_plan_completed for sp, got {events:?}"
+        );
     }
 
     /// The premature-completion guard: a still-`pending` child has **no**
@@ -1805,7 +1829,7 @@ nodes:
     #[test]
     fn propagate_does_not_complete_when_a_child_has_no_status_row() {
         let (db, _dir) = fresh_db();
-        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let yaml = r#"
 schema_version: 2
 title: "Sub-plan"
@@ -1849,6 +1873,17 @@ nodes:
         assert_eq!(
             rows, 0,
             "parent must not be written while a child is pending"
+        );
+        drop(conn);
+
+        // Task 5.2: no sub_plan_completed (nor the generic completion) fires
+        // while a child is unfinished.
+        let events = collect_events(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.contains("\"type\":\"sub_plan_completed\"")),
+            "must not broadcast sub_plan_completed while a child is pending, got {events:?}"
         );
     }
 
@@ -2005,6 +2040,15 @@ nodes:
                 .any(|e| e.contains("\"node_id\":\"sp\"") && e.contains("\"status\":\"completed\"")),
             "expected node_status_changed sp completed, got {events:?}"
         );
+        // Task 5.2: the dedicated sub_plan_completed signal fired for the
+        // parent (acceptance: completing all tasks in a sub-plan → event fires).
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("\"type\":\"sub_plan_completed\"")
+                    && e.contains("\"parent_node_id\":\"sp\"")),
+            "expected sub_plan_completed for sp, got {events:?}"
+        );
         // node_advanced names the spawned downstream node.
         let advanced: Vec<&String> = events
             .iter()
@@ -2069,7 +2113,7 @@ nodes:
             .unwrap();
         }
 
-        let (registry, _rx) = test_registry(db.clone());
+        let (registry, mut rx) = test_registry(db.clone());
         try_dag_advance(
             registry,
             plans_dir,
@@ -2094,6 +2138,20 @@ nodes:
                 )
                 .unwrap_or_else(|_| panic!("no node_status row for {node_id}"));
             assert_eq!(status, expect, "node {node_id} expected {expect}");
+        }
+        drop(conn);
+
+        // Task 5.2: a dedicated sub_plan_completed fires at EACH nesting level
+        // as the cascade settles (inner then outer), each naming its scoped id.
+        let events = collect_events(&mut rx);
+        for parent in ["outer.inner", "outer"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.contains("\"type\":\"sub_plan_completed\"")
+                        && e.contains(&format!("\"parent_node_id\":\"{parent}\""))),
+                "expected sub_plan_completed for {parent}, got {events:?}"
+            );
         }
     }
 }

@@ -593,6 +593,22 @@ const NodeAdvanced = v.object({
   }),
 });
 
+/// A sub-plan node completed: every one of its direct child nodes finished,
+/// so the scheduler's Task 2.3 propagation marked the parent `completed`.
+/// Fires from `dag_scheduler.rs::propagate_sub_plan_completion` alongside the
+/// generic `node_status_changed`. `parent_node_id` is the **scoped** id of the
+/// completed sub-plan node (`integration` at top level, `outer.inner` nested).
+/// The dashboard patches that node's status to `completed` so the `SubPlanCard`
+/// flips to its completed state — the dedicated signal (Task 5.2) the card
+/// subscribes to distinctly from the generic per-node sync.
+const SubPlanCompleted = v.object({
+  type: v.literal("sub_plan_completed"),
+  data: v.object({
+    plan_name: v.string(),
+    parent_node_id: v.string(),
+  }),
+});
+
 /// A *gate* node changed status — fired alongside `node_status_changed` but
 /// carrying `gate_kind` (`init | end | ci | approval`) so the dashboard can
 /// drive gate-specific UI (approve affordance, failure banner) distinctly
@@ -752,6 +768,7 @@ export const WsMessageSchema = v.variant("type", [
   LearningPromoted,
   NodeStatusChanged,
   NodeAdvanced,
+  SubPlanCompleted,
   GateStatusChanged,
   GateAwaitingApproval,
   GateReadyForApproval,

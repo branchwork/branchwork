@@ -35,7 +35,14 @@ export function SubPlanCard({ node, scopedId, renderChild }: SubPlanCardProps) {
   // yank the panel shut under the user.
   const [expanded, setExpanded] = useState(total === 0 ? false : done < total);
 
-  const allDone = total > 0 && done === total;
+  // "Completed" reflects EITHER the server's propagated sub-plan node status
+  // (the `sub_plan_completed` / `node_status_changed` WS events → `patchNodeStatus`
+  // set `node.status = "completed"` once every direct child finishes — Task 5.2)
+  // OR every task descendant being done. The node status is authoritative: it
+  // accounts for non-task children (gates, nested sub-plans) the task-only
+  // progress count ignores, so a sub-plan that contains gates still flips to
+  // completed when its WS event arrives.
+  const allDone = node.status === "completed" || (total > 0 && done === total);
   const progressLabel = `${done}/${total} task${total === 1 ? "" : "s"} done`;
 
   return (
