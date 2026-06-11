@@ -143,9 +143,9 @@ pub fn practices_for_task(
 }
 
 fn all_practices(conn: &Connection) -> Vec<PracticeHit> {
-    let mut stmt = match conn.prepare(
-        "SELECT id, scope_globs, keywords, rule, why, source FROM practices ORDER BY id",
-    ) {
+    let mut stmt = match conn
+        .prepare("SELECT id, scope_globs, keywords, rule, why, source FROM practices ORDER BY id")
+    {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -169,14 +169,12 @@ fn all_practices(conn: &Connection) -> Vec<PracticeHit> {
 
 #[tool_router(router = practices_router, vis = "pub")]
 impl BranchworkMcp {
-    #[tool(
-        description = "Record a project practice: an org rule scoped by path \
+    #[tool(description = "Record a project practice: an org rule scoped by path \
                        globs and/or keywords, served automatically inside \
                        get_task_context whenever a task's file_paths or \
                        title/description match. Advisory only — practices \
                        never gate anything. Use it to promote a recurring \
-                       learning into a standing rule."
-    )]
+                       learning into a standing rule.")]
     pub async fn practice_add(
         &self,
         Parameters(req): Parameters<PracticeAddRequest>,
@@ -213,22 +211,29 @@ impl BranchworkMcp {
         }))
     }
 
-    #[tool(
-        description = "Search project practices (free-text across rule, why, \
-                       source, keywords, globs). No query lists everything."
-    )]
+    #[tool(description = "Search project practices (free-text across rule, why, \
+                       source, keywords, globs). No query lists everything.")]
     pub async fn practice_search(
         &self,
         Parameters(req): Parameters<PracticeSearchRequest>,
     ) -> Result<Json<PracticeList>, McpError> {
         let conn = self.ctx.db.lock().unwrap();
         let mut practices = all_practices(&conn);
-        if let Some(q) = req.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        if let Some(q) = req
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        {
             let q = q.to_lowercase();
             practices.retain(|p| {
                 p.rule.to_lowercase().contains(&q)
                     || p.why.as_deref().unwrap_or("").to_lowercase().contains(&q)
-                    || p.source.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                    || p.source
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&q)
                     || p.keywords.iter().any(|k| k.to_lowercase().contains(&q))
                     || p.scope_globs.iter().any(|g| g.to_lowercase().contains(&q))
             });
@@ -251,13 +256,19 @@ mod tests {
 
     #[test]
     fn glob_doublestar_crosses_segments() {
-        assert!(glob_match("packages/db/drizzle/**", "packages/db/drizzle/0072_x.sql"));
+        assert!(glob_match(
+            "packages/db/drizzle/**",
+            "packages/db/drizzle/0072_x.sql"
+        ));
         assert!(glob_match(
             "packages/db/drizzle/**",
             "packages/db/drizzle/meta/_journal.json"
         ));
         assert!(glob_match("**/i18n.ts", "apps/web/src/lib/i18n.ts"));
-        assert!(!glob_match("packages/db/drizzle/**", "packages/db/src/schema.ts"));
+        assert!(!glob_match(
+            "packages/db/drizzle/**",
+            "packages/db/src/schema.ts"
+        ));
     }
 
     #[test]

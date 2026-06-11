@@ -322,7 +322,13 @@ pub async fn get_plan(
         "SELECT task_number, status, updated_at, agent, started_at, ended_at \
          FROM task_status WHERE plan_name = ?",
     ) {
-        type StatusRow = (String, String, Option<String>, Option<String>, Option<String>);
+        type StatusRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let mut status_map: HashMap<String, StatusRow> = HashMap::new();
         if let Ok(rows) = stmt.query_map(params![name], |row| {
             Ok((
@@ -8556,7 +8562,13 @@ pub async fn get_plan_artifact_ci(
     let mut result: HashMap<String, TaskArtifactCi> = HashMap::new();
     for (task_number, url) in per_task.into_iter().take(ARTIFACT_CI_MAX_LOOKUPS) {
         let ci_state = resolve_pr_ci_state(&url).await;
-        result.insert(task_number, TaskArtifactCi { url, state: ci_state });
+        result.insert(
+            task_number,
+            TaskArtifactCi {
+                url,
+                state: ci_state,
+            },
+        );
     }
     Json(serde_json::json!(result)).into_response()
 }

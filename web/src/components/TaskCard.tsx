@@ -802,18 +802,18 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
             )}
           {/* Check button — always available except while an agent is running */}
           {!isObserved && (
-          <button
-            onClick={handleCheck}
-            disabled={checking || status === "checking" || taskLocked}
-            className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-300 rounded transition"
-            title={
-              taskLocked
-                ? "Agent running — wait for it to finish"
-                : "Spawn an agent to verify this task against the codebase"
-            }
-          >
-            {checking || status === "checking" ? "..." : "Check"}
-          </button>
+            <button
+              onClick={handleCheck}
+              disabled={checking || status === "checking" || taskLocked}
+              className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-300 rounded transition"
+              title={
+                taskLocked
+                  ? "Agent running — wait for it to finish"
+                  : "Spawn an agent to verify this task against the codebase"
+              }
+            >
+              {checking || status === "checking" ? "..." : "Check"}
+            </button>
           )}
 
           {/* Start — for pending tasks */}
