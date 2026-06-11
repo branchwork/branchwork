@@ -638,6 +638,8 @@ async fn spawn_dag_task_node(ctx: &SchedulerCtx<'_>, node: &DagNode, scoped_id: 
 
     let synthetic_task = PlanTask {
         agent: None,
+        started_at: None,
+        ended_at: None,
         artifacts: None,
         number: scoped_id.to_string(),
         title: node.title.clone(),

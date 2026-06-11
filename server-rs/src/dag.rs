@@ -805,6 +805,8 @@ mod tests {
                     tasks: vec![
                         PlanTask {
                             agent: None,
+                            started_at: None,
+                            ended_at: None,
                             artifacts: None,
                             number: "1.1".to_string(),
                             title: "Task A".to_string(),
@@ -820,6 +822,8 @@ mod tests {
                         },
                         PlanTask {
                             agent: None,
+                            started_at: None,
+                            ended_at: None,
                             artifacts: None,
                             number: "1.2".to_string(),
                             title: "Task B".to_string(),
@@ -843,6 +847,8 @@ mod tests {
                     description: String::new(),
                     tasks: vec![PlanTask {
                         agent: None,
+                        started_at: None,
+                        ended_at: None,
                         artifacts: None,
                         number: "2.1".to_string(),
                         title: "Task C".to_string(),
@@ -914,6 +920,8 @@ mod tests {
                 tasks: vec![
                     PlanTask {
                         agent: None,
+                        started_at: None,
+                        ended_at: None,
                         artifacts: None,
                         number: "1.1".to_string(),
                         title: "A".to_string(),
@@ -929,6 +937,8 @@ mod tests {
                     },
                     PlanTask {
                         agent: None,
+                        started_at: None,
+                        ended_at: None,
                         artifacts: None,
                         number: "1.2".to_string(),
                         title: "B".to_string(),

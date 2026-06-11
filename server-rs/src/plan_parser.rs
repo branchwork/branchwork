@@ -39,6 +39,13 @@ pub struct PlanTask {
     /// (observe-mode plans); merged from task_status.agent in get_plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Pivot 2026-06-11 — wall-clock: first transition into
+    /// in_progress/checking (trigger-maintained, see db.rs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// Pivot 2026-06-11 — wall-clock: transition into a terminal status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
     /// Pivot 2026-06-11 — artifact links declared with status updates
     /// (PR / commit / CI-run); merged from task_artifacts in get_plan.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -357,6 +364,8 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
         if tasks.is_empty() && !body.trim().is_empty() {
             tasks.push(PlanTask {
                 agent: None,
+                started_at: None,
+                ended_at: None,
                 artifacts: None,
                 number: format!("{phase_num}.1"),
                 title: phase_title.clone(),
@@ -486,6 +495,8 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
 
         tasks.push(PlanTask {
             agent: None,
+            started_at: None,
+            ended_at: None,
             artifacts: None,
             number: task_number,
             title: task_title,
@@ -517,6 +528,8 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
         let dependencies = extract_dependencies(full);
         tasks.push(PlanTask {
             agent: None,
+            started_at: None,
+            ended_at: None,
             artifacts: None,
             number: format!("{phase_num}.{idx}"),
             title,
@@ -602,6 +615,8 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
                 .into_iter()
                 .map(|t| PlanTask {
                     agent: None,
+                    started_at: None,
+                    ended_at: None,
                     artifacts: None,
                     number: t.number,
                     title: t.title,
@@ -818,6 +833,8 @@ fn dag_plan_to_parsed(dag: &crate::dag::DagPlan) -> ParsedPlan {
         .enumerate()
         .map(|(i, n)| PlanTask {
             agent: None,
+            started_at: None,
+            ended_at: None,
             artifacts: None,
             number: if n.id.contains('.') {
                 n.id.clone()
@@ -1818,6 +1835,8 @@ phases:
                 tasks: vec![
                     PlanTask {
                         agent: None,
+                        started_at: None,
+                        ended_at: None,
                         artifacts: None,
                         number: "0.1".to_string(),
                         title: "No commit".to_string(),
@@ -1833,6 +1852,8 @@ phases:
                     },
                     PlanTask {
                         agent: None,
+                        started_at: None,
+                        ended_at: None,
                         artifacts: None,
                         number: "0.2".to_string(),
                         title: "Has commit".to_string(),

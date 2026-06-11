@@ -317,30 +317,40 @@ pub async fn get_plan(
 
     let db = state.db.lock().unwrap();
 
-    // Merge task statuses (+ the declaring agent, pivot 2026-06-11)
+    // Merge task statuses (+ the declaring agent + wall-clock, pivot 2026-06-11)
     if let Ok(mut stmt) = db.prepare(
-        "SELECT task_number, status, updated_at, agent FROM task_status WHERE plan_name = ?",
+        "SELECT task_number, status, updated_at, agent, started_at, ended_at \
+         FROM task_status WHERE plan_name = ?",
     ) {
-        let mut status_map: HashMap<String, (String, String, Option<String>)> = HashMap::new();
+        type StatusRow = (String, String, Option<String>, Option<String>, Option<String>);
+        let mut status_map: HashMap<String, StatusRow> = HashMap::new();
         if let Ok(rows) = stmt.query_map(params![name], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                (
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ),
             ))
         }) {
-            for row in rows.flatten() {
-                status_map.insert(row.0, (row.1, row.2, row.3));
+            for (task_number, row) in rows.flatten() {
+                status_map.insert(task_number, row);
             }
         }
 
         for phase in &mut plan.phases {
             for task in &mut phase.tasks {
-                if let Some((status, updated_at, agent)) = status_map.get(&task.number) {
+                if let Some((status, updated_at, agent, started_at, ended_at)) =
+                    status_map.get(&task.number)
+                {
                     task.status = Some(status.clone());
                     task.status_updated_at = Some(updated_at.clone());
                     task.agent = agent.clone();
+                    task.started_at = started_at.clone();
+                    task.ended_at = ended_at.clone();
                 } else {
                     task.status = Some("pending".to_string());
                 }
@@ -5698,6 +5708,8 @@ pub async fn update_plan(
                     .into_iter()
                     .map(|t| plan_parser::PlanTask {
                         agent: None,
+                        started_at: None,
+                        ended_at: None,
                         artifacts: None,
                         number: t.number,
                         title: t.title,
@@ -7468,6 +7480,8 @@ mod check_prompt_tests {
     fn sample_task(number: &str, files: Vec<String>) -> plan_parser::PlanTask {
         plan_parser::PlanTask {
             agent: None,
+            started_at: None,
+            ended_at: None,
             artifacts: None,
             number: number.into(),
             title: "A task".into(),
@@ -8418,5 +8432,146 @@ mod phase_settings_yaml_edit_tests {
         assert!(out.contains("# inline phase comment"));
         assert!(out.contains("phase_verification: bash verify.sh"));
         let _: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pivot 2026-06-11, Task 2.2 — declared-vs-observed CI state for artifacts.
+//
+// `GET /api/plans/{name}/artifact-ci` resolves the CI state of every
+// PR-shaped artifact link declared on the plan's tasks, via `gh pr checks`
+// (exit code 0 = pass, 8 = pending, 1 = fail — the same contract the CLI
+// gives shell users). Results are cached in-process for 120 s so a board
+// refresh doesn't hammer the GitHub API; ≤ 8 distinct URLs are resolved per
+// request (newest artifacts first). The dashboard renders a divergence badge
+// when a task says `completed` but its PR's CI says failure.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static ARTIFACT_CI_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, (std::time::Instant, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+const ARTIFACT_CI_TTL: Duration = Duration::from_secs(120);
+const ARTIFACT_CI_MAX_LOOKUPS: usize = 8;
+
+/// True for `https://github.com/<owner>/<repo>/pull/<n>` links (the only
+/// artifact shape we can resolve CI for without knowing the repo context).
+pub(crate) fn is_pr_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    parts.len() >= 4
+        && !parts[0].is_empty()
+        && !parts[1].is_empty()
+        && parts[2] == "pull"
+        && parts[3]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .is_some_and(|n| !n.is_empty())
+}
+
+async fn resolve_pr_ci_state(url: &str) -> String {
+    if let Some((at, state)) = ARTIFACT_CI_CACHE.lock().unwrap().get(url).cloned()
+        && at.elapsed() < ARTIFACT_CI_TTL
+    {
+        return state;
+    }
+    let state = match tokio::process::Command::new("gh")
+        .args(["pr", "checks", url])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        Ok(s) => match s.code() {
+            Some(0) => "success",
+            Some(8) => "pending",
+            Some(1) => "failure",
+            _ => "unknown",
+        },
+        Err(_) => "unknown",
+    }
+    .to_string();
+    ARTIFACT_CI_CACHE
+        .lock()
+        .unwrap()
+        .insert(url.to_string(), (std::time::Instant::now(), state.clone()));
+    state
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArtifactCi {
+    pub url: String,
+    /// `success` | `pending` | `failure` | `unknown`
+    pub state: String,
+}
+
+pub async fn get_plan_artifact_ci(
+    State(state): State<AppState>,
+    auth: OptionalAuthUser,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Same org gate as get_plan.
+    {
+        let conn = state.db.lock().unwrap();
+        if !orgs::plan_belongs_to_org(&conn, &name, auth.org_id()) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Plan not found"})),
+            )
+                .into_response();
+        }
+    }
+
+    // Newest PR-shaped artifact per task (one lookup per task keeps the
+    // signal crisp: the latest declared PR is the one whose CI matters).
+    let per_task: Vec<(String, String)> = {
+        let db = state.db.lock().unwrap();
+        let mut stmt = match db.prepare(
+            "SELECT task_number, url FROM task_artifacts \
+             WHERE plan_name = ? ORDER BY id DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Json(serde_json::json!({})).into_response(),
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        if let Ok(rows) = stmt.query_map(params![name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for (task_number, url) in rows.flatten() {
+                if is_pr_url(&url) && seen.insert(task_number.clone()) {
+                    out.push((task_number, url));
+                }
+            }
+        }
+        out
+    };
+
+    let mut result: HashMap<String, TaskArtifactCi> = HashMap::new();
+    for (task_number, url) in per_task.into_iter().take(ARTIFACT_CI_MAX_LOOKUPS) {
+        let ci_state = resolve_pr_ci_state(&url).await;
+        result.insert(task_number, TaskArtifactCi { url, state: ci_state });
+    }
+    Json(serde_json::json!(result)).into_response()
+}
+
+#[cfg(test)]
+mod artifact_ci_tests {
+    use super::is_pr_url;
+
+    #[test]
+    fn pr_url_shapes() {
+        assert!(is_pr_url("https://github.com/cpoder/reglyze/pull/158"));
+        assert!(is_pr_url("https://github.com/x/y/pull/1#issuecomment-9"));
+        assert!(!is_pr_url("https://github.com/cpoder/reglyze"));
+        assert!(!is_pr_url("https://gitlab.com/x/y/pull/1"));
+        assert!(!is_pr_url("3a43b21"));
+        assert!(!is_pr_url("https://github.com/x/y/pull/"));
     }
 }

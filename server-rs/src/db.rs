@@ -2224,6 +2224,58 @@ pub(crate) fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE task_status ADD COLUMN agent TEXT DEFAULT NULL;")
         .ok();
 
+    // Pivot 2026-06-11 — task wall-clock: when work STARTED (first transition
+    // into in_progress/checking) and when it ENDED (transition into a terminal
+    // status). Maintained by TRIGGERS so every writer (MCP, HTTP, auto-mode,
+    // runners, check agents) gets the same semantics without touching eight
+    // call sites. Re-declaring the SAME status is a no-op (WHEN guard), a
+    // reopen (terminal → in_progress) clears ended_at and keeps the original
+    // started_at, and a reset to pending clears both.
+    conn.execute_batch("ALTER TABLE task_status ADD COLUMN started_at TEXT DEFAULT NULL;")
+        .ok();
+    conn.execute_batch("ALTER TABLE task_status ADD COLUMN ended_at TEXT DEFAULT NULL;")
+        .ok();
+    conn.execute_batch(
+        "
+        CREATE TRIGGER IF NOT EXISTS task_status_times_insert
+        AFTER INSERT ON task_status
+        BEGIN
+          UPDATE task_status SET
+            started_at = CASE WHEN NEW.status IN ('in_progress','checking')
+                              THEN datetime('now') ELSE started_at END,
+            ended_at   = CASE WHEN NEW.status IN ('completed','failed','skipped')
+                              THEN datetime('now') ELSE NULL END
+          WHERE plan_name = NEW.plan_name AND task_number = NEW.task_number;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS task_status_times_update
+        AFTER UPDATE OF status ON task_status
+        WHEN NEW.status IS NOT OLD.status
+        BEGIN
+          UPDATE task_status SET
+            started_at = CASE
+                WHEN NEW.status IN ('in_progress','checking') AND started_at IS NULL
+                  THEN datetime('now')
+                WHEN NEW.status = 'pending' THEN NULL
+                ELSE started_at END,
+            ended_at = CASE
+                WHEN NEW.status IN ('completed','failed','skipped') THEN datetime('now')
+                ELSE NULL END
+          WHERE plan_name = NEW.plan_name AND task_number = NEW.task_number;
+        END;
+        ",
+    )
+    .expect("task_status time triggers failed");
+
+    // One-time backfill: rows that reached a terminal status BEFORE the
+    // triggers existed — their updated_at IS the completion write, so it is
+    // the honest ended_at. started_at is unknowable retroactively (NULL).
+    conn.execute_batch(
+        "UPDATE task_status SET ended_at = updated_at
+         WHERE status IN ('completed','failed','skipped') AND ended_at IS NULL;",
+    )
+    .ok();
+
     // Per-plan opt-in for parallel spawn. Default 0 (off) — until
     // worktree-per-agent isolation ships, the spawn loop unconditionally
     // breaks after the first claim (Phase 3.5.1). 3.5.3 will reject toggle

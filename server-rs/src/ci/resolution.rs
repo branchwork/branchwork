@@ -499,6 +499,8 @@ mod tests {
     fn task(number: &str) -> PlanTask {
         PlanTask {
             agent: None,
+            started_at: None,
+            ended_at: None,
             artifacts: None,
             number: number.into(),
             title: format!("task {number}"),

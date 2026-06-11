@@ -117,6 +117,31 @@ const derivedStateConfig: Record<
 
 /// Short human-readable label for the auth blocker — used as a button
 /// tooltip so users know why Start is disabled without opening settings.
+/// SQLite emits UTC "YYYY-MM-DD HH:MM:SS" (no T, no Z) — normalise before
+/// Date-parsing so the clock renders in the viewer's locale.
+function parseDbTime(s: string | null | undefined): Date | null {
+  if (!s) return null;
+  const d = new Date(s.includes("T") ? s : `${s.replace(" ", "T")}Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function fmtClock(s: string | null | undefined): string {
+  const d = parseDbTime(s);
+  return d ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "\u2014";
+}
+
+/// " · 38m" / " · 2h05" between start and end (end falls back to now for
+/// in-flight tasks); empty when the start is unknown.
+function fmtDuration(start: string | null | undefined, end: string | null | undefined): string {
+  const s = parseDbTime(start);
+  if (!s) return "";
+  const e = parseDbTime(end) ?? new Date();
+  const mins = Math.max(0, Math.round((e.getTime() - s.getTime()) / 60000));
+  if (mins < 60) return ` \u00b7 ${mins}m`;
+  const h = Math.floor(mins / 60);
+  return ` \u00b7 ${h}h${String(mins % 60).padStart(2, "0")}`;
+}
+
 function authStatusLabel(auth: AuthStatus | undefined): string {
   if (!auth) return "driver status unknown";
   switch (auth.kind) {
@@ -346,6 +371,8 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
   // Retry / Fix CI) is hidden: spawning a runner on an observed plan
   // would contradict the plan's own contract.
   const isObserved = usePlanStore((s) => s.selectedPlan?.mode === "observe");
+  // Task 2.2 — observed CI state of the task's newest PR artifact.
+  const artifactCi = usePlanStore((s) => s.artifactCi[task.number]);
 
   // Pill tooltip — only set when a derived state is active so the
   // default behaviour (no tooltip on the regular pill) is preserved.
@@ -1023,8 +1050,44 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
           observe-mode ground truth (who said so, and the PR/commit/run
           links they attached). Rendered for any task that has them,
           observed plan or not. */}
-      {(task.agent || (task.artifacts?.length ?? 0) > 0) && (
+      {(task.agent ||
+        (task.artifacts?.length ?? 0) > 0 ||
+        task.startedAt ||
+        task.endedAt ||
+        (status === "completed" && artifactCi?.state === "failure")) && (
         <div className="mt-2 flex flex-wrap items-center gap-1.5" data-testid="declared-by-row">
+          {/* Task wall-clock (trigger-maintained server-side): start → end
+              and the human duration; observed and managed plans alike. */}
+          {(task.startedAt || task.endedAt) && (
+            <span
+              className="text-[10px] text-gray-500 tabular-nums"
+              data-testid="task-times"
+              title={`started: ${task.startedAt ?? "—"} · ended: ${task.endedAt ?? "—"} (UTC)`}
+            >
+              {"\u23F1 "}
+              {fmtClock(task.startedAt)}
+              {" \u2192 "}
+              {fmtClock(task.endedAt)}
+              {fmtDuration(task.startedAt, task.endedAt)}
+            </span>
+          )}
+          {/* Task 2.2 — DIVERGENCE: the task says completed, the linked
+              PR's CI says failure. The whole point of observed ground
+              truth: a declared ✓ never silently outlives a red CI. */}
+          {status === "completed" && artifactCi?.state === "failure" && (
+            <a
+              href={artifactCi.url}
+              target="_blank"
+              rel="noreferrer noopener"
+              onClick={(e) => e.stopPropagation()}
+              className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-600/20 text-amber-300 border border-amber-500/40 hover:bg-amber-600/30"
+              title={`Task declared completed, but CI on ${artifactCi.url} is failing`}
+              data-testid="divergence-badge"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+              {"Declared \u2713 / CI \u2717"}
+            </a>
+          )}
           {task.agent && (
             <span
               className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-violet-600/20 text-violet-300"

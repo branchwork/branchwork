@@ -1188,3 +1188,40 @@ describe("observe-mode plans (pivot 2026-06-11)", () => {
     expect(screen.getByTestId("artifact-ref").textContent).toBe("1a2b3c4");
   });
 });
+
+describe("task wall-clock + declared-vs-CI divergence (pivot 2.2)", () => {
+  it("renders start → end times with duration", () => {
+    const t = task({
+      status: "completed",
+      startedAt: "2026-06-11 20:00:00",
+      endedAt: "2026-06-11 20:38:00",
+    });
+    usePlanStore.setState({ selectedPlan: plan(t) });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    const times = screen.getByTestId("task-times");
+    expect(times.textContent).toContain("→");
+    expect(times.textContent).toContain("38m");
+  });
+
+  it("shows the divergence badge when completed but the PR CI fails", () => {
+    const t = task({ status: "completed" });
+    usePlanStore.setState({
+      selectedPlan: plan(t),
+      artifactCi: { "1.1": { url: "https://github.com/x/y/pull/7", state: "failure" } },
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    const badge = screen.getByTestId("divergence-badge") as HTMLAnchorElement;
+    expect(badge.textContent).toContain("Declared");
+    expect(badge.href).toBe("https://github.com/x/y/pull/7");
+  });
+
+  it("no badge when the CI is green or the task is not completed", () => {
+    const t = task({ status: "completed" });
+    usePlanStore.setState({
+      selectedPlan: plan(t),
+      artifactCi: { "1.1": { url: "https://github.com/x/y/pull/7", state: "success" } },
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    expect(screen.queryByTestId("divergence-badge")).toBeNull();
+  });
+});
