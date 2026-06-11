@@ -35,6 +35,31 @@ pub struct PlanTask {
     pub cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ci: Option<crate::ci::CiStatus>,
+    /// Pivot 2026-06-11 — foreign agent that declared the current status
+    /// (observe-mode plans); merged from task_status.agent in get_plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Pivot 2026-06-11 — wall-clock: first transition into
+    /// in_progress/checking (trigger-maintained, see db.rs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// Pivot 2026-06-11 — wall-clock: transition into a terminal status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    /// Pivot 2026-06-11 — artifact links declared with status updates
+    /// (PR / commit / CI-run); merged from task_artifacts in get_plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<TaskArtifact>>,
+}
+
+/// One declared artifact link on a task (observe-mode declarations).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArtifact {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +83,13 @@ pub struct ParsedPlan {
     pub title: String,
     pub context: String,
     pub project: Option<String>,
+    /// Pivot 2026-06-11 — `observe` plans are tracked, never driven: a
+    /// FOREIGN orchestrator (e.g. a Claude Code session and its sub-agents)
+    /// executes and only declares progress over MCP. Branchwork skips the
+    /// managed machinery for them (tree-clean completion gate, auto-advance).
+    /// `None` / anything else = managed (default, fully backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub created_at: String,
     pub modified_at: String,
     pub phases: Vec<PlanPhase>,
@@ -123,6 +155,9 @@ struct YamlPlan {
     context: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project: Option<String>,
+    /// `observe` = foreign-agent plan (see ParsedPlan::mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
     phases: Vec<YamlPlanPhase>,
@@ -328,6 +363,10 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
         // Last resort: entire phase body as one task
         if tasks.is_empty() && !body.trim().is_empty() {
             tasks.push(PlanTask {
+                agent: None,
+                started_at: None,
+                ended_at: None,
+                artifacts: None,
                 number: format!("{phase_num}.1"),
                 title: phase_title.clone(),
                 description: body.trim().to_string(),
@@ -355,6 +394,7 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
     }
 
     ParsedPlan {
+        mode: None,
         name: name.to_string(),
         file_path: file_path.to_string(),
         title,
@@ -454,6 +494,10 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
         let dependencies = extract_dependencies(&task_body);
 
         tasks.push(PlanTask {
+            agent: None,
+            started_at: None,
+            ended_at: None,
+            artifacts: None,
             number: task_number,
             title: task_title,
             description: task_body,
@@ -483,6 +527,10 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
         let file_paths = extract_file_paths(full);
         let dependencies = extract_dependencies(full);
         tasks.push(PlanTask {
+            agent: None,
+            started_at: None,
+            ended_at: None,
+            artifacts: None,
             number: format!("{phase_num}.{idx}"),
             title,
             description: desc,
@@ -566,6 +614,10 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
                 .tasks
                 .into_iter()
                 .map(|t| PlanTask {
+                    agent: None,
+                    started_at: None,
+                    ended_at: None,
+                    artifacts: None,
                     number: t.number,
                     title: t.title,
                     description: t.description,
@@ -592,6 +644,7 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
         .collect();
 
     Ok(ParsedPlan {
+        mode: yaml.mode,
         name: name.to_string(),
         file_path: file_path.to_string(),
         title: yaml.title,
@@ -614,6 +667,7 @@ pub fn serialize_plan_yaml(plan: &ParsedPlan) -> Result<String, String> {
         title: plan.title.clone(),
         context: plan.context.clone(),
         project: plan.project.clone(),
+        mode: plan.mode.clone(),
         created_at: if plan.created_at.is_empty() {
             None
         } else {
@@ -778,6 +832,10 @@ fn dag_plan_to_parsed(dag: &crate::dag::DagPlan) -> ParsedPlan {
         .filter(|n| n.node_type == NodeType::Task)
         .enumerate()
         .map(|(i, n)| PlanTask {
+            agent: None,
+            started_at: None,
+            ended_at: None,
+            artifacts: None,
             number: if n.id.contains('.') {
                 n.id.clone()
             } else {
@@ -815,6 +873,7 @@ fn dag_plan_to_parsed(dag: &crate::dag::DagPlan) -> ParsedPlan {
     };
 
     ParsedPlan {
+        mode: None,
         name: dag.name.clone(),
         file_path: dag.file_path.clone(),
         title: dag.title.clone(),
@@ -1761,6 +1820,7 @@ phases:
     fn produces_commit_round_trip_serialization() {
         // Build a plan with one task produces_commit=false, another =true
         let plan = ParsedPlan {
+            mode: None,
             name: "rt".to_string(),
             file_path: "/tmp/rt.yaml".to_string(),
             title: "Round-trip".to_string(),
@@ -1774,6 +1834,10 @@ phases:
                 description: String::new(),
                 tasks: vec![
                     PlanTask {
+                        agent: None,
+                        started_at: None,
+                        ended_at: None,
+                        artifacts: None,
                         number: "0.1".to_string(),
                         title: "No commit".to_string(),
                         description: String::new(),
@@ -1787,6 +1851,10 @@ phases:
                         ci: None,
                     },
                     PlanTask {
+                        agent: None,
+                        started_at: None,
+                        ended_at: None,
+                        artifacts: None,
                         number: "0.2".to_string(),
                         title: "Has commit".to_string(),
                         description: String::new(),

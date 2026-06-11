@@ -574,6 +574,14 @@ mod tests {
             params![plan],
         )
         .unwrap();
+        // Pivot 2026-06-11: task_artifacts joined the cascade — one row so
+        // the round-trip audit covers it.
+        conn.execute(
+            "INSERT INTO task_artifacts (plan_name, task_number, url, agent) \
+             VALUES (?1, '1.1', 'https://github.com/x/y/pull/1', 'claude-session')",
+            params![plan],
+        )
+        .unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO plan_org (plan_name, org_id) \
              VALUES (?1, 'default-org')",

@@ -660,7 +660,9 @@ function dispatch(msg: WsMessage) {
       // and `selectedPlan.task.status` with the pre-event server snapshot.
       // See the audit-§4 acceptance test in ws-store.test.ts.
       deferBehindPlansFetch(() => {
-        usePlanStore.getState().patchTaskStatus(d.plan_name, d.task_number, d.status);
+        usePlanStore
+          .getState()
+          .patchTaskStatus(d.plan_name, d.task_number, d.status, d.agent, d.artifacts);
         // Authoritative refetch — guarantees convergence to server truth
         // (doneCount drift on non-selected plans, MCP/agent-driven
         // transitions) even when the signed-delta in patchTaskStatus

@@ -32,6 +32,16 @@ export interface PlanTask {
   agentId?: string;
   costUsd?: number;
   ci?: CiStatus | null;
+  /// Pivot 2026-06-11 — foreign agent that declared the current status
+  /// (observe-mode plans). Distinct from agentId (a managed runner).
+  agent?: string | null;
+  /// Pivot 2026-06-11 — wall-clock: first transition into in_progress
+  /// (trigger-maintained server-side); SQLite UTC "YYYY-MM-DD HH:MM:SS".
+  startedAt?: string | null;
+  /// Wall-clock: transition into a terminal status.
+  endedAt?: string | null;
+  /// Declared artifact links (PR / commit / CI run), newest first.
+  artifacts?: { url: string; agent?: string | null; createdAt: string }[];
 }
 
 /// Node type for `schema_version: 2` (DAG) plans. Matches the server's
@@ -119,6 +129,10 @@ export interface ParsedPlan {
   title: string;
   context: string;
   project: string | null;
+  /// Pivot 2026-06-11 — `observe` plans are executed by a FOREIGN agent
+  /// that only declares progress: the board hides every orchestration
+  /// affordance (Start / Continue / Retry / Check) for them.
+  mode?: string | null;
   createdAt: string;
   modifiedAt: string;
   phases: PlanPhase[];
@@ -467,7 +481,18 @@ interface PlanStore {
   /// matches the gone name (so App.tsx routes back to ProjectDashboard).
   /// Driven by the `plan_deleted` WS event.
   removePlan: (planName: string) => void;
-  patchTaskStatus: (planName: string, taskNumber: string, status: string) => void;
+  patchTaskStatus: (
+    planName: string,
+    taskNumber: string,
+    status: string,
+    agent?: string | null,
+    artifacts?: string[] | null,
+  ) => void;
+  /// Pivot 2026-06-11 (Task 2.2) — observed CI state per task for the
+  /// SELECTED plan's newest PR-shaped artifact links. Keyed by task
+  /// number; refreshed on plan select (server caches gh lookups 120 s).
+  artifactCi: Record<string, { url: string; state: string }>;
+  fetchArtifactCi: (planName: string) => Promise<void>;
   /// Patch a DAG node's status on the selected v2 plan. Driven by the
   /// `node_status_changed` / `gate_status_changed` WS events (and the gate
   /// approve/retry responses). `nodeId` is the scoped id (`wire-api` at top
@@ -625,6 +650,7 @@ export function patchGateChecksInTree(
 export const usePlanStore = create<PlanStore>((set, get) => ({
   plans: [],
   selectedPlan: null,
+  artifactCi: {},
   loading: false,
   plansFetched: false,
   lastPlansFetchedAt: null,
@@ -703,7 +729,10 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     if (!isRefresh) set({ loading: true });
     try {
       const plan = await fetchJson<ParsedPlan>(`/api/plans/${name}`);
-      set({ selectedPlan: plan, loading: false });
+      set({ selectedPlan: plan, loading: false, artifactCi: {} });
+      // Task 2.2 — observed ground truth, fetched after the board paints
+      // (gh lookups are slow; the badge pops in when it lands).
+      void get().fetchArtifactCi(name);
     } catch (e) {
       set({ loading: false });
       throw e;
@@ -793,7 +822,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     set({ plans: updatedPlans });
   },
 
-  patchTaskStatus: (planName, taskNumber, status) => {
+  patchTaskStatus: (planName, taskNumber, status, agent, artifacts) => {
     const { selectedPlan, plans } = get();
 
     // Look up the prior status BEFORE mutating so we can compute a signed delta.
@@ -820,7 +849,27 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
           ...p,
           tasks: p.tasks.map((t) =>
             t.number === taskNumber
-              ? { ...t, status, statusUpdatedAt: new Date().toISOString() }
+              ? {
+                  ...t,
+                  status,
+                  statusUpdatedAt: new Date().toISOString(),
+                  // Pivot 2026-06-11 — live-patch the declaring agent and
+                  // prepend freshly declared artifacts (the authoritative
+                  // refetch reconciles ordering/duplicates).
+                  ...(agent !== undefined ? { agent } : {}),
+                  ...(artifacts?.length
+                    ? {
+                        artifacts: [
+                          ...artifacts.map((url) => ({
+                            url,
+                            agent,
+                            createdAt: new Date().toISOString(),
+                          })),
+                          ...(t.artifacts ?? []),
+                        ],
+                      }
+                    : {}),
+                }
               : t,
           ),
         })),
@@ -848,6 +897,17 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
       return { ...p, doneCount: p.doneCount + delta };
     });
     set({ plans: updatedPlans });
+  },
+
+  fetchArtifactCi: async (planName) => {
+    try {
+      const map = await fetchJson<Record<string, { url: string; state: string }>>(
+        `/api/plans/${planName}/artifact-ci`,
+      );
+      if (get().selectedPlan?.name === planName) set({ artifactCi: map });
+    } catch {
+      // Best-effort: no CI signal renders as no badge, never an error.
+    }
   },
 
   patchNodeStatus: (planName, nodeId, status) => {

@@ -789,6 +789,7 @@ mod tests {
     #[test]
     fn legacy_conversion_simple() {
         let legacy = ParsedPlan {
+            mode: None,
             name: "test".to_string(),
             file_path: "test.yaml".to_string(),
             title: "Test".to_string(),
@@ -803,6 +804,10 @@ mod tests {
                     description: String::new(),
                     tasks: vec![
                         PlanTask {
+                            agent: None,
+                            started_at: None,
+                            ended_at: None,
+                            artifacts: None,
                             number: "1.1".to_string(),
                             title: "Task A".to_string(),
                             description: String::new(),
@@ -816,6 +821,10 @@ mod tests {
                             ci: None,
                         },
                         PlanTask {
+                            agent: None,
+                            started_at: None,
+                            ended_at: None,
+                            artifacts: None,
                             number: "1.2".to_string(),
                             title: "Task B".to_string(),
                             description: String::new(),
@@ -837,6 +846,10 @@ mod tests {
                     title: "Phase 2".to_string(),
                     description: String::new(),
                     tasks: vec![PlanTask {
+                        agent: None,
+                        started_at: None,
+                        ended_at: None,
+                        artifacts: None,
                         number: "2.1".to_string(),
                         title: "Task C".to_string(),
                         description: String::new(),
@@ -892,6 +905,7 @@ mod tests {
     #[test]
     fn legacy_conversion_with_explicit_deps() {
         let legacy = ParsedPlan {
+            mode: None,
             name: "test".to_string(),
             file_path: "test.yaml".to_string(),
             title: "Test".to_string(),
@@ -905,6 +919,10 @@ mod tests {
                 description: String::new(),
                 tasks: vec![
                     PlanTask {
+                        agent: None,
+                        started_at: None,
+                        ended_at: None,
+                        artifacts: None,
                         number: "1.1".to_string(),
                         title: "A".to_string(),
                         description: String::new(),
@@ -918,6 +936,10 @@ mod tests {
                         ci: None,
                     },
                     PlanTask {
+                        agent: None,
+                        started_at: None,
+                        ended_at: None,
+                        artifacts: None,
                         number: "1.2".to_string(),
                         title: "B".to_string(),
                         description: String::new(),

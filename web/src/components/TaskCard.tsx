@@ -117,6 +117,31 @@ const derivedStateConfig: Record<
 
 /// Short human-readable label for the auth blocker — used as a button
 /// tooltip so users know why Start is disabled without opening settings.
+/// SQLite emits UTC "YYYY-MM-DD HH:MM:SS" (no T, no Z) — normalise before
+/// Date-parsing so the clock renders in the viewer's locale.
+function parseDbTime(s: string | null | undefined): Date | null {
+  if (!s) return null;
+  const d = new Date(s.includes("T") ? s : `${s.replace(" ", "T")}Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function fmtClock(s: string | null | undefined): string {
+  const d = parseDbTime(s);
+  return d ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "\u2014";
+}
+
+/// " · 38m" / " · 2h05" between start and end (end falls back to now for
+/// in-flight tasks); empty when the start is unknown.
+function fmtDuration(start: string | null | undefined, end: string | null | undefined): string {
+  const s = parseDbTime(start);
+  if (!s) return "";
+  const e = parseDbTime(end) ?? new Date();
+  const mins = Math.max(0, Math.round((e.getTime() - s.getTime()) / 60000));
+  if (mins < 60) return ` \u00b7 ${mins}m`;
+  const h = Math.floor(mins / 60);
+  return ` \u00b7 ${h}h${String(mins % 60).padStart(2, "0")}`;
+}
+
 function authStatusLabel(auth: AuthStatus | undefined): string {
   if (!auth) return "driver status unknown";
   switch (auth.kind) {
@@ -339,6 +364,15 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
       : null;
   const derivedCfg = derivedKey ? derivedStateConfig[derivedKey] : null;
   const cfg = derivedCfg ?? statusConfig[status] ?? statusConfig.pending;
+
+  // Pivot 2026-06-11 — `mode: observe` plans are executed by a FOREIGN
+  // agent that declares progress over MCP; Branchwork tracks but never
+  // drives. Every orchestration affordance (Check / Start / Continue /
+  // Retry / Fix CI) is hidden: spawning a runner on an observed plan
+  // would contradict the plan's own contract.
+  const isObserved = usePlanStore((s) => s.selectedPlan?.mode === "observe");
+  // Task 2.2 — observed CI state of the task's newest PR artifact.
+  const artifactCi = usePlanStore((s) => s.artifactCi[task.number]);
 
   // Pill tooltip — only set when a derived state is active so the
   // default behaviour (no tooltip on the regular pill) is preserved.
@@ -673,7 +707,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
                       its recovery action read as one unit. Spawns an agent on
                       a recovery branch off the failing commit with the failure
                       log baked into the prompt. */}
-                    {isFailed && !agentId && (
+                    {!isObserved && isFailed && !agentId && (
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -767,21 +801,23 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
               </TouchTarget>
             )}
           {/* Check button — always available except while an agent is running */}
-          <button
-            onClick={handleCheck}
-            disabled={checking || status === "checking" || taskLocked}
-            className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-300 rounded transition"
-            title={
-              taskLocked
-                ? "Agent running — wait for it to finish"
-                : "Spawn an agent to verify this task against the codebase"
-            }
-          >
-            {checking || status === "checking" ? "..." : "Check"}
-          </button>
+          {!isObserved && (
+            <button
+              onClick={handleCheck}
+              disabled={checking || status === "checking" || taskLocked}
+              className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-gray-300 rounded transition"
+              title={
+                taskLocked
+                  ? "Agent running — wait for it to finish"
+                  : "Spawn an agent to verify this task against the codebase"
+              }
+            >
+              {checking || status === "checking" ? "..." : "Check"}
+            </button>
+          )}
 
           {/* Start — for pending tasks */}
-          {status === "pending" && !agentId && (
+          {!isObserved && status === "pending" && !agentId && (
             <Button
               variant="primary"
               size="sm"
@@ -806,7 +842,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
           )}
 
           {/* Continue — for in_progress tasks */}
-          {status === "in_progress" && !agentId && (
+          {!isObserved && status === "in_progress" && !agentId && (
             <button
               onClick={() => handleStart("continue")}
               disabled={starting || !authReady || taskLocked || runnerBlock !== null}
@@ -827,7 +863,7 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
           )}
 
           {/* Retry — for failed tasks */}
-          {status === "failed" && !agentId && (
+          {!isObserved && status === "failed" && !agentId && (
             <button
               onClick={() => handleStart("continue")}
               disabled={starting || !authReady || taskLocked || runnerBlock !== null}
@@ -1007,6 +1043,97 @@ function TaskCardInner({ task, planName, phaseNumber }: Props) {
               </>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Pivot 2026-06-11 — declared-by chip + artifact links: the
+          observe-mode ground truth (who said so, and the PR/commit/run
+          links they attached). Rendered for any task that has them,
+          observed plan or not. */}
+      {(task.agent ||
+        (task.artifacts?.length ?? 0) > 0 ||
+        task.startedAt ||
+        task.endedAt ||
+        (status === "completed" && artifactCi?.state === "failure")) && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5" data-testid="declared-by-row">
+          {/* Task wall-clock (trigger-maintained server-side): start → end
+              and the human duration; observed and managed plans alike. */}
+          {(task.startedAt || task.endedAt) && (
+            <span
+              className="text-[10px] text-gray-500 tabular-nums"
+              data-testid="task-times"
+              title={`started: ${task.startedAt ?? "—"} · ended: ${task.endedAt ?? "—"} (UTC)`}
+            >
+              {"\u23F1 "}
+              {fmtClock(task.startedAt)}
+              {" \u2192 "}
+              {fmtClock(task.endedAt)}
+              {fmtDuration(task.startedAt, task.endedAt)}
+            </span>
+          )}
+          {/* Task 2.2 — DIVERGENCE: the task says completed, the linked
+              PR's CI says failure. The whole point of observed ground
+              truth: a declared ✓ never silently outlives a red CI. */}
+          {status === "completed" && artifactCi?.state === "failure" && (
+            <a
+              href={artifactCi.url}
+              target="_blank"
+              rel="noreferrer noopener"
+              onClick={(e) => e.stopPropagation()}
+              className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-600/20 text-amber-300 border border-amber-500/40 hover:bg-amber-600/30"
+              title={`Task declared completed, but CI on ${artifactCi.url} is failing`}
+              data-testid="divergence-badge"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+              {"Declared \u2713 / CI \u2717"}
+            </a>
+          )}
+          {task.agent && (
+            <span
+              className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-violet-600/20 text-violet-300"
+              title={`Declared by ${task.agent}`}
+              data-testid="agent-chip"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-violet-400" />
+              {task.agent}
+            </span>
+          )}
+          {(task.artifacts ?? []).slice(0, 4).map((a) => {
+            const label = a.url.includes("/pull/")
+              ? `PR #${a.url.split("/pull/")[1]?.split(/[/?#]/)[0] ?? ""}`
+              : /^[0-9a-f]{7,40}$/i.test(a.url)
+                ? a.url.slice(0, 7)
+                : (a.url.split("/").pop() ?? a.url).slice(0, 24);
+            const isLink = /^https?:\/\//.test(a.url);
+            return isLink ? (
+              <a
+                key={a.url + a.createdAt}
+                href={a.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                onClick={(e) => e.stopPropagation()}
+                className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-gray-800 text-sky-300 hover:bg-gray-700 truncate max-w-[160px]"
+                title={a.url}
+                data-testid="artifact-link"
+              >
+                {label}
+              </a>
+            ) : (
+              <span
+                key={a.url + a.createdAt}
+                className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 truncate max-w-[160px]"
+                title={a.url}
+                data-testid="artifact-ref"
+              >
+                {label}
+              </span>
+            );
+          })}
+          {(task.artifacts?.length ?? 0) > 4 && (
+            <span className="text-[10px] text-gray-600">
+              +{(task.artifacts?.length ?? 0) - 4} more
+            </span>
+          )}
         </div>
       )}
 

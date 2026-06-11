@@ -1150,3 +1150,78 @@ describe("TaskCard spawn-error banner", () => {
     expect(screen.queryByTestId("spawn-error-banner")).toBeNull();
   });
 });
+
+describe("observe-mode plans (pivot 2026-06-11)", () => {
+  function setObservedPlan(t: PlanTask) {
+    const p = plan(t);
+    usePlanStore.setState({ selectedPlan: { ...p, mode: "observe" } });
+  }
+
+  it("hides every orchestration affordance on observed plans", () => {
+    setObservedPlan(task({ status: "pending" }));
+    render(<TaskCard task={task({ status: "pending" })} planName={PLAN} phaseNumber={1} />);
+    expect(screen.queryByTestId("start-task-button")).toBeNull();
+    expect(screen.queryByText("Check")).toBeNull();
+  });
+
+  it("still shows Start on managed plans", () => {
+    usePlanStore.setState({ selectedPlan: plan(task({ status: "pending" })) });
+    render(<TaskCard task={task({ status: "pending" })} planName={PLAN} phaseNumber={1} />);
+    expect(screen.getByTestId("start-task-button")).toBeTruthy();
+  });
+
+  it("renders the declaring-agent chip and artifact links", () => {
+    const t = task({
+      status: "completed",
+      agent: "claude-fable (session 2026-06-11)",
+      artifacts: [
+        { url: "https://github.com/x/y/pull/42", createdAt: new Date().toISOString() },
+        { url: "1a2b3c4d5e6f7a8b", createdAt: new Date().toISOString() },
+      ],
+    });
+    setObservedPlan(t);
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    expect(screen.getByTestId("agent-chip").textContent).toContain("claude-fable");
+    const link = screen.getByTestId("artifact-link") as HTMLAnchorElement;
+    expect(link.href).toBe("https://github.com/x/y/pull/42");
+    expect(link.textContent).toBe("PR #42");
+    expect(screen.getByTestId("artifact-ref").textContent).toBe("1a2b3c4");
+  });
+});
+
+describe("task wall-clock + declared-vs-CI divergence (pivot 2.2)", () => {
+  it("renders start → end times with duration", () => {
+    const t = task({
+      status: "completed",
+      startedAt: "2026-06-11 20:00:00",
+      endedAt: "2026-06-11 20:38:00",
+    });
+    usePlanStore.setState({ selectedPlan: plan(t) });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    const times = screen.getByTestId("task-times");
+    expect(times.textContent).toContain("→");
+    expect(times.textContent).toContain("38m");
+  });
+
+  it("shows the divergence badge when completed but the PR CI fails", () => {
+    const t = task({ status: "completed" });
+    usePlanStore.setState({
+      selectedPlan: plan(t),
+      artifactCi: { "1.1": { url: "https://github.com/x/y/pull/7", state: "failure" } },
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    const badge = screen.getByTestId("divergence-badge") as HTMLAnchorElement;
+    expect(badge.textContent).toContain("Declared");
+    expect(badge.href).toBe("https://github.com/x/y/pull/7");
+  });
+
+  it("no badge when the CI is green or the task is not completed", () => {
+    const t = task({ status: "completed" });
+    usePlanStore.setState({
+      selectedPlan: plan(t),
+      artifactCi: { "1.1": { url: "https://github.com/x/y/pull/7", state: "success" } },
+    });
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    expect(screen.queryByTestId("divergence-badge")).toBeNull();
+  });
+});

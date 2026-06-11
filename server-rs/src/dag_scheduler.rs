@@ -637,6 +637,10 @@ async fn spawn_dag_task_node(ctx: &SchedulerCtx<'_>, node: &DagNode, scoped_id: 
     let mcp_available = ctx.registry.drivers.injects_mcp(None);
 
     let synthetic_task = PlanTask {
+        agent: None,
+        started_at: None,
+        ended_at: None,
+        artifacts: None,
         number: scoped_id.to_string(),
         title: node.title.clone(),
         description: node.description.clone(),
@@ -658,6 +662,7 @@ async fn spawn_dag_task_node(ctx: &SchedulerCtx<'_>, node: &DagNode, scoped_id: 
         phase_verification: None,
     };
     let synthetic_plan = ParsedPlan {
+        mode: None,
         name: ctx.dag.name.clone(),
         file_path: ctx.dag.file_path.clone(),
         title: ctx.dag.title.clone(),

@@ -156,6 +156,7 @@ mod tests {
 
     fn empty_plan() -> ParsedPlan {
         ParsedPlan {
+            mode: None,
             name: "p".into(),
             file_path: "p.yaml".into(),
             title: "Test plan".into(),
@@ -497,6 +498,10 @@ mod tests {
 
     fn task(number: &str) -> PlanTask {
         PlanTask {
+            agent: None,
+            started_at: None,
+            ended_at: None,
+            artifacts: None,
             number: number.into(),
             title: format!("task {number}"),
             description: String::new(),

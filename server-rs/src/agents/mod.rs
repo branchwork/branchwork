@@ -3311,6 +3311,10 @@ mod tests {
 
     fn sample_plan_for_prompt() -> (ParsedPlan, PlanPhase, PlanTask) {
         let task = PlanTask {
+            agent: None,
+            started_at: None,
+            ended_at: None,
+            artifacts: None,
             number: "2.6".to_string(),
             title: "Update agent prompts".to_string(),
             description: "Replace curl with MCP tools.".to_string(),
@@ -3332,6 +3336,7 @@ mod tests {
             phase_verification: None,
         };
         let plan = ParsedPlan {
+            mode: None,
             name: "portable-agents".to_string(),
             file_path: String::new(),
             title: "Portable agents".to_string(),
