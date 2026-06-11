@@ -156,6 +156,7 @@ mod tests {
 
     fn empty_plan() -> ParsedPlan {
         ParsedPlan {
+            mode: None,
             name: "p".into(),
             file_path: "p.yaml".into(),
             title: "Test plan".into(),

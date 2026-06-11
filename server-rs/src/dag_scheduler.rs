@@ -658,6 +658,7 @@ async fn spawn_dag_task_node(ctx: &SchedulerCtx<'_>, node: &DagNode, scoped_id: 
         phase_verification: None,
     };
     let synthetic_plan = ParsedPlan {
+        mode: None,
         name: ctx.dag.name.clone(),
         file_path: ctx.dag.file_path.clone(),
         title: ctx.dag.title.clone(),

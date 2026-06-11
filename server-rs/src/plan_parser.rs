@@ -58,6 +58,13 @@ pub struct ParsedPlan {
     pub title: String,
     pub context: String,
     pub project: Option<String>,
+    /// Pivot 2026-06-11 — `observe` plans are tracked, never driven: a
+    /// FOREIGN orchestrator (e.g. a Claude Code session and its sub-agents)
+    /// executes and only declares progress over MCP. Branchwork skips the
+    /// managed machinery for them (tree-clean completion gate, auto-advance).
+    /// `None` / anything else = managed (default, fully backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub created_at: String,
     pub modified_at: String,
     pub phases: Vec<PlanPhase>,
@@ -123,6 +130,9 @@ struct YamlPlan {
     context: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project: Option<String>,
+    /// `observe` = foreign-agent plan (see ParsedPlan::mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
     phases: Vec<YamlPlanPhase>,
@@ -355,6 +365,7 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
     }
 
     ParsedPlan {
+        mode: None,
         name: name.to_string(),
         file_path: file_path.to_string(),
         title,
@@ -592,6 +603,7 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
         .collect();
 
     Ok(ParsedPlan {
+        mode: yaml.mode,
         name: name.to_string(),
         file_path: file_path.to_string(),
         title: yaml.title,
@@ -614,6 +626,7 @@ pub fn serialize_plan_yaml(plan: &ParsedPlan) -> Result<String, String> {
         title: plan.title.clone(),
         context: plan.context.clone(),
         project: plan.project.clone(),
+        mode: plan.mode.clone(),
         created_at: if plan.created_at.is_empty() {
             None
         } else {
@@ -815,6 +828,7 @@ fn dag_plan_to_parsed(dag: &crate::dag::DagPlan) -> ParsedPlan {
     };
 
     ParsedPlan {
+        mode: None,
         name: dag.name.clone(),
         file_path: dag.file_path.clone(),
         title: dag.title.clone(),
@@ -1761,6 +1775,7 @@ phases:
     fn produces_commit_round_trip_serialization() {
         // Build a plan with one task produces_commit=false, another =true
         let plan = ParsedPlan {
+            mode: None,
             name: "rt".to_string(),
             file_path: "/tmp/rt.yaml".to_string(),
             title: "Round-trip".to_string(),

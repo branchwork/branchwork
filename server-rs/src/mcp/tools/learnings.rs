@@ -525,6 +525,8 @@ mod tests {
             task: "1.1".to_string(),
             status: "completed".to_string(),
             reason: None,
+            agent: None,
+            artifacts: None,
         }))
         .await
         .expect("post-capture completed must pass the pending-learning gate");

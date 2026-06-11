@@ -789,6 +789,7 @@ mod tests {
     #[test]
     fn legacy_conversion_simple() {
         let legacy = ParsedPlan {
+            mode: None,
             name: "test".to_string(),
             file_path: "test.yaml".to_string(),
             title: "Test".to_string(),
@@ -892,6 +893,7 @@ mod tests {
     #[test]
     fn legacy_conversion_with_explicit_deps() {
         let legacy = ParsedPlan {
+            mode: None,
             name: "test".to_string(),
             file_path: "test.yaml".to_string(),
             title: "Test".to_string(),

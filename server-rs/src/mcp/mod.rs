@@ -68,7 +68,8 @@ impl BranchworkMcp {
             tool_router: Self::hello_router()
                 + Self::plans_router()
                 + Self::status_router()
-                + Self::learnings_router(),
+                + Self::learnings_router()
+                + Self::practices_router(),
         }
     }
 
@@ -88,8 +89,11 @@ impl ServerHandler for BranchworkMcp {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "Branchwork MCP server. Tools: hello, list_plans, get_plan, get_task, \
-                 get_task_context, create_plan, update_task_status, report_cost, \
-                 report_blocker, capture_learning."
+                 get_task_context (includes scoped practices), create_plan, \
+                 update_task_status (accepts agent label + artifact links; \
+                 observe-mode plans skip managed gates), report_cost, \
+                 report_blocker, capture_learning, practice_add, \
+                 practice_search."
                     .to_string(),
             )
     }

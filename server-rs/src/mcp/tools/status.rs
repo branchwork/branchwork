@@ -44,6 +44,16 @@ pub struct UpdateTaskStatusRequest {
     /// learning so downstream tasks can see the context.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Pivot 2026-06-11 — label of the DECLARING agent (a foreign
+    /// orchestrator such as a Claude Code session, or one of its
+    /// sub-agents). Shown on the dashboard task card.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Artifact links this update produced (PR URLs, commit SHAs, CI run
+    /// URLs). Persisted to `task_artifacts` and broadcast, so the dashboard
+    /// can show observed ground truth next to the declared status.
+    #[serde(default)]
+    pub artifacts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -120,11 +130,22 @@ impl BranchworkMcp {
             ));
         }
 
+        // Pivot 2026-06-11 — `mode: observe` plans are declared against by
+        // FOREIGN agents; Branchwork tracks but never drives. The tree-clean
+        // gate assumes a Branchwork-managed worktree and auto-advance assumes
+        // Branchwork-spawned runners — both are skipped for observe plans.
+        // The pending-learning CI gate stays: it is knowledge hygiene, not
+        // execution machinery.
+        let observe_mode = crate::plan_parser::find_plan_file(&self.ctx.plans_dir, &req.plan)
+            .and_then(|p| crate::plan_parser::parse_plan_file(&p).ok())
+            .is_some_and(|p| p.mode.as_deref() == Some("observe"));
+
         // Reject `completed` on a dirty working tree — the most common way
         // tasks get silently dropped is an agent that edits files, calls
         // this tool, and exits without `git commit`. See
         // `agents::check_tree_clean_for_completion` for the full story.
-        if req.status == "completed"
+        if !observe_mode
+            && req.status == "completed"
             && let crate::agents::TreeState::Dirty { files } =
                 crate::agents::check_tree_clean_for_completion(
                     &self.ctx.db,
@@ -211,6 +232,19 @@ impl BranchworkMcp {
                     params![req.plan, req.task, reason],
                 );
             }
+
+            // Pivot 2026-06-11 — persist artifact links (best-effort, like
+            // the learning above): the ground truth the dashboard shows next
+            // to the declared status.
+            if let Some(artifacts) = req.artifacts.as_ref() {
+                for url in artifacts.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    let _ = db.execute(
+                        "INSERT INTO task_artifacts (plan_name, task_number, url, agent) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![req.plan, req.task, url, req.agent],
+                    );
+                }
+            }
         }
 
         // Task 2.2 (DAG model): for `schema_version: 2` plans, `req.task` is a
@@ -245,10 +279,12 @@ impl BranchworkMcp {
                 "plan_name": req.plan,
                 "task_number": req.task,
                 "status": req.status,
+                "agent": req.agent,
+                "artifacts": req.artifacts,
             }),
         );
 
-        if req.status == "completed" || req.status == "skipped" {
+        if !observe_mode && (req.status == "completed" || req.status == "skipped") {
             let registry = self.ctx.registry.clone();
             let plans_dir = self.ctx.plans_dir.clone();
             let effort = *self.ctx.effort.lock().unwrap();
@@ -477,6 +513,8 @@ mod tests {
                 task: "1.1".to_string(),
                 status: "completed".to_string(),
                 reason: None,
+                agent: None,
+                artifacts: None,
             }))
             .await;
         // rmcp::Json<T> doesn't impl Debug, so we can't .expect_err — pattern
@@ -516,6 +554,8 @@ mod tests {
                     task: "1.1".to_string(),
                     status: st.to_string(),
                     reason: None,
+                    agent: None,
+                    artifacts: None,
                 }))
                 .await;
             // rmcp::Json<T> doesn't impl Debug; report the error message
@@ -538,6 +578,8 @@ mod tests {
             task: "1.1".to_string(),
             status: "in_progress".to_string(),
             reason: Some("CI tripped because of fmt".to_string()),
+            agent: None,
+            artifacts: None,
         }))
         .await
         .expect("in_progress+reason should succeed");
@@ -552,6 +594,8 @@ mod tests {
             task: "1.1".to_string(),
             status: "completed".to_string(),
             reason: None,
+            agent: None,
+            artifacts: None,
         }))
         .await
         .expect("post-resolve completed should succeed");
@@ -590,6 +634,8 @@ mod tests {
             task: "1.1".to_string(),
             status: "completed".to_string(),
             reason: None,
+            agent: None,
+            artifacts: None,
         }))
         .await
         .expect("no pending rows → completed must succeed");

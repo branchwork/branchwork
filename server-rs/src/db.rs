@@ -1502,7 +1502,39 @@ pub fn init(db_path: &Path) -> Db {
     Arc::new(Mutex::new(conn))
 }
 
-fn migrate(conn: &Connection) {
+pub(crate) fn migrate(conn: &Connection) {
+    // Pivot 2026-06-11 (observe-mode + scoped practices) — additive tables.
+    // `task_artifacts`: ground-truth links (PR / commit / CI run) a foreign
+    // agent attaches to its status declarations; the dashboard renders them
+    // next to the DECLARED status so divergence is visible.
+    // `practices`: org rules scoped by path globs / keywords, served inside
+    // get_task_context (see mcp/tools/practices.rs). Advisory only.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS task_artifacts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_name   TEXT NOT NULL,
+            task_number TEXT NOT NULL,
+            url         TEXT NOT NULL,
+            agent       TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_artifacts_task
+            ON task_artifacts(plan_name, task_number);
+
+        CREATE TABLE IF NOT EXISTS practices (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_globs TEXT NOT NULL DEFAULT '[]',
+            keywords    TEXT NOT NULL DEFAULT '[]',
+            rule        TEXT NOT NULL,
+            why         TEXT,
+            source      TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        ",
+    )
+    .expect("pivot tables migration failed");
+
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS hook_events (

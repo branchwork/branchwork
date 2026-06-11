@@ -5645,6 +5645,7 @@ pub async fn update_plan(
 
     // Build a ParsedPlan from the update body
     let plan = plan_parser::ParsedPlan {
+        mode: None,
         name: name.clone(),
         file_path: plan_path.to_string_lossy().to_string(),
         title: body.title,
@@ -5770,6 +5771,7 @@ pub struct DeletePlanQuery {
 /// | plan_verdicts        | PRIMARY KEY              | cascade   |
 /// | plan_budget          | PRIMARY KEY              | cascade   |
 /// | task_learnings       | NOT NULL                 | cascade   |
+/// | task_artifacts       | NOT NULL                 | cascade   |
 /// | plan_org             | PRIMARY KEY              | cascade   |
 /// | plan_runner_affinity | PRIMARY KEY              | cascade   |
 /// | agents               | nullable (no FK)         | preserve  |
@@ -5812,6 +5814,7 @@ pub(crate) const PLAN_CASCADE_TABLES: &[&str] = &[
     "plan_verdicts",
     "plan_budget",
     "task_learnings",
+    "task_artifacts",
     "plan_org",
     "plan_runner_affinity",
     "node_status",
@@ -7410,6 +7413,7 @@ mod check_prompt_tests {
 
     fn sample_plan() -> plan_parser::ParsedPlan {
         plan_parser::ParsedPlan {
+            mode: None,
             name: "dashboard-polish".into(),
             file_path: String::new(),
             title: "Test Plan".into(),

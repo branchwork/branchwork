@@ -132,6 +132,10 @@ pub struct TaskContext {
     /// already completed or were skipped — with their recorded learnings, so
     /// callers inherit context from predecessors.
     pub prior_related_tasks: Vec<String>,
+    /// Pivot 2026-06-11 — project practices whose scope (path globs /
+    /// keywords) matches this task's file_paths or title/description.
+    /// Advisory rules the agent should apply while doing the work.
+    pub practices: Vec<crate::mcp::tools::practices::PracticeHit>,
 }
 
 // ── Tools ────────────────────────────────────────────────────────────────────
@@ -369,6 +373,18 @@ impl BranchworkMcp {
             dbmod::task_learnings(&conn, &req.plan, &req.task_number)
         };
 
+        // Pivot 2026-06-11 — scoped practices ride along with the context:
+        // the rule reaches the agent at the exact moment it starts the work
+        // that needs it (see mcp/tools/practices.rs).
+        let practices = {
+            let conn = self.ctx.db.lock().unwrap();
+            crate::mcp::tools::practices::practices_for_task(
+                &conn,
+                &task.file_paths,
+                &format!("{} {}", task.title, task.description),
+            )
+        };
+
         // Reuse the same listing agent prompts get. Emits a pre-formatted
         // block with "- Task X: title — files: ..." lines and indented "    •"
         // learnings; we split it into lines for structured consumption.
@@ -393,6 +409,7 @@ impl BranchworkMcp {
             status,
             learnings,
             prior_related_tasks,
+            practices,
         }))
     }
 }

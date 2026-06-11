@@ -3332,6 +3332,7 @@ mod tests {
             phase_verification: None,
         };
         let plan = ParsedPlan {
+            mode: None,
             name: "portable-agents".to_string(),
             file_path: String::new(),
             title: "Portable agents".to_string(),
