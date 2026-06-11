@@ -256,6 +256,19 @@ export function PlanBoard() {
             />
             <span className="text-sm font-mono font-normal text-gray-600 ml-2">{plan.name}</span>
           </h2>
+          {/* Pivot 2026-06-11 — observe-mode marker: a FOREIGN agent runs
+              this plan and declares progress over MCP; Branchwork tracks
+              but never drives (no Start/Continue/Check on the cards). */}
+          {plan.mode === "observe" && (
+            <span
+              className="inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-violet-600/15 text-violet-300 border border-violet-500/30"
+              title="Agent-driven plan: a foreign agent (e.g. a Claude Code session) executes and declares progress over MCP. Branchwork observes — it never spawns runners here."
+              data-testid="observe-badge"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-violet-400" />
+              Observed
+            </span>
+          )}
           <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">
             {done}/{total} tasks done ({pct}%)
             {inProgress > 0 && (

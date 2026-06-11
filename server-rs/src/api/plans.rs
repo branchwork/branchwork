@@ -317,30 +317,63 @@ pub async fn get_plan(
 
     let db = state.db.lock().unwrap();
 
-    // Merge task statuses
-    if let Ok(mut stmt) =
-        db.prepare("SELECT task_number, status, updated_at FROM task_status WHERE plan_name = ?")
-    {
-        let mut status_map: HashMap<String, (String, String)> = HashMap::new();
+    // Merge task statuses (+ the declaring agent, pivot 2026-06-11)
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT task_number, status, updated_at, agent FROM task_status WHERE plan_name = ?",
+    ) {
+        let mut status_map: HashMap<String, (String, String, Option<String>)> = HashMap::new();
         if let Ok(rows) = stmt.query_map(params![name], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         }) {
             for row in rows.flatten() {
-                status_map.insert(row.0, (row.1, row.2));
+                status_map.insert(row.0, (row.1, row.2, row.3));
             }
         }
 
         for phase in &mut plan.phases {
             for task in &mut phase.tasks {
-                if let Some((status, updated_at)) = status_map.get(&task.number) {
+                if let Some((status, updated_at, agent)) = status_map.get(&task.number) {
                     task.status = Some(status.clone());
                     task.status_updated_at = Some(updated_at.clone());
+                    task.agent = agent.clone();
                 } else {
                     task.status = Some("pending".to_string());
+                }
+            }
+        }
+    }
+
+    // Merge declared artifacts (pivot 2026-06-11) — newest first per task.
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT task_number, url, agent, created_at FROM task_artifacts \
+         WHERE plan_name = ? ORDER BY id DESC",
+    ) {
+        let mut artifact_map: HashMap<String, Vec<plan_parser::TaskArtifact>> = HashMap::new();
+        if let Ok(rows) = stmt.query_map(params![name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                plan_parser::TaskArtifact {
+                    url: row.get(1)?,
+                    agent: row.get(2)?,
+                    created_at: row.get(3)?,
+                },
+            ))
+        }) {
+            for (task_number, artifact) in rows.flatten() {
+                artifact_map.entry(task_number).or_default().push(artifact);
+            }
+        }
+        if !artifact_map.is_empty() {
+            for phase in &mut plan.phases {
+                for task in &mut phase.tasks {
+                    if let Some(artifacts) = artifact_map.remove(&task.number) {
+                        task.artifacts = Some(artifacts);
+                    }
                 }
             }
         }
@@ -5664,6 +5697,8 @@ pub async fn update_plan(
                     .tasks
                     .into_iter()
                     .map(|t| plan_parser::PlanTask {
+                        agent: None,
+                        artifacts: None,
                         number: t.number,
                         title: t.title,
                         description: t.description,
@@ -7432,6 +7467,8 @@ mod check_prompt_tests {
 
     fn sample_task(number: &str, files: Vec<String>) -> plan_parser::PlanTask {
         plan_parser::PlanTask {
+            agent: None,
+            artifacts: None,
             number: number.into(),
             title: "A task".into(),
             description: "Do things".into(),

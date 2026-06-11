@@ -637,6 +637,8 @@ async fn spawn_dag_task_node(ctx: &SchedulerCtx<'_>, node: &DagNode, scoped_id: 
     let mcp_available = ctx.registry.drivers.injects_mcp(None);
 
     let synthetic_task = PlanTask {
+        agent: None,
+        artifacts: None,
         number: scoped_id.to_string(),
         title: node.title.clone(),
         description: node.description.clone(),

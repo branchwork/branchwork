@@ -283,6 +283,11 @@ const TaskStatusChanged = v.object({
     plan_name: v.string(),
     task_number: v.string(),
     status: v.string(),
+    /// Pivot 2026-06-11 — foreign agent that declared the status
+    /// (observe-mode plans); absent for runner/human transitions.
+    agent: v.optional(v.nullable(v.string())),
+    /// Artifact links declared with the update (PR / commit / CI run).
+    artifacts: v.optional(v.nullable(v.array(v.string()))),
   }),
 });
 

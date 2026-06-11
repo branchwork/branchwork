@@ -804,6 +804,8 @@ mod tests {
                     description: String::new(),
                     tasks: vec![
                         PlanTask {
+                            agent: None,
+                            artifacts: None,
                             number: "1.1".to_string(),
                             title: "Task A".to_string(),
                             description: String::new(),
@@ -817,6 +819,8 @@ mod tests {
                             ci: None,
                         },
                         PlanTask {
+                            agent: None,
+                            artifacts: None,
                             number: "1.2".to_string(),
                             title: "Task B".to_string(),
                             description: String::new(),
@@ -838,6 +842,8 @@ mod tests {
                     title: "Phase 2".to_string(),
                     description: String::new(),
                     tasks: vec![PlanTask {
+                        agent: None,
+                        artifacts: None,
                         number: "2.1".to_string(),
                         title: "Task C".to_string(),
                         description: String::new(),
@@ -907,6 +913,8 @@ mod tests {
                 description: String::new(),
                 tasks: vec![
                     PlanTask {
+                        agent: None,
+                        artifacts: None,
                         number: "1.1".to_string(),
                         title: "A".to_string(),
                         description: String::new(),
@@ -920,6 +928,8 @@ mod tests {
                         ci: None,
                     },
                     PlanTask {
+                        agent: None,
+                        artifacts: None,
                         number: "1.2".to_string(),
                         title: "B".to_string(),
                         description: String::new(),

@@ -35,6 +35,24 @@ pub struct PlanTask {
     pub cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ci: Option<crate::ci::CiStatus>,
+    /// Pivot 2026-06-11 — foreign agent that declared the current status
+    /// (observe-mode plans); merged from task_status.agent in get_plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Pivot 2026-06-11 — artifact links declared with status updates
+    /// (PR / commit / CI-run); merged from task_artifacts in get_plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<TaskArtifact>>,
+}
+
+/// One declared artifact link on a task (observe-mode declarations).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArtifact {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +356,8 @@ pub fn parse_plan_markdown(raw: &str, name: &str, file_path: &str) -> ParsedPlan
         // Last resort: entire phase body as one task
         if tasks.is_empty() && !body.trim().is_empty() {
             tasks.push(PlanTask {
+                agent: None,
+                artifacts: None,
                 number: format!("{phase_num}.1"),
                 title: phase_title.clone(),
                 description: body.trim().to_string(),
@@ -465,6 +485,8 @@ fn parse_tasks_from_headings(body: &str) -> Vec<PlanTask> {
         let dependencies = extract_dependencies(&task_body);
 
         tasks.push(PlanTask {
+            agent: None,
+            artifacts: None,
             number: task_number,
             title: task_title,
             description: task_body,
@@ -494,6 +516,8 @@ fn parse_tasks_from_bullets(body: &str, phase_num: u32) -> Vec<PlanTask> {
         let file_paths = extract_file_paths(full);
         let dependencies = extract_dependencies(full);
         tasks.push(PlanTask {
+            agent: None,
+            artifacts: None,
             number: format!("{phase_num}.{idx}"),
             title,
             description: desc,
@@ -577,6 +601,8 @@ pub fn parse_plan_yaml(raw: &str, name: &str, file_path: &str) -> Result<ParsedP
                 .tasks
                 .into_iter()
                 .map(|t| PlanTask {
+                    agent: None,
+                    artifacts: None,
                     number: t.number,
                     title: t.title,
                     description: t.description,
@@ -791,6 +817,8 @@ fn dag_plan_to_parsed(dag: &crate::dag::DagPlan) -> ParsedPlan {
         .filter(|n| n.node_type == NodeType::Task)
         .enumerate()
         .map(|(i, n)| PlanTask {
+            agent: None,
+            artifacts: None,
             number: if n.id.contains('.') {
                 n.id.clone()
             } else {
@@ -1789,6 +1817,8 @@ phases:
                 description: String::new(),
                 tasks: vec![
                     PlanTask {
+                        agent: None,
+                        artifacts: None,
                         number: "0.1".to_string(),
                         title: "No commit".to_string(),
                         description: String::new(),
@@ -1802,6 +1832,8 @@ phases:
                         ci: None,
                     },
                     PlanTask {
+                        agent: None,
+                        artifacts: None,
                         number: "0.2".to_string(),
                         title: "Has commit".to_string(),
                         description: String::new(),

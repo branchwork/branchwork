@@ -1150,3 +1150,41 @@ describe("TaskCard spawn-error banner", () => {
     expect(screen.queryByTestId("spawn-error-banner")).toBeNull();
   });
 });
+
+describe("observe-mode plans (pivot 2026-06-11)", () => {
+  function setObservedPlan(t: PlanTask) {
+    const p = plan(t);
+    usePlanStore.setState({ selectedPlan: { ...p, mode: "observe" } });
+  }
+
+  it("hides every orchestration affordance on observed plans", () => {
+    setObservedPlan(task({ status: "pending" }));
+    render(<TaskCard task={task({ status: "pending" })} planName={PLAN} phaseNumber={1} />);
+    expect(screen.queryByTestId("start-task-button")).toBeNull();
+    expect(screen.queryByText("Check")).toBeNull();
+  });
+
+  it("still shows Start on managed plans", () => {
+    usePlanStore.setState({ selectedPlan: plan(task({ status: "pending" })) });
+    render(<TaskCard task={task({ status: "pending" })} planName={PLAN} phaseNumber={1} />);
+    expect(screen.getByTestId("start-task-button")).toBeTruthy();
+  });
+
+  it("renders the declaring-agent chip and artifact links", () => {
+    const t = task({
+      status: "completed",
+      agent: "claude-fable (session 2026-06-11)",
+      artifacts: [
+        { url: "https://github.com/x/y/pull/42", createdAt: new Date().toISOString() },
+        { url: "1a2b3c4d5e6f7a8b", createdAt: new Date().toISOString() },
+      ],
+    });
+    setObservedPlan(t);
+    render(<TaskCard task={t} planName={PLAN} phaseNumber={1} />);
+    expect(screen.getByTestId("agent-chip").textContent).toContain("claude-fable");
+    const link = screen.getByTestId("artifact-link") as HTMLAnchorElement;
+    expect(link.href).toBe("https://github.com/x/y/pull/42");
+    expect(link.textContent).toBe("PR #42");
+    expect(screen.getByTestId("artifact-ref").textContent).toBe("1a2b3c4");
+  });
+});

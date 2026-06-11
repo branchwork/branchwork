@@ -32,6 +32,11 @@ export interface PlanTask {
   agentId?: string;
   costUsd?: number;
   ci?: CiStatus | null;
+  /// Pivot 2026-06-11 — foreign agent that declared the current status
+  /// (observe-mode plans). Distinct from agentId (a managed runner).
+  agent?: string | null;
+  /// Declared artifact links (PR / commit / CI run), newest first.
+  artifacts?: { url: string; agent?: string | null; createdAt: string }[];
 }
 
 /// Node type for `schema_version: 2` (DAG) plans. Matches the server's
@@ -119,6 +124,10 @@ export interface ParsedPlan {
   title: string;
   context: string;
   project: string | null;
+  /// Pivot 2026-06-11 — `observe` plans are executed by a FOREIGN agent
+  /// that only declares progress: the board hides every orchestration
+  /// affordance (Start / Continue / Retry / Check) for them.
+  mode?: string | null;
   createdAt: string;
   modifiedAt: string;
   phases: PlanPhase[];
@@ -467,7 +476,13 @@ interface PlanStore {
   /// matches the gone name (so App.tsx routes back to ProjectDashboard).
   /// Driven by the `plan_deleted` WS event.
   removePlan: (planName: string) => void;
-  patchTaskStatus: (planName: string, taskNumber: string, status: string) => void;
+  patchTaskStatus: (
+    planName: string,
+    taskNumber: string,
+    status: string,
+    agent?: string | null,
+    artifacts?: string[] | null,
+  ) => void;
   /// Patch a DAG node's status on the selected v2 plan. Driven by the
   /// `node_status_changed` / `gate_status_changed` WS events (and the gate
   /// approve/retry responses). `nodeId` is the scoped id (`wire-api` at top
@@ -793,7 +808,7 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
     set({ plans: updatedPlans });
   },
 
-  patchTaskStatus: (planName, taskNumber, status) => {
+  patchTaskStatus: (planName, taskNumber, status, agent, artifacts) => {
     const { selectedPlan, plans } = get();
 
     // Look up the prior status BEFORE mutating so we can compute a signed delta.
@@ -820,7 +835,27 @@ export const usePlanStore = create<PlanStore>((set, get) => ({
           ...p,
           tasks: p.tasks.map((t) =>
             t.number === taskNumber
-              ? { ...t, status, statusUpdatedAt: new Date().toISOString() }
+              ? {
+                  ...t,
+                  status,
+                  statusUpdatedAt: new Date().toISOString(),
+                  // Pivot 2026-06-11 — live-patch the declaring agent and
+                  // prepend freshly declared artifacts (the authoritative
+                  // refetch reconciles ordering/duplicates).
+                  ...(agent !== undefined ? { agent } : {}),
+                  ...(artifacts?.length
+                    ? {
+                        artifacts: [
+                          ...artifacts.map((url) => ({
+                            url,
+                            agent,
+                            createdAt: new Date().toISOString(),
+                          })),
+                          ...(t.artifacts ?? []),
+                        ],
+                      }
+                    : {}),
+                }
               : t,
           ),
         })),

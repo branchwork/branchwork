@@ -2218,6 +2218,12 @@ pub(crate) fn migrate(conn: &Connection) {
     conn.execute_batch("ALTER TABLE task_status ADD COLUMN source TEXT DEFAULT NULL;")
         .ok();
 
+    // Pivot 2026-06-11 — label of the foreign agent that DECLARED the
+    // current status (observe-mode plans). NULL for managed-runner and
+    // human-set statuses; surfaced as a chip on the dashboard task card.
+    conn.execute_batch("ALTER TABLE task_status ADD COLUMN agent TEXT DEFAULT NULL;")
+        .ok();
+
     // Per-plan opt-in for parallel spawn. Default 0 (off) — until
     // worktree-per-agent isolation ships, the spawn loop unconditionally
     // breaks after the first claim (Phase 3.5.1). 3.5.3 will reject toggle

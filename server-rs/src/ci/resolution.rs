@@ -498,6 +498,8 @@ mod tests {
 
     fn task(number: &str) -> PlanTask {
         PlanTask {
+            agent: None,
+            artifacts: None,
             number: number.into(),
             title: format!("task {number}"),
             description: String::new(),

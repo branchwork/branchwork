@@ -3311,6 +3311,8 @@ mod tests {
 
     fn sample_plan_for_prompt() -> (ParsedPlan, PlanPhase, PlanTask) {
         let task = PlanTask {
+            agent: None,
+            artifacts: None,
             number: "2.6".to_string(),
             title: "Update agent prompts".to_string(),
             description: "Replace curl with MCP tools.".to_string(),

@@ -207,13 +207,14 @@ impl BranchworkMcp {
         {
             let db = self.ctx.db.lock().unwrap();
             db.execute(
-                "INSERT INTO task_status (plan_name, task_number, status, source, updated_at)
-                 VALUES (?1, ?2, ?3, 'manual', datetime('now'))
+                "INSERT INTO task_status (plan_name, task_number, status, source, updated_at, agent)
+                 VALUES (?1, ?2, ?3, 'manual', datetime('now'), ?4)
                  ON CONFLICT(plan_name, task_number)
                  DO UPDATE SET status = excluded.status,
                                source = 'manual',
-                               updated_at = excluded.updated_at",
-                params![req.plan, req.task, req.status],
+                               updated_at = excluded.updated_at,
+                               agent = COALESCE(excluded.agent, task_status.agent)",
+                params![req.plan, req.task, req.status, req.agent],
             )
             .map_err(|e| {
                 McpError::internal_error(format!("failed to write task_status: {e}"), None)
