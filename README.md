@@ -1,12 +1,18 @@
 # Branchwork
 
-**Your Claude Code sessions, on any screen.** Run Branchwork on your workstation, open the dashboard from your laptop, your phone, a hotel TV — anywhere your browser can reach the host — and you're in a live terminal with a real Claude Code agent working on your codebase.
+**See what your agents are doing — against the plan.** Agents orchestrate themselves; Branchwork is the layer they report to: shared plan state, scoped project practices served at the moment a task starts, and a live dashboard that shows declared progress next to observed ground truth (commits, PRs, CI). The agent drives. Branchwork knows, advises and shows.
 
 ![Demo](screenshots/demo.gif)
 
-Plans live as YAML in `~/.claude/plans/`. Every task has a Start button. Click it and a Claude agent spins up on a dedicated git branch, you watch it work, type to it, and when it's done you review the diff and merge — all from the browser.
+Plans live as YAML in `~/.claude/plans/`. Any MCP-speaking agent — a Claude Code session and its sub-agents, a runner, Bob Shell — connects to the Branchwork MCP server and:
 
-It is a **project-management layer for AI agents**. Like Linear/Jira, except assignees are AI agents (Claude Code today, Aider/Codex/Gemini as drivers), status updates come from the code and git, and "complete a task" means: spawn an agent on a branch, watch it, review the diff, merge. Ships as a single ~15 MB Rust binary. No Node, no Docker, no daemon to install separately.
+- **declares** where it is (`update_task_status` with its agent label + artifact links — PR, commit, CI run);
+- **asks** for task context (`get_task_context`: the task's spec, prior learnings, **and every project practice whose scope matches the files it is about to touch** — your org's hard-won rules, injected exactly when they're needed);
+- **teaches** (`practice_add`: promote a recurring learning into a standing, scoped rule).
+
+Mark a plan `mode: observe` and Branchwork tracks a foreign orchestrator without driving anything — no spawn, no gates on your worktree, pure visibility. Practices are advisory by design: CI stays the enforcement layer.
+
+**Managed mode still exists** for when you want Branchwork to drive: every task has a Start button that spins up a Claude agent on a dedicated git branch — you watch it work, type to it, review the diff and merge from the browser (Claude Code today, Aider/Codex/Gemini as drivers). Ships as a single ~15 MB Rust binary. No Node, no Docker, no daemon to install separately.
 
 ## Screenshots
 

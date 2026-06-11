@@ -1,0 +1,96 @@
+{
+  "comment": "Reglyze operational practices — seeded 2026-06-11 from the Claude memory corpus (the recurring 'bits'). Loaded via seeds/seed-practices.py → MCP practice_add. Each entry: scope (path globs and/or keywords), the imperative rule, the incident behind it, the source memory.",
+  "practices": [
+    {
+      "scope_globs": ["packages/db/drizzle/**"],
+      "keywords": ["migration drizzle"],
+      "rule": "Every migration: hand-author the NNNN_name.down.sql pair, bump the journal `when` PAST the latest future-dated entry (floor ≥ 2026-08-16 after 0072), prefer ADD COLUMN IF NOT EXISTS, then run infra/scripts/check-migration-down-files.sh.",
+      "why": "Drizzle applies migrations by created_at: a real-dated entry below the future-dated floor is SILENTLY SKIPPED on prod (CI's fresh DB stays green) — bits 0060/0061/0063 and PR #152's 0071. The down-file gate is CI-only: green local, red main, deploy skipped.",
+      "source": "memory feedback_migration_when_floor_skip + feedback_migration_down_sql_pair"
+    },
+    {
+      "scope_globs": ["packages/db/src/schema/**"],
+      "keywords": ["new column", "drizzle schema"],
+      "rule": "After ANY schema change: pnpm --filter @reglyze/db build (runtime resolves dist), AND add the new columns to every hand-crafted CREATE TABLE in tests (rg \"CREATE TABLE\" apps/*/test packages/*/test) — drizzle full-row selects name every schema column.",
+      "why": "New schema exports are undefined at runtime until the dist rebuild (route 500 / Symbol(drizzle:Columns)); raw-SQL test schemas 42703 in CI only (green local, red CI).",
+      "source": "memory feedback_db_dist_rebuild + feedback_handcrafted_test_schema"
+    },
+    {
+      "scope_globs": ["packages/shared/src/types/**"],
+      "keywords": ["DocumentType", "union extension", "PlanTier"],
+      "rule": "Extending a shared union: run the FULL pnpm typecheck (16 packages) and the full suites of web, ai-service and core-api before pushing — exhaustive Record<Union, …> maps and contract pins live in packages outside the obvious filter.",
+      "why": "PR #157 went red twice in CI: ai-service native-doc-prompt Record maps and the CSV-export 21.2.f pin — both invisible to a 4-package local check.",
+      "source": "memory project_documentation_score_derivation (2026-06-11 amendment)"
+    },
+    {
+      "scope_globs": [],
+      "keywords": ["planTier", "entitlement", "quota", "feature gate"],
+      "rule": "Never read org.planTier raw for feature/quota/default decisions — use org.effectivePlanTier ?? org.planTier server-side and useEntitlements() client-side.",
+      "why": "msp_included child orgs store plan_tier='free' and inherit the parent MSP tier; raw reads silently break Pro/MSP for them (EDF « 0 sur 0 jetons IA » incident; PRs #93/#97/#151).",
+      "source": "memory project_msp_effective_tier_client_gate"
+    },
+    {
+      "scope_globs": ["packages/regulatory-data/**"],
+      "keywords": ["native framework", "recyf", "misure", "cyfun", "grundschutz", "country"],
+      "rule": "Native-framework orgs (IT/DE/FR/BE) see 100% native data and ZERO NIS2 anywhere — never a crosswalk, never `if (country === \"FR\")` inline; read country behavior via the typed regulatory-data helpers, one concern per config.",
+      "why": "Highest-priority product invariant (Cyril, repeatedly): either native or NIS2, never both. Inline country switches rot and leak NIS2 wording into native surfaces.",
+      "source": "memory project_native_framework_supremacy + ADR 0031"
+    },
+    {
+      "scope_globs": ["tests/integration/**"],
+      "keywords": ["integration spec"],
+      "rule": "tests/integration specs PATH-SKIP on PR CI but run on main: any behavior change must update them IN THE SAME PR. Validate with `cd tests/integration && npx vitest run` — never `turbo test:integration` (replays stale passes).",
+      "why": "PR #144-class incidents: green PR, red main, deploy skipped. Turbo doesn't track core-api routes as inputs of the integration task.",
+      "source": "memory feedback_turbo_integration_cache + feedback_e2e_default_fr_vs_native_gates"
+    },
+    {
+      "scope_globs": ["apps/core-api/test/**"],
+      "keywords": ["vitest core-api"],
+      "rule": "Run core-api suites with --no-file-parallelism; a random toHaveLength(1) audit-row failure in full-parallel mode is the known flake, not a real bug.",
+      "why": "Fire-and-forget audit writes (void writeTabletopAudit & co) race the assertions under full parallelism.",
+      "source": "memory feedback_coreapi_audit_flake"
+    },
+    {
+      "scope_globs": ["infra/compose/**"],
+      "keywords": ["docker compose", "restart prod", "redis"],
+      "rule": "Any prod stack invocation uses `--env-file <prod env> -p reglyze`; never bare docker compose. Prod deploys go ONLY through .github/workflows/deploy.yml (backup/migrate/smoke/rollback) — no ad-hoc git reset && up -d.",
+      "why": "Without --env-file, ${REDIS_PASSWORD} substitution silently breaks the stack. Ad-hoc deploys bypass the pre-deploy backup and the rollback path.",
+      "source": "memory feedback_prod_compose_invocation + CLAUDE.md deploy section"
+    },
+    {
+      "scope_globs": [".github/workflows/**"],
+      "keywords": ["CI failure", "deploy", "rerun"],
+      "rule": "Trust `gh run view --json conclusion`, not `gh run watch` exit codes. 'job was not acquired by Runner', Docker Hub registry timeouts, and actions-cache blob ECONNRESET are GitHub infra flakes: `gh run rerun --failed`, never a code fix. A failed main CI silently SKIPS the deploy — always verify the deploy actually ran.",
+      "why": "Three distinct infra-flake reds on main on 2026-06-11 alone; the dangerous failure mode is assuming a merge deployed when main was red.",
+      "source": "memory feedback_ci_runner_flakes + session 2026-06-11"
+    },
+    {
+      "scope_globs": ["apps/core-api/src/routes/conversational-assessment.routes.ts", "apps/ai-service/**"],
+      "keywords": ["conversational", "AI turn", "session state"],
+      "rule": "Any persisted AI state machine must be re-enterable from EVERY stored state (paused, failure-record tail, answered tail) — never render a wait state without an affordance or auto-kick. Never await an AI call in-request beyond ~100s (Cloudflare 524): 202 + poll. Prompt guidance lives inside template literals: escape backticks.",
+      "why": "The EDF zombie-session incident (2026-06-09→11): an ai_quota failure tail dead-ended the pane in an eternal spinner masking an already-fixed server bug. The unescaped-backtick error cost a CI round-trip the same week.",
+      "source": "memory project_conversational_session_recovery + project_async_ai_architecture"
+    },
+    {
+      "scope_globs": ["apps/web/src/lib/i18n.ts"],
+      "keywords": ["i18n", "locale", "translation"],
+      "rule": "Every new key ships ×6 locales (en/fr/it/de/pt/nl) as NATIVE AUTHORING in context — never literal translation. Anchor legal terms to the official national sources.",
+      "why": "Cyril: « translations lead to errors » — locales are native writing; nl shipped 2026-06-08 and is mandatory since.",
+      "source": "memory feedback_native_copy_not_translation"
+    },
+    {
+      "scope_globs": ["tests/e2e/**"],
+      "keywords": ["playwright", "fixture country"],
+      "rule": "Generic-flow E2E fixtures use PT (NIS2-substrate): native countries (FR/IT/DE/BE) hit native-content 409 gates on gated phases. PR CI path-skips untouched E2E; main runs the full matrix — check the curated matrix list in ci.yml before assuming a spec runs.",
+      "why": "Native-country fixtures broke E2E on main (green PR / red main / deploy skipped) during the native-supremacy phases.",
+      "source": "memory feedback_e2e_default_fr_vs_native_gates"
+    },
+    {
+      "scope_globs": [],
+      "keywords": ["worktree", "merge", "main branch"],
+      "rule": "/home/cpo/reglyze is a SHARED worktree often left on a work branch: verify `git branch --show-current` before any merge/reset; land onto main via explicit `git push origin <branch>:main` refspec rather than checkout when in doubt.",
+      "why": "Agent worktree collisions corrupted merges before the rule existed.",
+      "source": "memory feedback_shared_worktree_merge_safety"
+    }
+  ]
+}
